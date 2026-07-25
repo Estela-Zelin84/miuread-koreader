@@ -99,38 +99,20 @@ function Popup:_book_font_css()
         )
     end
 
+    -- The popup CSS uses normal weight and style throughout. Resolving four
+    -- font variants made the first popup noticeably slower on older Kindles,
+    -- so only the regular face is embedded. The book font is still preserved.
     local family = "MiuReadBookFont"
-    local seen = {}
-    local rules = {}
-    for i = 1, 4 do
-        local bold = i >= 3
-        local italic = i == 2 or i == 4
-        local got, font_path, face_index = pcall(
-            cre.getFontFaceFilenameAndFaceIndex,
-            font_name, bold, italic
-        )
-        if got and type(font_path) == "string" and font_path ~= "" and can_embed_font(font_path, face_index) then
-            local key = table.concat({font_path, tostring(face_index or ""), bold and "b" or "n", italic and "i" or "n"}, "|")
-            if not seen[key] then
-                seen[key] = true
-                rules[#rules + 1] = string.format(
-                    "@font-face{font-family:'%s';src:url('%s')%s%s}",
-                    family,
-                    css_string(font_path),
-                    bold and ";font-weight:bold" or "",
-                    italic and ";font-style:italic" or ""
-                )
-            end
-        end
-    end
-
+    local got, font_path, face_index = pcall(
+        cre.getFontFaceFilenameAndFaceIndex,
+        font_name, false, false
+    )
     local css
-    if #rules > 0 then
-        rules[#rules + 1] = string.format(
-            "@page{font-family:'%s','%s'} html,body{font-family:'%s','%s'!important}",
-            family, escaped_name, family, escaped_name
+    if got and type(font_path) == "string" and font_path ~= "" and can_embed_font(font_path, face_index) then
+        css = string.format(
+            "@font-face{font-family:'%s';src:url('%s')}\n@page{font-family:'%s','%s'} html,body{font-family:'%s','%s'!important}",
+            family, css_string(font_path), family, escaped_name, family, escaped_name
         )
-        css = table.concat(rules, "\n")
     else
         css = string.format(
             "@page{font-family:'%s'} html,body{font-family:'%s'!important}",
@@ -210,23 +192,42 @@ function Popup:_new_html_widget(width, height, html, scrollable)
     }
 end
 
-local function single_page_height(widget)
-    local ok, value = pcall(function() return widget:getSinglePageHeight() end)
-    if ok then return tonumber(value) end
-end
+function Popup:_comments_height(width, max_height, minimum)
+    local metrics = type(self.metrics) == "table" and self.metrics or {}
+    local count = math.max(0, tonumber(metrics.comment_count) or 0)
+    local units = type(metrics.comment_units) == "table" and metrics.comment_units or {}
+    local chars = type(metrics.comment_chars) == "table" and metrics.comment_chars or {}
 
-function Popup:_fit_widget(width, max_height, minimum, html, scrollable)
-    local probe = self:_new_html_widget(width, max_height, html, scrollable)
-    local used = single_page_height(probe)
-    local fitted = max_height
-    if used and used > 0 then
-        fitted = math.max(minimum, math.min(max_height, math.ceil(used + Screen:scaleBySize(2))))
+    -- Estimate the final height from the same em values used by popup_css().
+    -- This avoids creating a full MuPDF widget only to measure and recreate it.
+    -- A slight overestimate is intentional: underestimated content remains
+    -- scrollable, while the maximum height is still capped at the user setting.
+    local content_font = math.max(1, self.font_size * 0.80)
+    local usable_width = math.max(content_font * 7, width - self.font_size * 0.62 - Screen:scaleBySize(5))
+    local units_per_line = math.max(7, usable_width / content_font)
+    local estimated = self.font_size * 0.38 -- body top and bottom padding
+
+    if self.source_html == "" then
+        estimated = estimated + self.font_size * 0.72 -- comments heading
     end
-    if fitted < max_height then
-        pcall(function() probe:free() end)
-        return self:_new_html_widget(width, fitted, html, scrollable), fitted
+
+    if count == 0 then
+        estimated = estimated + self.font_size * 1.65
+    else
+        for i = 1, count do
+            local item_units = tonumber(units[i]) or tonumber(chars[i]) or 1
+            local lines = math.max(1, math.ceil(item_units / units_per_line - 0.001))
+            estimated = estimated
+                + self.font_size * 0.54 -- author and like row
+                + lines * content_font * 1.20
+                + self.font_size * 0.35 -- comment padding and content margin
+            if i > 1 then estimated = estimated + self.font_size * 0.31 end
+            if estimated >= max_height then return max_height end
+        end
     end
-    return probe, fitted
+
+    estimated = estimated + math.max(Screen:scaleBySize(4), self.font_size * 0.10)
+    return math.max(minimum, math.min(max_height, math.ceil(estimated)))
 end
 
 
@@ -294,10 +295,14 @@ function Popup:_build()
         comments_max_h,
         math.max(Screen:scaleBySize(58), math.floor(self.font_size * 2.7))
     )
-    self.htmlwidget, self.comments_height = self:_fit_widget(
+    self.comments_height = self:_comments_height(
         inner_w,
         comments_max_h,
-        comments_min_h,
+        comments_min_h
+    )
+    self.htmlwidget = self:_new_html_widget(
+        inner_w,
+        self.comments_height,
         self.html,
         true
     )

@@ -2878,7 +2878,7 @@ function Plugin:check_update()
         end})
     end)
 end
-function Plugin:show_about() self:info(Config.NAME.." "..self.version.."\n\n".."菜单防崩溃与跨章节尾注修复版".."\n".."尾注完整性检查 · Release 全量更新".."\n".._("Unofficial client").."\n\n".._("This build has not been verified with every Kindle model or every WeRead book.")) end
+function Plugin:show_about() self:info(Config.NAME.." "..self.version.."\n\n".."想法弹窗性能优化版".."\n".."单次渲染 · 章节索引缓存 · Release 全量更新".."\n".._("Unofficial client").."\n\n".._("This build has not been verified with every Kindle model or every WeRead book.")) end
 function Plugin:onShowMiuRead() self:show_shelf(false) end
 local function extract_thought_href(value,seen,depth)
     if depth>4 or value==nil then return nil end
@@ -2942,21 +2942,39 @@ function Plugin:_thought_font_name()
 end
 function Plugin:_show_thought_href(href)
     local info=Thoughts.parse_href(href); if not info then return false end
-    local group,err=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
-    if not group then self:info(tostring(err or "没有想法内容")); return true end
-    local prefs=self.store:preferences().thoughts or {}
-    local source_html,html,metrics=Thoughts.popup_parts(group)
-    if html=="" then self:info("没有想法内容"); return true end
-    ThoughtPopup.show{
-        source_html=source_html,
-        html=html,
-        font_size=self:_thought_font_size(prefs.font),
-        font_name=self:_thought_font_name(),
-        width_ratio=tonumber(prefs.width_ratio) or 0.91,
-        height_ratio=tonumber(prefs.height_ratio) or 0.60,
-        css=Thoughts.popup_css(),
-        metrics=metrics,
-    }
+    if self._thought_popup_busy then return true end
+    self._thought_popup_busy=true
+    local started=os.clock()
+    local ok,unexpected=xpcall(function()
+        local group,err,token=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
+        if not group then self:info(tostring(err or "没有想法内容")); return end
+        local prefs=self.store:preferences().thoughts or {}
+        local source_html,html,metrics,html_cache_hit=Thoughts.popup_parts_cached(
+            self.store,info.book_id,info.chapter_uid,info.range,group,token
+        )
+        if html=="" then self:info("没有想法内容"); return end
+        ThoughtPopup.show{
+            source_html=source_html,
+            html=html,
+            font_size=self:_thought_font_size(prefs.font),
+            font_name=self:_thought_font_name(),
+            width_ratio=tonumber(prefs.width_ratio) or 0.91,
+            height_ratio=tonumber(prefs.height_ratio) or 0.60,
+            css=Thoughts.popup_css(),
+            metrics=metrics,
+        }
+        logger.info("[MiuRead][ThoughtPopup] opened",
+            "book=",tostring(info.book_id),"chapter=",tostring(info.chapter_uid),
+            "comments=",tostring(metrics and metrics.comment_count or 0),
+            "chapter_cache=",token and token.cache_hit and "hit" or "miss",
+            "html_cache=",html_cache_hit and "hit" or "miss",
+            "elapsed_ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
+    end,debug.traceback)
+    self._thought_popup_busy=false
+    if not ok then
+        logger.err("[MiuRead][ThoughtPopup] open failed",tostring(unexpected))
+        self:info("想法弹窗打开失败：\n"..U.first_line(unexpected,220))
+    end
     return true
 end
 function Plugin:_on_thought_tap(ges)

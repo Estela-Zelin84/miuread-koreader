@@ -1,8 +1,50 @@
 local Json = require("miuread.json")
 local U = require("miuread.util")
 local logger = require("logger")
+local lfs = require("libs/libkoreader-lfs")
 
 local Thoughts = {}
+
+local CHAPTER_CACHE_LIMIT = 1
+local POPUP_CACHE_LIMIT = 8
+local chapter_cache = {}
+local chapter_cache_order = {}
+local popup_cache = {}
+local popup_cache_order = {}
+
+local function cache_touch(order, key)
+    for i = #order, 1, -1 do
+        if order[i] == key then table.remove(order, i); break end
+    end
+    order[#order + 1] = key
+end
+
+local function cache_trim(cache, order, limit)
+    while #order > limit do
+        local expired = table.remove(order, 1)
+        cache[expired] = nil
+    end
+end
+
+local function file_signature(path)
+    local attr = lfs.attributes(path)
+    if type(attr) ~= "table" then return nil end
+    return tostring(attr.modification or 0) .. ":" .. tostring(attr.size or 0)
+end
+
+local function invalidate_path(path)
+    chapter_cache[path] = nil
+    for i = #chapter_cache_order, 1, -1 do
+        if chapter_cache_order[i] == path then table.remove(chapter_cache_order, i) end
+    end
+    local prefix = tostring(path) .. "|"
+    for key in pairs(popup_cache) do
+        if key:sub(1, #prefix) == prefix then popup_cache[key] = nil end
+    end
+    for i = #popup_cache_order, 1, -1 do
+        if popup_cache_order[i]:sub(1, #prefix) == prefix then table.remove(popup_cache_order, i) end
+    end
+end
 
 local function hex_encode(value)
     return (tostring(value or ""):gsub(".", function(ch)
@@ -138,6 +180,7 @@ function Thoughts.save(store, book_id, chapter_uid, groups)
         if item then rows[#rows + 1] = item end
     end
     local path = Thoughts.cache_path(store, book_id, chapter_uid)
+    invalidate_path(path)
     if #rows == 0 then
         os.remove(path)
         return 0, path
@@ -150,18 +193,39 @@ end
 
 function Thoughts.load(store, book_id, chapter_uid)
     local path = Thoughts.cache_path(store, book_id, chapter_uid)
+    local signature = file_signature(path)
+    if not signature then return nil, "想法缓存不存在" end
+
+    local cached = chapter_cache[path]
+    if cached and cached.signature == signature then
+        cache_touch(chapter_cache_order, path)
+        return cached.rows, nil, cached, true
+    end
+
     local raw = U.read_file(path, true)
     if not raw then return nil, "想法缓存不存在" end
     local ok, rows = pcall(Json.decode, raw)
     if not ok or type(rows) ~= "table" then return nil, "想法缓存损坏" end
-    return rows
+
+    local index = {}
+    for _, row in ipairs(rows) do
+        local key = tostring(type(row) == "table" and row.range or "")
+        if key ~= "" and index[key] == nil then index[key] = row end
+    end
+    cached = {rows = rows, index = index, signature = signature, path = path}
+    chapter_cache[path] = cached
+    cache_touch(chapter_cache_order, path)
+    cache_trim(chapter_cache, chapter_cache_order, CHAPTER_CACHE_LIMIT)
+    return rows, nil, cached, false
 end
 
 function Thoughts.find(store, book_id, chapter_uid, range)
-    local rows, err = Thoughts.load(store, book_id, chapter_uid)
-    if not rows then return nil, err end
-    for _, row in ipairs(rows) do
-        if tostring(row.range or "") == tostring(range or "") then return row end
+    local _, err, cached, cache_hit = Thoughts.load(store, book_id, chapter_uid)
+    if not cached then return nil, err end
+    local key = tostring(range or "")
+    local group = cached.index[key]
+    if group then
+        return group, nil, {path=cached.path, signature=cached.signature, cache_hit=cache_hit}
     end
     return nil, "没有找到该划线对应的想法"
 end
@@ -299,11 +363,11 @@ end
 
 function Thoughts.popup_parts(group)
     if type(group) ~= "table" then
-        return "", "", {source_chars=0, source_units=0, comment_count=0, comment_chars={}}
+        return "", "", {source_chars=0, source_units=0, comment_count=0, comment_chars={}, comment_units={}}
     end
 
     local fixed, body = {}, {}
-    local metrics = {source_chars=0, source_units=0, comment_count=0, comment_chars={}}
+    local metrics = {source_chars=0, source_units=0, comment_count=0, comment_chars={}, comment_units={}}
     local abstract = Thoughts.group_abstract(group)
     if abstract ~= "" then
         local source = preview(abstract, 72)
@@ -327,6 +391,7 @@ function Thoughts.popup_parts(group)
                 seen[key] = true
                 metrics.comment_count = metrics.comment_count + 1
                 metrics.comment_chars[#metrics.comment_chars + 1] = codepoint_len(content)
+                metrics.comment_units[#metrics.comment_units + 1] = display_units(content)
                 body[#body + 1] = entry_html{
                     author = author,
                     content = content,
@@ -336,6 +401,30 @@ function Thoughts.popup_parts(group)
         end
     end
     return table.concat(fixed), table.concat(body), metrics
+end
+
+function Thoughts.popup_parts_cached(store, book_id, chapter_uid, range, group, token)
+    token = type(token) == "table" and token or {}
+    local path = tostring(token.path or Thoughts.cache_path(store, book_id, chapter_uid))
+    local signature = tostring(token.signature or file_signature(path) or "missing")
+    local key = table.concat({path, signature, tostring(range or "")}, "|")
+    local cached = popup_cache[key]
+    if cached then
+        cache_touch(popup_cache_order, key)
+        return cached.source_html, cached.html, cached.metrics, true
+    end
+    local source_html, html, metrics = Thoughts.popup_parts(group)
+    popup_cache[key] = {source_html=source_html, html=html, metrics=metrics}
+    cache_touch(popup_cache_order, key)
+    cache_trim(popup_cache, popup_cache_order, POPUP_CACHE_LIMIT)
+    return source_html, html, metrics, false
+end
+
+function Thoughts.clear_memory_cache()
+    chapter_cache = {}
+    chapter_cache_order = {}
+    popup_cache = {}
+    popup_cache_order = {}
 end
 
 function Thoughts.full_html(group)
