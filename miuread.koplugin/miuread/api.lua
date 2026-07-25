@@ -1,5 +1,7 @@
 local Protocol = require("miuread.protocol")
 local U = require("miuread.util")
+local Http = require("miuread.http")
+local logger = require("logger")
 
 local Api = {}
 Api.__index = Api
@@ -80,27 +82,44 @@ local function unique_candidates(value)
     return out
 end
 
-function Api:new(http, store) return setmetatable({http = http, store = store}, self) end
+function Api:new(http, store, reader)
+    return setmetatable({http = http, store = store, reader = reader}, self)
+end
 
 function Api:call(name, params, request_options)
-    local auth = self.store:auth()
-    if tostring(auth.api_key or "") == "" then error("API key is not configured") end
     local payload = sanitize(U.copy(params or {}))
     payload.api_name = tostring(name)
     payload.skill_version = Protocol.SKILL_VERSION
-    local options = U.copy(request_options or {})
-    options.auth = false
-    options.headers = options.headers or {}
-    options.headers.Authorization = "Bearer " .. auth.api_key
-    if options.retries == nil then options.retries = 2 end
-    local ok, data = pcall(self.http.post_json, self.http,
-        "https://i.weread.qq.com/api/agent/gateway", payload, options)
+
+    local function request_once()
+        local auth = self.store:auth()
+        if tostring(auth.api_key or "") == "" then error("API key is not configured") end
+        local options = U.copy(request_options or {})
+        options.auth = false
+        options.headers = options.headers or {}
+        options.headers.Authorization = "Bearer " .. tostring(auth.api_key)
+        if options.retries == nil then options.retries = 2 end
+        return self.http:post_json("https://i.weread.qq.com/api/agent/gateway", payload, options)
+    end
+
+    local ok, data = pcall(request_once)
+    if not ok and Http.is_auth_error(data) and self.reader then
+        local recovered, recover_error = self.reader:_recover_login_session()
+        logger.warn("[MiuRead][API] authentication recovery",
+            "api=", tostring(name), "ok=", tostring(recovered),
+            "error=", recovered and "" or tostring(recover_error))
+        if recovered then ok, data = pcall(request_once) end
+    end
     if not ok then error(tostring(name) .. ": " .. tostring(data)) end
     return unwrap(data)
 end
 
-function Api:shelf()
-    return self:call("/shelf/sync", {}, {retries=1, timeout={10, 18}})
+function Api:shelf(options)
+    options=options or {}
+    return self:call("/shelf/sync", {}, {
+        retries=options.retries==nil and 1 or options.retries,
+        timeout=options.timeout or {10,18},
+    })
 end
 function Api:search(q, offset, count)
     return self:call("/store/search", {keyword=tostring(q or ""), scope=10, maxIdx=offset or 0, count=count or 30}, {retries=1, timeout={10, 18}})
@@ -108,6 +127,26 @@ end
 function Api:book(id) return self:call("/book/info", {bookId=tostring(id)}) end
 function Api:chapters(id) return self:call("/book/chapterinfo", {bookId=tostring(id)}) end
 function Api:progress(id) return self:call("/book/getprogress", {bookId=tostring(id), _t=os.time()}) end
+function Api:web_progress(id)
+    id=tostring(id or "")
+    if id=="" then error("invalid book id") end
+    local url="https://weread.qq.com/web/book/getProgress?bookId="
+        ..Protocol.escape(id).."&_="..tostring(os.time())..tostring(math.random(1000,9999))
+    local data=self.http:get_json(url,{
+        auth=true,retries=0,timeout={8,15},
+        headers={
+            Accept="application/json, text/plain, */*",
+            Referer=Protocol.reader_url(id),
+            ["Cache-Control"]="no-cache, no-store, max-age=0",
+            Pragma="no-cache",
+        },
+    })
+    if type(data)=="table" then
+        data._progress_source="web_cookie"
+        data._progress_fetched_at=os.time()
+    end
+    return data
+end
 
 function Api:_chapter_call(name, id, chapter_uid, extra)
     local last

@@ -50,7 +50,9 @@ local function sort_chapters(chapters)
     local sorted = {}
     for index, chapter in ipairs(chapters) do sorted[index] = chapter end
     table.sort(sorted, function(a, b)
-        return (a.chapterIdx or a.chapterUid or 0) < (b.chapterIdx or b.chapterUid or 0)
+        local av=tonumber(a.chapterIdx or a.index or a.chapterUid or a.uid or 0) or 0
+        local bv=tonumber(b.chapterIdx or b.index or b.chapterUid or b.uid or 0) or 0
+        return av < bv
     end)
     return sorted
 end
@@ -83,6 +85,96 @@ local function strip_tags(html)
     return html:gsub("%s+", " "):match("^%s*(.-)%s*$") or ""
 end
 
+local function safe_attr(attrs,name)
+    attrs=tostring(attrs or "")
+    local escaped=tostring(name or ""):gsub("([^%w])","%%%1")
+    return attrs:match('^%s*'..escaped..'%s*=%s*"([^"]*)"')
+        or attrs:match('%s+'..escaped..'%s*=%s*"([^"]*)"')
+        or attrs:match("^%s*"..escaped.."%s*=%s*'([^']*)'")
+        or attrs:match("%s+"..escaped.."%s*=%s*'([^']*)'")
+end
+
+local function safe_href(value)
+    value=decode_entities(value):match("^%s*(.-)%s*$") or ""
+    local lower=value:lower()
+    if lower=="" or lower:find("javascript:",1,true)==1 or lower:find("data:",1,true)==1
+        or lower:find("vbscript:",1,true)==1 or lower:find("file:",1,true)==1 then return nil end
+    return value
+end
+
+local NOTE_TAGS={
+    p=true,div=true,span=true,strong=true,b=true,em=true,i=true,u=true,s=true,
+    sub=true,sup=true,br=true,hr=true,a=true,blockquote=true,code=true,pre=true,
+    ul=true,ol=true,li=true,dl=true,dt=true,dd=true,table=true,thead=true,
+    tbody=true,tfoot=true,tr=true,th=true,td=true,ruby=true,rt=true,rp=true,
+    img=true,figure=true,figcaption=true,h1=true,h2=true,h3=true,h4=true,h5=true,h6=true,
+}
+
+local function neutralize_thought_links(html)
+    return tostring(html or ""):gsub("<[aA]([^>]*)>(.-)</[aA]%s*>", function(attrs, inner)
+        local class=safe_attr(attrs,"class") or ""
+        local href=safe_attr(attrs,"href") or ""
+        local hint=(class.." "..href):lower()
+        if hint:find("thought",1,true) or hint:find("miuread",1,true)
+            or hint:find("miuthought",1,true) or hint:find("wrthought",1,true) then
+            local kept=class~="" and class or "miu-footnote-mark"
+            return '<span class="'..xml_escape(kept)..'">'..inner..'</span>'
+        end
+        return "<a"..attrs..">"..inner.."</a>"
+    end)
+end
+
+local function sanitize_note_html(html)
+    html=neutralize_thought_links(html)
+    html=html:gsub("<!%-%-.-%-%->","")
+    html=html:gsub("<[sS][cC][rR][iI][pP][tT][^>]*>.-</[sS][cC][rR][iI][pP][tT]%s*>","")
+    html=html:gsub("<[sS][tT][yY][lL][eE][^>]*>.-</[sS][tT][yY][lL][eE]%s*>","")
+    html=html:gsub("<([^>]+)>",function(raw)
+        local closing=raw:match("^%s*/%s*([%w]+)")
+        local name=(closing or raw:match("^%s*([%w]+)") or ""):lower()
+        if not NOTE_TAGS[name] then return "" end
+        if closing then return "</"..name..">" end
+        if name=="br" or name=="hr" then return "<"..name.."/>" end
+        if name=="a" then
+            local href=safe_href(safe_attr(raw,"href") or "")
+            if not href then return "<a>" end
+            local class=safe_attr(raw,"class")
+            local class_attr=""
+            if class and (class:lower():find("thought",1,true) or class:lower():find("miuread",1,true)) then
+                class_attr=' class="'..xml_escape(class)..'"'
+            end
+            return '<a href="'..xml_escape(href)..'"'..class_attr..'>'
+        end
+        if name=="img" then
+            local src=safe_href(safe_attr(raw,"src") or "")
+            if not src then return "" end
+            local alt=safe_attr(raw,"alt") or ""
+            local title=safe_attr(raw,"title")
+            return '<img src="'..xml_escape(src)..'" alt="'..xml_escape(alt)..'"'
+                ..(title and (' title="'..xml_escape(title)..'"') or '')..'/>'
+        end
+        if name=="span" then
+            local class=safe_attr(raw,"class")
+            if class and (class:lower():find("thought",1,true) or class:lower():find("miuread",1,true)) then
+                return '<span class="'..xml_escape(class)..'">'
+            end
+        end
+        return "<"..name..">"
+    end)
+    html=html:gsub("\226\128\139",""):gsub("\226\128\140",""):gsub("\226\128\141","")
+    return html:match("^%s*(.-)%s*$") or ""
+end
+
+local function note_content(value)
+    if type(value)=="table" then
+        local html=sanitize_note_html(value.html or value.content or "")
+        local text=strip_tags(value.text or html)
+        return {html=html,text=text}
+    end
+    local html=sanitize_note_html(value)
+    return {html=html,text=strip_tags(html)}
+end
+
 local function cleanup_footnote_text(text)
     text = strip_tags(text)
     text = text:gsub("^%[%s*[%d一二三四五六七八九十]+%s*%]%s*", "")
@@ -90,8 +182,8 @@ local function cleanup_footnote_text(text)
     return text:match("^%s*(.-)%s*$") or ""
 end
 
-local function is_trivial_footnote_text(text)
-    text = strip_tags(text)
+local function is_trivial_footnote_text(value)
+    local text=type(value)=="table" and tostring(value.text or strip_tags(value.html or "")) or strip_tags(value)
     if text == "" then return true end
     return text:match("^%[%s*%d+%s*%]$") ~= nil or text:match("^%d+$") ~= nil
 end
@@ -131,6 +223,26 @@ local function basename(path)
     return tostring(path or ""):gsub("\\", "/"):match("([^/]+)$") or tostring(path or "")
 end
 
+local function normalize_ref_path(path)
+    path=tostring(path or ""):gsub("\\","/"):gsub("^%s+",""):gsub("%s+$","")
+    path=path:gsub("^/+","")
+    local parts={}
+    for part in path:gmatch("[^/]+") do
+        if part==".." then
+            if #parts>0 then table.remove(parts) end
+        elseif part~="." and part~="" then
+            parts[#parts+1]=part
+        end
+    end
+    return table.concat(parts,"/"):lower()
+end
+
+local function ref_key(file,anchor)
+    local normalized=normalize_ref_path(file)
+    if normalized=="" then return tostring(anchor or "") end
+    return normalized.."#"..tostring(anchor or "")
+end
+
 local function split_href(href)
     href = decode_entities(href):gsub("^%s+", ""):gsub("%s+$", "")
     local file, anchor = href:match("^(.-)#(.+)$")
@@ -146,8 +258,9 @@ local function extract_anchor_text(html, anchor)
         local pattern = "<" .. tag .. "([^>]*)>(.-)</" .. tag .. "%s*>"
         for attrs, inner in html:gmatch(pattern) do
             if get_attr(attrs, "id") == anchor or get_attr(attrs, "name") == anchor then
-                local text = cleanup_footnote_text(inner)
-                if text ~= "" and not is_trivial_footnote_text(text) then return text end
+                local content=note_content(inner)
+                content.text=cleanup_footnote_text(content.text)
+                if content.text~="" and not is_trivial_footnote_text(content) then return content end
             end
         end
         local upper = tag:upper()
@@ -155,8 +268,9 @@ local function extract_anchor_text(html, anchor)
             local upattern = "<" .. upper .. "([^>]*)>(.-)</" .. upper .. "%s*>"
             for attrs, inner in html:gmatch(upattern) do
                 if get_attr(attrs, "id") == anchor or get_attr(attrs, "name") == anchor then
-                    local text = cleanup_footnote_text(inner)
-                    if text ~= "" and not is_trivial_footnote_text(text) then return text end
+                    local content=note_content(inner)
+                    content.text=cleanup_footnote_text(content.text)
+                    if content.text~="" and not is_trivial_footnote_text(content) then return content end
                 end
             end
         end
@@ -169,12 +283,21 @@ local function extract_anchor_text(html, anchor)
         "<[aA][^>]-id='" .. escaped .. "'[^>]*>%s*</[aA]>%s*<[pP][^>]*>(.-)</[pP]>",
         '<[aA][^>]-name="' .. escaped .. '"[^>]*>%s*</[aA]>%s*<[pP][^>]*>(.-)</[pP]>',
         "<[aA][^>]-name='" .. escaped .. "'[^>]*>%s*</[aA]>%s*<[pP][^>]*>(.-)</[pP]>",
+        '<[pP][^>]*>%s*<[aA][^>]-id="' .. escaped .. '"[^>]*>%s*</[aA]>%s*(.-)</[pP]>',
+        "<[pP][^>]*>%s*<[aA][^>]-id='" .. escaped .. "'[^>]*>%s*</[aA]>%s*(.-)</[pP]>",
+        '<[pP][^>]*>%s*<[aA][^>]-name="' .. escaped .. '"[^>]*>%s*</[aA]>%s*(.-)</[pP]>',
+        "<[pP][^>]*>%s*<[aA][^>]-name='" .. escaped .. "'[^>]*>%s*</[aA]>%s*(.-)</[pP]>",
+        '<[aA][^>]-id="' .. escaped .. '"[^>]*>(.-)</[aA]>',
+        "<[aA][^>]-id='" .. escaped .. "'[^>]*>(.-)</[aA]>",
+        '<[aA][^>]-name="' .. escaped .. '"[^>]*>(.-)</[aA]>',
+        "<[aA][^>]-name='" .. escaped .. "'[^>]*>(.-)</[aA]>",
     }
     for _, pattern in ipairs(patterns) do
         local block = html:match(pattern)
         if block then
-            local text = cleanup_footnote_text(block)
-            if text ~= "" and not is_trivial_footnote_text(text) then return text end
+            local content=note_content(block)
+            content.text=cleanup_footnote_text(content.text)
+            if content.text~="" and not is_trivial_footnote_text(content) then return content end
         end
     end
 end
@@ -274,7 +397,9 @@ local function looks_like_footnote_ref(attrs, href, inner)
     local marker = compact:match("^%[?[%d一二三四五六七八九十]+%]?$")
         or compact:match("^[%*†‡※]+$")
     local anchor_hint = lower_anchor:find("note", 1, true) or lower_anchor:find("foot", 1, true)
-        or lower_anchor:find("fn", 1, true) or lower_anchor:match("^n%d+")
+        or lower_anchor:find("fn", 1, true) or lower_anchor:match("^n[_%-]?%d+")
+        or lower_anchor:match("^[wr][_%-%d]*%d+")
+        or lower_anchor:match("^ref[_%-]?%d+") or lower_anchor:match("^back[_%-]?%d+")
     local file_hint = tostring(file or ""):lower():find("note", 1, true)
     return marker and (anchor_hint or file_hint or file == "") and true or false
 end
@@ -286,10 +411,13 @@ function Footnotes.collect_footnote_refs(html)
         local href = get_attr(attrs, "href")
         if href and looks_like_footnote_ref(attrs, href, inner) then
             local file, anchor = split_href(href)
+            local normalized_file=normalize_ref_path(file)
             refs[#refs + 1] = {
                 href = href,
-                file = basename(file),
+                file = normalized_file,
+                basename = basename(normalized_file),
                 anchor = anchor,
+                key = ref_key(normalized_file,anchor),
                 display = ref_display(inner),
             }
         end
@@ -302,88 +430,124 @@ function Footnotes.collect_cross_file_refs(html)
     return Footnotes.collect_footnote_refs(html)
 end
 
-function Footnotes.fetch_missing_anchors(meta, missing, ref_files)
-    if type(missing) ~= "table" or #missing == 0 or type(meta) ~= "table" then return {} end
-    local file_set = {}
-    for _, file_name in ipairs(ref_files or {}) do
-        if type(file_name) == "string" and file_name ~= "" then file_set[file_name] = true end
+function Footnotes.fetch_missing_anchors(meta, missing_refs, ref_files)
+    if type(missing_refs) ~= "table" or #missing_refs == 0 or type(meta) ~= "table" then return {} end
+    local refs={}
+    for _,item in ipairs(missing_refs) do
+        if type(item)=="table" then
+            local file=normalize_ref_path(item.file or "")
+            local anchor=tostring(item.anchor or "")
+            refs[#refs+1]={file=file,basename=basename(file),anchor=anchor,key=item.key or ref_key(file,anchor)}
+        else
+            local anchor=tostring(item or "")
+            refs[#refs+1]={file="",basename="",anchor=anchor,key=anchor}
+        end
     end
+    local file_set = {}
+    for _, ref in ipairs(refs) do
+        if ref.basename~="" then file_set[ref.basename]=true end
+    end
+    for _, file_name in ipairs(ref_files or {}) do
+        local base=basename(normalize_ref_path(file_name))
+        if base~="" then file_set[base]=true end
+    end
+
     local book_dir = meta.book_dir
     local cache = Footnotes.load_anchor_cache(book_dir)
     local found, still_missing = {}, {}
-    for _, anchor in ipairs(missing) do
-        local cached = cache[anchor]
-        if cached and cached ~= "" and not is_trivial_footnote_text(cached) then
-            found[anchor] = cached
+    for _, ref in ipairs(refs) do
+        local cached = cache[ref.key]
+        if cached and not is_trivial_footnote_text(cached) then
+            found[ref.key]=note_content(cached)
         else
-            cache[anchor] = nil
-            still_missing[#still_missing + 1] = anchor
+            cache[ref.key]=nil
+            still_missing[#still_missing+1]=ref
         end
     end
-    if #still_missing == 0 then return found end
+    if #still_missing==0 then return found end
 
-    local chapters = meta.chapters
-    if type(chapters) ~= "table" or #chapters == 0 then
-        if type(meta.fetch_catalog) == "function" then
-            local ok, toc = pcall(meta.fetch_catalog)
-            if ok and type(toc) == "table" then chapters = toc end
+    local chapters=meta.chapters
+    if type(chapters)~="table" or #chapters==0 then
+        if type(meta.fetch_catalog)=="function" then
+            local ok,toc=pcall(meta.fetch_catalog)
+            if ok and type(toc)=="table" then chapters=toc end
         end
     end
-    if type(chapters) ~= "table" or #chapters == 0 or type(meta.fetch_chapter_html) ~= "function" then return found end
+    if type(chapters)~="table" or #chapters==0 or type(meta.fetch_chapter_html)~="function" then return found end
 
-    local sorted = sort_chapters(chapters)
-    local scanned_uids = {}
-    local function try_chapter(chapter, preloaded_html)
-        if not chapter or not chapter.chapterUid or scanned_uids[chapter.chapterUid] then return end
-        scanned_uids[chapter.chapterUid] = true
-        local html = preloaded_html
-        if not html then
-            local ok, fetched = pcall(meta.fetch_chapter_html, chapter)
-            if not ok or type(fetched) ~= "string" or fetched == "" then return end
-            html = fetched
-        end
-        for _, anchor in ipairs(still_missing) do
-            if not found[anchor] then
-                local text = extract_anchor_text(html, anchor)
-                if text and text ~= "" then found[anchor] = text; cache[anchor] = text end
-            end
-        end
-        for i = #still_missing, 1, -1 do
-            if found[still_missing[i]] then table.remove(still_missing, i) end
-        end
-    end
+    local sorted=sort_chapters(chapters)
+    local scanned_uids={}
+    if meta.current_chapter_uid~=nil then scanned_uids[tostring(meta.current_chapter_uid)]=true end
+    local max_scan=math.max(1,tonumber(meta.max_remote_chapters) or 8)
+    local scanned=0
 
-    -- First scan likely note chapters and chapters mentioning target filenames.
-    for _, chapter in ipairs(sorted) do
-        if #still_missing == 0 then break end
-        local title = tostring(chapter.title or ""):lower()
-        if title:find("注释", 1, true) or title:find("脚注", 1, true)
-            or title:find("尾注", 1, true) or title:find("note", 1, true) then
-            try_chapter(chapter)
-        end
-    end
-    if next(file_set) and #still_missing > 0 then
-        for _, chapter in ipairs(sorted) do
-            if #still_missing == 0 then break end
-            local ok, html = pcall(meta.fetch_chapter_html, chapter)
-            if ok and type(html) == "string" and html ~= "" then
-                for file_name in pairs(file_set) do
-                    if html:find(file_name, 1, true) then try_chapter(chapter, html); break end
+    local function remember_from_html(chapter,html)
+        local matched={}
+        for _,ref in ipairs(still_missing) do
+            if not found[ref.key] then
+                local content=extract_anchor_text(html,ref.anchor)
+                if content and not is_trivial_footnote_text(content) then
+                    content=note_content(content)
+                    found[ref.key]=content
+                    cache[ref.key]=content
+                    matched[#matched+1]=ref
                 end
             end
         end
+        if #matched>0 and type(meta.decorate_chapter_html)=="function" then
+            local ok,decorated=pcall(meta.decorate_chapter_html,chapter,html)
+            if ok and type(decorated)=="string" and decorated~="" then
+                for _,ref in ipairs(matched) do
+                    local content=extract_anchor_text(decorated,ref.anchor)
+                    if content and not is_trivial_footnote_text(content) then
+                        content=note_content(content)
+                        found[ref.key]=content
+                        cache[ref.key]=content
+                    end
+                end
+            end
+        end
+        for i=#still_missing,1,-1 do
+            if found[still_missing[i].key] then table.remove(still_missing,i) end
+        end
     end
-    -- Then scan from the end (endnotes are commonly near the back), finally all chapters.
-    local scanned, max_scan = 0, math.min(40, #sorted)
-    for i = #sorted, 1, -1 do
-        if #still_missing == 0 or scanned >= max_scan then break end
-        try_chapter(sorted[i]); scanned = scanned + 1
+
+    local function try_chapter(chapter)
+        if scanned>=max_scan or #still_missing==0 then return end
+        local uid=chapter and (chapter.chapterUid or chapter.uid)
+        if not chapter or uid==nil or scanned_uids[tostring(uid)] then return end
+        scanned_uids[tostring(uid)]=true
+        scanned=scanned+1
+        local ok,html=pcall(meta.fetch_chapter_html,chapter)
+        if ok and type(html)=="string" and html~="" then remember_from_html(chapter,html) end
     end
-    for _, chapter in ipairs(sorted) do
-        if #still_missing == 0 then break end
-        try_chapter(chapter)
+
+    local function chapter_file_matches(chapter)
+        if not next(file_set) or type(chapter)~="table" then return false end
+        for _,key in ipairs({"href","file","filename","fileName","path","url","chapterPath","chapterUrl"}) do
+            local value=chapter[key]
+            if type(value)=="string" and value~="" and file_set[basename(normalize_ref_path(value))] then return true end
+        end
+        return false
     end
-    if next(cache) then Footnotes.save_anchor_cache(book_dir, cache) end
+
+    -- Only exact catalog filename matches and explicitly named note chapters are
+    -- allowed. Never fall back to scanning the tail or the entire book while a
+    -- chapter is being processed.
+    for _,chapter in ipairs(sorted) do
+        if scanned>=max_scan or #still_missing==0 then break end
+        if chapter_file_matches(chapter) then try_chapter(chapter) end
+    end
+    for _,chapter in ipairs(sorted) do
+        if scanned>=max_scan or #still_missing==0 then break end
+        local title=tostring(chapter.title or ""):lower()
+        if title:find("注释",1,true) or title:find("脚注",1,true)
+            or title:find("尾注",1,true) or title:find("附注",1,true)
+            or title:find("note",1,true) then
+            try_chapter(chapter)
+        end
+    end
+    if next(cache) then Footnotes.save_anchor_cache(book_dir,cache) end
     return found
 end
 
@@ -394,14 +558,15 @@ local function convert_anchor_refs(html, anchor_texts, fn_offset)
         if not href or not looks_like_footnote_ref(attrs, href, inner) then
             return "<a" .. attrs .. ">" .. inner .. "</a>"
         end
-        local _, anchor = split_href(href)
-        local text = anchor and anchor_texts[anchor]
-        if not text or text == "" or is_trivial_footnote_text(text) then
+        local file, anchor = split_href(href)
+        local content=anchor and (anchor_texts[ref_key(file,anchor)] or anchor_texts[anchor])
+        if not content or is_trivial_footnote_text(content) then
             return "<a" .. attrs .. ">" .. inner .. "</a>"
         end
+        content=note_content(content)
         fn_idx = fn_idx + 1
         local display = ref_display(inner)
-        notes[#notes + 1] = { display = display, text = text, anchor = anchor, fn_idx = fn_idx }
+        notes[#notes + 1] = { display=display, text=content.text, html=content.html, anchor=anchor, fn_idx=fn_idx }
         return string.format(
             '<span class="fn-ref"><a epub:type="noteref" role="doc-noteref" href="#wt_%d" id="wtref_%d">%s</a></span>',
             fn_idx, fn_idx, xml_escape(display)
@@ -425,9 +590,11 @@ local function build_footnote_section(img_notes, anchor_notes)
         )
     end
     for _, note in ipairs(anchor_notes or {}) do
+        local body=sanitize_note_html(note.html or "")
+        if body=="" then body=xml_escape(note.text) end
         parts[#parts + 1] = string.format(
             '<aside epub:type="footnote" role="doc-footnote" id="wt_%d" class="footnote weread-book-footnote"><p><a href="#wtref_%d" class="fn-num">%s</a> %s</p></aside>\n',
-            note.fn_idx, note.fn_idx, xml_escape(note.display), xml_escape(note.text)
+            note.fn_idx,note.fn_idx,xml_escape(note.display),body
         )
     end
     parts[#parts + 1] = "</div>\n"
@@ -435,31 +602,102 @@ local function build_footnote_section(img_notes, anchor_notes)
 end
 
 function Footnotes.process(html, meta)
-    if type(html) ~= "string" or html == "" or (meta and meta.is_txt) then return html, "" end
+    local empty_stats={refs=0,converted=0,image_notes=0,unresolved=0,deferred=0,missing_anchors={},missing_targets={}}
+    if type(html) ~= "string" or html == "" or (meta and meta.is_txt) then return html, "", empty_stats end
+    meta=type(meta)=="table" and meta or {}
     local local_index = Footnotes.index_anchors(html)
     local refs = Footnotes.collect_footnote_refs(html)
-    local missing, ref_files, missing_seen, file_seen = {}, {}, {}, {}
+    local missing_refs, ref_files, missing_seen, file_seen = {}, {}, {}, {}
     for _, ref in ipairs(refs) do
-        if not local_index[ref.anchor] and not missing_seen[ref.anchor] then
-            missing_seen[ref.anchor] = true; missing[#missing + 1] = ref.anchor
+        if not local_index[ref.anchor] and not missing_seen[ref.key] then
+            missing_seen[ref.key]=true
+            missing_refs[#missing_refs+1]=ref
         end
-        if ref.file and ref.file ~= "" and not file_seen[ref.file] then
-            file_seen[ref.file] = true; ref_files[#ref_files + 1] = ref.file
+        if ref.file and ref.file~="" and not file_seen[ref.file] then
+            file_seen[ref.file]=true
+            ref_files[#ref_files+1]=ref.file
         end
     end
-    local remote = Footnotes.fetch_missing_anchors(meta, missing, ref_files)
-    local anchor_texts = {}
-    for _, ref in ipairs(refs) do anchor_texts[ref.anchor] = local_index[ref.anchor] or remote[ref.anchor] end
 
-    local html1, img_notes = Footnotes.convert_img_footnotes(html)
-    local html2, anchor_notes = convert_anchor_refs(html1, anchor_texts, #img_notes)
-    local section = build_footnote_section(img_notes, anchor_notes)
-    if section ~= "" then
-        log_info("footnotes converted:", #img_notes + #anchor_notes, "notes")
-    elseif #refs > 0 then
-        log_info("footnotes refs found but content missing:", #refs)
+    local remote={}
+    if not meta.defer_cross_file then
+        remote=Footnotes.fetch_missing_anchors(meta,missing_refs,ref_files)
     end
-    return html2, section
+    local anchor_texts, unresolved, deferred, unresolved_seen = {}, {}, {}, {}
+    for _,ref in ipairs(refs) do
+        local local_content=local_index[ref.anchor]
+        local content=local_content or remote[ref.key] or remote[ref.anchor]
+        -- Cross-file links whose target is already present in the final chapter
+        -- are deliberately kept as page links. The post-download link repairer
+        -- will rewrite the stale filename while preserving comments and return
+        -- links in the original tail-note page.
+        if not (local_content and ref.file and ref.file~="") then
+            anchor_texts[ref.key]=content
+            if ref.file=="" then anchor_texts[ref.anchor]=content end
+        end
+        if not content and not unresolved_seen[ref.key] then
+            unresolved_seen[ref.key]=true
+            if meta.defer_cross_file and ref.file~="" then
+                deferred[#deferred+1]=ref.key
+            else
+                unresolved[#unresolved+1]=ref.key
+            end
+        end
+    end
+
+    local html1,img_notes=Footnotes.convert_img_footnotes(html)
+    local html2,anchor_notes=convert_anchor_refs(html1,anchor_texts,#img_notes)
+    local section=build_footnote_section(img_notes,anchor_notes)
+    local stats={
+        refs=#refs,converted=#anchor_notes,image_notes=#img_notes,
+        unresolved=#unresolved,deferred=#deferred,
+        missing_anchors=unresolved,missing_targets=deferred,
+    }
+    log_info("refs=",tostring(stats.refs),"converted=",tostring(stats.converted),
+        "images=",tostring(stats.image_notes),"missing=",tostring(stats.unresolved),
+        "deferred=",tostring(stats.deferred))
+    if stats.unresolved>0 then
+        local sample={}
+        for index,key in ipairs(unresolved) do if index>20 then break end; sample[#sample+1]=tostring(key) end
+        log_info("missing targets:",table.concat(sample,","))
+    end
+    return html2,section,stats
 end
 
+function Footnotes.validate(html)
+    if type(html)~="string" then return nil,"章节正文无效" end
+    local ids,anchor_depth={},0
+    for raw in html:gmatch("<[^>]+>") do
+        local slash,name=raw:match("^<%s*(/?)%s*([%w:_%-]+)")
+        name=tostring(name or ""):lower()
+        local closing=slash=="/"
+        local self_closing=raw:match("/%s*>$")~=nil
+        if closing and name=="a" then
+            anchor_depth=math.max(0,anchor_depth-1)
+        elseif not closing and not self_closing and name=="a" then
+            if anchor_depth>0 then return nil,"检测到链接嵌套" end
+            anchor_depth=anchor_depth+1
+        end
+        if not closing then
+            local id=get_attr(raw,"id")
+            if id and id~="" then
+                local generated=id:match("^wt_") or id:match("^wtref_")
+                if generated and ids[id] then return nil,"检测到重复脚注目标："..tostring(id) end
+                ids[id]=true
+            end
+        end
+    end
+    if anchor_depth~=0 then return nil,"链接标签未正确闭合" end
+    for attrs in html:gmatch("<[aA]([^>]*)>") do
+        local href=get_attr(attrs,"href")
+        local target=href and (href:match("^#(wt_[%w_%-%.]+)$") or href:match("^#(wtref_[%w_%-%.]+)$"))
+        if target and not ids[target] then return nil,"脚注目标不存在："..tostring(target) end
+    end
+    return true
+end
+
+Footnotes._sanitize_note_html=sanitize_note_html
+Footnotes._note_content=note_content
+Footnotes._normalize_ref_path=normalize_ref_path
+Footnotes._ref_key=ref_key
 return Footnotes

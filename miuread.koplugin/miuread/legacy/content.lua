@@ -1,4 +1,4 @@
--- Exact reading-context subset copied from the working 0.3.6.7 Content module.
+-- Reading-context subset used by the compatibility reporting path.
 local WeRead = require("miuread.legacy.weread")
 local Content = {}
 

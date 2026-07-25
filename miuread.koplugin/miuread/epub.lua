@@ -1,6 +1,7 @@
 local bit = require("bit")
 local Json = require("miuread.json")
 local U = require("miuread.util")
+local AnnotationStyle = require("miuread.annotation_style")
 
 local E = {}
 local CHUNK_SIZE = 64 * 1024
@@ -175,11 +176,13 @@ local function stream_zip(path, entries)
     end
 end
 
-local function chapter_source(book, chapter, index)
+local function chapter_source(book, chapter, index, inline_style)
     local title = chapter.title or ("Chapter " .. tostring(index))
     local header = '<?xml version="1.0" encoding="utf-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>'
         .. U.xml(title)
-        .. '</title><link rel="stylesheet" href="../style.css" type="text/css"/></head><body data-miuread-book="'
+        .. '</title><link rel="stylesheet" href="../style.css" type="text/css"/>'
+        .. tostring(inline_style or "")
+        .. '</head><body data-miuread-book="'
         .. U.xml(book.bookId or book.book_id)
         .. '" data-miuread-chapter="'
         .. U.xml(chapter.uid or index)
@@ -214,6 +217,9 @@ function E.build(path, book, chapters, css, assets, cover, meta)
     }
     local spine, nav, ncx = {}, {}, {}
     local cover_meta = ""
+    local inline_style = tostring(css or ""):find(AnnotationStyle.MARKER_BEGIN, 1, true)
+        and AnnotationStyle.inline_style_tag()
+        or ""
 
     if cover and (cover.data or cover.data_path or cover.path) then
         entries[#entries + 1] = {
@@ -247,7 +253,7 @@ function E.build(path, book, chapters, css, assets, cover, meta)
         local title = chapter.title or ("Chapter " .. tostring(index))
         entries[#entries + 1] = {
             name = "OEBPS/" .. file,
-            source = chapter_source(book, chapter, index),
+            source = chapter_source(book, chapter, index, inline_style),
         }
         manifest[#manifest + 1] = '<item id="' .. id .. '" href="' .. file .. '" media-type="application/xhtml+xml"/>'
         spine[#spine + 1] = '<itemref idref="' .. id .. '"/>'

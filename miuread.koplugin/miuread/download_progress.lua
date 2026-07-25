@@ -19,6 +19,7 @@ local Screen = Device.screen
 local DownloadProgress = InputContainer:extend{
     title = "MiuRead",
     on_cancel = nil,
+    on_background = nil,
 }
 
 local function clamp(v, lo, hi)
@@ -98,6 +99,13 @@ function DownloadProgress:init()
                     self.status_widget:setText("正在取消……")
                     self:_redraw()
                     if self.on_cancel then self.on_cancel() end
+                end,
+            },
+            {
+                text = "后台下载",
+                callback = function()
+                    if self.cancelled then return end
+                    if self.on_background then self.on_background() end
                 end,
             },
         }},

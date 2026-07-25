@@ -21,7 +21,7 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Read and verify version
+      - name: Read plugin version
         shell: bash
         run: |
           set -euo pipefail
@@ -34,10 +34,13 @@ jobs:
           config_path = Path("miuread.koplugin/miuread/config.lua")
           meta_path = Path("miuread.koplugin/_meta.lua")
 
-          for path in (config_path, meta_path):
-              if not path.is_file():
-                  print(f"::error::缺少必要文件：{path}")
-                  sys.exit(1)
+          if not config_path.is_file():
+              print(f"::error::缺少文件：{config_path}")
+              sys.exit(1)
+
+          if not meta_path.is_file():
+              print(f"::error::缺少文件：{meta_path}")
+              sys.exit(1)
 
           config_text = config_path.read_text(encoding="utf-8")
           meta_text = meta_path.read_text(encoding="utf-8")
@@ -52,10 +55,11 @@ jobs:
           )
 
           if not config_match:
-              print("::error::无法从 config.lua 读取版本号")
+              print("::error::无法从 config.lua 读取版本号。")
               sys.exit(1)
+
           if not meta_match:
-              print("::error::无法从 _meta.lua 读取版本号")
+              print("::error::无法从 _meta.lua 读取版本号。")
               sys.exit(1)
 
           config_version = config_match.group(1)
@@ -69,23 +73,23 @@ jobs:
               )
               sys.exit(1)
 
-          env_path = Path("release.env")
-          env_path.write_text(
-              f"VERSION={config_version}\n"
-              f"RELEASE_TAG=v{config_version}\n"
-              f"PACKAGE_NAME=miuread-v{config_version}-full.zip\n",
-              encoding="utf-8",
-          )
+          with Path("release.env").open("w", encoding="utf-8") as handle:
+              handle.write(f"VERSION={config_version}\n")
+              handle.write(f"RELEASE_TAG=v{config_version}\n")
+              handle.write(
+                  f"PACKAGE_NAME=miuread-v{config_version}-full.zip\n"
+              )
 
           print(f"准备发布：v{config_version}")
           PY
 
           cat release.env >> "$GITHUB_ENV"
 
-      - name: Build package and manifest
+      - name: Build full package
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p dist
 
           python3 - <<'PY'
@@ -160,13 +164,30 @@ jobs:
                   info.create_system = 3
                   info.external_attr = 0o100644 << 16
                   info.compress_type = ZIP_DEFLATED
-                  archive.writestr(info, path.read_bytes())
+                  archive.writestr(
+                      info,
+                      path.read_bytes(),
+                      compress_type=ZIP_DEFLATED,
+                      compresslevel=9,
+                  )
 
           payload = output.read_bytes()
           official = (
               f"https://github.com/{repo}/releases/download/"
               f"v{version}/{package_name}"
           )
+
+          previous_notes = ""
+          current_manifest = Path("update.json")
+          if current_manifest.is_file():
+              try:
+                  previous_notes = str(
+                      json.loads(
+                          current_manifest.read_text(encoding="utf-8")
+                      ).get("notes") or ""
+                  ).strip()
+              except Exception:
+                  previous_notes = ""
 
           manifest = {
               "version": version,
@@ -181,9 +202,9 @@ jobs:
               ],
               "size": len(payload),
               "sha256": hashlib.sha256(payload).hexdigest(),
-              "notes": (
+              "notes": previous_notes or (
                   "Release 仅发布完整安装包；"
-                  "更新清单保存在仓库根目录。"
+                  "update.json 保存在仓库根目录。"
               ),
           }
 
@@ -196,12 +217,12 @@ jobs:
               encoding="utf-8",
           )
 
-          print(f"完整包：{output}")
+          print(f"已生成：{output}")
           print(f"大小：{len(payload)}")
           print(f"SHA-256：{manifest['sha256']}")
           PY
 
-      - name: Verify local package
+      - name: Verify package
         shell: bash
         run: |
           set -euo pipefail
@@ -213,6 +234,11 @@ jobs:
           import sys
 
           package = Path("dist") / os.environ["PACKAGE_NAME"]
+
+          if not package.is_file():
+              print(f"::error::未生成完整包：{package}")
+              sys.exit(1)
+
           required = {
               "miuread.koplugin/_meta.lua",
               "miuread.koplugin/main.lua",
@@ -229,25 +255,24 @@ jobs:
               ".log",
           }
 
-          if not package.is_file():
-              print(f"::error::完整包不存在：{package}")
-              sys.exit(1)
-
           with ZipFile(package) as archive:
               names = archive.namelist()
-              damaged = archive.testzip()
+              bad_file = archive.testzip()
 
           errors = []
-          if damaged:
-              errors.append(f"ZIP 损坏：{damaged}")
 
-          for name in sorted(required.difference(names)):
-              errors.append(f"缺少必要文件：{name}")
+          if bad_file:
+              errors.append(f"ZIP 文件损坏：{bad_file}")
+
+          missing = sorted(required.difference(names))
+          errors.extend(f"缺少文件：{name}" for name in missing)
 
           for name in names:
               path = Path(name)
+
               if not name.startswith("miuread.koplugin/"):
                   errors.append(f"根目录错误：{name}")
+
               if (
                   path.name in forbidden_names
                   or path.suffix.lower() in forbidden_suffixes
@@ -260,10 +285,10 @@ jobs:
                   print(f"::error::{error}")
               sys.exit(1)
 
-          print(f"本地安装包检查通过，共 {len(names)} 个条目")
+          print(f"安装包检查通过，共 {len(names)} 个条目。")
           PY
 
-      - name: Publish only full package
+      - name: Create or update Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -273,135 +298,70 @@ jobs:
           FILE="dist/$PACKAGE_NAME"
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-              while IFS= read -r asset; do
-                  [ -n "$asset" ] || continue
-                  echo "删除旧 Asset：$asset"
-                  gh release delete-asset \
-                    "$RELEASE_TAG" \
-                    "$asset" \
-                    --yes
-              done < <(
-                  gh release view "$RELEASE_TAG" \
-                    --json assets \
-                    --jq '.assets[].name'
-              )
-
-              gh release upload "$RELEASE_TAG" "$FILE"
-          else
-              gh release create \
+            while IFS= read -r asset; do
+              [ -n "$asset" ] || continue
+              echo "删除旧 Asset：$asset"
+              gh release delete-asset \
                 "$RELEASE_TAG" \
-                "$FILE" \
-                --target main \
-                --title "觅阅 MiuRead v$VERSION" \
-                --notes "全量更新包"
-          fi
-
-          count="$(
-              gh release view "$RELEASE_TAG" \
-                --json assets \
-                --jq '.assets | length'
-          )"
-          name="$(
-              gh release view "$RELEASE_TAG" \
-                --json assets \
-                --jq '.assets[0].name'
-          )"
-
-          if [ "$count" != "1" ] || [ "$name" != "$PACKAGE_NAME" ]; then
-              echo "::error::Release Assets 不正确"
+                "$asset" \
+                --yes
+            done < <(
               gh release view "$RELEASE_TAG" \
                 --json assets \
                 --jq '.assets[].name'
-              exit 1
-          fi
+            )
 
-          echo "Release 中只保留：$PACKAGE_NAME"
-
-      - name: Verify public download URL
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$PACKAGE_NAME"
-          EXPECTED="$(
-              python3 -c \
-              'import json; print(json.load(open("dist/update.json"))["sha256"])'
-          )"
-
-          rm -f dist/public-download.zip
-          success=0
-
-          for attempt in $(seq 1 12); do
-              echo "验证公开下载地址，第 ${attempt}/12 次"
-
-              if curl \
-                  --fail \
-                  --location \
-                  --silent \
-                  --show-error \
-                  --connect-timeout 20 \
-                  --max-time 180 \
-                  --output dist/public-download.zip \
-                  "$URL"
-              then
-                  ACTUAL="$(
-                      sha256sum dist/public-download.zip \
-                      | awk '{print $1}'
-                  )"
-
-                  if [ "$ACTUAL" = "$EXPECTED" ]; then
-                      success=1
-                      break
-                  fi
-
-                  echo "下载文件校验不符，等待后重试"
-              fi
-
-              rm -f dist/public-download.zip
-              sleep 5
-          done
-
-          if [ "$success" != "1" ]; then
-              echo "::error::公开下载地址尚不可用或文件校验失败。"
-              echo "::error::为保护旧用户，本次不会更新仓库 update.json。"
-              exit 1
-          fi
-
-          echo "公开下载地址验证通过：$URL"
-
-      - name: Publish repository update.json
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          CONTENT="$(base64 -w 0 dist/update.json)"
-          API_PATH="repos/$GITHUB_REPOSITORY/contents/update.json"
-          CURRENT_SHA="$(
-              gh api "$API_PATH?ref=main" \
-                --jq '.sha' \
-                2>/dev/null \
-              || true
-          )"
-
-          if [ -n "$CURRENT_SHA" ]; then
-              gh api \
-                --method PUT \
-                "$API_PATH" \
-                -f message="Update manifest to $RELEASE_TAG" \
-                -f content="$CONTENT" \
-                -f branch="main" \
-                -f sha="$CURRENT_SHA" \
-                >/dev/null
+            gh release upload "$RELEASE_TAG" "$FILE"
           else
-              gh api \
-                --method PUT \
-                "$API_PATH" \
-                -f message="Add manifest for $RELEASE_TAG" \
-                -f content="$CONTENT" \
-                -f branch="main" \
-                >/dev/null
+            gh release create \
+              "$RELEASE_TAG" \
+              "$FILE" \
+              --target main \
+              --title "觅阅 · 微信读书助手 $VERSION" \
+              --notes "全量更新包。安装与在线更新使用同一个文件。"
           fi
 
-          echo "仓库根目录 update.json 已更新到 $VERSION"
+          asset_count="$(
+            gh release view "$RELEASE_TAG" \
+              --json assets \
+              --jq '.assets | length'
+          )"
+
+          asset_name="$(
+            gh release view "$RELEASE_TAG" \
+              --json assets \
+              --jq '.assets[0].name'
+          )"
+
+          if [ "$asset_count" != "1" ]; then
+            echo "::error::Release 中存在 $asset_count 个上传文件，应为 1 个。"
+            exit 1
+          fi
+
+          if [ "$asset_name" != "$PACKAGE_NAME" ]; then
+            echo "::error::Release 文件名错误：$asset_name"
+            exit 1
+          fi
+
+          echo "Release 检查通过：$PACKAGE_NAME"
+
+      - name: Update repository manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git pull --rebase origin main
+          cp dist/update.json update.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add update.json
+
+          if git diff --cached --quiet; then
+            echo "update.json 无变化。"
+          else
+            git commit -m "Update manifest to $RELEASE_TAG"
+            git push origin main
+          fi

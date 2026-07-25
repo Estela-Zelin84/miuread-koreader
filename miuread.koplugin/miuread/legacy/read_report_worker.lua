@@ -173,13 +173,17 @@ local function select_context_chapter(book)
 
     if not selected and #chapters > 0 then
         local ratio = normalize_progress_ratio(book.progress) or 0
-        local index = math.floor(ratio * #chapters) + 1
-        if index < 1 then
-            index = 1
-        elseif index > #chapters then
-            index = #chapters
+        local total = 0
+        for _, chapter in ipairs(chapters) do total = total + chapter_words(chapter) end
+        local target, before = ratio * total, 0
+        for index, chapter in ipairs(chapters) do
+            local words = chapter_words(chapter)
+            if target <= before + words or index == #chapters then
+                selected = chapter
+                break
+            end
+            before = before + words
         end
-        selected = chapters[index]
     end
 
     return selected or Content.first_readable_chapter(chapters)
@@ -282,17 +286,17 @@ local function estimate_position(book, progress_ratio)
     local chapter
     local within_chapter = 0
     if #chapters > 0 then
-        local scaled = ratio * #chapters
-        local index = math.floor(scaled) + 1
-        if index < 1 then
-            index = 1
-        elseif index > #chapters then
-            index = #chapters
-        end
-        chapter = chapters[index]
-        within_chapter = scaled - math.floor(scaled)
-        if index == #chapters and ratio >= 1 then
-            within_chapter = 1
+        local total = 0
+        for _, item in ipairs(chapters) do total = total + chapter_words(item) end
+        local target, before = ratio * total, 0
+        for index, item in ipairs(chapters) do
+            local words = chapter_words(item)
+            if target <= before + words or index == #chapters then
+                chapter = item
+                within_chapter = math.max(0, math.min(1, (target - before) / words))
+                break
+            end
+            before = before + words
         end
     end
 
@@ -305,10 +309,10 @@ local function estimate_position(book, progress_ratio)
         end
     end
 
-    local chapter_uid = chapter and chapter.chapterUid or book.chapter_uid or 0
-    local chapter_idx = tonumber(chapter and chapter.chapterIdx)
+    local chapter_uid = chapter and (chapter.chapterUid or chapter.uid or chapter.chapter_uid) or book.chapter_uid or 0
+    local chapter_idx = tonumber(chapter and (chapter.chapterIdx or chapter.index or chapter.chapter_idx))
         or tonumber(book.chapter_idx) or 0
-    local word_count = tonumber(chapter and chapter.wordCount)
+    local word_count = tonumber(chapter and (chapter.wordCount or chapter.word_count))
         or tonumber(book.chapter_word_count) or 0
     local chapter_offset = tonumber(book.chapter_offset) or 0
     if word_count > 0 then

@@ -12,28 +12,62 @@ local function pause(seconds)
     if ok_socket and socket and type(socket.sleep) == "function" then socket.sleep(seconds) end
 end
 
+local function is_network_failure(value)
+    local text=tostring(value or ""):lower()
+    return text:find("network request failed",1,true)~=nil
+        or text:find("timeout",1,true)~=nil
+        or text:find("connection refused",1,true)~=nil
+        or text:find("network is unreachable",1,true)~=nil
+end
+
 local function call_with_retry(label, fn)
     local last
     for attempt = 1, 3 do
         local ok, value = pcall(fn)
-        if ok and type(value) == "table" then return true, value end
+        if ok and type(value) == "table" then return true, value, false end
         last = ok and (label .. " returned invalid data") or tostring(value)
-        if attempt < 3 then
+        local network_down=is_network_failure(last)
+        local max_attempts=network_down and 2 or 3
+        if attempt < max_attempts then
             logger.warn("[MiuRead][Annotations] retry", "label=", label, "attempt=", tostring(attempt), "error=", tostring(last))
             pause(attempt == 1 and 0.6 or 1.4)
+        else
+            return false,last,network_down
         end
     end
-    return false, last
+    return false,last,is_network_failure(last)
 end
 
 local function str(v) return v == nil and "" or tostring(v) end
-local function range_key(v) return str(v and (v.range or v.markRange or v.bookmarkRange)) end
+local function scalar_str(v)
+    local kind=type(v)
+    if kind=="string" or kind=="number" then return tostring(v) end
+    return ""
+end
+
+local function range_key(v)
+    if type(v) ~= "table" then return "" end
+    return scalar_str(rawget(v,"range") or rawget(v,"markRange") or rawget(v,"bookmarkRange"))
+end
 
 local function array_from(data, names)
     if type(data) ~= "table" then return {} end
     for _, name in ipairs(names) do if type(data[name]) == "table" then return data[name] end end
     if #data > 0 then return data end
     return {}
+end
+
+local function table_entries(data)
+    local rows, invalid = {}, 0
+    if type(data) ~= "table" then return rows, invalid end
+    for _, value in ipairs(data) do
+        if type(value) == "table" then
+            rows[#rows + 1] = value
+        else
+            invalid = invalid + 1
+        end
+    end
+    return rows, invalid
 end
 
 local function parse_range(value)
@@ -44,35 +78,54 @@ local function parse_range(value)
 end
 
 local function review_texts(group)
-    local rows, seen = {}, {}
-    for _, page in ipairs(array_from(group, {"pageReviews", "reviews", "updated"})) do
-        local r = type(page.review) == "table" and page.review or page
-        local content = str(r.content or r.review or r.text)
-        local author = type(r.author) == "table" and r.author or {}
-        local author_name = str(author.nick or author.name or r.authorName)
-        local key = str(r.reviewId or r.id)
-        if key == "" then key = content .. "\0" .. author_name end
-        if content ~= "" and not seen[key] then
-            seen[key] = true
-            rows[#rows + 1] = {
+    local rows, seen, invalid = {}, {}, 0
+    local pages, skipped = table_entries(array_from(group, {"pageReviews", "reviews", "updated"}))
+    invalid = invalid + skipped
+    for _, page in ipairs(pages) do
+        -- Review payloads occasionally contain placeholders, functions or tables
+        -- with surprising metatables. Keep each entry isolated so one malformed
+        -- review can never abort the whole book download.
+        local ok, item = pcall(function()
+            if type(page) ~= "table" then return nil end
+            local nested = rawget(page, "review")
+            local r = type(nested) == "table" and nested or page
+            if type(r) ~= "table" then return nil end
+            local content = scalar_str(rawget(r, "content") or rawget(r, "review") or rawget(r, "text"))
+            if content == "" then return nil end
+            local author = type(rawget(r, "author")) == "table" and rawget(r, "author") or {}
+            local author_name = scalar_str(rawget(author, "nick") or rawget(author, "name") or rawget(r, "authorName"))
+            local key = scalar_str(rawget(r, "reviewId") or rawget(r, "id"))
+            if key == "" then key = content .. "\0" .. author_name end
+            return {
+                key = key,
                 content = content,
-                abstract = str(r.abstract or r.contextAbstract or r.markText),
-                created = tonumber(r.createTime or r.createdAt or 0) or 0,
+                abstract = scalar_str(rawget(r, "abstract") or rawget(r, "contextAbstract") or rawget(r, "markText")),
+                created = tonumber(rawget(r, "createTime") or rawget(r, "createdAt") or 0) or 0,
                 author = author_name,
-                likes = tonumber(page.likesCount or r.likesCount or 0) or 0,
-                review_id = str(r.reviewId or r.id),
+                likes = tonumber(rawget(page, "likesCount") or rawget(r, "likesCount") or 0) or 0,
+                review_id = scalar_str(rawget(r, "reviewId") or rawget(r, "id")),
             }
+        end)
+        if ok and item and not seen[item.key] then
+            seen[item.key] = true
+            item.key = nil
+            rows[#rows + 1] = item
+        elseif not ok or item == nil then
+            invalid = invalid + 1
         end
     end
-    return rows
+    return rows, invalid
 end
 
 local function normalize_reviews(data)
-    local map, groups, group_count, entry_count = {}, {}, 0, 0
-    for _, group in ipairs(array_from(data, {"reviews", "updated"})) do
+    local map, groups, group_count, entry_count, invalid_count = {}, {}, 0, 0, 0
+    local source, skipped = table_entries(array_from(data, {"reviews", "updated"}))
+    invalid_count = invalid_count + skipped
+    for _, group in ipairs(source) do
         local key = range_key(group)
         if key ~= "" then
-            local texts = review_texts(group)
+            local texts, invalid = review_texts(group)
+            invalid_count = invalid_count + invalid
             if #texts > 0 then
                 if not map[key] then group_count = group_count + 1; map[key] = {} end
                 for _, item in ipairs(texts) do map[key][#map[key] + 1] = item end
@@ -82,7 +135,7 @@ local function normalize_reviews(data)
     end
     for key, texts in pairs(map) do groups[#groups + 1] = {range = key, texts = texts} end
     table.sort(groups, function(a, b) return tostring(a.range) < tostring(b.range) end)
-    return map, groups, group_count, entry_count
+    return map, groups, group_count, entry_count, invalid_count
 end
 
 function Annotations:new(api) return setmetatable({api = api}, self) end
@@ -98,8 +151,14 @@ function Annotations:fetch_chapter(book_id, uid, progress)
         return result
     end
     result.underline_request_ok = true
-    result.underlines = array_from(data, {"underlines", "updated", "bookmarks"})
+    local invalid_underlines
+    result.underlines, invalid_underlines = table_entries(array_from(data, {"underlines", "updated", "bookmarks"}))
     result.underline_count = #result.underlines
+    if invalid_underlines > 0 then
+        logger.warn("[MiuRead][Annotations] ignored invalid underline entries",
+            "book=", result.book_id, "chapter=", result.chapter_uid,
+            "count=", tostring(invalid_underlines))
+    end
     local ranges, seen = {}, {}
     for _, row in ipairs(result.underlines) do
         local key = range_key(row)
@@ -111,14 +170,29 @@ function Annotations:fetch_chapter(book_id, uid, progress)
     local batches = self.api:review_batches(ranges, 5)
     for index, batch in ipairs(batches) do
         progress("thoughts", index, #batches, "")
-        local good, response = call_with_retry("thoughts batch " .. tostring(index), function()
+        local good, response, network_down = call_with_retry("thoughts batch " .. tostring(index), function()
             return self.api:readreviews(book_id, uid, batch)
         end)
         if good then
-            for _, item in ipairs(array_from(response, {"reviews", "updated"})) do groups[#groups + 1] = item end
+            local rows, invalid = table_entries(array_from(response, {"reviews", "updated"}))
+            for _, item in ipairs(rows) do groups[#groups + 1] = item end
+            if invalid > 0 then
+                logger.warn("[MiuRead][Annotations] ignored invalid review groups",
+                    "book=", result.book_id, "chapter=", result.chapter_uid,
+                    "batch=", tostring(index), "count=", tostring(invalid))
+            end
         else
+            if network_down then
+                local err="batch "..tostring(index)..": "..str(response)
+                result.errors[#result.errors+1]=err
+                logger.warn("[MiuRead][Annotations] network unavailable; individual thought fallback skipped",
+                    "book=",result.book_id,"chapter=",result.chapter_uid,
+                    "batch=",tostring(index),"/",tostring(#batches),"error=",str(response))
+                break
+            end
             -- A grouped request can fail even when each individual range is valid.
-            -- Fall back to one range at a time before declaring the chapter incomplete.
+            -- Fall back to one range at a time only for data-specific failures;
+            -- a network outage must not explode into dozens of extra requests.
             local batch_errors = {}
             logger.warn("[MiuRead][Annotations] thoughts batch failed; trying individual ranges",
                 "book=", result.book_id, "chapter=", result.chapter_uid,
@@ -129,8 +203,13 @@ function Annotations:fetch_chapter(book_id, uid, progress)
                     "thought range " .. tostring(index) .. "." .. tostring(item_index),
                     function() return self.api:readreviews(book_id, uid, {item}) end)
                 if single_ok then
-                    for _, row in ipairs(array_from(single_response, {"reviews", "updated"})) do
-                        groups[#groups + 1] = row
+                    local rows, invalid = table_entries(array_from(single_response, {"reviews", "updated"}))
+                    for _, row in ipairs(rows) do groups[#groups + 1] = row end
+                    if invalid > 0 then
+                        logger.warn("[MiuRead][Annotations] ignored invalid review groups",
+                            "book=", result.book_id, "chapter=", result.chapter_uid,
+                            "batch=", tostring(index), "item=", tostring(item_index),
+                            "count=", tostring(invalid))
                     end
                 else
                     batch_errors[#batch_errors + 1] = str(item.range) .. ": " .. str(single_response)
@@ -145,7 +224,14 @@ function Annotations:fetch_chapter(book_id, uid, progress)
             end
         end
     end
-    result.review_map, result.review_groups, result.thought_count, result.thought_entry_count = normalize_reviews({reviews=groups})
+    local invalid_reviews
+    result.review_map, result.review_groups, result.thought_count,
+        result.thought_entry_count, invalid_reviews = normalize_reviews({reviews=groups})
+    if invalid_reviews > 0 then
+        logger.warn("[MiuRead][Annotations] ignored invalid review entries",
+            "book=", result.book_id, "chapter=", result.chapter_uid,
+            "count=", tostring(invalid_reviews))
+    end
     logger.info("[MiuRead][Annotations] chapter fetched", "book=", result.book_id, "chapter=", result.chapter_uid,
         "underlines=", result.underline_count, "thought_groups=", result.thought_count,
         "thought_entries=", result.thought_entry_count, "errors=", #result.errors)
@@ -243,24 +329,29 @@ end
 
 local function tokenize(html)
     local tokens, visible = {}, 0
-    local i, skip_depth = 1, 0
+    local i, skip_depth, anchor_depth = 1, 0, 0
     while i <= #html do
         if html:sub(i, i) == "<" then
             local j = html:find(">", i + 1, true)
             if not j then
                 local raw = html:sub(i)
-                tokens[#tokens + 1] = {kind="text", raw=raw, units=split_units(raw), start=visible, skip=skip_depth > 0}
+                tokens[#tokens + 1] = {
+                    kind="text", raw=raw, units=split_units(raw), start=visible,
+                    skip=skip_depth > 0, inside_anchor=anchor_depth > 0,
+                }
                 if skip_depth == 0 then visible = visible + #tokens[#tokens].units end
                 break
             end
             local raw = html:sub(i, j)
-            tokens[#tokens + 1] = {kind="tag", raw=raw}
             local closing, name, self_closing = tag_info(raw)
+            if closing and name == "a" then anchor_depth = math.max(0, anchor_depth - 1) end
+            tokens[#tokens + 1] = {kind="tag", raw=raw}
             if closing and SKIP_TEXT_TAGS[name] then
                 skip_depth = math.max(0, skip_depth - 1)
             elseif not closing and not self_closing and SKIP_TEXT_TAGS[name] then
                 skip_depth = skip_depth + 1
             end
+            if not closing and not self_closing and name == "a" then anchor_depth = anchor_depth + 1 end
             i = j + 1
         else
             local j = html:find("<", i, true) or (#html + 1)
@@ -270,6 +361,7 @@ local function tokenize(html)
             tokens[#tokens + 1] = {
                 kind="text", raw=raw, units=units, start=visible,
                 stop=skipped and visible or (visible + #units), skip=skipped,
+                inside_anchor=anchor_depth > 0,
             }
             if not skipped then visible = visible + #units end
             i = j
@@ -428,12 +520,13 @@ end
 local function render_text_token(token, marks, data)
     if token.skip or not token.units or #token.units == 0 then return token.raw end
     local out, pos = {}, token.start
-    local active, active_id_written = nil, false
+    local active, thought_link_open = nil, false
     local function close_active()
         if not active then return end
         out[#out + 1] = "</span>"
-        if active.thought then out[#out + 1] = "</a>" end
-        active = nil; active_id_written = false
+        if thought_link_open then out[#out + 1] = "</a>" end
+        active = nil
+        thought_link_open = false
     end
     for _, unit in ipairs(token.units) do
         local mark
@@ -442,26 +535,22 @@ local function render_text_token(token, marks, data)
             close_active()
             active = mark
             if active then
-                if active.thought then
+                -- HTML does not allow links inside links. When an underline overlaps
+                -- an existing footnote/noteref link, preserve the underline style but
+                -- leave the original link as the only clickable target.
+                if active.thought and not token.inside_anchor then
                     local href = Thoughts.href(data.book_id, data.chapter_uid, active.key)
-                    out[#out + 1] = '<a class="miu-thought-link" style="' .. AnnotationStyle.LINK_INLINE_STYLE
-                        .. '" href="' .. href .. '">'
-                    active_id_written = true
+                    out[#out + 1] = '<a class="miu-thought-link" href="' .. href .. '">'
+                    thought_link_open = true
                 end
                 local mark_class = Thoughts.mark_class(active.key)
                 local display_class = active.thought and "miu-thought-mark" or "miu-inline-mark"
-                out[#out + 1] = '<span class="' .. display_class .. ' ' .. mark_class
-                    .. '" style="' .. AnnotationStyle.MARK_INLINE_STYLE .. '" data-miu-range="'
-                    .. active.key .. '">'
+                out[#out + 1] = '<span class="' .. display_class .. ' ' .. mark_class .. '" data-miu-range="' .. active.key .. '">'
             end
         end
         out[#out + 1] = unit
         pos = pos + 1
-        if active and pos >= active.b then
-            local finished = active
-            close_active()
-
-        end
+        if active and pos >= active.b then close_active() end
     end
     close_active()
     return table.concat(out)

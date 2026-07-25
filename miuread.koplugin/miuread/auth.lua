@@ -34,7 +34,8 @@ local function merge_auth_headers(jar,vid,key)
     return {Accept="application/json, text/plain, */*",Referer=BASE.."/r/weread-skills",Cookie=Cookies.header(jar),["X-Vid"]=vid,["X-Skey"]=key}
 end
 local function skill_api_key(value)
-    return type(value)=="table" and type(value.apikey)=="string" and value.apikey or ""
+    if type(value)~="table" or type(value.apikey)~="string" then return "" end
+    return value.apikey
 end
 function Auth:_close_dialog()
     if not self.dialog then return end
@@ -75,7 +76,7 @@ function Auth:_finish(data)
     if vid=="" or key=="" then error("login credentials missing") end
     local jar=Cookies.sanitize(self.jar)
     jar.wr_vid=vid; jar.wr_skey=key; jar.wr_ql="0"; if refresh~="" then jar.wr_rt=Protocol.escape(refresh) end
-    -- Persist only the stable 0.3.6.7-compatible cookie set. QR-page and
+    -- Persist only the stable reporting-cookie set. QR-page and
     -- browser-session cookies remain temporary and are never saved.
     local user,user_headers=self.http:get_json(BASE.."/api/userInfo?userVid="..Protocol.escape(vid),{auth=false,headers=merge_auth_headers(jar,vid,key)})
     jar=Cookies.absorb(jar,header_value(user_headers,"set-cookie"))
@@ -83,8 +84,7 @@ function Auth:_finish(data)
     jar=Cookies.absorb(jar,header_value(skill_headers,"set-cookie"))
     local api_key=skill_api_key(skill)
     if api_key=="" then
-        -- only_show=1 never creates a key. New Skills users receive
-        -- { isEmpty = true } until the creation endpoint is requested.
+        -- only_show=1 does not create a key for first-time Skills users.
         skill,skill_headers=self.http:get_json(BASE.."/api/skills/apikeyGet",{auth=false,headers=merge_auth_headers(jar,vid,key)})
         jar=Cookies.absorb(jar,header_value(skill_headers,"set-cookie"))
         api_key=skill_api_key(skill)

@@ -82,10 +82,10 @@ function EpubStyleRepairTask:_finish(job, forced_error)
     if forced_error then
         result = {ok = false, error = forced_error, repaired = 0, skipped = 0, errors = {forced_error}}
     elseif not raw then
-        result = {ok = false, error = "样式修复进程异常退出", repaired = 0, skipped = 0, errors = {"样式修复进程异常退出"}}
+        result = {ok = false, error = "书籍修复进程异常退出", repaired = 0, skipped = 0, errors = {"书籍修复进程异常退出"}}
     else
         local ok, decoded = pcall(Json.decode, raw)
-        result = ok and decoded or {ok = false, error = "样式修复结果无法解析", repaired = 0, skipped = 0, errors = {"样式修复结果无法解析"}}
+        result = ok and decoded or {ok = false, error = "书籍修复结果无法解析", repaired = 0, skipped = 0, errors = {"书籍修复结果无法解析"}}
     end
     os.remove(job.result_path)
     self.job = nil
@@ -102,7 +102,7 @@ function EpubStyleRepairTask:_poll()
     end
     if os.time() - job.started_at > job.timeout then
         pcall(FFIUtil.terminateSubProcess, job.pid)
-        self:_finish(job, "样式修复超时")
+        self:_finish(job, "书籍修复超时")
         return
     end
     local ok, done = pcall(FFIUtil.isSubProcessDone, job.pid, false)
@@ -119,7 +119,7 @@ function EpubStyleRepairTask:_poll()
 end
 
 function EpubStyleRepairTask:start(paths, on_done)
-    if self.job then return false, "已有样式修复任务正在运行" end
+    if self.job then return false, "已有书籍修复任务正在运行" end
     if not self:available() then return false, "当前 KOReader 不支持后台修复" end
     paths = clean_paths(paths)
     if #paths == 0 then
@@ -137,6 +137,7 @@ function EpubStyleRepairTask:start(paths, on_done)
         local UChild = require("miuread.util")
         local EpubChild = require("miuread.epub")
         local AnnotationStyleChild = require("miuread.annotation_style")
+        local InternalLinksChild = require("miuread.internal_links")
         local lfsChild = require("libs/libkoreader-lfs")
 
         local function child_os_ok(value)
@@ -187,6 +188,9 @@ function EpubStyleRepairTask:start(paths, on_done)
         local errors = {}
         local repaired = 0
         local skipped = 0
+        local links_checked = 0
+        local links_rewritten = 0
+        local links_unresolved = 0
         UChild.remove_tree(temp_root)
         UChild.mkdir(temp_root)
 
@@ -217,10 +221,21 @@ function EpubStyleRepairTask:start(paths, on_done)
                     if not css then
                         fail("未找到 OEBPS/style.css：" .. tostring(read_error or "读取失败"))
                     else
-                        local rewritten_css, css_changed = AnnotationStyleChild.rewrite_css(css)
+                        local meta_raw = UChild.read_file(unpack_dir .. "/OEBPS/miuread.json", true)
+                        local book_meta = {}
+                        if meta_raw then
+                            local meta_ok, decoded_meta = pcall(JsonChild.decode, meta_raw)
+                            if meta_ok and type(decoded_meta) == "table" then book_meta = decoded_meta end
+                        end
+                        local repair_style = tostring(book_meta.variant or "") ~= "clean"
+                        local rewritten_css, css_changed
+                        if repair_style then rewritten_css, css_changed = AnnotationStyleChild.rewrite_css(css)
+                        else rewritten_css, css_changed = css, false end
                         local html_changed = 0
+                        local miuread_chapters = 0
                         local html_error
-                        local function rewrite_html_tree(dir)
+                        local html_entries = {}
+                        local function collect_html_tree(dir, relative)
                             local names = {}
                             for name in lfsChild.dir(dir) do
                                 if name ~= "." and name ~= ".." then names[#names + 1] = name end
@@ -228,9 +243,10 @@ function EpubStyleRepairTask:start(paths, on_done)
                             table.sort(names)
                             for _, name in ipairs(names) do
                                 local full = dir .. "/" .. name
+                                local rel = relative == "" and name or (relative .. "/" .. name)
                                 local mode = lfsChild.attributes(full, "mode")
                                 if mode == "directory" then
-                                    rewrite_html_tree(full)
+                                    collect_html_tree(full, rel)
                                     if html_error then return end
                                 elseif mode == "file" and name:lower():match("%.x?html?$") then
                                     local raw, err = UChild.read_file(full, true)
@@ -238,22 +254,57 @@ function EpubStyleRepairTask:start(paths, on_done)
                                         html_error = "无法读取正文文件：" .. tostring(err or name)
                                         return
                                     end
-                                    local rewritten, changed = AnnotationStyleChild.rewrite_xhtml(raw)
-                                    if changed then
+                                    local is_miuread_chapter = raw:find("data-miuread-book=", 1, true) ~= nil
+                                    local rewritten, style_changed
+                                    if repair_style then rewritten, style_changed = AnnotationStyleChild.rewrite_xhtml(raw)
+                                    else rewritten, style_changed = raw, false end
+                                    if is_miuread_chapter then
+                                        miuread_chapters = miuread_chapters + 1
+                                        if repair_style and not AnnotationStyleChild.xhtml_is_current(rewritten) then
+                                            html_error = "章节内虚线样式校验失败：" .. tostring(name)
+                                            return
+                                        end
+                                    end
+                                    if style_changed then
                                         local ok_write, write_err = UChild.atomic_write(full, rewritten, true)
                                         if not ok_write then
-                                            html_error = "无法改写正文标签：" .. tostring(write_err or name)
+                                            html_error = "无法改写正文样式：" .. tostring(write_err or rel)
                                             return
                                         end
                                         html_changed = html_changed + 1
                                     end
+                                    html_entries[#html_entries + 1] = {path = rel, full = full}
+                                    raw, rewritten = nil, nil
+                                    collectgarbage("step", 150)
                                 end
                             end
                         end
-                        rewrite_html_tree(unpack_dir)
+                        collect_html_tree(unpack_dir, "")
+                        local link_stats
+                        if not html_error then
+                            link_stats, html_error = InternalLinksChild.rewrite_files_strict(html_entries, {
+                                sample_limit = 12,
+                                read_file = function(file) return UChild.read_file(file, true) end,
+                                write_file = function(file, data) return UChild.atomic_write(file, data, true) end,
+                            })
+                            if link_stats then
+                                links_checked = links_checked + (tonumber(link_stats.links) or 0)
+                                links_rewritten = links_rewritten + (tonumber(link_stats.rewritten) or 0)
+                                links_unresolved = links_unresolved + (tonumber(link_stats.unresolved_critical) or 0)
+                                html_changed = html_changed + (tonumber(link_stats.files_changed) or 0)
+                            end
+                            if html_error then
+                                local samples = link_stats and link_stats.samples or {}
+                                html_error = "内部链接修复失败：" .. tostring(html_error)
+                                if #samples > 0 then html_error = html_error .. "：" .. table.concat(samples, "；") end
+                            end
+                        end
                         if html_error then
                             fail(html_error)
-                        elseif not css_changed and html_changed == 0 and AnnotationStyleChild.css_is_current(css) then
+                        elseif miuread_chapters == 0 then
+                            fail("未找到觅阅正文章节")
+                        elseif not css_changed and html_changed == 0
+                            and (not repair_style or AnnotationStyleChild.css_is_current(css)) then
                             skipped = skipped + 1
                             UChild.remove_tree(work_dir)
                         else
@@ -276,7 +327,7 @@ function EpubStyleRepairTask:start(paths, on_done)
                                         local style_check = read_zip_entry(temp_epub, "OEBPS/style.css")
                                         if mime_check ~= "application/epub+zip"
                                             or not style_check
-                                            or not AnnotationStyleChild.css_is_current(style_check) then
+                                            or (repair_style and not AnnotationStyleChild.css_is_current(style_check)) then
                                             fail("修复后的 EPUB 完整性检查失败")
                                         else
                                             os.remove(backup)
@@ -290,7 +341,7 @@ function EpubStyleRepairTask:start(paths, on_done)
                                                     fail("无法覆盖原 EPUB：" .. tostring(replace_error or "替换失败"))
                                                 else
                                                     local verify = read_zip_entry(path, "OEBPS/style.css")
-                                                    if not verify or not AnnotationStyleChild.css_is_current(verify) then
+                                                    if not verify or (repair_style and not AnnotationStyleChild.css_is_current(verify)) then
                                                         os.remove(path)
                                                         os.rename(backup, path)
                                                         fail("覆盖后校验失败，已恢复原文件")
@@ -318,13 +369,16 @@ function EpubStyleRepairTask:start(paths, on_done)
             skipped = skipped,
             total = #child_paths,
             errors = errors,
+            links_checked = links_checked,
+            links_rewritten = links_rewritten,
+            links_unresolved = links_unresolved,
             error = #errors > 0 and table.concat(errors, "\n") or nil,
         }
         UChild.atomic_write(result_path, JsonChild.encode(payload), true)
     end
 
     local ok, pid, err = pcall(FFIUtil.runInSubProcess, child, false, false)
-    if not ok or not pid then return false, tostring(err or pid or "无法启动样式修复") end
+    if not ok or not pid then return false, tostring(err or pid or "无法启动书籍修复") end
     self:_hold_awake()
     self.job = {
         pid = pid,

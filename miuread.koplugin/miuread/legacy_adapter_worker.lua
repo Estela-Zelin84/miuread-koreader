@@ -69,23 +69,34 @@ local function position(context, ratio)
         end
     end
 
-    local selected, within
+    local selected, within = nil, 0
     if #chapters > 0 then
-        local scaled = ratio * #chapters
-        local index = math.floor(scaled) + 1
-        if index < 1 then index = 1 elseif index > #chapters then index = #chapters end
-        selected = chapters[index]
-        within = scaled - math.floor(scaled)
-        if index == #chapters and ratio >= 1 then within = 1 end
+        local total = 0
+        for _, chapter in ipairs(chapters) do
+            total = total + math.max(1, tonumber(chapter.wordCount or chapter.word_count or 0) or 0)
+        end
+        local target, before = ratio * total, 0
+        for index, chapter in ipairs(chapters) do
+            local words = math.max(1, tonumber(chapter.wordCount or chapter.word_count or 0) or 0)
+            if target <= before + words or index == #chapters then
+                selected = chapter
+                within = math.max(0, math.min(1, (target - before) / words))
+                break
+            end
+            before = before + words
+        end
     end
-    local words = tonumber(selected and selected.wordCount) or tonumber(context.chapter_word_count) or 0
+    local words = tonumber(selected and (selected.wordCount or selected.word_count))
+        or tonumber(context.chapter_word_count) or 0
     local offset = tonumber(context.chapter_offset) or 0
-    if words > 0 and within then offset = math.floor(within * words) end
+    if words > 0 and selected then offset = math.floor(within * words + 0.5) end
     return {
         progress = math.floor(ratio * 100 + 0.5),
-        chapter_uid = selected and selected.chapterUid or context.chapter_uid or 0,
-        chapter_index = tonumber(selected and selected.chapterIdx) or tonumber(context.chapter_idx) or 0,
+        chapter_uid = selected and (selected.chapterUid or selected.uid or selected.chapter_uid) or context.chapter_uid or 0,
+        chapter_index = tonumber(selected and (selected.chapterIdx or selected.index or selected.chapter_idx))
+            or tonumber(context.chapter_idx) or 0,
         offset = offset,
+        source = "word_weighted",
     }
 end
 
@@ -105,7 +116,7 @@ function Adapter.run(job)
     }
     local result = Legacy.run(legacy_job)
     local context = merge(legacy_job.book, result.book_patch)
-    local path = "legacy_0.3.6.7_" .. tostring(result.path or result.error_kind or "unknown")
+    local path = "compat_read_report_" .. tostring(result.path or result.error_kind or "unknown")
     return {
         accepted = result.ok == true,
         response = result.result or {},
@@ -121,10 +132,10 @@ function Adapter.run(job)
         wr_ticket = result.wr_ticket,
         wr_wrpa_changed = result.wr_wrpa_changed == true,
         wr_wrpa = result.wr_wrpa,
-        response_summary = result.ok == true and "succ=1 (0.3.6.7 original path)"
-            or tostring(result.error or "0.3.6.7 original path rejected"),
-        attempts = { { stage = tostring(result.path or "legacy") } },
-        payload_public = { legacy_original = true },
+        response_summary = result.ok == true and "succ=1 (compatibility path)"
+            or tostring(result.error or "compatibility path rejected"),
+        attempts = { { stage = tostring(result.path or "compatibility") } },
+        payload_public = { compatibility_path = true },
     }
 end
 

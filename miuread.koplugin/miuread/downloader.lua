@@ -1,8 +1,8 @@
 local Protocol = require("miuread.protocol")
 local Codec = require("miuread.codec")
 local Footnotes = require("miuread.footnotes")
+local InternalLinks = require("miuread.internal_links")
 local Thoughts = require("miuread.thoughts")
-local AnnotationStyle = require("miuread.annotation_style")
 local Epub = require("miuread.epub")
 local Json = require("miuread.json")
 local U = require("miuread.util")
@@ -16,38 +16,13 @@ end
 local Downloader = {}
 Downloader.__index = Downloader
 
-local CACHE_SCHEMA = 5
+local CACHE_SCHEMA = 9
 
 local BASE_CSS = [[
-body { margin: 0; }
+body { line-height: 1.75; margin: 5%; }
 img { max-width: 100%; height: auto; }
 .miu-chapter { display: block; page-break-before: always; break-before: page; }
 .miu-chapter-title { font-size: 1.55em; font-weight: bold; line-height: 1.35; margin: 1.2em 0 .9em 0; page-break-before: always; break-before: page; }
-]]
-
--- WeRead serves publisher CSS for regular books, while official-account
--- collections arrive as lightly styled HTML. Apply one final typography layer
--- after both paths so KOReader remains in charge of the reading font, line
--- spacing and CJK width/word spacing. Structural styles (alignment, indents,
--- headings, images and page breaks) are intentionally preserved.
-local READER_CONTROL_CSS = [[
-/* MIUREAD_READER_CONTROL_BEGIN */
-html, body, article, section, div, p, span, li, blockquote,
-h1, h2, h3, h4, h5, h6, td, th {
-    font-family: inherit !important;
-    letter-spacing: normal !important;
-    word-spacing: normal !important;
-}
-body {
-    margin: 0 !important;
-    padding: 0 !important;
-    line-height: normal !important;
-}
-p, div, article, section, li, blockquote, td, th {
-    line-height: inherit !important;
-}
-pre, code, kbd, samp { font-family: monospace !important; }
-/* MIUREAD_READER_CONTROL_END */
 ]]
 
 local function normalized_book(value)
@@ -65,18 +40,6 @@ end
 local function css_add(list, seen, css)
     css = tostring(css or "")
     if css ~= "" and not seen[css] then seen[css] = true; list[#list + 1] = css end
-end
-
-local function final_css(list, seen)
-    css_add(list, seen, READER_CONTROL_CSS)
-    -- A publisher may return a slightly different full stylesheet for each
-    -- chapter. Concatenating those styles also concatenates the annotation
-    -- rules, so a stale solid-underline rule can end up after the dashed one.
-    -- Normalize the completed stylesheet once, after every chapter style has
-    -- been collected, leaving exactly one annotation block at the true end.
-    local css = table.concat(list, "\n")
-    local rewritten = AnnotationStyle.rewrite_css(css)
-    return rewritten
 end
 
 local function plain(value)
@@ -348,7 +311,7 @@ local function cache_load_base(cache, entry)
     return body, style, assets
 end
 
-local function cache_save_final(cache, chapter, body, annotation, style)
+local function cache_save_final(cache, chapter, body, annotation, style, footnote_stats)
     local uid = tostring(chapter.chapterUid or chapter.uid)
     local entry = cache.manifest.chapters[uid]
     if not entry or not entry.content_done then error("正文断点尚未建立") end
@@ -363,6 +326,10 @@ local function cache_save_final(cache, chapter, body, annotation, style)
     entry.underlines = annotation and (annotation.underline_count or 0) or 0
     entry.thoughts = annotation and (annotation.thought_count or 0) or 0
     entry.thought_entries = annotation and (annotation.thought_entry_count or 0) or 0
+    entry.footnote_refs = footnote_stats and tonumber(footnote_stats.refs or 0) or 0
+    entry.footnotes_converted = footnote_stats and tonumber(footnote_stats.converted or 0) or 0
+    entry.footnotes_missing = footnote_stats and tonumber(footnote_stats.unresolved or 0) or 0
+    entry.footnotes_deferred = footnote_stats and tonumber(footnote_stats.deferred or 0) or 0
     cache_save(cache)
     return entry
 end
@@ -390,6 +357,14 @@ local function cache_load_final_source(cache, entry)
     local assets, asset_error = cache_load_asset_sources(cache, entry)
     if style == nil or not assets then return nil, asset_error or "完成断点文件缺失" end
     return body_path, style, assets
+end
+
+local function validate_cached_chapter(path)
+    local raw, read_error=U.read_file(path,true)
+    if type(raw)~="string" then return nil,read_error or "无法读取完成章节断点" end
+    local valid, validation_error=Footnotes.validate(raw)
+    raw=nil
+    return valid,validation_error
 end
 
 local function le16(data, position)
@@ -528,6 +503,70 @@ function Downloader:_cover(book, enabled)
     return {data=data, ext=ext, mime=mime}
 end
 
+local function repair_internal_links(chapters)
+    local file_entries, all_on_disk = {}, true
+    for index, chapter in ipairs(chapters or {}) do
+        if not chapter.body_path then all_on_disk = false; break end
+        file_entries[index] = {
+            path = string.format("OEBPS/text/chapter-%04d.xhtml", index),
+            full = chapter.body_path,
+        }
+    end
+
+    if all_on_disk then
+        local stats, repair_error = InternalLinks.rewrite_files_strict(file_entries, {sample_limit = 12, neutralize_unresolved = true})
+        if not stats then error("书内链接索引失败：" .. tostring(repair_error)) end
+        if repair_error then
+            local detail = #(stats.samples or {}) > 0 and ("\n" .. table.concat(stats.samples, "\n")) or ""
+            error("书内链接处理未完成：" .. tostring(repair_error) .. detail)
+        end
+        logger.info("[MiuRead][InternalLinks] low-memory links=", tostring(stats.links or 0),
+            "rewritten=", tostring(stats.rewritten or 0),
+            "unresolved=", tostring(stats.unresolved or 0),
+            "critical=", tostring(stats.unresolved_critical or 0),
+            "dropped=", tostring(stats.dropped or 0),
+            "aliases=", tostring(stats.aliases and stats.aliases.resolved or 0))
+        collectgarbage("collect")
+        return stats
+    end
+
+    -- Small in-memory fallback for article downloads that do not use chapter
+    -- checkpoint files.
+    local documents = {}
+    for index, chapter in ipairs(chapters or {}) do
+        local raw, read_error
+        if chapter.body_path then raw, read_error = U.read_file(chapter.body_path, true)
+        else raw = tostring(chapter.body or "") end
+        if type(raw) ~= "string" then
+            error("无法读取章节以检查内部链接：" .. tostring(read_error or chapter.title or index))
+        end
+        documents[index] = {
+            path = string.format("OEBPS/text/chapter-%04d.xhtml", index),
+            html = raw,
+            chapter = chapter,
+        }
+    end
+    local stats = InternalLinks.rewrite_documents_strict(documents, {sample_limit = 12, neutralize_unresolved = true})
+    for index, doc in ipairs(documents) do
+        if doc.changed then
+            local chapter = chapters[index]
+            if chapter.body_path then
+                local ok, write_error = U.atomic_write(chapter.body_path, doc.html, true)
+                if not ok then error("无法写入修复后的章节：" .. tostring(write_error or index)) end
+            else
+                chapter.body = doc.html
+            end
+        end
+    end
+    local valid, validation_error, validation_stats = InternalLinks.validate_documents(documents, {sample_limit = 12})
+    if not valid then
+        local detail = validation_stats and #validation_stats.samples > 0
+            and ("\n" .. table.concat(validation_stats.samples, "\n")) or ""
+        error("书内链接验证失败：" .. tostring(validation_error) .. detail)
+    end
+    return stats
+end
+
 function Downloader:_save(book, chapters, assets, css, cover, opt, failures, session)
     local kind = opt.annotations and "notes" or "clean"
     local expected_chapter_count = tonumber(opt.expected_chapter_count) or #chapters
@@ -552,14 +591,18 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     -- Build beside the formal file. Only a fully validated temporary EPUB may
     -- replace the existing book, so a failed refresh never destroys a known
     -- good copy.
+    local link_stats = repair_internal_links(chapters)
     local temp_path = path .. ".miuread-new-" .. tostring(os.time()) .. "-" .. tostring(math.random(1000, 9999))
     collectgarbage("collect")
     logger.info("[MiuRead][Download] low-memory EPUB package started",
         "chapters=", tostring(#chapters), "assets=", tostring(#assets),
         "memory_kb=", tostring(math.floor(collectgarbage("count"))))
     local built, build_error = pcall(Epub.build, temp_path, book, chapters, css, assets, cover, {
-        schema=3, book_id=book.bookId, variant=kind, standalone=standalone,
+        schema=6, book_id=book.bookId, title=book.title, author=book.author,
+        variant=kind, standalone=standalone, chapter_uid=opt.chapter_uid,
         chapters=map, generated_at=os.time(), complete=true,
+        internal_links={links=link_stats.links or 0, rewritten=link_stats.rewritten or 0,
+            unresolved=link_stats.unresolved or 0, critical=link_stats.unresolved_critical or 0},
     })
     if not built then os.remove(temp_path); error(build_error) end
     logger.info("[MiuRead][Download] low-memory EPUB package completed",
@@ -571,29 +614,44 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         error("EPUB 完整性验证失败：" .. tostring(validation_error))
     end
 
-    local backup_path = path .. ".miuread-backup"
-    os.remove(backup_path)
-    local had_previous = U.file_exists(path)
-    if had_previous then
-        local backed_up, backup_error = os.rename(path, backup_path)
-        if not backed_up then
+    local active_path = tostring(opt.active_document_path or "")
+    local defer_install = active_path ~= "" and active_path == tostring(path) and U.file_exists(path)
+    local pending_path
+    if defer_install then
+        pending_path = path .. ".miuread-pending"
+        os.remove(pending_path)
+        local staged, stage_error = os.rename(temp_path, pending_path)
+        if not staged then
             os.remove(temp_path)
-            error("无法保护原 EPUB：" .. tostring(backup_error))
+            error("无法暂存当前正在阅读书籍的新版本：" .. tostring(stage_error))
         end
+    else
+        local backup_path = path .. ".miuread-backup"
+        os.remove(backup_path)
+        local had_previous = U.file_exists(path)
+        if had_previous then
+            local backed_up, backup_error = os.rename(path, backup_path)
+            if not backed_up then
+                os.remove(temp_path)
+                error("无法保护原 EPUB：" .. tostring(backup_error))
+            end
+        end
+        local installed, install_error = os.rename(temp_path, path)
+        if not installed then
+            if had_previous then os.rename(backup_path, path) end
+            os.remove(temp_path)
+            error("无法安装新 EPUB：" .. tostring(install_error))
+        end
+        if had_previous then os.remove(backup_path) end
     end
-    local installed, install_error = os.rename(temp_path, path)
-    if not installed then
-        if had_previous then os.rename(backup_path, path) end
-        os.remove(temp_path)
-        error("无法安装新 EPUB：" .. tostring(install_error))
-    end
-    if had_previous then os.remove(backup_path) end
 
     local record = {
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
         file=path, directory=dir, variant=kind, downloaded_at=os.time(),
         chapter_count=#chapters, expected_chapter_count=expected_chapter_count,
-        chapter_map=map, failures={}, complete=true,
+        chapter_map=map, failures={}, complete=true, file_size=U.file_size(path) or U.file_size(pending_path),
+        pending_install=defer_install or nil,
+        pending_file=pending_path,
     }
     if standalone then
         record.chapter_uid = tostring(opt.chapter_uid)
@@ -681,6 +739,28 @@ function Downloader:book(input, opt, progress)
         local cache = cache_new(self.store, book, opt, selected, format)
         session = cache.manifest.session
         local failure_map = {}
+        local function chapter_uid(chapter)
+            return tostring(chapter and (chapter.chapterUid or chapter.uid) or "")
+        end
+
+        local function fetch_annotation(chapter, report_progress)
+            local uid=chapter_uid(chapter)
+            local ok,annotation=pcall(self.annotations.fetch_chapter,self.annotations,
+                book.bookId,chapter.chapterUid or chapter.uid,function(stage,current,total)
+                    if report_progress then report_progress(stage,current,total) end
+                end)
+            if not ok or type(annotation)~="table" then
+                annotation={
+                    book_id=tostring(book.bookId),chapter_uid=uid,underlines={},review_map={},review_groups={},
+                    underline_count=0,thought_count=0,thought_entry_count=0,
+                    underline_request_ok=false,errors={tostring(annotation)},
+                }
+            end
+            if annotation.underline_request_ok and #(annotation.errors or {})==0 then
+                Thoughts.save(self.store,book.bookId,chapter.chapterUid or chapter.uid,annotation.review_groups)
+            end
+            return annotation
+        end
 
         local function mark_failure(chapter, message)
             local uid = tostring(chapter.chapterUid or chapter.uid)
@@ -728,8 +808,12 @@ function Downloader:book(input, opt, progress)
             if entry and entry.complete then
                 local cached_path, cached_style = cache_load_final_source(cache, entry)
                 if cached_path then
-                    failure_map[uid] = nil
-                    return true
+                    local valid,validation_error=validate_cached_chapter(cached_path)
+                    if valid then
+                        failure_map[uid] = nil
+                        return true
+                    end
+                    cached_style="完成章节结构无效："..tostring(validation_error)
                 end
                 logger.warn("[MiuRead][Download] completed checkpoint invalid", "chapter=", uid, "error=", tostring(cached_style))
                 cache_reset_entry(cache, uid)
@@ -764,10 +848,8 @@ function Downloader:book(input, opt, progress)
             local annotation
             if opt.annotations then
                 progress("underlines", index, expected, chapter.title)
-                annotation = self.annotations:fetch_chapter(book.bookId, chapter.chapterUid, function(stage, current, total)
-                    progress(stage, index, expected, chapter.title, {
-                        batch=current, batches=total,
-                    })
+                annotation = fetch_annotation(chapter,function(stage,current,total)
+                    progress(stage,index,expected,chapter.title,{batch=current,batches=total})
                 end)
                 if not annotation.underline_request_ok or #(annotation.errors or {}) > 0 then
                     entry.annotation_done = false
@@ -778,7 +860,6 @@ function Downloader:book(input, opt, progress)
                 end
                 entry.annotation_done = true
                 entry.annotation_error = nil
-                Thoughts.save(self.store, book.bookId, chapter.chapterUid, annotation.review_groups)
                 local extra_css
                 body, extra_css = self.annotations:apply(body, annotation)
                 style = tostring(style or "") .. "\n" .. tostring(extra_css or "")
@@ -786,20 +867,40 @@ function Downloader:book(input, opt, progress)
 
             progress("footnotes", index, expected, chapter.title)
             local content_format = entry and entry.content_format or format
-            local foot_body, foot_section = Footnotes.process(body, {is_txt=content_format == "txt" or format == "txt"})
+            local foot_body, foot_section, foot_stats = Footnotes.process(body, {
+                is_txt=content_format == "txt" or format == "txt",
+                book_dir=cache.root,
+                current_chapter_uid=uid,
+                defer_cross_file=true,
+            })
             body = foot_body .. (foot_section or "")
+            if foot_stats and tonumber(foot_stats.unresolved or 0)>0 then
+                local sample={}
+                for missing_index,anchor in ipairs(foot_stats.missing_anchors or {}) do
+                    if missing_index>5 then break end
+                    sample[#sample+1]=tostring(anchor)
+                end
+                entry.footnotes_missing=tonumber(foot_stats.unresolved or 0) or 0
+                cache_save(cache)
+                return mark_failure(chapter,"尾注处理未完成：发现 "..tostring(foot_stats.refs or 0)
+                    .." 个引用，缺失 "..tostring(foot_stats.unresolved or 0)
+                    .." 个正文"..(#sample>0 and ("（"..table.concat(sample,", ").."）") or ""))
+            end
             if foot_section and foot_section ~= "" then
                 style = tostring(style or "") .. "\n" .. Footnotes.FOOTNOTES_CSS
             end
+            local footnote_valid,footnote_error=Footnotes.validate(body)
+            if not footnote_valid then return mark_failure(chapter,"尾注链接检查失败："..tostring(footnote_error)) end
             progress("images", index, expected, chapter.title)
 
             local fallback_title = "第 " .. tostring(index) .. " 节"
             body = prepare_chapter_body(body, chapter.title and chapter.title ~= "" and chapter.title or fallback_title)
-            entry = cache_save_final(cache, chapter, body, annotation, style)
+            entry = cache_save_final(cache, chapter, body, annotation, style, foot_stats)
             local final_path, final_error = cache_load_final_source(cache, entry)
             if not final_path then return mark_failure(chapter, final_error) end
             failure_map[uid] = nil
-            collectgarbage("step", 200)
+            body, annotation, new_assets = nil, nil, nil
+            collectgarbage("collect")
             return true
         end
 
@@ -854,7 +955,7 @@ function Downloader:book(input, opt, progress)
         progress("package", #chapters, expected, book.title)
         opt.expected_chapter_count = expected
         opt.checkpointed = true
-        local record = self:_save(book, chapters, assets, final_css(css_list, css_seen), self:_cover(book, true), opt, failures, session)
+        local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session)
         record.annotation_summary = annotation_summary
         U.remove_tree(cache.root)
         return record
@@ -866,7 +967,7 @@ function Downloader:book(input, opt, progress)
     progress("package", #chapters, expected, book.title)
     opt.expected_chapter_count = expected
     opt.checkpointed = false
-    local record = self:_save(book, chapters, assets, final_css(css_list, css_seen), self:_cover(book, true), opt, failures, session)
+    local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session)
     record.annotation_summary = annotation_summary
     return record
 end
@@ -876,7 +977,5 @@ Downloader._namespace_assets = namespace_assets
 Downloader._catalog_signature = catalog_signature
 Downloader._option_key = option_key
 Downloader._validate_epub = validate_epub
-Downloader._reader_control_css = READER_CONTROL_CSS
-Downloader._final_css = final_css
 
 return Downloader

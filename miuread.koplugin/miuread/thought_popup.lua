@@ -13,8 +13,12 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Screen = Device.screen
 
+local FONT_CSS_CACHE_LIMIT = 8
+local font_css_cache = {}
+local font_css_cache_order = {}
+
 local function screen_ratios()
-    return 0.92, 0.68
+    return 0.91, 0.60
 end
 
 local function safe_margins()
@@ -39,6 +43,7 @@ local Popup = InputContainer:extend{
     html = nil,
     source_html = nil,
     font_size = Screen:scaleBySize(19),
+    font_name = nil,
     width_ratio = nil,
     height_ratio = nil,
     css = "",
@@ -50,15 +55,105 @@ local Popup = InputContainer:extend{
     close_hit_dimen = nil,
 }
 
+local function css_string(value)
+    value = tostring(value or "")
+    value = value:gsub("\\", "\\\\"):gsub("'", "\\'")
+    return value
+end
+
+local function cache_font_css(key, value)
+    if font_css_cache[key] == nil then
+        font_css_cache_order[#font_css_cache_order + 1] = key
+        if #font_css_cache_order > FONT_CSS_CACHE_LIMIT then
+            local expired = table.remove(font_css_cache_order, 1)
+            font_css_cache[expired] = nil
+        end
+    end
+    font_css_cache[key] = value
+    return value
+end
+
+local function can_embed_font(path, face_index)
+    local ext = tostring(path or ""):lower():match("%.([%w]+)$")
+    if ext == "ttf" or ext == "otf" then return true end
+    if ext == "ttc" or ext == "otc" then
+        local index = tonumber(face_index)
+        return index == nil or index == 0
+    end
+    return false
+end
+
+function Popup:_book_font_css()
+    local font_name = tostring(self.font_name or ""):match("^%s*(.-)%s*$")
+    if font_name == "" then return "" end
+    if font_css_cache[font_name] ~= nil then return font_css_cache[font_name] end
+
+    local escaped_name = css_string(font_name)
+    local ok, cre = pcall(function()
+        return require("document/credocument"):engineInit()
+    end)
+    if not ok or not cre or type(cre.getFontFaceFilenameAndFaceIndex) ~= "function" then
+        return cache_font_css(
+            font_name,
+            string.format("@page{font-family:'%s'} html,body{font-family:'%s'!important}", escaped_name, escaped_name)
+        )
+    end
+
+    local family = "MiuReadBookFont"
+    local seen = {}
+    local rules = {}
+    for i = 1, 4 do
+        local bold = i >= 3
+        local italic = i == 2 or i == 4
+        local got, font_path, face_index = pcall(
+            cre.getFontFaceFilenameAndFaceIndex,
+            font_name, bold, italic
+        )
+        if got and type(font_path) == "string" and font_path ~= "" and can_embed_font(font_path, face_index) then
+            local key = table.concat({font_path, tostring(face_index or ""), bold and "b" or "n", italic and "i" or "n"}, "|")
+            if not seen[key] then
+                seen[key] = true
+                rules[#rules + 1] = string.format(
+                    "@font-face{font-family:'%s';src:url('%s')%s%s}",
+                    family,
+                    css_string(font_path),
+                    bold and ";font-weight:bold" or "",
+                    italic and ";font-style:italic" or ""
+                )
+            end
+        end
+    end
+
+    local css
+    if #rules > 0 then
+        rules[#rules + 1] = string.format(
+            "@page{font-family:'%s','%s'} html,body{font-family:'%s','%s'!important}",
+            family, escaped_name, family, escaped_name
+        )
+        css = table.concat(rules, "\n")
+    else
+        css = string.format(
+            "@page{font-family:'%s'} html,body{font-family:'%s'!important}",
+            escaped_name, escaped_name
+        )
+    end
+    return cache_font_css(font_name, css)
+end
+
 function Popup:init()
     self.html = tostring(self.html or "")
     self.source_html = tostring(self.source_html or "")
     if self.html == "" then self.html = "<p>没有想法内容</p>" end
 
+    local font_css = self:_book_font_css()
+    if font_css ~= "" then
+        self.css = font_css .. "\n" .. tostring(self.css or "")
+    end
+
     local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
     local auto_w, auto_h = screen_ratios()
-    local width_ratio = math.max(0.88, math.min(0.95, tonumber(self.width_ratio) or auto_w))
-    local height_ratio = math.max(0.54, math.min(0.72, tonumber(self.height_ratio) or auto_h))
+    local width_ratio = math.max(0.86, math.min(0.92, tonumber(self.width_ratio) or auto_w))
+    local height_ratio = math.max(0.48, math.min(0.64, tonumber(self.height_ratio) or auto_h))
     local side_margin, vertical_margin = safe_margins()
 
     self.width = math.min(math.floor(screen_w * width_ratio), screen_w - side_margin * 2)
@@ -141,10 +236,10 @@ function Popup:_source_height(width, max_height)
         or tonumber(metrics.source_chars)
         or 1
 
-    -- The source text is rendered at .88em. Account for the HTML body and
+    -- The source text is rendered at .68em. Account for the HTML body and
     -- source-box horizontal padding, then estimate the actual wrapped lines.
-    local source_font = math.max(1, self.font_size * 0.88)
-    local horizontal_padding = self.font_size * (0.52 + 1.16) + Screen:scaleBySize(6)
+    local source_font = math.max(1, self.font_size * 0.68)
+    local horizontal_padding = self.font_size * (0.52 + 0.46) + Screen:scaleBySize(4)
     local usable_width = math.max(source_font * 6, width - horizontal_padding)
     local units_per_line = math.max(6, usable_width / source_font)
     local lines = math.max(1, math.min(3, math.ceil(source_units / units_per_line - 0.001)))
@@ -153,9 +248,9 @@ function Popup:_source_height(width, max_height)
     -- padding/border and the real number of source lines. A small safety pad
     -- avoids clipping from font rounding without leaving a blank viewport.
     local body_padding = self.font_size * (0.18 + 0.20)
-    local heading_height = self.font_size * (0.82 * 1.10 + 0.32 + 0.26)
-    local source_lines = lines * self.font_size * 0.88 * 1.42
-    local box_padding = self.font_size * (0.40 * 2) + 3
+    local heading_height = self.font_size * (0.52 * 1.02 + 0.16)
+    local source_lines = lines * self.font_size * 0.68 * 1.15
+    local box_padding = self.font_size * (0.17 * 2) + 2
     local safety = math.max(2, Screen:scaleBySize(3))
     local estimated = math.ceil(body_padding + heading_height + source_lines + box_padding + safety)
 
@@ -167,8 +262,8 @@ function Popup:_build()
 
     local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
     local border = math.max(1, tonumber(Size.border.window) or 1)
-    local padding = math.max(7, Screen:scaleBySize(7))
-    local close_size = math.max(Screen:scaleBySize(24), math.floor(self.font_size * 0.82))
+    local padding = math.max(4, Screen:scaleBySize(4))
+    local close_size = math.max(Screen:scaleBySize(18), math.floor(self.font_size * 0.62))
     local close_inset = math.max(4, Screen:scaleBySize(5))
     local inner_w = self.width - padding * 2 - border * 2
     local max_inner_h = self.max_height - padding * 2 - border * 2
@@ -244,7 +339,7 @@ function Popup:_build()
         padding = 0,
         bordersize = 0,
         text_font_face = "cfont",
-        text_font_size = math.max(16, math.floor(self.font_size * 0.62)),
+        text_font_size = math.max(13, math.floor(self.font_size * 0.50)),
         text_font_bold = true,
         show_parent = self,
         callback = function() self:_request_close() end,
@@ -362,6 +457,7 @@ function M.show(opts)
         html = opts.html,
         source_html = opts.source_html,
         font_size = opts.font_size,
+        font_name = opts.font_name,
         width_ratio = opts.width_ratio,
         height_ratio = opts.height_ratio,
         css = opts.css or "",

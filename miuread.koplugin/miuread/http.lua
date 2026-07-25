@@ -170,18 +170,55 @@ function Http:request(opt)
     error("network request failed: " .. tostring(last_error or "unknown"))
 end
 
+local AUTH_ERROR_MARKER = "[MiuReadAuth]"
+
+local function auth_error_message(code, message)
+    local suffix = tostring(message or ""):gsub("[%c]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    local out = "登录状态已失效 " .. AUTH_ERROR_MARKER .. " error_code=" .. tostring(code or "unknown")
+    if suffix ~= "" then out = out .. ": " .. suffix end
+    return out
+end
+
 local function service_error(data, url)
     local code = data.errCode or data.errcode or data.code
     local message = tostring(data.errMsg or data.errmsg or data.message or data.msg or code or "")
     local lower = message:lower()
     if tonumber(code) == -2012 or lower:find("login timeout", 1, true)
         or message:find("登录超时", 1, true) then
-        return "登录状态已失效（可能被另一台设备的新扫码登录替换）"
+        -- -2012 means the current web session can no longer be used. It does
+        -- not prove that another device replaced this one, so keep the real
+        -- code and let the caller attempt one controlled cookie renewal.
+        return auth_error_message(code or -2012, message)
     end
     if is_weread_url(url) and (message == "用户不存在" or lower == "user not found") then
-        return "登录状态已失效（服务端未识别当前用户）"
+        return auth_error_message(code or "user_not_found", message)
     end
     return message
+end
+
+local function auth_error_code(value)
+    local text = tostring(value or "")
+    return text:match("%[MiuReadAuth%]%s+error_code=([^:%s]+)")
+        or text:match("error_code=([%-]?%d+)")
+end
+
+local function is_auth_error(value)
+    local text = tostring(value or "")
+    local lower = text:lower()
+    return text:find(AUTH_ERROR_MARKER, 1, true) ~= nil
+        or tonumber(auth_error_code(text)) == -2012
+        or lower:find("http 401", 1, true) ~= nil
+        or lower:find("http 403", 1, true) ~= nil
+        or lower:find("login expired", 1, true) ~= nil
+        or lower:find("login timeout", 1, true) ~= nil
+        or lower:find("session expired", 1, true) ~= nil
+        or lower:find("not logged", 1, true) ~= nil
+        or lower:find("api key is not configured", 1, true) ~= nil
+        or text:find("未登录", 1, true) ~= nil
+        or text:find("登录过期", 1, true) ~= nil
+        or text:find("登录超时", 1, true) ~= nil
+        or text:find("登录失效", 1, true) ~= nil
+        or text:find("登录状态已失效", 1, true) ~= nil
 end
 
 function Http:json(opt)
@@ -200,6 +237,7 @@ function Http:json(opt)
     if not ok then error("invalid JSON from " .. tostring(url) .. ": " .. Util.first_line(text, 180)) end
     if type(data) == "table" then
         local ec = data.errCode or data.errcode
+        if ec == nil and tonumber(data.code) and tonumber(data.code) < 0 then ec = data.code end
         if ec and tonumber(ec) ~= 0 then error(service_error(data, url)) end
     end
     local meta = {
@@ -227,5 +265,9 @@ function Http:download(url, opt)
     if code < 200 or code >= 300 then error("download HTTP " .. tostring(code)) end
     return body, headers, final
 end
+
+Http.auth_error_code = auth_error_code
+Http.auth_error_message = auth_error_message
+Http.is_auth_error = is_auth_error
 
 return Http

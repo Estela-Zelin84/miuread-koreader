@@ -512,8 +512,7 @@ function Client:complete_qr_login(login_result)
     )
     local api_key = type(api_result.apikey) == "string" and api_result.apikey or ""
     if api_key == "" then
-        -- only_show=1 reports an empty result for accounts that have never
-        -- created a Skills API key. Calling the base endpoint creates it.
+        -- only_show=1 reports an empty result until a Skills key is created.
         api_result, cookies = authenticated_get_json(
             self, API_KEY_URL, cookies, web_login_vid, access_token
         )

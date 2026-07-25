@@ -18,18 +18,67 @@ local UnderlineContainer = require("ui/widget/container/underlinecontainer")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local UIManager = require("ui/uimanager")
+local logger = require("logger")
 
 local Screen = Device.screen
 
 local function status_text(book)
+    if book.status_text and tostring(book.status_text)~="" then return tostring(book.status_text) end
+    if book.download_status and tostring(book.download_status)~="" then return tostring(book.download_status) end
     local state
-    if book.downloaded then state = "已下载"
-    elseif book.local_only then state = "仅本地"
-    else state = "仅云端" end
+    if book.downloaded then state="已生成"
+    elseif book.local_only then state="已生成书籍"
+    else state="未生成" end
     local progress = tonumber(book.progress or 0) or 0
     if progress >= 100 then return state .. " · 已读完" end
     if progress > 0 then return state .. " · " .. tostring(math.floor(progress + .5)) .. "%" end
     return state
+end
+
+local function supported_image(path)
+    path=tostring(path or "")
+    if path=="" then return false end
+    local ok,registry=pcall(require,"document/documentregistry")
+    if ok and registry and type(registry.isImageFile)=="function" then
+        local checked,value=pcall(registry.isImageFile,registry,path)
+        if checked then return value==true end
+    end
+    local ext=path:lower():match("%.([%w]+)$")
+    return ext=="png" or ext=="jpg" or ext=="jpeg" or ext=="gif"
+        or ext=="webp" or ext=="svg"
+end
+
+local function placeholder(cover_w,cover_h)
+    return FrameContainer:new{
+        width=cover_w,
+        height=cover_h,
+        bordersize=Size.border.thin,
+        padding=0,
+        margin=0,
+        background=Blitbuffer.COLOR_WHITE,
+        CenterContainer:new{
+            dimen=Geom:new{w=cover_w, h=cover_h},
+            TextWidget:new{text="", face=Font:getFace("smallinfofont", 12)},
+        },
+    }
+end
+
+local function safe_cover(path,cover_w,cover_h,book_id)
+    if not supported_image(path) then return nil,"unsupported" end
+    local image
+    local ok,err=pcall(function()
+        image=ImageWidget:new{
+            file=path,
+            width=cover_w,
+            height=cover_h,
+            file_do_cache=false,
+        }
+        image:getSize()
+    end)
+    if ok and image then return image end
+    if image and type(image.free)=="function" then pcall(image.free,image) end
+    logger.warn("[MiuRead][Cover] render failed","book_id=",tostring(book_id or ""),"path=",tostring(path),"error=",tostring(err))
+    return nil,tostring(err or "render failed")
 end
 
 local ShelfItem = InputContainer:extend{
@@ -45,7 +94,7 @@ function ShelfItem:init()
     }
 
     local h = self.dimen.h
-    if self.entry and self.entry._miu_action_row then
+    if self.entry and (self.entry._miu_action_row or self.entry._miu_tab_row) then
         local divider = TextWidget:new{
             text="│",
             face=Font:getFace("smallinfofont", math.min(17, Screen:scaleBySize(15))),
@@ -54,16 +103,22 @@ function ShelfItem:init()
         local divider_w = divider:getSize().w
         local half_w = math.max(1, math.floor((self.dimen.w - divider_w) / 2))
         local action_face = Font:getFace("cfont", math.min(20, Screen:scaleBySize(17)))
+        local left_text="搜索书架"
+        local right_text="排序筛选"
+        if self.entry._miu_tab_row then
+            left_text=(self.entry.selected_tab=="account" and "● " or "").."账号书架"
+            right_text=(self.entry.selected_tab=="generated" and "● " or "").."已生成书籍"
+        end
         local row = HorizontalGroup:new{
             align="center",
             CenterContainer:new{
                 dimen=Geom:new{w=half_w, h=h},
-                TextWidget:new{text="搜索书架", face=action_face, bold=true},
+                TextWidget:new{text=left_text, face=action_face, bold=true},
             },
             divider,
             CenterContainer:new{
                 dimen=Geom:new{w=half_w, h=h},
-                TextWidget:new{text="排序筛选", face=action_face, bold=true},
+                TextWidget:new{text=right_text, face=action_face, bold=true},
             },
         }
         self._underline = UnderlineContainer:new{
@@ -84,27 +139,9 @@ function ShelfItem:init()
     local cover
 
     if show_cover and self.entry.cover_path then
-        cover = ImageWidget:new{
-            file=self.entry.cover_path,
-            width=cover_w,
-            height=cover_h,
-            scale_factor=0,
-            file_do_cache=true,
-        }
-    elseif show_cover then
-        cover = FrameContainer:new{
-            width=cover_w,
-            height=cover_h,
-            bordersize=Size.border.thin,
-            padding=0,
-            margin=0,
-            background=Blitbuffer.COLOR_WHITE,
-            CenterContainer:new{
-                dimen=Geom:new{w=cover_w, h=cover_h},
-                TextWidget:new{text="", face=Font:getFace("smallinfofont", 12)},
-            },
-        }
+        cover=safe_cover(self.entry.cover_path,cover_w,cover_h,self.entry.book_id)
     end
+    if show_cover and not cover then cover=placeholder(cover_w,cover_h) end
 
     local gap = show_cover and Size.padding.large or 0
     local text_w = math.max(Screen:scaleBySize(120), self.dimen.w - cover_w - gap - side * 2)
@@ -192,24 +229,33 @@ end
 local ShelfMenu = Menu:extend{
     on_page_changed = nil,
     on_close_callback = nil,
+    on_rendered_callback = nil,
     _miu_closed = false,
     _suppress_page_callback = false,
 }
 
 function ShelfMenu:onMenuSelect(entry, pos)
-    if entry and entry._miu_action_row then
+    if entry and (entry._miu_action_row or entry._miu_tab_row) then
         local callback
-        if pos and tonumber(pos.x) and pos.x >= 0.5 then
-            callback = entry.sort_callback
+        if entry._miu_tab_row then
+            if pos and tonumber(pos.x) and pos.x >= 0.5 then
+                callback=entry.generated_callback
+            elseif pos then
+                callback=entry.account_callback
+            else
+                callback=entry.account_callback or entry.generated_callback
+            end
+        elseif pos and tonumber(pos.x) and pos.x >= 0.5 then
+            callback=entry.sort_callback
         elseif pos then
-            callback = entry.search_callback
+            callback=entry.search_callback
         else
-            callback = entry.sort_callback or entry.search_callback
+            callback=entry.sort_callback or entry.search_callback
         end
         if callback then callback() end
         return true
     end
-    return Menu.onMenuSelect(self, entry)
+    return Menu.onMenuSelect(self,entry)
 end
 
 function ShelfMenu:updateItems(select_number, no_recalculate_dimen)
@@ -240,6 +286,12 @@ function ShelfMenu:updateItems(select_number, no_recalculate_dimen)
     UIManager:setDirty(self.show_parent, function()
         return "ui", old_dimen and old_dimen:combine(self.dimen) or self.dimen
     end)
+    if self.on_rendered_callback and not self._miu_closed then
+        local callback=self.on_rendered_callback
+        UIManager:scheduleIn(0,function()
+            if not self._miu_closed and callback then pcall(callback,self) end
+        end)
+    end
     if not self._suppress_page_callback and not self._miu_closed and self.on_page_changed then
         local page = tonumber(self.page) or 1
         local first = (page - 1) * self.perpage + 1
@@ -265,12 +317,21 @@ end
 local ShelfView = {}
 
 function ShelfView.show(opts)
-    opts = opts or {}
-    local items = {}
-    local action_count = 0
-    if opts.show_actions ~= false and (opts.on_search or opts.on_sort) then
-        action_count = 1
-        items[#items + 1] = {
+    opts=opts or {}
+    local items={}
+    local action_count=0
+    if opts.show_tabs~=false and (opts.on_account_tab or opts.on_generated_tab) then
+        action_count=action_count+1
+        items[#items+1]={
+            _miu_tab_row=true,
+            selected_tab=opts.selected_tab or "account",
+            account_callback=opts.on_account_tab,
+            generated_callback=opts.on_generated_tab,
+        }
+    end
+    if opts.show_actions~=false and (opts.on_search or opts.on_sort) then
+        action_count=action_count+1
+        items[#items+1]={
             _miu_action_row=true,
             search_callback=opts.on_search,
             sort_callback=opts.on_sort,
@@ -301,11 +362,12 @@ function ShelfView.show(opts)
     local menu = ShelfMenu:new{
         title=opts.title or "书架",
         item_table=items,
-        items_per_page=action_count > 0 and 8 or 7,
+        items_per_page=action_count > 1 and 9 or (action_count > 0 and 8 or 7),
         is_borderless=true,
         title_bar_fm_style=true,
         on_page_changed=page_callback,
         on_close_callback=opts.on_close,
+        on_rendered_callback=opts.on_rendered,
     }
     UIManager:show(menu)
     return menu

@@ -1,6 +1,7 @@
 local Json = require("miuread.json")
 local Protocol = require("miuread.protocol")
 local Cookies = require("miuread.cookies")
+local Http = require("miuread.http")
 local Codec = require("miuread.codec")
 local Util = require("miuread.util")
 local logger = require("logger")
@@ -189,21 +190,41 @@ local function is_confirmed_empty_error(value)
 end
 
 local function is_auth_error(value)
-    local text = tostring(value or ""):lower()
-    return text:find("http 401", 1, true) or text:find("http 403", 1, true)
-        or text:find("login expired", 1, true) or text:find("login timeout", 1, true)
-        or text:find("session expired", 1, true) or text:find("not logged", 1, true)
-        or text:find("未登录", 1, true) or text:find("登录过期", 1, true)
-        or text:find("登录超时", 1, true) or text:find("登录失效", 1, true)
+    return Http.is_auth_error(value)
 end
 
-local function is_replaced_session_error(value)
-    local text = tostring(value or ""):lower()
-    return text:find("另一台设备", 1, true)
-        or text:find("服务端未识别当前用户", 1, true)
-        or text:find("error_code=-2012", 1, true)
+local function login_page_error(html, final_url)
+    local url = tostring(final_url or ""):lower()
+    if url:find("/web/login", 1, true) or url:find("/web/confirm", 1, true)
+        or url:find("/r/weread%-skills") then
+        return Http.auth_error_message("reader_redirect", "reader page redirected to login")
+    end
+    local head = tostring(html or ""):sub(1, 8192)
+    local lower = head:lower()
+    if lower:find('"errcode":-2012', 1, true)
+        or lower:find('"errcode": -2012', 1, true)
+        or lower:find('"err_code":-2012', 1, true)
+        or lower:find("login_timeout", 1, true)
+        or lower:find("login timeout", 1, true)
+        or lower:find("getloginuid", 1, true)
+        or head:find("扫码登录", 1, true)
+        or head:find("登录微信读书", 1, true) then
+        return Http.auth_error_message(-2012, "reader page session expired")
+    end
 end
 
+local function raw_service_auth_error(raw)
+    local text = tostring(raw or ""):gsub("^%s+", "")
+    if text:sub(1, 1) ~= "{" then return nil end
+    local ok, data = pcall(Json.decode, text)
+    if not ok or type(data) ~= "table" then return nil end
+    local code = data.errCode or data.errcode or data.code
+    local message = tostring(data.errMsg or data.errmsg or data.message or data.msg or "")
+    if tonumber(code) == -2012 or message:lower():find("login timeout", 1, true)
+        or message:find("登录超时", 1, true) then
+        return Http.auth_error_message(code or -2012, message)
+    end
+end
 
 local function image_trim(value)
     return tostring(value or ""):gsub("&amp;", "&"):gsub("^%s+", ""):gsub("%s+$", "")
@@ -421,7 +442,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
 
         if image_is_optional_reference(attrs, clean_source) then
             summary.optional = summary.optional + 1
-            logger.info("[MiuRead][Reader] optional image reference replaced", "src=", tostring(clean_source))
+            logger.dbg("[MiuRead][Reader] optional image reference replaced", "src=", tostring(clean_source))
             return "<img" .. image_set_local_src(attrs, OPTIONAL_IMAGE_PLACEHOLDER) .. ">"
         end
 
@@ -498,31 +519,55 @@ end
 
 function Reader:_recover_login_session()
     if self._renewing_session then return false, "登录状态正在续期" end
-    self._renewing_session=true
+    self._renewing_session = true
 
-    local renewed, renew_result=pcall(self.renew,self)
-    if not renewed then
-        logger.warn("[MiuRead][Reader] cookie renewal failed", tostring(renew_result))
-        local repaired, repair_result=pcall(self.repair_login_session,self)
-        if repaired then
-            renewed, renew_result=pcall(self.renew,self)
-        else
-            renew_result=tostring(renew_result).."; repair="..tostring(repair_result)
+    local before = self.store:auth()
+    local before_vid = tostring((before.account or {}).vid or (before.cookies or {}).wr_vid or "")
+    local ok, result = pcall(function()
+        local renewed, meta = self:renew()
+        if type(renewed) ~= "table" then error("续期接口返回无效数据") end
+
+        -- A successful HTTP response alone is not enough: verify the renewed
+        -- web cookies against userInfo and refresh the Skills API key before
+        -- allowing the failed request to retry.
+        local verified
+        local last_error
+        for attempt = 1, 2 do
+            local verify_ok, verify_result = pcall(self.repair_login_session, self)
+            if verify_ok then
+                verified = verify_result
+                break
+            end
+            last_error = verify_result
+            if attempt < 2 then pause(0.4) end
         end
-    end
+        if not verified then error("续期后的账户验证失败：" .. tostring(last_error)) end
 
-    self._renewing_session=false
-    if renewed then
-        logger.info("[MiuRead][Reader] login session renewed")
-        return true
+        local after = self.store:auth()
+        local after_vid = tostring((after.account or {}).vid or (after.cookies or {}).wr_vid or "")
+        if before_vid ~= "" and after_vid ~= "" and before_vid ~= after_vid then
+            self.store:save_auth(before)
+            error("续期返回了不同账户，已保留原账户凭据")
+        end
+        return {meta=meta, verified=verified, vid=after_vid}
+    end)
+
+    self._renewing_session = false
+    if ok then
+        logger.info("[MiuRead][Reader] login session renewed and verified",
+            "vid_unchanged=", tostring(before_vid == "" or before_vid == tostring(result.vid or "")))
+        return true, result
     end
-    return false, renew_result
+    logger.warn("[MiuRead][Reader] login session recovery failed", tostring(result))
+    return false, result
 end
 
 function Reader:state(book_id, chapter_uid)
     local url = Protocol.is_mp(book_id) and Protocol.mp_reader_url(book_id) or Protocol.reader_url(book_id, chapter_uid)
-    local html = self.http:download(url, {headers={Accept="text/html,application/xhtml+xml"}, retries=3})
-    -- 0.3.6.7 used the top-level reader-page fields directly. Prefer that
+    local html, _, final_url = self.http:download(url, {headers={Accept="text/html,application/xhtml+xml"}, retries=3})
+    local page_error = login_page_error(html, final_url)
+    if page_error then error(page_error) end
+    -- Prefer the top-level reader-page fields when they are available.
     -- exact path before recursively searching nested JSON nodes, which may
     -- contain stale preview/session objects with different tokens.
     local context = regex_context(html)
@@ -574,6 +619,8 @@ function Reader:shard(path, book_id, chapter_uid, psvts, style)
         headers={Origin=BASE, Referer=Protocol.reader_url(book_id, chapter_uid), ["Content-Type"]="application/json;charset=UTF-8"},
     }
     if code < 200 or code >= 300 then error(path .. " failed: HTTP " .. tostring(code)) end
+    local auth_error = raw_service_auth_error(raw)
+    if auth_error then error(auth_error) end
     if not raw or raw == "{}" or #raw < 8 then error(path .. " returned empty content") end
     return raw
 end
@@ -737,11 +784,7 @@ function Reader:chapter(book, chapter, format, opt)
 
         logger.warn("[MiuRead][Reader] chapter retry", "chapter=", tostring(uid),
             "attempt=", tostring(attempt), "error=", tostring(a))
-        if is_replaced_session_error(a) then
-            -- Do not rotate the account session automatically. On two devices
-            -- that would make them repeatedly invalidate each other.
-            break
-        elseif is_auth_error(a) and not renewed then
+        if is_auth_error(a) and not renewed then
             renewed = true
             local renew_ok, renew_error = self:_recover_login_session()
             logger.warn("[MiuRead][Reader] authentication renewal", "ok=", tostring(renew_ok),
@@ -776,7 +819,9 @@ function Reader:mp_articles(book_id)
 end
 
 function Reader:mp_content(review_id)
-    local html = self.http:download(BASE .. "/web/mp/content?reviewId=" .. Protocol.escape(review_id), {headers={Referer=BASE .. "/"}, retries=3})
+    local html, _, final_url = self.http:download(BASE .. "/web/mp/content?reviewId=" .. Protocol.escape(review_id), {headers={Referer=BASE .. "/"}, retries=3})
+    local page_error = login_page_error(html, final_url)
+    if page_error then error(page_error) end
     return Codec.mp_body(html)
 end
 
@@ -788,7 +833,7 @@ local function response_header(headers, name)
 end
 
 -- Repair QR-login web cookies using the authenticated follow-up flow from
--- the working 0.3.6.7 build. Only stable wr_ / ptcz / RK / pgv_pvid cookies
+-- the compatibility reporting path. Only stable wr_ / ptcz / RK / pgv_pvid cookies
 -- are retained; browser-session cookies are deliberately discarded.
 function Reader:repair_login_session()
     local auth = self.store:auth()
@@ -810,19 +855,34 @@ function Reader:repair_login_session()
 
     local user, user_headers = self.http:get_json(
         BASE .. "/api/userInfo?userVid=" .. Protocol.escape(vid),
-        {auth=false, headers=headers(), retries=1}
+        {auth=false, headers=headers(), retries=2}
     )
     jar = Cookies.absorb(jar, response_header(user_headers, "set-cookie"))
+    vid = tostring(jar.wr_vid or vid)
+    skey = tostring(jar.wr_skey or skey)
 
     local skill, skill_headers = self.http:get_json(
         BASE .. "/api/skills/apikeyGet?only_show=1",
-        {auth=false, headers=headers(), retries=1}
+        {auth=false, headers=headers(), retries=2}
     )
     jar = Cookies.absorb(jar, response_header(skill_headers, "set-cookie"))
+    vid = tostring(jar.wr_vid or vid)
+    skey = tostring(jar.wr_skey or skey)
+    if type(skill) ~= "table" or tostring(skill.apikey or "") == "" then
+        skill, skill_headers = self.http:get_json(
+            BASE .. "/api/skills/apikeyGet",
+            {auth=false, headers=headers(), retries=2}
+        )
+        jar = Cookies.absorb(jar, response_header(skill_headers, "set-cookie"))
+        vid = tostring(jar.wr_vid or vid)
+        skey = tostring(jar.wr_skey or skey)
+    end
 
     auth.cookies = jar
     if type(skill) == "table" and tostring(skill.apikey or "") ~= "" then
         auth.api_key = tostring(skill.apikey)
+    elseif tostring(auth.api_key or "") == "" then
+        error("续期后未能取得 API key")
     end
     auth.account = Util.merge(account, {
         name = tostring(type(user) == "table" and user.name or account.name or ""),

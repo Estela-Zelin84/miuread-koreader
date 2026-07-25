@@ -12,6 +12,9 @@ local Sync = {}
 Sync.__index = Sync
 
 local CONTEXT_MAX_AGE = 15 * 60
+local READ_REPORT_SERVICE_VERSION = 4
+local FIRST_REPORT_DELAY = 10
+local FINAL_REPORT_MIN_SECONDS = 10
 
 local function response_confirmation(value, depth, path, seen)
     if type(value) ~= "table" or (depth or 0) > 6 then return false end
@@ -86,24 +89,88 @@ local function response_summary(value, meta)
     return table.concat(out, ", ")
 end
 
-local function deep_progress(value, depth)
-    if type(value) ~= "table" or (depth or 0) > 5 then return nil end
-    local p = tonumber(value.progress or value.readingProgress or value.bookProgress or value.progressPercent)
-    if p then
-        if p <= 1 then p = p * 100 end
-        return {
-            percent = U.clamp(p, 0, 100),
-            chapter_uid = value.chapterUid or value.chapterId or value.chapter_uid,
-            chapter_idx = value.chapterIdx or value.chapterIndex or value.chapter_idx,
-            offset = value.chapterOffset or value.chapterPos or value.offset,
-            updated_at = value.updateTime or value.updatedAt,
-            raw = value,
-        }
+local function progress_from_node(node, expected_book_id)
+    if type(node) ~= "table" then return nil end
+    local node_book_id = rawget(node, "bookId") or rawget(node, "book_id")
+    if node_book_id ~= nil and tostring(node_book_id) ~= tostring(expected_book_id or "") then return nil end
+    local p = tonumber(rawget(node, "progress") or rawget(node, "readingProgress")
+        or rawget(node, "progressPercent") or rawget(node, "bookProgress"))
+    if p == nil then return nil end
+    -- The Web API normally returns 0-100. Only true fractions are expanded;
+    -- a literal 1 must remain 1%, not be mistaken for 100%.
+    if p > 0 and p < 1 then p = p * 100 end
+    return {
+        percent = U.clamp(p, 0, 100),
+        chapter_uid = rawget(node, "chapterUid") or rawget(node, "chapterId") or rawget(node, "chapter_uid"),
+        chapter_idx = rawget(node, "chapterIdx") or rawget(node, "chapterIndex") or rawget(node, "chapter_idx"),
+        offset = rawget(node, "chapterOffset") or rawget(node, "chapterPos") or rawget(node, "offset"),
+        updated_at = rawget(node, "updateTime") or rawget(node, "updatedAt") or rawget(node, "update_time"),
+        raw = node,
+    }
+end
+
+local function response_progress(value, expected_book_id)
+    if type(value) ~= "table" then return nil end
+    local queue = {value}
+    local seen = {}
+    local allowed = {"book", "data", "result", "reader", "progressInfo", "bookProgress", "payload", "books", "bookList", "progresses"}
+    local index = 1
+    while index <= #queue and index <= 32 do
+        local node = queue[index]; index = index + 1
+        if type(node) == "table" and not seen[node] then
+            seen[node] = true
+            local found = progress_from_node(node, expected_book_id)
+            if found then return found end
+            for _, key in ipairs(allowed) do
+                local child = rawget(node, key)
+                if type(child) == "table" then queue[#queue + 1] = child end
+            end
+            for i = 1, math.min(#node, 20) do
+                if type(node[i]) == "table" then queue[#queue + 1] = node[i] end
+            end
+        end
     end
-    for _, key in ipairs({"data", "bookProgress", "progressInfo", "reader", "result", "book"}) do
-        local found = deep_progress(value[key], (depth or 0) + 1)
-        if found then return found end
+end
+
+local function normalize_timestamp(value)
+    local ts=tonumber(value)
+    if not ts then return nil end
+    if ts>100000000000 then ts=math.floor(ts/1000) end
+    return ts
+end
+
+local function sourced_progress(value, expected_book_id, source)
+    local progress=response_progress(value, expected_book_id)
+    if not progress then return nil end
+    progress.source=tostring(source or "unknown")
+    progress.updated_at=normalize_timestamp(progress.updated_at)
+    progress.fetched_at=os.time()
+    return progress
+end
+
+local function choose_remote_progress(web,agent,threshold)
+    threshold=math.max(0,tonumber(threshold) or 2)
+    if web and agent then
+        local delta=math.abs((tonumber(web.percent) or 0)-(tonumber(agent.percent) or 0))
+        if delta>threshold then
+            return {
+                conflict=true,
+                web=web,
+                agent=agent,
+                source="conflict",
+                fetched_at=os.time(),
+            }
+        end
+        local wt,at=normalize_timestamp(web.updated_at) or 0,normalize_timestamp(agent.updated_at) or 0
+        local selected=wt>at and web or agent
+        if wt==at then selected=web end
+        selected.sources={web=web,agent=agent}
+        selected.source=(wt==at and "web_cookie" or selected.source)
+        return selected
     end
+    local selected=web or agent
+    if selected then selected.sources={web=web,agent=agent} end
+    return selected
 end
 
 local function context_from(state, fallback)
@@ -201,6 +268,44 @@ local function map_standalone_position(chapters, source_uid, ratio, fallback)
     }
 end
 
+local function catalog_progress_from_remote(remote, chapters)
+    if type(remote)~="table" then return remote end
+    chapters=type(chapters)=="table" and chapters or {}
+    remote.raw_percent=tonumber(remote.raw_percent or remote.percent)
+    if #chapters==0 then return remote end
+
+    local wanted_uid=tostring(remote.chapter_uid or "")
+    local wanted_idx=tonumber(remote.chapter_idx)
+    local selected,selected_pos,before,total=nil,nil,0,0
+    for index,chapter in ipairs(chapters) do
+        local words=chapter_words(chapter)
+        local uid=tostring(chapter_uid(chapter) or "")
+        local idx=chapter_index(chapter,index)
+        local matches=(wanted_uid~="" and uid==wanted_uid)
+            or (wanted_uid=="" and wanted_idx~=nil and (idx==wanted_idx or index==wanted_idx or index-1==wanted_idx))
+        if not selected and matches then selected=chapter; selected_pos=index end
+        if not selected then before=before+words end
+        total=total+words
+    end
+    if not selected or total<=0 then return remote end
+
+    local words=chapter_words(selected)
+    local offset=tonumber(remote.offset)
+    if offset==nil then return remote end
+    offset=math.max(0,math.min(words,offset))
+    local calculated=U.clamp(((before+offset)/total)*100,0,100)
+    remote.calculated_percent=calculated
+    remote.percent=calculated
+    remote.position_basis="chapter_offset"
+    remote.chapter_uid=chapter_uid(selected) or remote.chapter_uid
+    remote.chapter_idx=chapter_index(selected,selected_pos)
+    remote.offset=offset
+    remote.chapter_word_count=words
+    remote.total_word_count=total
+    remote.words_before=before
+    return remote
+end
+
 function Sync:new(reader, api, store, host, async)
     local object = setmetatable({
         reader=reader, api=api, store=store, host=host, async=async,
@@ -214,12 +319,18 @@ function Sync:new(reader, api, store, host, async)
         verified_remote_percent=nil, verification_ttl=4 * 60 * 60,
         daemon=nil, daemon_poll=nil, daemon_status_stamp=nil,
         daemon_context=nil, daemon_last_persist=0, daemon_generation=0,
-        control_write_task=nil,
+        control_write_task=nil, session_started_at=0,
+        record_generation=0, record_retry_task=nil, record_checked_path=nil,
+        time_enabled=(store:preferences().sync or {}).time_enabled==true,
         controller_token=tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999)),
     }, self)
-    -- Start the lightweight service before a large EPUB is opened. Forking after
-    -- CREngine loads a book duplicates far more memory on low-RAM Kindles.
-    object:_ensure_daemon()
+    -- Retire the pre-1.1.33 service so an OTA reload cannot keep reusing an
+    -- older worker that was already resident in the KOReader process.
+    object:_retire_legacy_daemon()
+    -- Prestart only when the feature is enabled. This keeps the low-memory
+    -- benefit of forking before CREngine opens a large book without imposing a
+    -- permanent polling process on users who disabled reading-time sync.
+    if object.time_enabled then object:_ensure_daemon() end
     return object
 end
 
@@ -227,8 +338,15 @@ function Sync:record()
     if not self.host.ui or not self.host.ui.document then return nil end
     local document = self.host.ui.document
     local path = document.file or (document.getFilePath and document:getFilePath())
+    if not path or path=="" then return nil end
+    if self.current and self.current.path==path then return self.current end
+    if self.record_checked_path==path then return nil end
+    self.record_checked_path=path
     local book, record, variant = self.store:file_record(path)
-    if book then return {book=book, record=record, variant=variant, path=path} end
+    if book then
+        self.current={book=book,record=record,variant=variant,path=path}
+        return self.current
+    end
 end
 
 function Sync:local_ratio()
@@ -389,9 +507,9 @@ function Sync:clear_verified(reason)
 end
 
 function Sync:begin_progress_sync(reason)
-    -- Cloud-position checks are informational and must never pause the 30-second
-    -- reading-time service.
-    self.progress_hold = false
+    -- The read-report request also carries a position. Keep reporting paused
+    -- until local and cloud positions have been compared and explicitly chosen.
+    self.progress_hold = true
     self.state = "fetching_remote"
     self.last_stage = reason or "读取云端进度"
     return true
@@ -399,29 +517,94 @@ end
 
 function Sync:end_progress_sync(reason)
     self.progress_hold = false
-    self.state = self.store:preferences().sync.time_enabled and "waiting" or "stopped"
     self.last_stage = reason or "阅读进度检查完成"
     self.last_report_clock = os.time()
+    if self:is_current_verified() then
+        self.state = self.store:preferences().sync.time_enabled and "waiting" or "stopped"
+        if self.store:preferences().sync.time_enabled and not self.suspended then
+            self:start("progress_confirmed")
+        end
+    else
+        self.state = "verification_required"
+    end
 end
 
-function Sync:remote(book_id, callback)
+function Sync:_remote_catalog(book_id)
+    local record=self:record()
+    if not record or tostring(record.book.book_id or "")~=tostring(book_id or "") then return {} end
+    local map=(record.record and record.record.chapter_map) or record.book.catalog or {}
+    local standalone_uid=record.record and record.record.chapter_uid
+    if standalone_uid~=nil and tostring(standalone_uid)~="" then
+        local session=self.store:session(record.book.book_id) or {}
+        local context=self.daemon_context
+            or (type(session.legacy_report_context)=="table" and session.legacy_report_context)
+            or {}
+        if context.catalog_complete==true and type(context.chapters)=="table" and #context.chapters>0 then
+            map=context.chapters
+        end
+    end
+    return type(map)=="table" and map or {}
+end
+
+function Sync:_normalize_remote_progress(remote,book_id)
+    if type(remote)~="table" then return remote end
+    local chapters=self:_remote_catalog(book_id)
+    return catalog_progress_from_remote(remote,chapters)
+end
+
+function Sync:remote(book_id, callback, options)
+    options=options or {}
     self.state = "fetching_remote"
     self.last_stage = "读取云端进度"
-    local ok, err = self.async:run("remote_progress", function() return self.api:progress(book_id) end, function(result)
+    local threshold=tonumber(self.store:preferences().sync.threshold) or 2
+    local ok, err = self.async:run("remote_progress", function()
+        local out={}
+        local agent_ok,agent=pcall(self.api.progress,self.api,book_id)
+        if agent_ok then out.agent=agent else out.agent_error=tostring(agent) end
+        local web_ok,web=pcall(self.api.web_progress,self.api,book_id)
+        if web_ok then out.web=web else out.web_error=tostring(web) end
+        return out
+    end, function(result)
         self.store:reload()
         self.state = self.progress_hold and "progress_sync" or "waiting"
-        if not result.ok then
-            self.last_error = result.error
-            logger.warn("[MiuRead][Sync] remote progress failed", tostring(result.error))
-            callback(nil, result.error)
+        if not result.ok or type(result.value)~="table" then
+            self.last_error = result.error or "remote progress unavailable"
+            logger.warn("[MiuRead][Sync] remote progress failed", tostring(self.last_error))
+            callback(nil, self.last_error)
             return
         end
-        local remote = deep_progress(result.value)
-        if not remote then self.last_error = "remote progress unavailable"; callback(nil, self.last_error); return end
-        self.store:save_session(book_id, {remote=remote, remote_checked_at=os.time()})
-        logger.info("[MiuRead][Sync] remote progress", "book=", tostring(book_id), "percent=", tostring(remote.percent))
-        callback(remote)
-    end, 35)
+        local value=result.value
+        local web=self:_normalize_remote_progress(sourced_progress(value.web,book_id,"web_cookie"),book_id)
+        local agent=self:_normalize_remote_progress(sourced_progress(value.agent,book_id,"agent_gateway"),book_id)
+        local remote=choose_remote_progress(web,agent,threshold)
+        if not remote then
+            self.last_error=tostring(value.web_error or value.agent_error or "remote progress unavailable")
+            callback(nil,self.last_error)
+            return
+        end
+        self.last_error=nil
+        self.store:save_session(book_id,{
+            remote=remote,
+            remote_sources={web=web,agent=agent},
+            remote_checked_at=os.time(),
+            remote_web_error=value.web_error,
+            remote_agent_error=value.agent_error,
+        })
+        if remote.conflict then
+            logger.warn("[MiuRead][Sync] cloud progress source conflict",
+                "book=",tostring(book_id),
+                "web=",tostring(web and web.percent or "-"),
+                "agent=",tostring(agent and agent.percent or "-"))
+        else
+            logger.info("[MiuRead][Sync] remote progress", "book=", tostring(book_id),
+                "percent=", tostring(remote.percent), "raw_percent=",tostring(remote.raw_percent or "-"),
+                "basis=",tostring(remote.position_basis or "raw_percent"),
+                "source=",tostring(remote.source or "-"),
+                "chapter=", tostring(remote.chapter_uid or "-"),
+                "offset=", tostring(remote.offset or "-"), "updated=", tostring(remote.updated_at or "-"))
+        end
+        callback(remote,nil)
+    end, 42)
     if not ok then callback(nil, err) end
 end
 
@@ -437,7 +620,9 @@ function Sync:mark_verified(book_id, reason, local_percent, remote_percent)
         verified_reason=tostring(reason or "confirmed"),
         verified_local_percent=self.verified_local_percent,
         verified_remote_percent=self.verified_remote_percent,
+        progress_local_percent=self.verified_local_percent, pending=false,
     })
+    self.store:update_cached_progress(book_id, self.verified_local_percent)
     logger.info("[MiuRead][Sync] cloud progress verified",
         "book=", book_id, "reason=", tostring(reason or "confirmed"),
         "local=", tostring(self.verified_local_percent or "-"),
@@ -472,8 +657,10 @@ function Sync:upload(elapsed, callback, options)
     options = options or {}
     local record = self:record()
     if not record then if callback then callback(false, "未识别到 MiuRead 生成的当前书籍") end; return false end
-    -- Reading-time upload is independent from cloud progress synchronization.
-    self.progress_hold = false
+    if self.progress_hold and not options.progress_only then
+        if callback then callback(false, "阅读位置尚未确认") end
+        return false
+    end
     if self.busy then if callback then callback(false, "同步任务忙") end; return false end
 
     local book_id = tostring(record.book.book_id)
@@ -483,15 +670,15 @@ function Sync:upload(elapsed, callback, options)
     local chapters = (record.record and record.record.chapter_map) or record.book.catalog or {}
     -- Keep the old worker's own field names and cached context isolated from
     -- MiuRead's newer protocol model. On first use it refreshes the reader page,
-    -- catalog and reporting context exactly as 0.3.6.7 did.
+    -- catalog and reporting context through the isolated compatibility worker.
     local legacy_book = U.copy(type(session.legacy_report_context) == "table"
         and session.legacy_report_context or {})
     legacy_book.book_id = book_id
     legacy_book.title = record.book.title
     self:_decorate_legacy_context(legacy_book, record)
 
-    self.busy, self.state, self.last_attempt = true, "uploading", os.time()
-    self.last_stage = "调用 0.3.6.7 原版阅读时长链路"
+    self.busy, self.state, self.last_attempt = true, options.progress_only and "progress_uploading" or "uploading", os.time()
+    self.last_stage = options.progress_only and "主动提交阅读进度" or "调用兼容阅读时间上传链路"
     local ok, err = self.async:run("legacy_read_report", function()
         return ReadReportWorker.run{
             book_id = book_id,
@@ -507,7 +694,7 @@ function Sync:upload(elapsed, callback, options)
         }
     end, function(result)
         self.busy = false
-        self.state = "waiting"
+        self.state = self.progress_hold and "verification_required" or "waiting"
         self.store:reload()
         if not result.ok or type(result.value) ~= "table" then
             self.consecutive_failures = self.consecutive_failures + 1
@@ -535,9 +722,9 @@ function Sync:upload(elapsed, callback, options)
         self.last_response_summary = value.response_summary or value.error
         self.last_http_code = value.meta and value.meta.code or nil
         self.last_http_length = value.meta and value.meta.length or nil
-        self.last_stage = value.accepted and "0.3.6.7 原版链路已确认"
-            or (tostring(value.path or ""):find("context", 1, true) and "0.3.6.7 原版上下文失败"
-            or "0.3.6.7 原版链路被服务端拒绝")
+        self.last_stage = value.accepted and "兼容上传链路已确认"
+            or (tostring(value.path or ""):find("context", 1, true) and "兼容上传上下文失败"
+            or "兼容上传链路被服务端拒绝")
 
         self.store:save_session(book_id, {
             legacy_report_context=legacy_context,
@@ -576,14 +763,12 @@ function Sync:upload(elapsed, callback, options)
         end
 
         local response = value.response or {}
-        self.session_uploads = self.session_uploads + 1
-        self.last_upload = os.time()
+        local completed_at=os.time()
         self.last_error = nil
         self.consecutive_failures = 0
         self.failure_notified = false
-        self.store:save_session(book_id, {
+        local patch={
             local_percent=position.progress,
-            last_upload=self.last_upload,
             pending=nil,
             synckey=response_synckey(response) or legacy_context.synckey or session.synckey,
             last_error=false,
@@ -594,12 +779,26 @@ function Sync:upload(elapsed, callback, options)
             last_http_code=self.last_http_code,
             last_http_length=self.last_http_length,
             last_payload_public=public,
-        })
-        logger.info("[MiuRead][ReadReport] success", "count=", tostring(self.session_uploads),
-            "book=", tostring(book_id), "elapsed=", tostring(elapsed or 0),
-            "progress=", tostring(position.progress), "path=", tostring(value.path),
-            "attempts=", tostring(attempts_count))
-        if not self.first_success_notified and not options.silent then
+        }
+        if options.progress_only then
+            patch.progress_upload_at=completed_at
+            patch.progress_upload_percent=position.progress
+            patch.progress_upload_state="submitted"
+            self.last_stage="阅读进度已提交，等待云端确认"
+            logger.info("[MiuRead][Progress] submit accepted",
+                "book=",tostring(book_id),"progress=",tostring(position.progress),
+                "path=",tostring(value.path),"attempts=",tostring(attempts_count))
+        else
+            self.session_uploads = self.session_uploads + 1
+            self.last_upload = completed_at
+            patch.last_upload=self.last_upload
+            logger.info("[MiuRead][ReadReport] success", "count=", tostring(self.session_uploads),
+                "book=", tostring(book_id), "elapsed=", tostring(elapsed or 0),
+                "progress=", tostring(position.progress), "path=", tostring(value.path),
+                "attempts=", tostring(attempts_count))
+        end
+        self.store:save_session(book_id,patch)
+        if not options.progress_only and not self.first_success_notified and not options.silent then
             self.first_success_notified = true
             if self.host.on_read_report_success then pcall(self.host.on_read_report_success, self.host, value.path) end
         end
@@ -613,6 +812,10 @@ function Sync:upload(elapsed, callback, options)
         return false
     end
     return true
+end
+
+function Sync:upload_progress(callback)
+    return self:upload(0,callback,{silent=true,progress_only=true})
 end
 
 function Sync:_notify_failure()
@@ -713,10 +916,21 @@ local function acquire_lock_dir(path)
     return made == true
 end
 
-function Sync:_daemon_paths()
-    -- One fixed service per KOReader process. A random path allowed every plugin
-    -- instance to start its own 30-second uploader.
+function Sync:_retire_legacy_daemon()
+    -- Stop workers created by earlier service layouts before starting the
+    -- current version. This prevents an OTA reload from leaving an older
+    -- process uploading stale book or position data.
     local base = self.store.temp_dir .. "/readtime-service"
+    for _, suffix in ipairs({"", "-v1", "-v2"}) do
+        U.atomic_write(base .. suffix .. ".stop", "1", true)
+    end
+end
+
+function Sync:_daemon_paths()
+    -- One versioned service per KOReader process. The version suffix prevents
+    -- an OTA reload from reusing a worker created by older plugin code.
+    local base = self.store.temp_dir .. "/readtime-service-v"
+        .. tostring(READ_REPORT_SERVICE_VERSION)
     return {
         job = base .. ".job.json",
         control = base .. ".control.json",
@@ -745,11 +959,15 @@ end
 
 function Sync:_attach_existing_daemon(paths, owner)
     if type(owner) ~= "table" or not process_alive(owner.pid) then return false end
+    if tonumber(owner.service_version or 0) ~= READ_REPORT_SERVICE_VERSION then return false end
+    local parent_pid = current_pid()
+    if tonumber(owner.parent_pid or 0) ~= tonumber(parent_pid or 0) then return false end
     local control = read_json_file(paths.control) or {}
     self.daemon = {
         pid=tonumber(owner.pid), paths=paths, active=false,
         generation=tonumber(control.generation or 0) or 0,
         book_id=nil, interval=30, reason="reused", is_child=false,
+        service_version=READ_REPORT_SERVICE_VERSION,
     }
     self.daemon_status_stamp = nil
     self:_schedule_daemon_poll(10)
@@ -783,6 +1001,7 @@ function Sync:_ensure_daemon()
     os.remove(paths.stop)
     local service_job = {
         parent_pid = current_pid(),
+        service_version = READ_REPORT_SERVICE_VERSION,
         poll_interval = 1,
         job_path = paths.job,
         control_path = paths.control,
@@ -800,10 +1019,14 @@ function Sync:_ensure_daemon()
         self.last_error = tostring(err or pid or "无法启动后台阅读时间服务")
         return false, self.last_error
     end
-    U.atomic_write(paths.owner, Json.encode({pid=pid,parent_pid=current_pid(),started_at=os.time()}), true)
+    U.atomic_write(paths.owner, Json.encode({
+        pid=pid, parent_pid=current_pid(), started_at=os.time(),
+        service_version=READ_REPORT_SERVICE_VERSION,
+    }), true)
     self.daemon = {
         pid=pid, paths=paths, active=false, generation=0,
         book_id=nil, interval=30, reason="prestarted", is_child=true,
+        service_version=READ_REPORT_SERVICE_VERSION,
     }
     self.daemon_status_stamp = nil
     self:_schedule_daemon_poll(10)
@@ -811,11 +1034,12 @@ function Sync:_ensure_daemon()
     return true
 end
 
-function Sync:_write_daemon_control(active, immediate)
+function Sync:_write_daemon_control(active, immediate, extra)
     local daemon = self.daemon
     if not daemon and not self:_ensure_daemon() then return false end
     daemon = self.daemon
     if not daemon then return false end
+    extra = type(extra) == "table" and extra or {}
 
     local function write_now()
         self.control_write_task = nil
@@ -834,10 +1058,11 @@ function Sync:_write_daemon_control(active, immediate)
             active = active ~= false and d.active == true,
             generation = own_generation,
             controller_token = self.controller_token,
-            progress_ratio = self:local_ratio() or 0,
+            progress_ratio = self:local_ratio() or tonumber(existing.progress_ratio) or 0,
             last_activity = tonumber(self.last_activity) or os.time(),
             updated_at = os.time(),
         }
+        for key, value in pairs(extra) do control[key] = value end
         U.atomic_write(d.paths.control, Json.encode(control), true)
     end
 
@@ -857,9 +1082,9 @@ function Sync:_write_daemon_control(active, immediate)
     return true
 end
 
-function Sync:_persist_daemon_session(force)
+function Sync:_persist_daemon_session(force, explicit_book_id)
     local daemon = self.daemon
-    local book_id = daemon and daemon.book_id
+    local book_id = explicit_book_id or (daemon and (daemon.book_id or daemon.final_book_id))
     if not book_id then return end
     local now = os.time()
     if not force and now - (tonumber(self.daemon_last_persist) or 0) < 300 then return end
@@ -892,11 +1117,23 @@ function Sync:_import_daemon_status(force)
     if not raw then return end
     local ok, status = pcall(Json.decode, raw)
     if not ok or type(status) ~= "table" then return end
-    if daemon.active and tonumber(status.generation or -1) ~= tonumber(daemon.generation or 0) then return end
+    if tonumber(status.generation or -1) ~= tonumber(daemon.generation or 0) then return end
 
+    local status_book_id = tostring(status.book_id or daemon.book_id or daemon.final_book_id or "")
+    local final_flush = status.final_flush == true
     local stamp = daemon_stamp(status)
+    if final_flush and stamp and self.store:is_read_report_consumed(stamp) then
+        self.daemon_status_stamp=stamp
+        daemon.final_flush_pending=false
+        if not daemon.active then daemon.book_id=nil end
+        if force then self:_load_daemon_context() end
+        return
+    end
     if stamp and stamp == self.daemon_status_stamp then
-        if force then self:_load_daemon_context(); self:_persist_daemon_session(true) end
+        if force then
+            self:_load_daemon_context()
+            self:_persist_daemon_session(true, status_book_id ~= "" and status_book_id or nil)
+        end
         return
     end
     self.daemon_status_stamp = stamp
@@ -904,6 +1141,10 @@ function Sync:_import_daemon_status(force)
     if status.context_changed or force then self:_load_daemon_context() end
     self.next_due = tonumber(status.next_due) or self.next_due or 0
     if status.state == "service_waiting" or status.state == "inactive" then
+        if final_flush then
+            daemon.final_flush_pending = false
+            if not daemon.active then daemon.book_id = nil end
+        end
         if not daemon.active then self.state = "stopped" end
         return
     elseif status.state == "waiting" and status.accepted == nil then
@@ -914,11 +1155,15 @@ function Sync:_import_daemon_status(force)
         return
     end
 
-    if not daemon.active then return end
+    if not daemon.active and not final_flush then return end
     self.last_attempt = tonumber(status.attempted_at) or self.last_attempt
     self.last_path = status.path or self.last_path
     self.last_response_summary = status.response_summary or status.error or self.last_response_summary
-    self.last_stage = status.accepted and "0.3.6.7 原版链路已确认" or "后台上传失败"
+    if final_flush then
+        self.last_stage = status.accepted and "关闭前阅读时间补传成功" or "关闭前阅读时间补传失败"
+    else
+        self.last_stage = status.accepted and "兼容上传链路已确认" or "后台上传失败"
+    end
 
     if status.cookies_changed and type(status.cookies) == "table" then
         local auth = self.store:auth()
@@ -929,38 +1174,61 @@ function Sync:_import_daemon_status(force)
     end
 
     if status.accepted then
-        self.state = "waiting"
+        self.state = daemon.active and "waiting" or "stopped"
         self.session_uploads = self.session_uploads + 1
         self.last_upload = tonumber(status.completed_at) or os.time()
         self.last_error = nil
         self.consecutive_failures = 0
         self.failure_notified = false
-        -- Clear an older persisted error as soon as the service succeeds again.
-        -- This is a one-time write after recovery, not a 30-second log write.
-        if not self.first_success_notified then
-            self.store:save_session(tostring(daemon.book_id), {
+        if status_book_id ~= "" and (not self.first_success_notified or final_flush) then
+            self.store:save_session(status_book_id, {
                 last_error=false,
                 consecutive_failures=0,
                 last_upload=self.last_upload,
+                last_elapsed=tonumber(status.elapsed_seconds),
+                last_report_reason=final_flush and tostring(status.flush_reason or "stop") or "interval",
             })
         end
-        -- Avoid a synchronous log write every 30 seconds on e-ink devices.
-        if not self.first_success_notified then
+        if not final_flush and self.host.on_read_report_interval_success then
+            pcall(self.host.on_read_report_interval_success,self.host,status)
+        end
+        if final_flush then
+            logger.info("[MiuRead][ReadReport] final upload success",
+                "book=", status_book_id, "elapsed=", tostring(status.elapsed_seconds or "-"),
+                "reason=", tostring(status.flush_reason or "stop"),
+                "path=", tostring(status.path or "-"))
+            daemon.final_flush_pending = false
+            if not daemon.active then daemon.book_id = nil end
+        elseif not self.first_success_notified then
             logger.info("[MiuRead][ReadReport] service first success",
-                "book=", tostring(daemon.book_id), "path=", tostring(status.path or "-"))
+                "book=", status_book_id, "elapsed=", tostring(status.elapsed_seconds or "-"),
+                "path=", tostring(status.path or "-"))
             self.first_success_notified = true
             if self.host.on_read_report_success then
                 pcall(self.host.on_read_report_success, self.host, status.path)
             end
         end
-        self:_persist_daemon_session(force)
+        self:_persist_daemon_session(force or final_flush, status_book_id ~= "" and status_book_id or nil)
+        if final_flush and stamp then self.store:mark_read_report_consumed(stamp) end
     elseif status.error then
-        self.state = "waiting"
+        self.state = daemon.active and "waiting" or "stopped"
         self.consecutive_failures = self.consecutive_failures + 1
         self.last_error = tostring(status.error)
-        logger.warn("[MiuRead][ReadReport] service rejected", self.last_error)
-        self:_notify_failure()
-        if force or self.consecutive_failures >= 2 then self:_persist_daemon_session(force) end
+        if final_flush then
+            logger.warn("[MiuRead][ReadReport] final upload failed",
+                "book=", status_book_id, "elapsed=", tostring(status.elapsed_seconds or "-"),
+                "reason=", tostring(status.flush_reason or "stop"),
+                "error=", self.last_error)
+            daemon.final_flush_pending = false
+            if not daemon.active then daemon.book_id = nil end
+        else
+            logger.warn("[MiuRead][ReadReport] service rejected", self.last_error)
+            self:_notify_failure()
+        end
+        if force or final_flush or self.consecutive_failures >= 2 then
+            self:_persist_daemon_session(true, status_book_id ~= "" and status_book_id or nil)
+        end
+        if final_flush and stamp then self.store:mark_read_report_consumed(stamp) end
     end
 end
 
@@ -1024,6 +1292,8 @@ function Sync:_start_daemon(reason)
     daemon.generation = self.daemon_generation
     daemon.active = true
     daemon.book_id = book_id
+    daemon.final_book_id = nil
+    daemon.final_flush_pending = false
     daemon.interval = interval
     daemon.reason = reason
 
@@ -1040,32 +1310,67 @@ function Sync:_start_daemon(reason)
             wr_wrpa = auth.wr_wrpa or "",
         },
         interval = interval,
+        first_delay = math.min(interval, FIRST_REPORT_DELAY),
         idle_timeout = tonumber(prefs.idle_timeout) or 600,
     }
     U.atomic_write(daemon.paths.job, Json.encode(job), true)
     self.daemon_status_stamp = nil
     self.daemon_last_persist = os.time()
     self.state = "waiting"
-    self.next_due = os.time() + interval
-    self.last_stage = "轻量后台服务运行中，每30秒上传一次"
+    self.next_due = os.time() + math.min(interval, FIRST_REPORT_DELAY)
+    self.last_stage = "轻量后台服务运行中，首次约10秒后上传"
     self:_write_daemon_control(true, true)
     self:_schedule_daemon_poll(5)
     logger.info("[MiuRead][ReadReport] service activated",
         "pid=", tostring(daemon.pid), "book=", book_id,
+        "first_delay=", tostring(math.min(interval, FIRST_REPORT_DELAY)),
         "interval=", tostring(interval), "reason=", tostring(reason or "start"))
     return true
 end
 
-function Sync:_stop_daemon(reason, persist)
+function Sync:_stop_daemon(reason, persist, flush_elapsed)
     local daemon = self.daemon
     if self.control_write_task then UIManager:unschedule(self.control_write_task); self.control_write_task=nil end
     if not daemon then return end
     self:_import_daemon_status(true)
     if persist ~= false then self:_persist_daemon_session(true) end
+
+    local extra = {}
+    flush_elapsed = math.floor(tonumber(flush_elapsed) or 0)
+    if daemon.book_id and flush_elapsed >= FINAL_REPORT_MIN_SECONDS then
+        local existing = read_json_file(daemon.paths.control) or {}
+        extra.flush_seq = (tonumber(existing.flush_seq or 0) or 0) + 1
+        extra.flush_elapsed = flush_elapsed
+        extra.flush_reason = tostring(reason or "stop")
+        daemon.final_book_id = daemon.book_id
+        daemon.final_flush_pending = true
+    end
+
     daemon.active = false
-    self:_write_daemon_control(false, true)
-    daemon.book_id = nil
+    self:_write_daemon_control(false, true, extra)
     self.next_due = 0
+
+    if daemon.final_flush_pending then
+        UIManager:scheduleIn(2, function() self:_import_daemon_status(true) end)
+        UIManager:scheduleIn(6, function() self:_import_daemon_status(true) end)
+    else
+        daemon.book_id = nil
+    end
+end
+
+function Sync:_final_elapsed()
+    if not self.store:preferences().sync.time_enabled or not self:record() then return nil end
+    self:_import_daemon_status(true)
+    local now = os.time()
+    local started = tonumber(self.session_started_at or 0) or 0
+    if started <= 0 then started = now end
+    local uploaded = tonumber(self.last_upload or 0) or 0
+    local base = math.max(started, uploaded)
+    local elapsed = math.max(0, now - base)
+    local maximum = tonumber(self.store:preferences().sync.idle_timeout) or 600
+    elapsed = math.min(elapsed, math.max(FINAL_REPORT_MIN_SECONDS, maximum))
+    if elapsed < FINAL_REPORT_MIN_SECONDS then return nil end
+    return elapsed
 end
 
 -- Kept for compatibility with older callers. Automatic reporting now uses one
@@ -1082,7 +1387,35 @@ end
 
 function Sync:start(reason)
     self.last_activity = os.time()
-    local enabled = self.store:preferences().sync.time_enabled
+    if reason == "reader_ready" or reason == "resume" or reason == "enabled"
+        or tonumber(self.session_started_at or 0) <= 0
+    then
+        self.session_started_at = self.last_activity
+    end
+    local prefs = self.store:preferences().sync or {}
+    local enabled = prefs.time_enabled == true
+    self.time_enabled = enabled
+    if not enabled then
+        self.progress_hold = false
+        self.state = "stopped"
+        self.last_stage = "阅读时间同步已关闭"
+        return false
+    end
+    local record = self:record()
+    if not record then
+        self.state = "stopped"
+        self.last_stage = "未识别当前觅阅书籍"
+        logger.info("[MiuRead][ReadReport] start deferred", "reason=", tostring(reason), "record=not_found")
+        return false, "未识别到 MiuRead 书籍"
+    end
+    if enabled and prefs.progress_enabled ~= false and not self:is_verified(record.book.book_id) then
+        self.progress_hold = true
+        self.state = "verification_required"
+        self.last_stage = "等待确认本机与云端阅读位置"
+        logger.info("[MiuRead][ReadReport] start deferred", "reason=", tostring(reason),
+            "book=", tostring(record.book.book_id), "progress=unverified")
+        return false, "阅读位置尚未确认"
+    end
     self.progress_hold = false
     self.state = enabled and "waiting" or "stopped"
     self.last_stage = enabled and "准备后台阅读时间工作器" or "阅读时间同步已关闭"
@@ -1092,8 +1425,9 @@ function Sync:start(reason)
     return enabled
 end
 
-function Sync:stop(reason)
-    self:_stop_daemon(reason, true)
+function Sync:stop(reason, flush_elapsed)
+    self.time_enabled = (self.store:preferences().sync or {}).time_enabled==true
+    self:_stop_daemon(reason, true, flush_elapsed)
     self.async:cancel(reason)
     self.busy = false
     self.progress_hold = false
@@ -1101,22 +1435,90 @@ function Sync:stop(reason)
     logger.info("[MiuRead][ReadReport] stopped", "reason=", tostring(reason))
 end
 
+function Sync:_cancel_record_retry()
+    if self.record_retry_task then
+        UIManager:unschedule(self.record_retry_task)
+        self.record_retry_task = nil
+    end
+end
+
+function Sync:_resolve_reader_record(generation, attempt)
+    if generation ~= self.record_generation or not self.host.ui or not self.host.ui.document then return end
+    self.record_retry_task = nil
+    local current = self:record()
+    if current then
+        self.current = current
+        self.progress_hold = self.store:preferences().sync.progress_enabled ~= false
+        self.state = self.progress_hold and "verification_required" or "stopped"
+        self.last_stage = self.progress_hold and "等待读取云端位置" or "当前书籍已识别"
+        logger.info("[MiuRead][Sync] reader record", tostring(current.book.book_id),
+            "attempt=", tostring(attempt))
+        if self.host.on_sync_record_ready then
+            pcall(self.host.on_sync_record_ready, self.host, current)
+        end
+        if self.store:preferences().sync.progress_enabled == false then
+            self:start("reader_ready")
+        end
+        return
+    end
+
+    logger.info("[MiuRead][Sync] reader record not_found", "attempt=", tostring(attempt))
+    if self.record_checked_path then
+        self.current = nil
+        self.progress_hold = false
+        self.state = "stopped"
+        self.last_stage = "未识别当前觅阅书籍"
+        if self.host.on_sync_record_missing then
+            pcall(self.host.on_sync_record_missing, self.host)
+        end
+        return
+    end
+    local delays = {0.55, 1.25, 2.25}
+    if attempt < #delays + 1 then
+        local task
+        task = function()
+            if self.record_retry_task ~= task then return end
+            self:_resolve_reader_record(generation, attempt + 1)
+        end
+        self.record_retry_task = task
+        UIManager:scheduleIn(delays[attempt] or 1, task)
+        return
+    end
+    self.current = nil
+    self.progress_hold = false
+    self.state = "stopped"
+    self.last_stage = "未识别当前觅阅书籍"
+    if self.host.on_sync_record_missing then
+        pcall(self.host.on_sync_record_missing, self.host)
+    end
+end
+
 function Sync:on_reader_ready()
-    self.current = self:record()
+    self:_import_daemon_status(true)
+    if self.daemon and self.daemon.active then self:_stop_daemon("reader_switch", true) end
+    self:_cancel_record_retry()
+    self.record_generation = (tonumber(self.record_generation) or 0) + 1
+    self.current = nil
+    self.record_checked_path = nil
     self.suspended = false
     self.session_uploads = 0
     self.last_upload = 0
+    self.session_started_at = os.time()
     self.first_success_notified = false
     self.failure_notified = false
     self.consecutive_failures = 0
     self.last_error = nil
     self.progress_hold = false
     self.daemon_context = nil
-    logger.info("[MiuRead][Sync] reader record", self.current and tostring(self.current.book.book_id) or "not_found")
-    self:start("reader_ready")
+    self.verified_book_id = nil
+    self.verified_at = 0
+    self.verified_local_percent = nil
+    self.verified_remote_percent = nil
+    self:_resolve_reader_record(self.record_generation, 1)
 end
 
 function Sync:on_page(page)
+    if self.time_enabled~=true or self.suspended or not self.current then return end
     if page and page ~= self.last_page then
         self.last_page = page
         self.last_activity = os.time()
@@ -1126,49 +1528,71 @@ end
 
 function Sync:on_suspend()
     self.suspended = true
-    local r = self:record()
+    local r = self.current or self:record()
     if r then
         local position = self:local_position()
+        local now=os.time()
         self.store:save_session(r.book.book_id, {
             pending={
                 percent=position and position.progress or nil,
                 chapter_percent=position and position.chapter_percent or math.floor((self:local_ratio() or 0) * 100 + .5),
                 chapter_uid=position and position.chapter_uid or nil,
-                saved_at=os.time(), reason="suspend",
-            }
+                saved_at=now, reason="suspend",
+            },
+            last_read_at=now,last_read_path=r.path,
+            progress_local_percent=position and position.progress or nil,
         })
-        self.store:mark_last_read(r.book.book_id,r.path,position and position.progress or nil)
     end
-    self:stop("suspend")
+    self:stop("suspend", self:_final_elapsed())
 end
 
 function Sync:on_resume(_slept)
+    self:_import_daemon_status(true)
     self.suspended = false
+    self.last_upload = 0
+    self.session_started_at = os.time()
     self:start("resume")
 end
 
 function Sync:on_close()
-    local r = self:record()
+    self.record_generation = (tonumber(self.record_generation) or 0) + 1
+    self:_cancel_record_retry()
+    local r = self.current or self:record()
+    local now=os.time()
+    local duplicate=false
     if r then
-        local position = self:local_position()
-        self.store:save_session(r.book.book_id, {
-            pending={
-                percent=position and position.progress or nil,
-                chapter_percent=position and position.chapter_percent or math.floor((self:local_ratio() or 0) * 100 + .5),
-                chapter_uid=position and position.chapter_uid or nil,
-                saved_at=os.time(), reason="close",
-            }
-        })
-        self.store:mark_last_read(r.book.book_id,r.path,position and position.progress or nil)
+        local session=self.store:session(r.book.book_id) or {}
+        local path=tostring(r.path or "")
+        duplicate=path~="" and tostring(session.last_close_path or "")==path
+            and now-(tonumber(session.last_close_at) or 0)<=4
+        if duplicate then
+            logger.info("[MiuRead][ReadReport] duplicate close ignored","path=",path)
+        else
+            local position = self:local_position()
+            self.store:save_session(r.book.book_id, {
+                pending={
+                    percent=position and position.progress or nil,
+                    chapter_percent=position and position.chapter_percent or math.floor((self:local_ratio() or 0) * 100 + .5),
+                    chapter_uid=position and position.chapter_uid or nil,
+                    saved_at=now, reason="close",
+                },
+                last_read_at=now,last_read_path=r.path,
+                progress_local_percent=position and position.progress or nil,
+                last_close_path=path,last_close_at=now,
+            })
+        end
     end
-    self:stop("close")
+    -- Even a duplicate close event must stop this plugin instance's service.
+    -- It simply must not emit a second final upload.
+    self:stop("close", duplicate and 0 or self:_final_elapsed())
     self.current = nil
+    self.record_checked_path = nil
 end
 
 function Sync:status_label()
     if not self.store:preferences().sync.time_enabled then return "已关闭" end
     local labels = {
-        stopped="未运行", waiting="运行中", uploading="正在上传", fetching_remote="读取云进度",
+        stopped="未运行", waiting="运行中", uploading="正在上传", progress_uploading="上传阅读进度", fetching_remote="读取云进度",
         progress_sync="检查云端位置", verification_required="等待位置选择", paused="已暂停", idle="空闲暂停",
     }
     if self.last_error then return "上传失败" end
@@ -1209,11 +1633,17 @@ function Sync:status()
         progress_state=session and session.progress_sync_state,
         progress_message=session and session.progress_sync_message,
         service_pid=self.daemon and self.daemon.pid or nil,
+        service_version=self.daemon and self.daemon.service_version or READ_REPORT_SERVICE_VERSION,
+        final_flush_pending=self.daemon and self.daemon.final_flush_pending==true or false,
+        last_elapsed=session and session.last_elapsed,
+        last_report_reason=session and session.last_report_reason,
     }
 end
 
 Sync._accepted = accepted
 Sync._response_summary = response_summary
 Sync._response_synckey = response_synckey
+Sync._response_progress = response_progress
+Sync._catalog_progress_from_remote = catalog_progress_from_remote
 
 return Sync

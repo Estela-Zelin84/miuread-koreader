@@ -1,5 +1,6 @@
 local Protocol = require("miuread.protocol")
 local U = require("miuread.util")
+local Http = require("miuread.http")
 
 local Worker = {}
 
@@ -71,8 +72,8 @@ local function progress_node(value, depth, seen)
     if seen[value] then return nil end
     seen[value] = true
     local p = tonumber(value.progress or value.readingProgress or value.bookProgress or value.progressPercent)
-    if p then
-        if p > 1 then p = p / 100 end
+    if p ~= nil then
+        if p >= 1 then p = p / 100 end
         return {
             ratio = U.clamp(p, 0, 1),
             chapter_uid = value.chapterUid or value.chapterId or value.chapter_uid,
@@ -101,9 +102,16 @@ local function select_context_chapter(book)
     end
     if #chapters > 0 then
         local ratio = normalize_ratio(book.progress) or 0
-        local index = math.floor(ratio * #chapters) + 1
-        index = math.max(1, math.min(#chapters, index))
-        return chapters[index]
+        local total = 0
+        for _, chapter in ipairs(chapters) do
+            total = total + math.max(1, tonumber(chapter.word_count or chapter.wordCount or 0) or 0)
+        end
+        local target, before = ratio * total, 0
+        for index, chapter in ipairs(chapters) do
+            local words = math.max(1, tonumber(chapter.word_count or chapter.wordCount or 0) or 0)
+            if target <= before + words or index == #chapters then return chapter end
+            before = before + words
+        end
     end
 end
 
@@ -169,12 +177,20 @@ local function estimate_position(book, progress_ratio)
     local ratio = normalize_ratio(progress_ratio) or normalize_ratio(book.progress) or 0
     local chapter, within = nil, 0
     if #chapters > 0 then
-        local scaled = ratio * #chapters
-        local index = math.floor(scaled) + 1
-        index = math.max(1, math.min(#chapters, index))
-        chapter = chapters[index]
-        within = scaled - math.floor(scaled)
-        if index == #chapters and ratio >= 1 then within = 1 end
+        local total = 0
+        for _, item in ipairs(chapters) do
+            total = total + math.max(1, tonumber(item.word_count or item.wordCount or 0) or 0)
+        end
+        local target, before = ratio * total, 0
+        for index, item in ipairs(chapters) do
+            local words = math.max(1, tonumber(item.word_count or item.wordCount or 0) or 0)
+            if target <= before + words or index == #chapters then
+                chapter = item
+                within = math.max(0, math.min(1, (target - before) / words))
+                break
+            end
+            before = before + words
+        end
     end
     if not chapter and book.chapter_uid ~= nil then
         for _, item in ipairs(chapters) do
@@ -183,7 +199,7 @@ local function estimate_position(book, progress_ratio)
     end
     local words = tonumber(chapter and chapter.word_count) or tonumber(book.chapter_word_count) or 0
     local offset = tonumber(book.chapter_offset) or 0
-    if words > 0 then offset = math.floor(within * words) end
+    if words > 0 then offset = math.floor(within * words + 0.5) end
     return {
         chapter_uid = chapter and chapter.uid or book.chapter_uid or 0,
         chapter_index = tonumber(chapter and chapter.index) or tonumber(book.chapter_index) or 0,
@@ -231,10 +247,7 @@ local function attempt(reader, book_id, elapsed, book, progress_ratio, stage)
 end
 
 local function auth_error(text)
-    text = tostring(text or ""):lower()
-    return text:find("http 401", 1, true) or text:find("http 403", 1, true)
-        or text:find("login expired", 1, true) or text:find("未登录", 1, true)
-        or text:find("登录过期", 1, true)
+    return Http.is_auth_error(text)
 end
 
 function Worker.run(job)

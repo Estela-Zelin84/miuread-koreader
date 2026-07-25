@@ -1,30 +1,26 @@
 local M = {}
 
-M.MARKER_BEGIN = "/* MIUREAD_ANNOTATION_STYLE_V4_BEGIN */"
-M.MARKER_END = "/* MIUREAD_ANNOTATION_STYLE_V4_END */"
-M.LINK_INLINE_STYLE = "text-decoration:none; border-bottom:0; color:inherit;"
-M.MARK_INLINE_STYLE = "text-decoration:none; border-bottom:2px dashed #555; padding-bottom:2px; color:inherit;"
+M.MARKER_BEGIN = "/* MIUREAD_ANNOTATION_STYLE_V2_BEGIN */"
+M.MARKER_END = "/* MIUREAD_ANNOTATION_STYLE_V2_END */"
 
--- Use one unmistakable style for every WeRead mark. Publisher styles and
--- KOReader's default link decoration must not turn thought links into solid
--- or double underlines.
+-- Keep this intentionally close to the proven weread implementation.
+-- The thought text uses its own class, so it can never inherit the solid
+-- underline rule used by ordinary WeRead marks.
 M.CSS = [[
-/* MIUREAD_ANNOTATION_STYLE_V4_BEGIN */
+/* MIUREAD_ANNOTATION_STYLE_V2_BEGIN */
 .miu-inline-mark {
-    text-decoration: none;
-    border-bottom: 2px dashed #555;
-    padding-bottom: 2px;
+    text-decoration: underline;
 }
 .miu-thought-link {
     text-decoration: none;
-    border-bottom: 0;
+    color: inherit;
+}
+.miu-thought-link .miu-thought-mark {
     color: inherit;
 }
 .miu-thought-mark {
-    text-decoration: none;
-    border-bottom: 2px dashed #555;
+    border-bottom: 2px dashed #ff6b35;
     padding-bottom: 2px;
-    color: inherit;
 }
 .miu-thought-star {
     font-size: 0;
@@ -33,14 +29,19 @@ M.CSS = [[
     padding: 0;
     color: transparent;
 }
-/* MIUREAD_ANNOTATION_STYLE_V4_END */
+/* MIUREAD_ANNOTATION_STYLE_V2_END */
 ]]
+
+M.INLINE_STYLE_ID = "miuread-annotation-style"
+
+function M.inline_style_tag()
+    return '<style id="' .. M.INLINE_STYLE_ID .. '" type="text/css">\n'
+        .. M.CSS
+        .. '\n</style>'
+end
 
 local OLD_MARKERS = {
     {"/* MIUREAD_ANNOTATION_STYLE_REPAIR_BEGIN */", "/* MIUREAD_ANNOTATION_STYLE_REPAIR_END */"},
-    {"/* MIUREAD_ANNOTATION_STYLE_V2_BEGIN */", "/* MIUREAD_ANNOTATION_STYLE_V2_END */"},
-    {"/* MIUREAD_ANNOTATION_STYLE_V3_BEGIN */", "/* MIUREAD_ANNOTATION_STYLE_V3_END */"},
-    {"/* MIUREAD_UNIFIED_DASHED_MARKS_BEGIN */", "/* MIUREAD_UNIFIED_DASHED_MARKS_END */"},
     {M.MARKER_BEGIN, M.MARKER_END},
 }
 
@@ -139,6 +140,50 @@ local function rewrite_class_value(value)
     return tostring(value or ""), false
 end
 
+local function style_bounds_for_token(html, token)
+    local token_at = html:find(token, 1, true)
+    if not token_at then return nil end
+    local before = html:sub(1, token_at)
+    local open_at = before:match(".*()<style")
+    local open_end = open_at and html:find(">", open_at, true) or nil
+    local close_at = open_end and html:find("</style>", open_end + 1, true) or nil
+    if not open_at or not open_end or not close_at then return nil end
+    return open_at, open_end, close_at
+end
+
+local function replace_style_block(html, open_at, close_at, replacement)
+    return html:sub(1, open_at - 1)
+        .. replacement
+        .. html:sub(close_at + #"</style>")
+end
+
+local function ensure_inline_style(html)
+    if not html:find("data-miuread-book=", 1, true) then return html, false end
+
+    local replacement = M.inline_style_tag()
+    local open_at, _, close_at = style_bounds_for_token(html, 'id="' .. M.INLINE_STYLE_ID .. '"')
+    if not open_at then
+        open_at, _, close_at = style_bounds_for_token(html, "id='" .. M.INLINE_STYLE_ID .. "'")
+    end
+    if open_at then
+        local current = html:sub(open_at, close_at + #"</style>" - 1)
+        if current == replacement then return html, false end
+        return replace_style_block(html, open_at, close_at, replacement), true
+    end
+
+    -- Experimental builds embedded the whole book stylesheet without an id.
+    -- Replace it with the lightweight annotation-only block; the full stylesheet
+    -- remains available through the existing external style.css reference.
+    open_at, _, close_at = style_bounds_for_token(html, M.MARKER_BEGIN)
+    if open_at then
+        return replace_style_block(html, open_at, close_at, replacement), true
+    end
+
+    local head_end = html:find("</head>", 1, true)
+    if not head_end then return html, false end
+    return html:sub(1, head_end - 1) .. replacement .. html:sub(head_end), true
+end
+
 function M.rewrite_xhtml(html)
     local original = tostring(html or "")
     local changed = false
@@ -152,15 +197,25 @@ function M.rewrite_xhtml(html)
         if did_change then changed = true end
         return "class='" .. new_value .. "'"
     end)
-    return rewritten, changed or rewritten ~= original
+    local with_style, style_changed = ensure_inline_style(rewritten)
+    return with_style, changed or style_changed or with_style ~= original
+end
+
+function M.xhtml_is_current(html)
+    html = tostring(html or "")
+    if not html:find("data-miuread-book=", 1, true) then return true end
+    return html:find('id="' .. M.INLINE_STYLE_ID .. '"', 1, true) ~= nil
+        and html:find(M.MARKER_BEGIN, 1, true) ~= nil
+        and html:find("border-bottom: 2px dashed #ff6b35;", 1, true) ~= nil
 end
 
 function M.css_is_current(css)
     css = tostring(css or "")
-    local rewritten = M.rewrite_css(css)
-    return rewritten == css
-        and css:find(M.MARKER_BEGIN, 1, true) ~= nil
-        and css:find("border-bottom: 2px dashed #555;", 1, true) ~= nil
+    return css:find(M.MARKER_BEGIN, 1, true) ~= nil
+        and css:find(".miu-thought-mark", 1, true) ~= nil
+        and css:find("border-bottom: 2px dashed #ff6b35;", 1, true) ~= nil
+        and css:find(".miu-inline-mark.miu-has-thought", 1, true) == nil
+        and css:find(".miu-thought-link .miu-inline-mark", 1, true) == nil
 end
 
 return M

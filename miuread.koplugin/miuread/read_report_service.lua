@@ -4,6 +4,8 @@ local Adapter = require("miuread.legacy_adapter_worker")
 
 local Service = {}
 
+local MIN_FINAL_SECONDS = 10
+
 local function sleep(seconds)
     local ok, socket = pcall(require, "socket")
     if ok and socket and type(socket.sleep) == "function" then
@@ -108,12 +110,80 @@ function Service.run(job)
     local auth = {}
     local next_due = 0
     local last_control_state = nil
+    local last_report_at = 0
+    local last_flush_seq = 0
+
+    local function run_report(control, elapsed, final_flush, reason)
+        local interval = math.max(10, tonumber(current_job.interval) or 30)
+        elapsed = math.max(1, math.floor(tonumber(elapsed) or interval))
+        sequence = sequence + 1
+        local report_job = {
+            book_id = tostring(current_job.book_id or ""),
+            book_title = tostring(current_job.book_title or current_job.book_id or ""),
+            book = book,
+            progress_ratio = tonumber(control.progress_ratio) or 0,
+            elapsed_seconds = elapsed,
+            cookies = auth.cookies or {},
+            api_key = auth.api_key or "",
+            wr_ticket = auth.wr_ticket or "",
+            wr_wrpa = auth.wr_wrpa or "",
+            allow_renewal = false,
+        }
+        local attempted_at = os.time()
+        local ok, result = pcall(Adapter.run, report_job)
+        local completed_at = os.time()
+        last_report_at = completed_at
+
+        if ok and type(result) == "table" then
+            if type(result.legacy_context) == "table" then
+                book = U.copy(result.legacy_context)
+                if result.context_changed then
+                    U.atomic_write(context_path, Json.encode(book), true)
+                end
+            end
+            if result.cookies_changed and type(result.cookies) == "table" then auth.cookies = U.copy(result.cookies) end
+            if result.wr_ticket_changed then auth.wr_ticket = result.wr_ticket or "" end
+            if result.wr_wrpa_changed then auth.wr_wrpa = result.wr_wrpa or "" end
+
+            local out = public_result(result)
+            out.generation = generation
+            out.seq = sequence
+            out.state = result.accepted and "waiting" or "error"
+            out.attempted_at = attempted_at
+            out.completed_at = completed_at
+            out.elapsed_seconds = elapsed
+            out.final_flush = final_flush == true
+            out.flush_reason = reason
+            out.next_due = final_flush and 0 or (completed_at + interval)
+            out.book_id = tostring(current_job.book_id or "")
+            write_status(status_path, out)
+            return out.next_due
+        end
+
+        local due = final_flush and 0 or (completed_at + interval)
+        write_status(status_path, {
+            generation = generation,
+            seq = sequence,
+            state = "error",
+            accepted = false,
+            error = tostring(result or "read report service failed"),
+            attempted_at = attempted_at,
+            completed_at = completed_at,
+            elapsed_seconds = elapsed,
+            final_flush = final_flush == true,
+            flush_reason = reason,
+            next_due = due,
+            book_id = tostring(current_job.book_id or ""),
+        })
+        return due
+    end
 
     write_status(status_path, {
         generation = 0,
         seq = 0,
         state = "service_waiting",
         started_at = os.time(),
+        service_version = tonumber(job.service_version) or 0,
     })
 
     while true do
@@ -129,7 +199,11 @@ function Service.run(job)
                 book = U.copy(loaded.book or {})
                 auth = U.copy(loaded.auth or {})
                 local interval = math.max(10, tonumber(loaded.interval) or 30)
-                next_due = os.time() + interval
+                local first_delay = math.max(5, math.min(interval, tonumber(loaded.first_delay) or interval))
+                local now = os.time()
+                next_due = now + first_delay
+                last_report_at = now
+                last_flush_seq = 0
                 last_control_state = nil
                 U.atomic_write(context_path, Json.encode(book), true)
                 write_status(status_path, {
@@ -138,6 +212,8 @@ function Service.run(job)
                     state = "waiting",
                     next_due = next_due,
                     book_id = tostring(loaded.book_id or ""),
+                    first_delay = first_delay,
+                    service_version = tonumber(job.service_version) or 0,
                 })
             end
         end
@@ -147,22 +223,51 @@ function Service.run(job)
         then
             local active = control.active == true
             local state_key = active and "active" or "inactive"
+            local flush_seq = tonumber(control.flush_seq or 0) or 0
+            local pending_flush = flush_seq > last_flush_seq
+
             if state_key ~= last_control_state then
                 last_control_state = state_key
                 if not active then
+                    next_due = 0
+                    if not pending_flush then
+                        write_status(status_path, {
+                            generation = generation,
+                            seq = sequence,
+                            state = "inactive",
+                            book_id = tostring(current_job.book_id or ""),
+                        })
+                    end
+                elseif next_due <= 0 then
+                    local interval = math.max(10, tonumber(current_job.interval) or 30)
+                    local first_delay = math.max(5, math.min(interval, tonumber(current_job.first_delay) or interval))
+                    local now = os.time()
+                    last_report_at = now
+                    next_due = now + first_delay
+                end
+            end
+
+            if pending_flush then
+                last_flush_seq = flush_seq
+                local now = os.time()
+                local elapsed = math.floor(tonumber(control.flush_elapsed) or math.max(0, now - last_report_at))
+                if elapsed >= MIN_FINAL_SECONDS then
+                    next_due = run_report(control, elapsed, true, tostring(control.flush_reason or "stop"))
+                else
                     next_due = 0
                     write_status(status_path, {
                         generation = generation,
                         seq = sequence,
                         state = "inactive",
+                        accepted = nil,
+                        final_flush = true,
+                        flush_skipped = true,
+                        flush_reason = tostring(control.flush_reason or "stop"),
+                        elapsed_seconds = elapsed,
                         book_id = tostring(current_job.book_id or ""),
                     })
-                elseif next_due <= 0 then
-                    next_due = os.time() + math.max(10, tonumber(current_job.interval) or 30)
                 end
-            end
-
-            if active then
+            elseif active then
                 local now = os.time()
                 local interval = math.max(10, tonumber(current_job.interval) or 30)
                 local idle_timeout = math.max(interval, tonumber(current_job.idle_timeout) or 600)
@@ -171,58 +276,8 @@ function Service.run(job)
 
                 if now >= next_due then
                     if idle <= idle_timeout then
-                        sequence = sequence + 1
-                        local report_job = {
-                            book_id = tostring(current_job.book_id or ""),
-                            book_title = tostring(current_job.book_title or current_job.book_id or ""),
-                            book = book,
-                            progress_ratio = tonumber(control.progress_ratio) or 0,
-                            elapsed_seconds = interval,
-                            cookies = auth.cookies or {},
-                            api_key = auth.api_key or "",
-                            wr_ticket = auth.wr_ticket or "",
-                            wr_wrpa = auth.wr_wrpa or "",
-                            allow_renewal = false,
-                        }
-                        local attempted_at = now
-                        local ok, result = pcall(Adapter.run, report_job)
-                        local completed_at = os.time()
-
-                        if ok and type(result) == "table" then
-                            if type(result.legacy_context) == "table" then
-                                book = U.copy(result.legacy_context)
-                                if result.context_changed then
-                                    U.atomic_write(context_path, Json.encode(book), true)
-                                end
-                            end
-                            if result.cookies_changed and type(result.cookies) == "table" then auth.cookies = U.copy(result.cookies) end
-                            if result.wr_ticket_changed then auth.wr_ticket = result.wr_ticket or "" end
-                            if result.wr_wrpa_changed then auth.wr_wrpa = result.wr_wrpa or "" end
-
-                            local out = public_result(result)
-                            out.generation = generation
-                            out.seq = sequence
-                            out.state = result.accepted and "waiting" or "error"
-                            out.attempted_at = attempted_at
-                            out.completed_at = completed_at
-                            out.next_due = completed_at + interval
-                            out.book_id = tostring(current_job.book_id or "")
-                            write_status(status_path, out)
-                            next_due = out.next_due
-                        else
-                            next_due = completed_at + interval
-                            write_status(status_path, {
-                                generation = generation,
-                                seq = sequence,
-                                state = "error",
-                                accepted = false,
-                                error = tostring(result or "read report service failed"),
-                                attempted_at = attempted_at,
-                                completed_at = completed_at,
-                                next_due = next_due,
-                                book_id = tostring(current_job.book_id or ""),
-                            })
-                        end
+                        local elapsed = math.max(1, now - last_report_at)
+                        next_due = run_report(control, elapsed, false, "interval")
                     else
                         next_due = now + interval
                     end
@@ -238,6 +293,7 @@ function Service.run(job)
         seq = sequence,
         state = "service_stopped",
         stopped_at = os.time(),
+        service_version = tonumber(job.service_version) or 0,
     })
     if owner_path then
         local owner = read_json(owner_path)

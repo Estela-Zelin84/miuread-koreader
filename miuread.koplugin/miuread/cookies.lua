@@ -7,7 +7,7 @@ local reserved = {
     samesite=true, secure=true, httponly=true,
 }
 
--- Keep the same persistent-cookie boundary used by the proven 0.3.6.7 build.
+-- Keep a conservative persistent-cookie boundary for the reporting path.
 -- QR/browser-only cookies must never be written into the long-lived account jar,
 -- because a second device login may rotate those temporary browser sessions.
 local stable = {
@@ -138,7 +138,7 @@ function Cookies.absorb(jar, raw, opt)
                 local deletion = v == "" or lower:find("max%-age%s*=%s*0") ~= nil
                     or lower:find("expires%s*=%s*thu,%s*01%s+jan%s+1970") ~= nil
                 if deletion then
-                    -- The working 0.3.6.7 path ignored browser deletion directives
+                    -- The compatibility path ignores browser deletion directives
                     -- for core login credentials. Preserve that behavior so an
                     -- unrelated response cannot silently invalidate this device.
                     if not (protect_core and protected_core[k] and jar[k]) then
