@@ -9,121 +9,6 @@ Access.__index = Access
 local TTL = tonumber(Config.ACCESS_VERIFY_TTL) or (3 * 24 * 60 * 60)
 local LOCK_SUFFIX = ".miuread-locked"
 
-local PERSONAL_KEYS = {
-    isupload=true, isuploaded=true, uploaded=true, isprivateupload=true,
-    ispersonal=true, isownbook=true, isselfuploaded=true, fromupload=true,
-    personalupload=true, ispersonalupload=true, userupload=true, isuserupload=true, isimported=true, imported=true,
-}
-local PURCHASE_KEYS = {
-    isbought=true, bought=true, ispurchased=true, purchased=true,
-    isowned=true, owned=true, haspurchased=true, purchaseok=true,
-    isbuy=true, hasbuy=true, hasbought=true, bookbought=true,
-    isbookbought=true, isbookpurchased=true, purchasedbook=true,
-}
-local CLAIM_KEYS = {
-    activityclaimed=true, isactivityclaimed=true, claimed=true, isclaimed=true,
-    redeemed=true, isredeemed=true, received=true, isreceived=true,
-    freeclaimed=true, permanentclaimed=true, exchangeowned=true,
-}
-local PERMANENT_KEYS = {
-    ispermanent=true, permanent=true, permanentaccess=true,
-    ispermanentaccess=true, permanentreadable=true,
-    ispermanentreadable=true, canpermanentread=true,
-    ownedforever=true, foreverreadable=true, lifetimeaccess=true,
-}
-local SOURCE_KEYS = {
-    sourcetype=true, source=true, booksource=true, origin=true, origintype=true,
-    importtype=true, ownership=true, ownershiptype=true, accesstype=true,
-    rightstype=true, entitlementtype=true, acquiretype=true, acquiredtype=true,
-}
-local PURCHASE_STATUS_KEYS = {
-    buystatus=true, purchasestatus=true, paidstatus=true, ownershipstatus=true,
-    accessstatus=true, rightsstatus=true, entitlementstatus=true,
-}
-
-local function compact_text(value)
-    return tostring(value or ""):lower():gsub("%s+", "")
-end
-
-local function truthy(value)
-    if value == true then return true end
-    if tonumber(value) == 1 then return true end
-    local text = compact_text(value)
-    return text == "true" or text == "yes" or text == "owned" or text == "purchased"
-        or text == "bought" or text == "paid" or text == "success"
-        or text == "permanent" or text == "forever"
-        or text == "已购买" or text == "永久"
-end
-
-local function explicit_text_ownership(value)
-    local text = compact_text(value)
-    if text == "" then return nil end
-    if text:find("个人上传", 1, true) or text:find("用户上传", 1, true)
-        or text:find("本地导入", 1, true) or text:find("私有上传", 1, true) then
-        return "personal_upload"
-    end
-    -- These are explicit account-rights messages rendered by the official
-    -- reader. Unlike chapter `paid` flags, they mean the current account owns
-    -- permanent reading rights (purchase, activity claim, redemption, etc.).
-    if text:find("可永久阅读", 1, true) or text:find("永久阅读", 1, true)
-        or text:find("书币购买", 1, true) or text:find("活动领取", 1, true)
-        or text:find("永久领取", 1, true) or text:find("永久拥有", 1, true)
-        or text:find("永久权益", 1, true) then
-        return "purchased"
-    end
-end
-
-local function ownership_field_text(value)
-    local explicit = explicit_text_ownership(value)
-    if explicit then return explicit end
-    local text = compact_text(value)
-    if text:find("upload", 1, true) or text:find("import", 1, true)
-        or text:find("personal", 1, true) or text:find("private", 1, true) then
-        return "personal_upload"
-    end
-    if text:find("purchased", 1, true) or text:find("bought", 1, true)
-        or text:find("owned", 1, true) or text:find("permanent", 1, true)
-        or text:find("forever", 1, true) or text:find("已购买", 1, true) then
-        return "purchased"
-    end
-end
-
-local function scan_ownership(value, depth, seen, path)
-    if type(value) ~= "table" or (depth or 0) > 8 then return nil end
-    seen = seen or {}
-    if seen[value] then return nil end
-    seen[value] = true
-    path = tostring(path or "")
-
-    for key, item in pairs(value) do
-        local lower = type(key) == "string" and key:lower() or ""
-        local field_path = path .. tostring(key)
-        if PERSONAL_KEYS[lower] and truthy(item) then return "personal_upload", field_path end
-        if (PURCHASE_KEYS[lower] or PERMANENT_KEYS[lower] or CLAIM_KEYS[lower]) and truthy(item) then
-            return "purchased", field_path
-        end
-        if PURCHASE_STATUS_KEYS[lower] and (type(item)=="string" or type(item)=="number") then
-            local found=ownership_field_text(item)
-            if found then return found,field_path end
-        end
-        if SOURCE_KEYS[lower] and (type(item) == "string" or type(item) == "number") then
-            local found=ownership_field_text(item)
-            if found then return found,field_path end
-        end
-        if type(item)=="string" then
-            local found=explicit_text_ownership(item)
-            if found then return found,field_path end
-        end
-    end
-    for key, item in pairs(value) do
-        if type(item) == "table" then
-            local found, source = scan_ownership(item, (depth or 0) + 1, seen,
-                path .. tostring(key) .. ".")
-            if found then return found, source end
-        end
-    end
-end
-
 local function find_book(rows, id)
     id = tostring(id or "")
     for _, row in ipairs(rows or {}) do
@@ -161,12 +46,12 @@ end
 
 local function reason_text(reason)
     local labels = {
-        not_in_shelf = "已从官方书架移除",
-        no_permission = "当前无阅读权限",
-        preview_only = "当前仅可试读",
-        login_required = "登录已失效，请重新登录",
-        network_required = "需要联网验证",
-        verify_failed = "暂时无法验证书籍状态",
+        not_in_shelf = "本书已从微信读书官方书架移除。重新加入书架后，可在这里重新验证并打开。",
+        no_permission = "微信读书当前无法打开本书内容。",
+        preview_only = "微信读书当前仅允许试读，完整版已锁定。",
+        login_required = "登录已失效，请重新扫码登录后再验证。",
+        network_required = "当前无法联网验证，已保留本地文件和原有状态。",
+        verify_failed = "暂时无法确认书籍状态，请稍后重新验证。",
     }
     return labels[tostring(reason or "")] or tostring(reason or "暂时无法验证书籍状态")
 end
@@ -193,54 +78,18 @@ local function scope_matches(record, kind, wanted)
     return not wanted or wanted == "all" or record_scope(record, kind) == wanted
 end
 
+local function record_locked(record)
+    if type(record) ~= "table" then return false end
+    local path = tostring(record.file or "")
+    return record.locked == true or path:sub(-#LOCK_SUFFIX) == LOCK_SUFFIX
+end
+
 function Access:new(library, api, reader, store)
     return setmetatable({library=library, api=api, reader=reader, store=store}, self)
 end
 
 function Access:ttl() return TTL end
 function Access:lock_suffix() return LOCK_SUFFIX end
-
-local function record_locked(record)
-    if type(record)~="table" then return false end
-    local path=tostring(record.file or "")
-    return record.locked==true or path:sub(-#LOCK_SUFFIX)==LOCK_SUFFIX
-end
-
-function Access:is_locked(book_or_id)
-    local book=type(book_or_id)=="table" and (book_or_id.local_record or book_or_id)
-        or self.store:book(book_or_id)
-    if type(book)~="table" then return false end
-    local found=false
-    each_record(book,function(record)
-        if record_locked(record) then found=true end
-    end)
-    if found then return true end
-    local access=type(book.access)=="table" and book.access or {}
-    return access.status=="blocked" or access.status=="restricted"
-end
-
-function Access:first_record(book_or_id,wanted_scope,locked_only)
-    local book=type(book_or_id)=="table" and (book_or_id.local_record or book_or_id)
-        or self.store:book(book_or_id)
-    if type(book)~="table" then return nil end
-    local found
-    each_record(book,function(record,kind)
-        if found or type(record)~="table" then return end
-        if wanted_scope and record_scope(record,kind)~=wanted_scope then return end
-        if locked_only and not record_locked(record) then return end
-        found=record
-    end)
-    return found
-end
-
-function Access:classify_ownership(...)
-    for i = 1, select("#", ...) do
-        local candidate = select(i, ...)
-        local found, source = scan_ownership(candidate)
-        if found then return found, source end
-    end
-    return "temporary", "no_permanent_marker"
-end
 
 function Access:_account_vid()
     local auth = self.store:auth()
@@ -251,9 +100,7 @@ function Access:_save(book_id, patch)
     local book = self.store:book(book_id) or {book_id=tostring(book_id), variants={}, chapters={}}
     local current = type(book.access) == "table" and book.access or {}
     patch = U.copy(patch or {})
-    if patch.policy_version == nil then
-        patch.policy_version = tonumber(Config.ACCESS_POLICY_VERSION) or 2
-    end
+    patch.policy_version = tonumber(Config.ACCESS_POLICY_VERSION) or 4
     local access = U.merge(current, patch)
     self.store:save_book(book_id, {access=access})
     return access
@@ -264,67 +111,72 @@ function Access:_refresh_shelf_row(book_id)
     return find_book(books, book_id) or find_book(mp, book_id), books, mp
 end
 
-function Access:_ownership(row, detail, existing, chapter_detail, reader_context)
-    if existing and (existing.ownership == "purchased" or existing.ownership == "personal_upload") then
-        return existing.ownership, tostring(existing.ownership_source or "existing_record")
-    end
-    -- Chapter metadata contains a generic `paid` flag for paid content. It is
-    -- not proof that the current user purchased the book, so chapter_detail is
-    -- deliberately excluded. Reader-page account-rights data is included.
-    return self:classify_ownership(row, row and row.raw, detail,
-        reader_context and reader_context.book,
-        reader_context and reader_context.source,
-        reader_context)
+function Access:is_locked(book_or_id)
+    local book = type(book_or_id) == "table" and (book_or_id.local_record or book_or_id)
+        or self.store:book(book_or_id)
+    if type(book) ~= "table" then return false end
+    local found = false
+    each_record(book, function(record)
+        if record_locked(record) then found = true end
+    end)
+    if found then return true end
+    local access = type(book.access) == "table" and book.access or {}
+    return access.status == "blocked" or access.status == "restricted"
+end
+
+function Access:first_record(book_or_id, wanted_scope, locked_only)
+    local book = type(book_or_id) == "table" and (book_or_id.local_record or book_or_id)
+        or self.store:book(book_or_id)
+    if type(book) ~= "table" then return nil end
+    local found
+    each_record(book, function(record, kind)
+        if found or type(record) ~= "table" then return end
+        if wanted_scope and record_scope(record, kind) ~= wanted_scope then return end
+        if locked_only and not record_locked(record) then return end
+        found = record
+    end)
+    return found
 end
 
 function Access:prepare_download(book)
     book = U.copy(book or {})
     local id = tostring(book.bookId or book.book_id or "")
     if id == "" then return nil, {kind="unknown", message="书籍缺少 bookId"} end
+
     local ok, row = pcall(self._refresh_shelf_row, self, id)
     if not ok then
         local kind = error_kind(row)
         return nil, {
             kind=kind,
-            message=kind == "auth" and "登录已失效，请重新登录后下载。"
+            message=kind == "auth" and "登录已失效，请重新扫码登录后下载。"
                 or "无法确认官方书架状态，本次未开始下载。",
         }
     end
     if not row then
         self:_save(id, {
-            shelf_present=false, status="blocked", lock_reason="not_in_shelf",
-            shelf_checked_at=os.time(),
+            ownership="temporary", shelf_present=false, status="blocked",
+            lock_reason="not_in_shelf", valid_until=0, shelf_checked_at=os.time(),
         })
+        self:lock_book(id, "not_in_shelf", "all")
         return nil, {kind="blocked", message="请先将本书加入微信读书官方书架，再返回觅阅下载。"}
     end
 
-    local detail, chapter_detail
-    local detail_ok, detail_value = pcall(self.api.book, self.api, id)
-    if detail_ok then detail = detail_value end
-    local chapter_ok, chapter_value = pcall(self.api.chapters, self.api, id)
-    if chapter_ok then chapter_detail = chapter_value end
-    local reader_context
-    local state_ok, state_value = pcall(self.reader.access_state, self.reader, id)
-    if state_ok then reader_context = state_value
-    else logger.warn("[MiuRead][Access] reader rights unavailable","book=",id,"error=",U.first_line(state_value,160)) end
-    local existing = (self.store:book(id) or {}).access or {}
-    local ownership, ownership_source = self:_ownership(row, detail, existing, chapter_detail, reader_context)
     local now = os.time()
     local access = self:_save(id, {
-        ownership=ownership,
-        ownership_source=ownership_source,
+        ownership="temporary",
+        ownership_source="official_shelf_policy",
         account_vid=self:_account_vid(),
         shelf_present=true,
         shelf_checked_at=now,
-        status=existing.status=="allowed" and "allowed" or "checking",
-        lock_reason=existing.status=="allowed" and tostring(existing.lock_reason or "") or "",
+        status="checking",
+        lock_reason="",
     })
     book.bookId = id
     book.title = book.title or row.title
     book.author = book.author or row.author
     book.cover = book.cover or row.cover
-    book.access_ownership = ownership
-    book.access_ownership_source = ownership_source
+    book.access_ownership = "temporary"
+    book.access_ownership_source = "official_shelf_policy"
     book.access_account_vid = access.account_vid
     return book, access
 end
@@ -340,6 +192,7 @@ function Access:lock_book(book_id, reason, wanted_scope)
         if path:sub(-#LOCK_SUFFIX) == LOCK_SUFFIX then
             record.locked = true
             record.lock_reason = reason
+            changed = true
             return
         end
         if not U.file_exists(path) or not path:lower():match("%.epub$") then return end
@@ -376,27 +229,22 @@ function Access:unlock_book(book_id, wanted_scope)
     each_record(book, function(record, kind)
         if type(record) ~= "table" or not scope_matches(record, kind, wanted_scope) then return end
         local path = tostring(record.file or "")
-        if path == "" or not (record.locked == true or path:sub(-#LOCK_SUFFIX) == LOCK_SUFFIX) then return end
+        if path == "" or not record_locked(record) then return end
         local target = tostring(record.original_file or path:gsub("%.miuread%-locked$", ""))
         if target == "" then return end
         if U.file_exists(target) then
             record.file = target
-            record.locked = nil
-            record.lock_reason = nil
-            record.locked_at = nil
-            record.original_file = nil
-            changed = true
-            return
-        end
-        if U.file_exists(path) then
+        elseif U.file_exists(path) then
             local ok, err = os.rename(path, target)
             if not ok then
                 logger.warn("[MiuRead][Access] unlock rename failed",
                     "book=", tostring(book_id), "error=", tostring(err))
                 return
             end
+            record.file = target
+        else
+            return
         end
-        record.file = target
         record.locked = nil
         record.lock_reason = nil
         record.locked_at = nil
@@ -434,10 +282,7 @@ function Access:_probe(book_id, access, record)
     local chapter
     if guard_uid ~= "" then
         for _, row in ipairs(rows) do
-            if tostring(row.chapterUid or row.uid or "") == guard_uid then
-                chapter = row
-                break
-            end
+            if tostring(row.chapterUid or row.uid or "") == guard_uid then chapter = row; break end
         end
     end
     chapter = chapter or rows[#rows]
@@ -457,20 +302,18 @@ function Access:_probe(book_id, access, record)
     return nil, error_kind(value), tostring(value)
 end
 
-function Access:needs_verification(book_id,record)
-    local book=self.store:book(book_id)
+function Access:needs_verification(book_id, record)
+    local book = self.store:book(book_id)
     if not book then return false end
-    local access=type(book.access)=="table" and book.access or {}
-    if access.ownership=="purchased" or access.ownership=="personal_upload" then return false end
+    local access = type(book.access) == "table" and book.access or {}
     if self:is_locked(book) then return true end
-    local current_vid=self:_account_vid()
-    local bound_vid=tostring(access.account_vid or "")
-    if bound_vid~="" and current_vid~=bound_vid then return true end
-    local status=tostring(access.status or "unverified")
-    if status~="allowed" then return true end
-    local scope=record_scope(record)
-    if scope=="full" and tostring(access.access_scope or "")~="full" then return true end
-    return (tonumber(access.valid_until or 0) or 0)<os.time()
+    local current_vid = self:_account_vid()
+    local bound_vid = tostring(access.account_vid or "")
+    if bound_vid ~= "" and current_vid ~= bound_vid then return true end
+    if tostring(access.status or "unverified") ~= "allowed" then return true end
+    local scope = record_scope(record)
+    if scope == "full" and tostring(access.access_scope or "") ~= "full" then return true end
+    return (tonumber(access.valid_until or 0) or 0) < os.time()
 end
 
 function Access:verify_open(book_id, force, record)
@@ -479,30 +322,23 @@ function Access:verify_open(book_id, force, record)
     if not book then return true, {status="external"} end
     local access = type(book.access) == "table" and U.copy(book.access) or {}
     local target_scope = record_scope(record)
-    logger.info("[MiuRead][Access] verify start","book=",book_id,"force=",tostring(force==true),
-        "status=",tostring(access.status or "unknown"),"ownership=",tostring(access.ownership or "unknown"))
-
-    if access.ownership == "purchased" or access.ownership == "personal_upload" then
-        self:unlock_book(book_id, "all")
-        logger.info("[MiuRead][Access] verify allowed","book=",book_id,"ownership=",tostring(access.ownership))
-        return true, access
-    end
-
     local now = os.time()
-    local current_vid=self:_account_vid()
-    local bound_vid=tostring(access.account_vid or "")
-    local account_changed=bound_vid~="" and current_vid~=bound_vid
+    local current_vid = self:_account_vid()
+    local bound_vid = tostring(access.account_vid or "")
+    local account_changed = bound_vid ~= "" and current_vid ~= bound_vid
     local still_valid = tonumber(access.valid_until or 0) >= now and not account_changed
+
     if not force and still_valid then
         if target_scope == "full" and access.access_scope == "preview" then
             self:lock_book(book_id, "preview_only", "full")
-            return false, {
-                status="blocked", reason="preview_only", message=reason_text("preview_only"),
-            }
+            return false, {status="blocked", reason="preview_only", message=reason_text("preview_only")}
         end
         self:unlock_book(book_id, target_scope == "preview" and "preview" or "full")
         return true, access
     end
+
+    logger.info("[MiuRead][Access] verify start", "book=", book_id,
+        "force=", tostring(force == true), "status=", tostring(access.status or "unknown"))
 
     local ok, row = pcall(self._refresh_shelf_row, self, book_id)
     if not ok then
@@ -513,79 +349,35 @@ function Access:verify_open(book_id, force, record)
     end
     if not row then
         self:_save(book_id, {
-            shelf_present=false, status="blocked", lock_reason="not_in_shelf",
-            valid_until=0, last_verify_attempt=now,
+            ownership="temporary", shelf_present=false, status="blocked",
+            lock_reason="not_in_shelf", valid_until=0, last_verify_attempt=now,
         })
         self:lock_book(book_id, "not_in_shelf", "all")
-        return false, {
-            status="blocked", reason="not_in_shelf", message=reason_text("not_in_shelf"),
-        }
+        return false, {status="blocked", reason="not_in_shelf", message=reason_text("not_in_shelf")}
     end
 
-    local detail, chapter_detail
-    local detail_ok, detail_value = pcall(self.api.book, self.api, book_id)
-    if detail_ok then detail = detail_value end
-    local chapter_ok, chapter_value = pcall(self.api.chapters, self.api, book_id)
-    if chapter_ok then chapter_detail = chapter_value end
-    local reader_context
-    local state_ok, state_value = pcall(self.reader.access_state, self.reader, book_id)
-    if state_ok then reader_context = state_value
-    else logger.warn("[MiuRead][Access] reader rights unavailable","book=",book_id,"error=",U.first_line(state_value,160)) end
-    local ownership, ownership_source = self:_ownership(row, detail, access, chapter_detail, reader_context)
-    logger.info("[MiuRead][Access] ownership result","book=",book_id,
-        "ownership=",tostring(ownership),"source=",tostring(ownership_source))
-    if ownership == "purchased" or ownership == "personal_upload" then
+    if target_scope == "preview" and tostring(record and record.preview_mode or access.preview_mode or "") == "info" then
         local saved = self:_save(book_id, {
-            ownership=ownership,
-            ownership_source=ownership_source,
-            account_vid=self:_account_vid(),
-            shelf_present=true,
-            status="allowed",
-            verified_at=now,
-            valid_until=0,
-            lock_reason="",
-            last_verify_attempt=now,
-            last_verify_error="",
+            ownership="temporary", ownership_source="official_shelf_policy",
+            account_vid=current_vid, shelf_present=true, access_scope="preview",
+            status="allowed", verified_at=now, valid_until=now + TTL,
+            lock_reason="preview_only", last_verify_attempt=now, last_verify_error="",
         })
-        self:unlock_book(book_id, "all")
-        logger.info("[MiuRead][Access] ownership classified","book=",book_id,
-            "ownership=",tostring(ownership),"source=",tostring(ownership_source))
+        self:lock_book(book_id, "preview_only", "full")
+        self:unlock_book(book_id, "preview")
         return true, saved
-    end
-
-    if target_scope=="preview" and tostring(record and record.preview_mode or access.preview_mode or "")=="info" then
-        local saved=self:_save(book_id,{
-            ownership="temporary",
-            account_vid=self:_account_vid(),
-            shelf_present=true,
-            access_scope="preview",
-            status="allowed",
-            verified_at=now,
-            valid_until=now+TTL,
-            lock_reason="preview_only",
-            last_verify_attempt=now,
-            last_verify_error="",
-        })
-        self:lock_book(book_id,"preview_only","full")
-        self:unlock_book(book_id,"preview")
-        return true,saved
     end
 
     local probe, kind, probe_error = self:_probe(book_id, access, record)
     if probe then
         local saved = self:_save(book_id, {
-            ownership="temporary",
-            account_vid=self:_account_vid(),
-            shelf_present=true,
-            access_scope=target_scope,
-            status="allowed",
-            verified_at=now,
-            valid_until=now + TTL,
+            ownership="temporary", ownership_source="official_shelf_policy",
+            account_vid=current_vid, shelf_present=true, access_scope=target_scope,
+            status="allowed", verified_at=now, valid_until=now + TTL,
             guard_chapter_uid=probe.guard_chapter_uid,
             catalog_count=probe.catalog_count or access.catalog_count,
             lock_reason=target_scope == "preview" and "preview_only" or "",
-            last_verify_attempt=now,
-            last_verify_error="",
+            last_verify_attempt=now, last_verify_error="",
         })
         if target_scope == "preview" then
             self:lock_book(book_id, "preview_only", "full")
@@ -599,34 +391,20 @@ function Access:verify_open(book_id, force, record)
     if kind == "blocked" then
         if target_scope == "full" then
             self:_save(book_id, {
-                ownership="temporary",
-                shelf_present=true,
-                access_scope="preview",
-                status="restricted",
-                valid_until=0,
-                lock_reason="preview_only",
-                last_verify_attempt=now,
-                last_verify_error=probe_error,
+                ownership="temporary", shelf_present=true, access_scope="preview",
+                status="restricted", valid_until=0, lock_reason="preview_only",
+                last_verify_attempt=now, last_verify_error=probe_error,
             })
             self:lock_book(book_id, "preview_only", "full")
-            return false, {
-                status="blocked", reason="preview_only", message=reason_text("preview_only"),
-            }
+            return false, {status="blocked", reason="preview_only", message=reason_text("preview_only")}
         end
         self:_save(book_id, {
-            ownership="temporary",
-            shelf_present=true,
-            access_scope="preview",
-            status="blocked",
-            valid_until=0,
-            lock_reason="no_permission",
-            last_verify_attempt=now,
-            last_verify_error=probe_error,
+            ownership="temporary", shelf_present=true, access_scope="preview",
+            status="blocked", valid_until=0, lock_reason="no_permission",
+            last_verify_attempt=now, last_verify_error=probe_error,
         })
         self:lock_book(book_id, "no_permission", "all")
-        return false, {
-            status="blocked", reason="no_permission", message=reason_text("no_permission"),
-        }
+        return false, {status="blocked", reason="no_permission", message=reason_text("no_permission")}
     end
 
     self:_save(book_id, {status="pending", last_verify_error=kind, last_verify_attempt=now})
@@ -637,31 +415,36 @@ end
 
 function Access:status_text(book_or_id)
     local book
-    if type(book_or_id)=="table" then
-        book=book_or_id.local_record or self.store:book(book_or_id.bookId or book_or_id.book_id)
+    if type(book_or_id) == "table" then
+        book = book_or_id.local_record or self.store:book(book_or_id.bookId or book_or_id.book_id)
     else
-        book=self.store:book(book_or_id)
+        book = self.store:book(book_or_id)
     end
-    local access=book and book.access or nil
-    if type(access)~="table" then return nil end
-    if access.ownership=="personal_upload" then return "个人上传" end
-    if access.access_scope=="preview" or access.lock_reason=="preview_only" then
-        local readable=tonumber(access.readable_count or 0) or 0
-        local catalog=tonumber(access.catalog_count or 0) or 0
-        if access.preview_mode=="info" then return "试读信息" end
-        if catalog>0 then return "试读 · "..tostring(readable).."/"..tostring(catalog).."章" end
+    local access = book and book.access or nil
+    if type(access) ~= "table" then return nil end
+
+    local reason = tostring(access.lock_reason or "")
+    if reason == "not_in_shelf" then return "已移出官方书架 · 已锁定" end
+    if reason == "no_permission" then return "当前不可阅读 · 已锁定" end
+    if access.access_scope == "preview" or reason == "preview_only" then
+        local readable = tonumber(access.readable_count or 0) or 0
+        local catalog = tonumber(access.catalog_count or 0) or 0
+        if access.preview_mode == "info" then return "试读信息" end
+        if catalog > 0 then return "试读 · " .. tostring(readable) .. "/" .. tostring(catalog) .. "章" end
         return "试读"
     end
-    if access.status=="blocked" then return "当前不可阅读" end
-    if self:needs_verification(book.book_id or book.bookId,self:first_record(book,nil,false)) then
+    if access.status == "pending" then
+        if access.last_verify_error == "auth" then return "登录失效 · 等待验证" end
+        return "等待联网验证"
+    end
+    if self:needs_verification(book.book_id or book.bookId, self:first_record(book, nil, false)) then
         return "需要联网确认"
     end
-    return "微信读书"
+    return "官方书架已验证"
 end
 
 Access.error_kind = error_kind
 Access.reason_text = reason_text
-Access._scan_ownership = scan_ownership
 Access._record_scope = record_scope
 
 return Access

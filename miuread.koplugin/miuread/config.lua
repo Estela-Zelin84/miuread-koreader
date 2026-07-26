@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "1.1.48-beta.3",
-    SCHEMA = 40,
+    VERSION = "1.1.49-beta.1",
+    SCHEMA = 41,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
@@ -28,11 +28,10 @@ local C = {
     IDLE_TIMEOUT = 600,
     REMOTE_THRESHOLD = 2,
 
-    -- Beta-only accelerated validation window. Stable builds use three days;
-    -- beta builds use ten minutes so testers can exercise
-    -- expiry, lock and recovery without changing the device clock.
-    ACCESS_VERIFY_TTL = 10 * 60,
-    ACCESS_POLICY_VERSION = 3,
+    -- Reading access is rechecked every three days. Account changes and
+    -- manual recovery of a locked book always trigger an immediate check.
+    ACCESS_VERIFY_TTL = 3 * 24 * 60 * 60,
+    ACCESS_POLICY_VERSION = 4,
 
     -- Coalesce page-turn control snapshots. Reading position stays in memory
     -- and is written at most once per window; suspend/close still flushes now.

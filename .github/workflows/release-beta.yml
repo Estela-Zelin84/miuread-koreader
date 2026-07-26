@@ -116,7 +116,7 @@ jobs:
               ],
               "size": len(payload),
               "sha256": hashlib.sha256(payload).hexdigest(),
-              "notes": "内测版：重做普通用户菜单，隐藏开发诊断与权限倒计时；合并可自定义手势；修复到期书未走验证、批注403反复续期、旧验证数据和Android后台下载恢复。",
+              "notes": "修复官方书架移除后的锁定与重新验证入口；恢复按章节下载和单章管理；修复文件浏览器中的六个通用手势并将关闭书籍限定为阅读器；精简重复菜单和无效设置。",
           }
           Path("dist/update-beta.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           print(f"已生成：{output}")
