@@ -18,6 +18,7 @@ local Http=require("miuread.http")
 local Api=require("miuread.api")
 local Auth=require("miuread.auth")
 local Reader=require("miuread.reader")
+local Access=require("miuread.access")
 local Annotations=require("miuread.annotations")
 local Downloader=require("miuread.downloader")
 local DownloadProgress=require("miuread.download_progress")
@@ -66,6 +67,7 @@ function Plugin:init()
     self.cache_cleanup_task=CacheCleanupTask:new(self.store)
     self.epub_style_repair_task=EpubStyleRepairTask:new(self.store)
     self.library=Library:new(self.api,self.http,self.store)
+    self.access=Access:new(self.library,self.api,self.reader,self.store)
     self.async=Async:new(self.store)
     self.search_async=Async:new(self.store,{poll_interval=.4})
     self.shelf_async=Async:new(self.store,{poll_interval=.4})
@@ -147,7 +149,7 @@ function Plugin:_clear_cover_guard()
 end
 function Plugin:_shelf_covers_enabled(prefs)
     prefs=prefs or self.store:preferences()
-    local enabled=prefs.shelf_covers~=false and not prefs.low_resource
+    local enabled=prefs.shelf_covers~=false
     if enabled and self._cover_safe_mode then
         if not self._cover_safe_notice_shown then
             self._cover_safe_notice_shown=true
@@ -181,6 +183,7 @@ function Plugin:home_menu()
         {text="下载管理",callback=self:safe("downloads",function() self:show_downloads() end)},
         {text="阅读同步",sub_item_table_func=function() return self:sync_menu() end},
         {text="设置",sub_item_table_func=function() return self:settings_menu() end},
+        {text="内测诊断",sub_item_table_func=function() return self:beta_access_test_menu() end},
         {text="账户",sub_item_table_func=function() return self:account_menu() end},
         {text="更新与关于",sub_item_table_func=function() return self:safe_menu("update-about-menu",function() return self:update_about_menu() end) end},
     }
@@ -189,17 +192,18 @@ function Plugin:home_menu()
 end
 function Plugin:reader_menu()
     local out={
-        {text="阅读同步",sub_item_table_func=function() return self:reader_sync_menu() end},
+        {text="阅读同步",sub_item_table_func=function() return self:sync_menu() end},
         {text="返回我的书架",callback=self:safe("shelf",function() self:show_shelf(nil) end)},
         {text="当前书籍信息",callback=function() self:show_current_book_info() end},
         {text="重新生成当前书籍",callback=self:safe("redownload",function() self:redownload_current() end)},
+        {text="内测诊断",sub_item_table_func=function() return self:beta_access_test_menu() end},
         {text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end},
     }
     if self:_has_download_status() then table.insert(out,1,{text=self:_download_status_label(),callback=function() self:show_download_status() end}) end
     return out
 end
 function Plugin:account_menu()
-    local out={{text=_("QR login"),callback=self:safe("login",function() self.auth_flow:start() end)},{text=_("Manual credentials"),callback=self:safe("manual",function() self:manual_credentials() end)},{text=_("Account status"),callback=function() local a=self.store:auth(); self:info((self:logged_in() and _("Logged in") or _("Not logged in")).."\n"..tostring(a.account.name or "").."\nVID: "..tostring(a.account.vid or "")) end}}
+    local out={{text=_("QR login"),callback=self:safe("login",function() self.auth_flow:start() end)},{text=_("Account status"),callback=function() local a=self.store:auth(); self:info((self:logged_in() and _("Logged in") or _("Not logged in")).."\n"..tostring(a.account.name or "").."\nVID: "..tostring(a.account.vid or "")) end}}
     if self:logged_in() then out[#out+1]={text=_("Clear account data"),callback=function() UIManager:show(ConfirmBox:new{text="清除当前账户信息？\n\n将退出微信读书账户，但不会删除已下载书籍。",ok_callback=function() self.auth_flow:cancel(); self.store:clear_auth(); self:toast(_("Logout")) end}) end} end; return out
 end
 function Plugin:manual_credentials()
@@ -426,6 +430,7 @@ function Plugin:_prepare_shelf_rows(rows)
             elseif download_state.status=="failed" or download_state.status=="interrupted" then b.download_status="生成未完成"
             elseif download_state.status=="completed" and download_state.seen~=true then b.download_status="刚刚生成完成" end
         end
+        b.revalidate_visible=b.shelf_section=="generated" and self.access:is_locked(b.bookId)
         b.status_text=self:_shelf_status_text(b)
     end
     if cover_index_changed then self.store:set("cover_index",cover_index) end
@@ -464,7 +469,9 @@ function Plugin:_shelf_status_text(b)
     if b.download_status and b.download_status~="" then return b.download_status end
     local state
     if b.shelf_section=="generated" then
-        if b.remote_status_known~=true then state="云端状态暂不可用"
+        local access_state=self.access and self.access:status_text(b) or nil
+        if access_state then state=access_state
+        elseif b.remote_status_known~=true then state="云端状态暂不可用"
         elseif b.in_account_shelf==true then state="账号书架中"
         else state="已从账号书架移除" end
         if b.hasClean and b.hasNotes then state=state.." · 两个版本"
@@ -480,9 +487,130 @@ function Plugin:_shelf_status_text(b)
     return state
 end
 
-function Plugin:_shelf_select(b)
+function Plugin:_locked_book_ids()
+    local out={}
+    for id,book in pairs(self.store:library() or {}) do
+        if self.access:is_locked(book) then out[#out+1]=tostring(id) end
+    end
+    table.sort(out)
+    return out
+end
+
+function Plugin:_current_access_context()
+    local path=self:_current_document_path()
+    if not path then return nil end
+    local book,record=self.store:identify_file(path,true)
+    if not book then return nil end
+    return tostring(book.book_id or book.bookId or ""),book,record
+end
+
+function Plugin:show_current_access_detail()
+    local id,_,record=self:_current_access_context()
+    if not id then self:info("请先打开一本觅阅生成的书籍。") return end
+    self:info("当前书籍权限详情\n\n"..self.access:diagnostic(id,record))
+end
+
+function Plugin:expire_current_access()
+    local id=self:_current_access_context()
+    if not id then self:info("请先打开一本觅阅生成的书籍。") return end
+    local book=self.store:book(id) or {}
+    local access=book.access or {}
+    if access.ownership=="purchased" or access.ownership=="personal_upload" then
+        self:info("永久书不执行周期验证，不能设置为过期。")
+        return
+    end
+    self.access:expire(id)
+    self:info("已让当前书立即过期。\n\n下次打开时会自动联网验证；不会立即锁定或删除文件。")
+end
+
+function Plugin:force_verify_current_access()
+    local id,_,record=self:_current_access_context()
+    if not id then self:info("请先打开一本觅阅生成的书籍。") return end
+    if not self:require_login() then return end
+    if not self:is_online() then self:info("当前没有网络，无法验证。") return end
+    local allowed,state=self.access:verify_open(id,true,record)
+    if allowed then
+        self:info("验证成功。\n\n"..self.access:diagnostic(id,record))
+    else
+        local message=(state and state.message) or "验证未通过"
+        self:info(message.."\n\n"..self.access:diagnostic(id,record))
+    end
+end
+
+function Plugin:revalidate_book(book,open_after)
+    local id=tostring(book and (book.bookId or book.book_id) or "")
+    if id=="" then return end
+    if not self:require_login() then return end
+    if not self:is_online() then self:info("当前没有网络，无法重新验证。") return end
+    local record=self.access:first_record(id,"full",true) or self.access:first_record(id,nil,true)
+        or self.access:first_record(id,"full",false)
+    local allowed,state=self.access:verify_open(id,true,record)
+    if allowed then
+        if open_after then
+            UIManager:scheduleIn(.05,function() self:_shelf_select(book,true) end)
+        else
+            self:toast("权限已恢复，书籍已自动解锁。",4)
+            self:_reopen_shelf(self._last_shelf_mode,"generated",false)
+        end
+    else
+        self:info((state and state.message) or "当前仍未恢复阅读权限。")
+        self:_reopen_shelf(self._last_shelf_mode,"generated",false)
+    end
+end
+
+function Plugin:verify_all_locked_books()
+    if not self:require_login() then return end
+    if not self:is_online() then self:info("当前没有网络，无法验证锁定书籍。") return end
+    local ids=self:_locked_book_ids()
+    if #ids==0 then self:info("当前没有需要重新验证的锁定书籍。") return end
+    local loading=InfoMessage:new{text="正在验证全部锁定书籍……\n\n共 "..tostring(#ids).." 本，请稍候。"}
+    UIManager:show(loading)
+    local index,unlocked,still_locked,pending=1,0,0,0
+    local function finish()
+        pcall(function() UIManager:close(loading) end)
+        self:info(table.concat({
+            "锁定书籍验证完成",
+            "",
+            "已解锁："..tostring(unlocked).." 本",
+            "仍无权限："..tostring(still_locked).." 本",
+            "网络或登录待验证："..tostring(pending).." 本",
+        },"\n"))
+        self:_reopen_shelf(self._last_shelf_mode,"generated",false)
+    end
+    local function step()
+        local id=ids[index]
+        if not id then finish(); return end
+        local record=self.access:first_record(id,"full",true) or self.access:first_record(id,nil,true)
+            or self.access:first_record(id,"full",false)
+        local allowed,state=self.access:verify_open(id,true,record)
+        if allowed then unlocked=unlocked+1
+        elseif state and state.status=="pending" then pending=pending+1
+        else still_locked=still_locked+1 end
+        index=index+1
+        UIManager:scheduleIn(.05,step)
+    end
+    UIManager:scheduleIn(.05,step)
+end
+
+function Plugin:beta_access_test_menu()
+    return {
+        {text="验证周期 · 10分钟",enabled=false},
+        {text="查看当前书权限详情",callback=function() self:show_current_access_detail() end},
+        {text="让当前书立即过期",callback=function() self:expire_current_access() end},
+        {text="强制验证当前书",callback=function() self:force_verify_current_access() end},
+        {text="验证全部锁定书籍",callback=function() self:verify_all_locked_books() end},
+        {text="测试上传 30 秒",callback=function() self:test_read_report() end},
+        {text="手动登录凭证（应急）",callback=function() self:manual_credentials() end},
+    }
+end
+
+function Plugin:_shelf_select(b,verified)
+    if not verified and self.access:is_locked(b.bookId) then
+        self:revalidate_book(b,true)
+        return
+    end
     local available={}
-    for _,kind in ipairs({"notes","clean"}) do
+    for _,kind in ipairs({"notes","clean","preview_notes","preview_clean"}) do
         local r=self.store:variant(b.bookId,kind)
         if r and r.file and U.file_exists(r.file) then available[#available+1]=r end
     end
@@ -516,8 +644,8 @@ function Plugin:show_shelf_search_dialog(mp_mode,source_rows,section)
                     show_actions=false,
                     show_tabs=false,
                     show_covers=show_covers,
+                    on_revalidate=section=="generated" and function(b) self:revalidate_book(b,false) end or nil,
                     on_select=function(b) self:_shelf_select(b) end,
-                    on_hold=function(b) self:book_menu(b) end,
                     on_page_changed=function(page,first,last,current)
                         if show_covers then self:_on_shelf_page(results,current,page,first,last) end
                     end,
@@ -537,7 +665,6 @@ function Plugin:show_shelf_search_dialog(mp_mode,source_rows,section)
                         text=(b.downloaded and "✓ " or "")..tostring(b.title or "未命名"),
                         post_text=(tostring(b.author or "")~="" and (tostring(b.author).." · ") or "")..self:_shelf_status_text(b),
                         callback=function() self:_shelf_select(b) end,
-                        hold_callback=function() self:book_menu(b) end,
                     }
                 end
                 self:list("搜索书架 · "..q,items)
@@ -740,8 +867,10 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
             on_generated_tab=open_generated,
             on_search=function() self:show_shelf_search_dialog(mp_mode,all_rows,section) end,
             on_sort=function() self:show_shelf_controls(mp_mode,section) end,
+            locked_count=section=="generated" and #self:_locked_book_ids() or 0,
+            on_verify_locked=section=="generated" and function() self:verify_all_locked_books() end or nil,
+            on_revalidate=function(b) self:revalidate_book(b) end,
             on_select=function(b) self:_shelf_select(b) end,
-            on_hold=function(b) self:book_menu(b) end,
             on_page_changed=function(page,first,last,current)
                 if show_covers then self:_on_shelf_page(rows,current,page,first,last) end
             end,
@@ -763,7 +892,7 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
         }
         for _,b in ipairs(rows) do
             local book=b
-            items[#items+1]={text=(book.downloaded and "✓ " or "")..book.title,post_text=self:_shelf_status_text(book),callback=function() self:_shelf_select(book) end,hold_callback=function() self:book_menu(book) end}
+            items[#items+1]={text=(book.downloaded and "✓ " or "")..book.title,post_text=self:_shelf_status_text(book),callback=function() self:_shelf_select(book) end}
         end
         self:list(title,items)
     end,force_remote,section)
@@ -878,6 +1007,16 @@ function Plugin:show_shelf_controls(mp_mode,section)
     local sort_labels=section=="generated" and GENERATED_SORT_LABELS or ACCOUNT_SORT_LABELS
     items[#items+1]={text="筛选范围",post_text=scope_labels[current_scope] or "全部",sub_item_table=scope_items}
     items[#items+1]={text="排序方式",post_text=sort_labels[current_sort] or (section=="generated" and "最近打开" or "最近阅读（默认）"),sub_item_table=sort_items}
+    if section=="generated" then
+        items[#items+1]={
+            text="验证全部锁定书籍",
+            enabled=self:logged_in(),
+            callback=function()
+                close_menu()
+                UIManager:scheduleIn(0,function() self:verify_all_locked_books() end)
+            end,
+        }
+    end
     items[#items+1]={
         text=section=="generated" and "刷新云端状态" or "刷新账号书架",
         enabled=self:logged_in(),
@@ -1026,6 +1165,8 @@ function Plugin:book_menu(b)
     b=U.merge(original,normalize(original))
     local clean=self:_variant_exists(b.bookId,"clean")
     local notes=self:_variant_exists(b.bookId,"notes")
+    local preview_clean=self:_variant_exists(b.bookId,"preview_clean")
+    local preview_notes=self:_variant_exists(b.bookId,"preview_notes")
     local items={}
     if clean and notes then
         items[#items+1]={text="打开纯净版",callback=function() self:open_file(clean.file) end}
@@ -1042,9 +1183,10 @@ function Plugin:book_menu(b)
         end
         items[#items+1]={text="重新生成",callback=function() self:choose_download(b,nil,false) end}
     else
-        items[#items+1]={text="生成书籍",callback=function() self:choose_download(b,nil,false) end}
-        items[#items+1]={text=_("Read first chapter"),callback=function() self:choose_download(b,1,true) end}
+        items[#items+1]={text=(preview_clean or preview_notes) and "重新检查并生成完整版" or "生成书籍",callback=function() self:choose_download(b,nil,false) end}
     end
+    if preview_notes then items[#items+1]={text="打开试读版 · 划线与想法版",callback=function() self:open_file(preview_notes.file) end} end
+    if preview_clean then items[#items+1]={text="打开试读版 · 纯净版",callback=function() self:open_file(preview_clean.file) end} end
     items[#items+1]={text=_("Chapter list"),callback=function() self:chapters(b) end}
     items[#items+1]={text=_("Book details"),callback=function() self:book_details(b) end}
     if b.archiveNames and tostring(b.archiveNames)~="" then
@@ -1100,11 +1242,20 @@ function Plugin:choose_download(b,limit,open_after,uid)
     UIManager:show(dialog)
 end
 function Plugin:_download_summary(rec,opt)
+    local preview=tostring(rec and rec.access_scope or "")=="preview" and not (opt and opt.chapter_uid)
+    local preview_mode=tostring(rec and rec.preview_mode or "complete")
+    local heading=preview and (preview_mode=="info" and "试读信息版生成完成"
+        or (preview_mode=="partial" and "部分试读版生成完成" or "试读版生成完成")) or "下载完成"
     local lines={
-        "下载完成",
+        heading,
         "保存位置："..tostring(rec.file or ""),
         "打开一次后会出现在 KOReader 最近阅读中",
     }
+    if preview then
+        lines[#lines+1]="成功取得正文："..tostring(rec.readable_chapter_count or 0).." / "..tostring(rec.catalog_chapter_count or rec.expected_chapter_count or 0)
+        if preview_mode=="info" then lines[#lines+1]="本文件只包含书籍信息和权限说明，不含试读正文。"
+        elseif preview_mode=="partial" then lines[#lines+1]="未成功取得的试读章节未写入文件，可稍后重新生成。" end
+    end
     if opt and opt.annotations then
         local a=rec.annotation_summary or {}
         lines[#lines+1]="划线："..tostring(a.underlines or 0)
@@ -1387,10 +1538,52 @@ function Plugin:_merge_download_result(result,book,opt)
     else
         self.store:remove_pending_install(book.bookId,kind,opt.chapter_uid)
     end
+    local ownership=tostring(rec.ownership or opt.access_ownership or book.access_ownership or "temporary")
+    local scope=tostring(rec.access_scope or "full")
+    local verified_at=tonumber(rec.verified_at) or os.time()
+    local valid_until=tonumber(rec.valid_until) or 0
+    local previous_access=(self.store:book(book.bookId) or {}).access or {}
+    local standalone=opt.chapter_uid~=nil
+    local saved_scope=scope
+    local saved_status="allowed"
+    local saved_valid_until=valid_until
+    local saved_lock_reason=scope=="preview" and "preview_only" or ""
+    if standalone and ownership~="purchased" and ownership~="personal_upload"
+        and previous_access.access_scope=="full" and previous_access.status=="allowed"
+        and tonumber(previous_access.valid_until or 0)>=os.time() then
+        -- Reading one chapter must not downgrade a still-valid full book, but
+        -- it also must not extend the full book's verification window.
+        saved_scope="full"
+        saved_valid_until=tonumber(previous_access.valid_until) or 0
+        saved_lock_reason=tostring(previous_access.lock_reason or "")
+    end
     self.store:save_book(book.bookId,{
         book_id=tostring(book.bookId),title=book.title,author=book.author,cover=book.cover,
         directory=rec.directory,updated_at=os.time(),catalog=rec.chapter_map,
+        access={
+            ownership=ownership,ownership_source=rec.ownership_source or opt.access_ownership_source or book.access_ownership_source,
+            access_scope=saved_scope,account_vid=rec.account_vid or opt.access_account_vid,
+            policy_version=tonumber(Config.ACCESS_POLICY_VERSION) or 2,
+            shelf_present=true,status=saved_status,verified_at=verified_at,valid_until=saved_valid_until,
+            catalog_count=tonumber(rec.catalog_chapter_count) or tonumber(rec.expected_chapter_count),
+            readable_count=tonumber(rec.readable_chapter_count) or tonumber(rec.chapter_count),
+            restricted_count=tonumber(rec.restricted_chapter_count) or 0,
+            failed_count=tonumber(rec.failed_chapter_count) or 0,
+            preview_mode=scope=="preview" and rec.preview_mode or nil,
+            guard_chapter_uid=standalone and previous_access.guard_chapter_uid or rec.guard_chapter_uid,
+            lock_reason=saved_lock_reason,
+        },
     })
+    if ownership=="purchased" or ownership=="personal_upload" then
+        self.access:unlock_book(book.bookId,"all")
+    elseif standalone and saved_scope=="full" then
+        self.access:unlock_book(book.bookId,"preview")
+    elseif scope=="preview" then
+        self.access:lock_book(book.bookId,"preview_only","full")
+        self.access:unlock_book(book.bookId,"preview")
+    else
+        self.access:unlock_book(book.bookId,"all")
+    end
     if type(result.session)=="table" then
         local allowed={"psvts","pclts","token","reader_url","chapters","context_updated_at","app_id"}
         local patch={}
@@ -1640,14 +1833,32 @@ function Plugin:chapter_menu(b,ch)
     end
     self:list(ch.title or tostring(uid),items)
 end
-function Plugin:open_file(path)
-    if not path or not U.file_exists(path) then self:info(_("No cached file")); return end
-    -- Do not inspect the EPUB or flush settings before opening it. The reader
-    -- ready callback identifies the book after input handling is restored.
+function Plugin:_open_file_direct(path)
     if self.ui.document then self.ui:switchDocument(path) else self.ui:openFile(path) end
 end
+function Plugin:open_file(path)
+    if not path or not U.file_exists(path) then self:info(_("No cached file")); return end
+    local book,record=self.store:identify_file(path,true)
+    if not book then self:_open_file_direct(path); return end
+    local book_id=tostring(book.book_id or book.bookId or "")
+    local allowed,state=self.access:verify_open(book_id,false,record)
+    if not allowed then
+        self:info((state and state.message) or "该书需要重新验证后才能阅读。")
+        return
+    end
+    local resolved=self.access:resolve_path(book_id,path)
+    if not resolved or not U.file_exists(resolved) then
+        self:info("书籍已解锁，但本地文件暂不可用。")
+        return
+    end
+    self:_open_file_direct(resolved)
+end
 function Plugin:_variant_label(kind)
-    return kind=="notes" and "划线与想法版" or "纯净版"
+    kind=tostring(kind or "clean")
+    local preview=kind:sub(1,8)=="preview_"
+    local base=preview and kind:sub(9) or kind
+    local label=base=="notes" and "划线与想法版" or "纯净版"
+    return preview and ("试读版 · "..label) or label
 end
 function Plugin:_close_download_menus()
     local detail=self._download_book_menu; self._download_book_menu=nil
@@ -1674,7 +1885,7 @@ function Plugin:_notes_epub_paths(book_id)
     end
     local function add_book(book)
         if not book then return end
-        for _,kind in ipairs({"clean","notes"}) do add(book.variants and book.variants[kind]) end
+        for _,kind in ipairs({"clean","notes","preview_clean","preview_notes"}) do add(book.variants and book.variants[kind]) end
         for _,row in pairs(book.chapters or {}) do
             for _,kind in ipairs({"clean","notes"}) do add(row and row[kind]) end
         end
@@ -1751,17 +1962,6 @@ function Plugin:_confirm_repair_book_style(book_id,title)
         ok_text="开始修复",
         ok_callback=function()
             self:_run_epub_style_repair(paths,{progress_text="正在修复本书……"})
-        end,
-    })
-end
-function Plugin:_confirm_repair_all_styles()
-    local paths=self:_notes_epub_paths()
-    if #paths==0 then self:info("没有可修复的已下载 EPUB。") return end
-    UIManager:show(ConfirmBox:new{
-        text="修复全部已下载书籍？\n\n共检测到 "..tostring(#paths).." 个 EPUB。会检查尾注双向链接、失效旧路径和旧划线样式；直接处理现有文件，失败文件会自动恢复。",
-        ok_text="修复全部",
-        ok_callback=function()
-            self:_run_epub_style_repair(paths,{progress_text="正在修复全部已下载书籍……"})
         end,
     })
 end
@@ -1984,7 +2184,7 @@ function Plugin:_confirm_delete_book_downloads(book_id,title)
 end
 function Plugin:_download_book_labels(b)
     local labels={}
-    for _,kind in ipairs({"clean","notes"}) do
+    for _,kind in ipairs({"clean","notes","preview_clean","preview_notes"}) do
         local r=b.variants and b.variants[kind]
         if r and r.file and U.file_exists(r.file) then labels[#labels+1]=self:_variant_label(kind) end
     end
@@ -2047,11 +2247,6 @@ function Plugin:show_download_cleanup_dialog()
     dialog=ButtonDialog:new{title="清理下载与缓存",title_align="center",buttons={
         {{text="清理下载断点与临时文件",callback=function() UIManager:close(dialog); self:_clear_download_residue() end}},
         {{text="清理封面缓存",callback=function() UIManager:close(dialog); self:_clear_cover_cache() end}},
-        {{text="清理无效书籍记录",callback=function()
-            UIManager:close(dialog)
-            local changed=self.store:prune_missing_files()
-            self:toast(changed and "无效书籍记录已清理" or "没有无效书籍记录",3)
-        end}},
         {{text="取消",callback=function() UIManager:close(dialog) end}},
     }}
     UIManager:show(dialog)
@@ -2069,10 +2264,6 @@ function Plugin:show_downloads()
     items[#items+1]={text="等待下载",post_text=tostring(#queue).." 项",callback=function() self:show_waiting_downloads() end}
     items[#items+1]={text="存储占用",callback=function() self:show_storage_usage() end}
     items[#items+1]={text="清理下载与缓存",callback=function() self:show_download_cleanup_dialog() end}
-    local repair_paths=self:_notes_epub_paths()
-    if #repair_paths>0 then
-        items[#items+1]={text="修复已下载书籍",post_text=tostring(#repair_paths).." 个 EPUB · 含尾注链接",callback=function() self:_confirm_repair_all_styles() end}
-    end
     items[#items+1]={text="已完成",enabled=false}
     for _,b in ipairs(self.store:all_books()) do
         local labels=self:_download_book_labels(b)
@@ -2108,7 +2299,7 @@ function Plugin:downloaded_book_menu(book_ref)
     if not b then self:toast("下载记录已不存在"); self:show_downloads(); return end
     local items={}
     local variants={}
-    for _,kind in ipairs({"clean","notes"}) do
+    for _,kind in ipairs({"clean","notes","preview_clean","preview_notes"}) do
         local r=b.variants and b.variants[kind]
         if r and r.file and U.file_exists(r.file) then variants[#variants+1]={kind=kind,file=r.file,label=self:_variant_label(kind)} end
     end
@@ -2132,9 +2323,6 @@ function Plugin:downloaded_book_menu(book_ref)
     local has_partial=self.store:book_has_partial_cache(book_id)
     if chapter_count>0 or has_partial then
         items[#items+1]={text="缓存与断点",enabled=false}
-        if chapter_count>0 then
-            items[#items+1]={text="查看单章文件",post_text=tostring(chapter_count).." 个",callback=function() self:downloaded_chapters_menu(book_id) end}
-        end
         if has_partial then
             items[#items+1]={text="清理未完成下载缓存",post_text="保留已生成 EPUB",callback=function() self:_confirm_clear_partial_cache(book_id,b.title) end}
         end
@@ -2169,7 +2357,6 @@ function Plugin:time_sync_menu()
     return {
         {text="启用阅读时间同步",checked_func=function() return self.store:preferences().sync.time_enabled end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
         {text="上传结果提醒",checked_func=function() return self.store:preferences().sync.time_notice_enabled~=false end,keep_menu_open=true,callback=function() self:toggle_time_notice() end},
-        {text="测试上传 30 秒",callback=function() self:test_read_report() end},
     }
 end
 function Plugin:progress_sync_settings_menu()
@@ -2680,9 +2867,19 @@ function Plugin:on_read_report_success(path)
             if self.ui and self.ui.document then self:ensure_read_report_progress("catalog_ready",true) end
         end)
     elseif r and self.store:preferences().sync.progress_enabled~=false then
-        UIManager:scheduleIn(1.5,function()
-            if self.ui and self.ui.document then self:_verify_automatic_progress_once() end
-        end)
+        -- Automatic background reports already carry the latest position. Do not
+        -- immediately query the cloud again: the extra read caused avoidable I/O
+        -- and UI stalls on slower devices. Manual uploads still perform full
+        -- confirmation through upload_local_progress().
+        local position=self.sync:local_position()
+        if position and position.safe==true and position.progress~=nil then
+            local target=math.floor((tonumber(position.progress) or 0)+.5)
+            self.store:save_session(r.book.book_id,{
+                progress_upload_state="submitted",
+                progress_upload_at=os.time(),
+                progress_upload_percent=target,
+            })
+        end
     end
 end
 function Plugin:on_read_report_interval_success(status)
@@ -2722,7 +2919,7 @@ function Plugin:_current_book_record()
     local raw=path and U.read_file(path,true)
     local id=raw and (raw:match('"book_id"%s*:%s*"([^"]+)"') or raw:match('miuread://book/([^<"]+)'))
     local fallback=id and self.store:book(id)
-    if fallback then return {book=fallback,record=fallback.variants and (fallback.variants.notes or fallback.variants.clean),variant=nil,path=path} end
+    if fallback then return {book=fallback,record=fallback.variants and (fallback.variants.notes or fallback.variants.clean or fallback.variants.preview_notes or fallback.variants.preview_clean),variant=nil,path=path} end
 end
 function Plugin:show_current_book_info()
     local r=self:_current_book_record()
@@ -2742,13 +2939,10 @@ function Plugin:redownload_current()
     local r=self:_current_book_record()
     if not r or not r.book then self:info(_("No matching MiuRead book is open.")); return end
     local b={bookId=r.book.book_id,title=r.book.title,author=r.book.author,cover=r.book.cover}
-    local current=(r.variant=="notes" or r.variant=="clean") and r.variant or (r.record and r.record.variant)
     local dialog
     local buttons={}
-    if current=="notes" then buttons[#buttons+1]={{text="重新生成当前划线与想法版",callback=function() UIManager:close(dialog); self:choose_download_mode(b,{annotations=true},false) end}}
-    elseif current=="clean" then buttons[#buttons+1]={{text="重新生成当前纯净版",callback=function() UIManager:close(dialog); self:choose_download_mode(b,{annotations=false},false) end}} end
-    buttons[#buttons+1]={{text="重新生成纯净版",callback=function() UIManager:close(dialog); self:choose_download_mode(b,{annotations=false},false) end}}
-    buttons[#buttons+1]={{text="重新生成划线与想法版",callback=function() UIManager:close(dialog); self:choose_download_mode(b,{annotations=true},false) end}}
+    buttons[#buttons+1]={{text="生成纯净版",callback=function() UIManager:close(dialog); self:choose_download_mode(b,{annotations=false},false) end}}
+    buttons[#buttons+1]={{text="生成划线与想法版",callback=function() UIManager:close(dialog); self:choose_download_mode(b,{annotations=true},false) end}}
     buttons[#buttons+1]={{text="关闭",callback=function() UIManager:close(dialog) end}}
     dialog=ButtonDialog:new{title="重新生成《"..tostring(b.title or "本书").."》",title_align="center",buttons=buttons}
     UIManager:show(dialog)
@@ -2758,18 +2952,12 @@ function Plugin:_toggle_preference(key)
 end
 function Plugin:reading_settings_menu()
     return {
-        {text="划线显示 · "..self:annotation_mode_label(),sub_item_table_func=function() return self:annotation_mode_menu() end},
         {text="想法字体大小",sub_item_table_func=function() return self:thought_font_menu() end},
     }
 end
 function Plugin:shelf_settings_menu()
     return {
         {text="显示封面",checked_func=function() return self.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("shelf_covers") end},
-    }
-end
-function Plugin:performance_settings_menu()
-    return {
-        {text="低资源模式",checked_func=function() return self.store:preferences().low_resource end,keep_menu_open=true,callback=function() self:_toggle_preference("low_resource") end},
     }
 end
 function Plugin:notification_settings_menu()
@@ -2782,7 +2970,6 @@ function Plugin:notification_settings_menu()
 end
 function Plugin:advanced_maintenance_menu()
     return {
-        {text="修复全部已下载书籍",post_text="尾注、链接与划线",callback=function() self:_confirm_repair_all_styles() end},
         {text="下载目录",post_text=self:_download_dir_label(),callback=function() self:directory_dialog() end},
         {text="查看详细同步日志",callback=function() self:show_sync_status(true) end},
     }
@@ -2791,7 +2978,6 @@ function Plugin:settings_menu()
     return {
         {text="阅读显示",sub_item_table_func=function() return self:reading_settings_menu() end},
         {text="书架显示",sub_item_table_func=function() return self:shelf_settings_menu() end},
-        {text="性能与后台",sub_item_table_func=function() return self:performance_settings_menu() end},
         {text="通知",sub_item_table_func=function() return self:notification_settings_menu() end},
         {text="高级维护",sub_item_table_func=function() return self:advanced_maintenance_menu() end},
     }
@@ -2855,8 +3041,9 @@ function Plugin:directory_dialog()
 end
 function Plugin:update_about_menu()
     return {
-        {text="检查更新",callback=self:safe("update",function() self:check_update() end)},
+        {text=(Config.UPDATE_CHANNEL=="beta" and "检查内测更新" or "检查更新"),callback=self:safe("update",function() self:check_update() end)},
         {text="当前版本 · "..tostring(self.version),enabled=false},
+        {text="更新通道 · "..tostring(Config.UPDATE_CHANNEL_LABEL or Config.UPDATE_CHANNEL or "正式"),enabled=false},
         {text="关于",callback=self:safe("about",function() self:show_about() end)},
     }
 end
@@ -2878,7 +3065,7 @@ function Plugin:check_update()
         end})
     end)
 end
-function Plugin:show_about() self:info(Config.NAME.." "..self.version.."\n\n".."想法弹窗性能优化版".."\n".."单次渲染 · 章节索引缓存 · Release 全量更新".."\n".._("Unofficial client").."\n\n".._("This build has not been verified with every Kindle model or every WeRead book.")) end
+function Plugin:show_about() self:info(Config.NAME.." "..self.version.."\n更新通道："..tostring(Config.UPDATE_CHANNEL_LABEL or Config.UPDATE_CHANNEL or "正式").."\n\n".."内测功能：权限验证、试读生成、同步卡顿优化".."\n".."Release 全量更新".."\n".._("Unofficial client").."\n\n".._("This build has not been verified with every Kindle model or every WeRead book.")) end
 function Plugin:onShowMiuRead() self:show_shelf(false) end
 local function extract_thought_href(value,seen,depth)
     if depth>4 or value==nil then return nil end
@@ -3019,6 +3206,24 @@ function Plugin:onReaderReady()
     self._progress_auto_verify_started=false
     self._last_progress_submit_notice=nil
     self.sync:on_reader_ready()
+    -- File-manager history and automatic resume can bypass MiuRead's shelf
+    -- button. Recheck the current generated book after the reader is ready.
+    UIManager:scheduleIn(.15,function()
+        if not self.ui or not self.ui.document then return end
+        local path=self:_current_document_path()
+        local book,record
+        if path then book,record=self.store:identify_file(path,true) end
+        if not book then return end
+        local book_id=tostring(book.book_id or book.bookId or "")
+        local allowed,state=self.access:verify_open(book_id,false,record)
+        if allowed then return end
+        local message=(state and state.message) or "该书需要重新验证后才能阅读。"
+        local closed=false
+        if self.ui and type(self.ui.onClose)=="function" then
+            closed=pcall(self.ui.onClose,self.ui)
+        end
+        UIManager:scheduleIn(closed and .15 or .05,function() self:info(message) end)
+    end)
 end
 function Plugin:onPageUpdate(page)
     self.sync:on_page(page)

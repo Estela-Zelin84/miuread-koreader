@@ -3,6 +3,7 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local FFIUtil = require("ffi/util")
 local Json = require("miuread.json")
+local Config = require("miuread.config")
 local ReadReportService = require("miuread.read_report_service")
 local Protocol = require("miuread.protocol")
 local ReadReportWorker = require("miuread.legacy_adapter_worker")
@@ -344,6 +345,10 @@ function Sync:record()
     self.record_checked_path=path
     local book, record, variant = self.store:file_record(path)
     if book then
+        if type(record)=="table" and tostring(record.preview_mode or "")=="info" then
+            self.record_checked_path=path
+            return nil
+        end
         self.current={book=book,record=record,variant=variant,path=path}
         return self.current
     end
@@ -1078,7 +1083,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
         write_now()
     end
     self.control_write_task = task
-    UIManager:scheduleIn(1.25, task)
+    UIManager:scheduleIn(tonumber(Config.CONTROL_WRITE_DELAY) or 30, task)
     return true
 end
 
@@ -1522,7 +1527,7 @@ function Sync:on_page(page)
     if page and page ~= self.last_page then
         self.last_page = page
         self.last_activity = os.time()
-        self:_write_daemon_control(true)
+        self:_write_daemon_control(true, false)
     end
 end
 

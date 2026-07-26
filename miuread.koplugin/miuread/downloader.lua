@@ -1,4 +1,5 @@
 local Protocol = require("miuread.protocol")
+local Config = require("miuread.config")
 local Codec = require("miuread.codec")
 local Footnotes = require("miuread.footnotes")
 local InternalLinks = require("miuread.internal_links")
@@ -68,6 +69,35 @@ local function prepare_chapter_body(html, title)
         fragment = '<h1 class="miu-chapter-title">' .. U.xml(title) .. "</h1>\n" .. fragment
     end
     return '<section class="miu-chapter" epub:type="chapter" data-miuread-section="1">' .. fragment .. "</section>"
+end
+
+local function preview_information_chapter(book, mode, catalog_count, readable_count, restricted_count, failures)
+    local title = mode == "info" and "试读信息" or "试读内容说明"
+    local lines = {
+        '<section class="miu-chapter miu-preview-info" epub:type="frontmatter">',
+        '<h1 class="miu-chapter-title">' .. U.xml(title) .. '</h1>',
+        '<p><strong>书名：</strong>' .. U.xml(book.title or "未命名") .. '</p>',
+        '<p><strong>作者：</strong>' .. U.xml(book.author or "") .. '</p>',
+        '<p><strong>当前状态：</strong>微信读书已明确限制为试读。</p>',
+        '<p><strong>官方目录：</strong>' .. tostring(catalog_count or 0) .. ' 章</p>',
+        '<p><strong>本次取得正文：</strong>' .. tostring(readable_count or 0) .. ' 章</p>',
+        '<p><strong>明确受限章节：</strong>' .. tostring(restricted_count or 0) .. ' 章</p>',
+    }
+    if mode == "info" then
+        lines[#lines + 1] = '<p>本次没有取得可写入 EPUB 的试读正文。该文件仅保留书籍信息和权限状态，不代表正文已经下载。</p>'
+    else
+        lines[#lines + 1] = '<p>本次只收录成功取得的试读正文。未成功取得的章节没有写入文件，可稍后重新生成。</p>'
+    end
+    if #(failures or {}) > 0 then
+        lines[#lines + 1] = '<h2>未能收录的章节</h2><ol>'
+        for index, item in ipairs(failures or {}) do
+            if index > 30 then break end
+            lines[#lines + 1] = '<li>' .. U.xml(item.title or item.uid or "未知章节") .. '：' .. U.xml(U.first_line(item.error, 120)) .. '</li>'
+        end
+        lines[#lines + 1] = '</ol>'
+    end
+    lines[#lines + 1] = '<p>生成时间：' .. U.xml(os.date("%Y-%m-%d %H:%M:%S")) .. '</p></section>'
+    return table.concat(lines, "\n"), title
 end
 
 local function localize(http, html, assets, enabled)
@@ -570,15 +600,24 @@ end
 function Downloader:_save(book, chapters, assets, css, cover, opt, failures, session)
     local kind = opt.annotations and "notes" or "clean"
     local expected_chapter_count = tonumber(opt.expected_chapter_count) or #chapters
-    if #chapters ~= expected_chapter_count or #(failures or {}) > 0 then
+    local preview_mode=tostring(opt.preview_mode or "complete")
+    local relaxed_preview=opt.access_scope=="preview" and (preview_mode=="partial" or preview_mode=="info")
+    if not relaxed_preview and (#chapters ~= expected_chapter_count or #(failures or {}) > 0) then
         error(failure_message(failures, expected_chapter_count, #chapters, opt.checkpointed == true))
     end
+    if #chapters<=0 then error("EPUB 至少需要一个说明页面") end
 
     local suffix = kind == "notes" and "划线与想法版" or "纯净版"
     local dir = self.store:epub_root()
     local standalone = opt.chapter_uid ~= nil
     local chapter_name = standalone and (" - " .. U.safe_name(chapters[1] and chapters[1].title or "章节")) or ""
-    local filename = U.safe_name(book.title, "book") .. chapter_name .. " [" .. suffix .. "].epub"
+    local preview_name=""
+    if not standalone and opt.access_scope=="preview" then
+        if preview_mode=="info" then preview_name="【试读信息版】"
+        elseif preview_mode=="partial" then preview_name="【试读版·部分内容】"
+        else preview_name="【试读版】" end
+    end
+    local filename = U.safe_name(book.title, "book") .. preview_name .. chapter_name .. " [" .. suffix .. "].epub"
     local path = self.store:epub_path(filename)
     local map = {}
     for index, chapter in ipairs(chapters) do
@@ -597,10 +636,33 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     logger.info("[MiuRead][Download] low-memory EPUB package started",
         "chapters=", tostring(#chapters), "assets=", tostring(#assets),
         "memory_kb=", tostring(math.floor(collectgarbage("count"))))
+    local now=os.time()
+    local ownership=tostring(opt.access_ownership or book.access_ownership or "temporary")
+    local access_scope=tostring(opt.access_scope or "full")
+    -- A single downloaded chapter never proves whole-book entitlement. Unless
+    -- ownership is already permanent, keep it in the controlled/preview scope
+    -- so it cannot unlock an older full EPUB.
+    if standalone and ownership~="purchased" and ownership~="personal_upload" then
+        access_scope="preview"
+    end
+    if access_scope=="preview" then ownership="temporary" end
+    local storage_kind=(access_scope=="preview" and not standalone) and ("preview_"..kind) or kind
+    local valid_until=(ownership=="purchased" or ownership=="personal_upload") and nil
+        or (now+(tonumber(Config.ACCESS_VERIFY_TTL) or 10*60))
     local built, build_error = pcall(Epub.build, temp_path, book, chapters, css, assets, cover, {
-        schema=6, book_id=book.bookId, title=book.title, author=book.author,
-        variant=kind, standalone=standalone, chapter_uid=opt.chapter_uid,
-        chapters=map, generated_at=os.time(), complete=true,
+        schema=7, book_id=book.bookId, title=book.title, author=book.author,
+        variant=storage_kind, base_variant=kind, standalone=standalone, chapter_uid=opt.chapter_uid,
+        chapters=map, generated_at=now, complete=true,
+        ownership=ownership, ownership_source=opt.access_ownership_source or book.access_ownership_source, access_scope=access_scope,
+        account_vid=opt.access_account_vid or book.access_account_vid,
+        verified_at=now, valid_until=valid_until,
+        access_policy_version=tonumber(Config.ACCESS_POLICY_VERSION) or 2,
+        catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
+        readable_count=tonumber(opt.readable_chapter_count) or #chapters,
+        restricted_count=tonumber(opt.restricted_chapter_count) or 0,
+        preview_mode=access_scope=="preview" and preview_mode or nil,
+        failed_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
+        guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
         internal_links={links=link_stats.links or 0, rewritten=link_stats.rewritten or 0,
             unresolved=link_stats.unresolved or 0, critical=link_stats.unresolved_critical or 0},
     })
@@ -608,7 +670,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     logger.info("[MiuRead][Download] low-memory EPUB package completed",
         "bytes=", tostring(U.file_size(temp_path) or 0),
         "memory_kb=", tostring(math.floor(collectgarbage("count"))))
-    local valid, validation_error = validate_epub(temp_path, expected_chapter_count)
+    local valid, validation_error = validate_epub(temp_path, #chapters)
     if not valid then
         os.remove(temp_path)
         error("EPUB 完整性验证失败：" .. tostring(validation_error))
@@ -647,21 +709,45 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
 
     local record = {
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
-        file=path, directory=dir, variant=kind, downloaded_at=os.time(),
+        file=path, directory=dir, variant=storage_kind, base_variant=kind, downloaded_at=now,
         chapter_count=#chapters, expected_chapter_count=expected_chapter_count,
-        chapter_map=map, failures={}, complete=true, file_size=U.file_size(path) or U.file_size(pending_path),
+        catalog_chapter_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
+        readable_chapter_count=tonumber(opt.readable_chapter_count) or #chapters,
+        restricted_chapter_count=tonumber(opt.restricted_chapter_count) or 0,
+        failed_chapter_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
+        preview_mode=access_scope=="preview" and preview_mode or nil,
+        access_scope=access_scope, ownership=ownership,
+        ownership_source=opt.access_ownership_source or book.access_ownership_source,
+        access_policy_version=tonumber(Config.ACCESS_POLICY_VERSION) or 2,
+        account_vid=opt.access_account_vid or book.access_account_vid,
+        verified_at=now, valid_until=valid_until,
+        guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
+        chapter_map=map, failures=U.copy(failures or {}), complete=true, file_size=U.file_size(path) or U.file_size(pending_path),
         pending_install=defer_install or nil,
         pending_file=pending_path,
     }
     if standalone then
         record.chapter_uid = tostring(opt.chapter_uid)
-        self.store:save_chapter_variant(book.bookId, opt.chapter_uid, kind, record)
+        self.store:save_chapter_variant(book.bookId, opt.chapter_uid, storage_kind, record)
     else
-        self.store:save_variant(book.bookId, kind, record)
+        self.store:save_variant(book.bookId, storage_kind, record)
     end
     self.store:save_book(book.bookId, {
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
-        directory=dir, updated_at=os.time(), catalog=map,
+        directory=dir, updated_at=now, catalog=map,
+        access={
+            ownership=ownership, ownership_source=opt.access_ownership_source or book.access_ownership_source, access_scope=access_scope,
+            account_vid=opt.access_account_vid or book.access_account_vid,
+            shelf_present=true, status="allowed", verified_at=now, valid_until=valid_until,
+            policy_version=tonumber(Config.ACCESS_POLICY_VERSION) or 2,
+            catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
+            readable_count=tonumber(opt.readable_chapter_count) or #chapters,
+            restricted_count=tonumber(opt.restricted_chapter_count) or 0,
+            failed_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
+            preview_mode=access_scope=="preview" and preview_mode or nil,
+            guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
+            lock_reason=nil,
+        },
     })
     if session then
         self.store:save_session(book.bookId, {
@@ -738,7 +824,7 @@ function Downloader:book(input, opt, progress)
         local format = catalog.format == "txt" and "txt" or "epub"
         local cache = cache_new(self.store, book, opt, selected, format)
         session = cache.manifest.session
-        local failure_map = {}
+        local failure_map, restricted_map = {}, {}
         local function chapter_uid(chapter)
             return tostring(chapter and (chapter.chapterUid or chapter.uid) or "")
         end
@@ -772,6 +858,22 @@ function Downloader:book(input, opt, progress)
             cache.manifest.chapters[uid] = failed_entry
             cache_save(cache)
             return false
+        end
+
+        local function mark_restricted(chapter, message)
+            local uid=tostring(chapter.chapterUid or chapter.uid)
+            restricted_map[uid]={uid=uid,title=chapter.title,error=tostring(message)}
+            failure_map[uid]=nil
+            local entry=cache.manifest.chapters[uid] or {uid=uid,title=chapter.title}
+            entry.restricted=true
+            entry.restricted_error=tostring(message)
+            entry.error=nil
+            entry.complete=false
+            cache.manifest.chapters[uid]=entry
+            cache_save(cache)
+            logger.info("[MiuRead][Download] chapter limited by official preview",
+                "chapter=",uid,"title=",tostring(chapter.title or ""))
+            return true
         end
 
         local function process_one(chapter, index, retry_round)
@@ -811,6 +913,7 @@ function Downloader:book(input, opt, progress)
                     local valid,validation_error=validate_cached_chapter(cached_path)
                     if valid then
                         failure_map[uid] = nil
+                        restricted_map[uid] = nil
                         return true
                     end
                     cached_style="完成章节结构无效："..tostring(validation_error)
@@ -835,7 +938,13 @@ function Downloader:book(input, opt, progress)
                 progress("content", index, expected, chapter.title)
                 local ok, downloaded, downloaded_style, downloaded_assets, state = pcall(
                     self.reader.chapter, self.reader, book, chapter, format, {images=opt.images})
-                if not ok then return mark_failure(chapter, downloaded) end
+                if not ok then
+                    if not opt.chapter_uid and type(self.reader.is_access_denied_error)=="function"
+                        and self.reader.is_access_denied_error(downloaded) then
+                        return mark_restricted(chapter, downloaded)
+                    end
+                    return mark_failure(chapter, downloaded)
+                end
                 if state and (state.psvts or state.pclts or state.token or state.url) then
                     session = state
                 end
@@ -899,6 +1008,7 @@ function Downloader:book(input, opt, progress)
             local final_path, final_error = cache_load_final_source(cache, entry)
             if not final_path then return mark_failure(chapter, final_error) end
             failure_map[uid] = nil
+            restricted_map[uid] = nil
             body, annotation, new_assets = nil, nil, nil
             collectgarbage("collect")
             return true
@@ -929,7 +1039,10 @@ function Downloader:book(input, opt, progress)
             local uid = tostring(chapter.chapterUid or chapter.uid)
             local entry = cache.manifest.chapters[uid]
             local final_path, final_style, final_assets = cache_load_final_source(cache, entry)
-            if final_path then
+            if restricted_map[uid] then
+                -- Official preview limits are intentionally omitted. They are
+                -- not download failures and must not create empty chapters.
+            elseif final_path then
                 append_entry(chapters, assets, css_list, css_seen, entry, {path=final_path}, final_style, final_assets, index)
                 if opt.annotations then
                     annotation_summary.chapters_ok = annotation_summary.chapters_ok + 1
@@ -949,11 +1062,47 @@ function Downloader:book(input, opt, progress)
         annotation_summary.chapters_failed = opt.annotations and #failures or 0
         for _, item in ipairs(failures) do annotation_summary.errors[#annotation_summary.errors + 1] = item end
 
-        if #chapters ~= expected or #failures > 0 then
-            error(failure_message(failures, expected, #chapters, true))
+        local restricted_count=0
+        for _ in pairs(restricted_map) do restricted_count=restricted_count+1 end
+        local accessible_expected=expected-restricted_count
+        local preview=restricted_count>0
+        local readable_count=#chapters
+        local guard_uid=chapters[#chapters] and chapters[#chapters].uid or nil
+        local preview_mode="complete"
+
+        if not preview then
+            if #chapters ~= accessible_expected or #failures > 0 then
+                error(failure_message(failures, accessible_expected, #chapters, true))
+            end
+        elseif readable_count<accessible_expected or #failures>0 then
+            preview_mode=readable_count>0 and "partial" or "info"
+            local body,title=preview_information_chapter(book,preview_mode,expected,readable_count,restricted_count,failures)
+            chapters[#chapters+1]={
+                title=title,body=body,uid="miuread-preview-info",index=expected+1,
+                word_count=#plain(body),structural=true,
+            }
+        elseif readable_count<=0 then
+            preview_mode="info"
+            local body,title=preview_information_chapter(book,preview_mode,expected,0,restricted_count,failures)
+            chapters[#chapters+1]={
+                title=title,body=body,uid="miuread-preview-info",index=expected+1,
+                word_count=#plain(body),structural=true,
+            }
         end
-        progress("package", #chapters, expected, book.title)
-        opt.expected_chapter_count = expected
+
+        progress("package", #chapters, math.max(1,accessible_expected), book.title, {
+            message=preview and (preview_mode=="info" and "正在生成试读信息版"
+                or (preview_mode=="partial" and ("正在生成部分试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章")
+                or ("正在生成官方试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章"))) or nil,
+        })
+        opt.expected_chapter_count = accessible_expected
+        opt.catalog_chapter_count = expected
+        opt.readable_chapter_count = readable_count
+        opt.restricted_chapter_count = restricted_count
+        opt.failed_chapter_count = #failures
+        opt.access_scope = preview and "preview" or "full"
+        opt.preview_mode = preview and preview_mode or nil
+        opt.guard_chapter_uid = guard_uid
         opt.checkpointed = true
         local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session)
         record.annotation_summary = annotation_summary

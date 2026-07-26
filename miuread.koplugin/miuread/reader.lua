@@ -56,7 +56,7 @@ local function find_context(value, depth, seen)
     local pclts = optional_value(value.pclts)
     local token = optional_value(value.token)
     if psvts or pclts or token then
-        return {psvts=psvts, pclts=pclts, token=token, book=value.bookInfo or value.book or {}}
+        return {psvts=psvts, pclts=pclts, token=token, book=value.bookInfo or value.book or {}, source=value}
     end
     for _, key in ipairs({"reader", "data", "result", "state", "readerState", "initialState", "payload", "book"}) do
         local found = find_context(value[key], (depth or 0) + 1, seen)
@@ -191,6 +191,34 @@ end
 
 local function is_auth_error(value)
     return Http.is_auth_error(value)
+end
+
+-- Only explicit service-side permission messages are treated as preview or
+-- entitlement limits. Network, login and decoding failures must never be
+-- downgraded into a preview book.
+local function is_access_denied_error(value)
+    if is_auth_error(value) then return false end
+    local text=tostring(value or "")
+    local lower=text:lower()
+    local markers={
+        "permission denied", "access denied", "not authorized", "not authorised",
+        "not entitled", "purchase required", "preview only", "trial only",
+        "subscription required", "membership required", "not available for reading",
+    }
+    for _,marker in ipairs(markers) do
+        if lower:find(marker,1,true) then return true end
+    end
+    local zh={
+        "无阅读权限", "没有阅读权限", "暂无阅读权限", "无权阅读",
+        "仅支持试读", "仅可试读", "只能试读", "试读结束",
+        "需要购买", "请购买后阅读", "购买后可读",
+        "会员已过期", "会员到期", "需要会员", "开通会员后阅读",
+        "不在可读范围", "本章暂不可读", "该章节暂不可读",
+    }
+    for _,marker in ipairs(zh) do
+        if text:find(marker,1,true) then return true end
+    end
+    return false
 end
 
 local function login_page_error(html, final_url)
@@ -571,13 +599,25 @@ function Reader:state(book_id, chapter_uid)
     -- exact path before recursively searching nested JSON nodes, which may
     -- contain stale preview/session objects with different tokens.
     local context = regex_context(html)
-    if not optional_value(context.psvts) then
-        local raw = Util.extract_balanced_json(html, "window.__INITIAL_STATE__")
-            or Util.extract_balanced_json(html, "__INITIAL_STATE__")
-        if raw then
-            local ok, data = pcall(Json.decode, raw)
-            if ok then context = find_context(data) or context end
+    local raw = Util.extract_balanced_json(html, "window.__INITIAL_STATE__")
+        or Util.extract_balanced_json(html, "__INITIAL_STATE__")
+    if raw then
+        local decoded, data = pcall(Json.decode, raw)
+        if decoded then
+            local parsed = find_context(data)
+            if parsed then
+                context.psvts = optional_value(context.psvts) or parsed.psvts
+                context.pclts = optional_value(context.pclts) or parsed.pclts
+                context.token = optional_value(context.token) or parsed.token
+                context.book = parsed.book or context.book or {}
+                context.source = data
+            end
         end
+    end
+    if html:find("可永久阅读",1,true) then context.ownership_hint="可永久阅读" end
+    if html:find("书币购买或活动领取",1,true) then context.ownership_hint="书币购买或活动领取" end
+    if html:find("个人上传",1,true) or html:find("用户上传",1,true) then
+        context.ownership_hint="个人上传"
     end
     context.url = url
     if not optional_value(context.psvts) then error("reader.psvts not found") end
@@ -918,6 +958,7 @@ Reader._is_structure_chapter = is_structure_chapter
 Reader._is_cover_chapter = is_cover_chapter
 Reader._is_unavailable_chapter = is_unavailable_chapter
 Reader._has_readable_content = has_readable_content
+Reader.is_access_denied_error = is_access_denied_error
 Reader._is_empty_error = is_empty_error
 Reader._is_auth_error = is_auth_error
 Reader._image_source_keys = image_source_keys

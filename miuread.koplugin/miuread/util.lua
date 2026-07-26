@@ -70,8 +70,41 @@ function U.clamp(v,a,b) v=tonumber(v) or a; if v<a then return a elseif v>b then
 function U.percent(n,d) d=tonumber(d) or 0; if d<=0 then return 0 end return math.floor(U.clamp((tonumber(n) or 0)*100/d,0,100)+.5) end
 function U.now_text(t) t=tonumber(t) or 0; return t>0 and os.date("%Y-%m-%d %H:%M:%S",t) or "—" end
 function U.shell_quote(s) return "'"..tostring(s):gsub("'","'\\''").."'" end
-function U.semver_newer(a,b)
-    local function parts(v) local o={}; for n in tostring(v):gmatch("%d+") do o[#o+1]=tonumber(n) end return o end
-    local x,y=parts(a),parts(b); for i=1,math.max(#x,#y) do local p,q=x[i] or 0,y[i] or 0; if p~=q then return p>q end end; return false
+local function semver_parse(value)
+    local major, minor, patch, pre = tostring(value or ""):match("^v?(%d+)%.(%d+)%.(%d+)(.*)$")
+    if not major then return nil end
+    local out={major=tonumber(major),minor=tonumber(minor),patch=tonumber(patch),pre={}}
+    pre=tostring(pre or ""):gsub("^[%-+]","")
+    if pre~="" then
+        pre=pre:match("^[^+]+") or pre
+        for part in pre:gmatch("[^%.]+") do
+            local number=part:match("^%d+$") and tonumber(part) or nil
+            out.pre[#out.pre+1]=number or tostring(part):lower()
+        end
+    end
+    return out
 end
+function U.semver_compare(a,b)
+    local x,y=semver_parse(a),semver_parse(b)
+    if not x or not y then return tostring(a)==tostring(b) and 0 or (tostring(a)>tostring(b) and 1 or -1) end
+    for _,key in ipairs({"major","minor","patch"}) do
+        if x[key]~=y[key] then return x[key]>y[key] and 1 or -1 end
+    end
+    if #x.pre==0 and #y.pre==0 then return 0 end
+    if #x.pre==0 then return 1 end
+    if #y.pre==0 then return -1 end
+    for index=1,math.max(#x.pre,#y.pre) do
+        local p,q=x.pre[index],y.pre[index]
+        if p==nil then return -1 end
+        if q==nil then return 1 end
+        if p~=q then
+            if type(p)=="number" and type(q)=="number" then return p>q and 1 or -1 end
+            if type(p)=="number" then return -1 end
+            if type(q)=="number" then return 1 end
+            return tostring(p)>tostring(q) and 1 or -1
+        end
+    end
+    return 0
+end
+function U.semver_newer(a,b) return U.semver_compare(a,b)>0 end
 return U

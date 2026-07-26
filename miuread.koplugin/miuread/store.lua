@@ -8,7 +8,7 @@ local Store={}; Store.__index=Store
 local defaults={
  schema=Config.SCHEMA,
  auth={api_key="",cookies={},account={name="",vid="",logged_at=0}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=true,download_complete_notice=true,show_annotations=true,annotation_mode="all",low_resource=false,download_dir="",shelf_sort="read",shelf_scope="all",shelf_view="compact",shelf_filters={},shelf_section="account",account_shelf_kind="books",account_shelf_sort="read",account_shelf_scope="all",generated_shelf_sort="opened",generated_shelf_scope="all",thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=true,progress_enabled=true,progress_notice_mode="first",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=true,download_complete_notice=true,download_dir="",shelf_sort="read",shelf_scope="all",shelf_view="compact",shelf_filters={},shelf_section="account",account_shelf_kind="books",account_shelf_sort="read",account_shelf_scope="all",generated_shelf_sort="opened",generated_shelf_scope="all",thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=true,progress_enabled=true,progress_notice_mode="first",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
@@ -273,6 +273,72 @@ function Store:migrate()
             self.db:saveSetting("pending_installs",pending)
             self.db:saveSetting("last_cleanup_result",{})
         end
+        if schema<37 then
+            -- Add a non-destructive access state to existing generated books.
+            -- Old files remain readable until their first explicit verification;
+            -- no migration-time file move or lock is performed.
+            local library=self.db:readSetting("library",{}) or {}
+            for _,book in pairs(library) do
+                if type(book)=="table" and type(book.access)~="table" then
+                    book.access={
+                        ownership="unknown",access_scope="unknown",status="unverified",
+                        verified_at=0,valid_until=0,shelf_present=nil,
+                    }
+                end
+            end
+            self.db:saveSetting("library",library)
+        end
+        if schema<39 then
+            -- beta.2 replaces the old five-day absolute deadlines with the
+            -- current beta policy. Old EPUB metadata must not restore those
+            -- deadlines after the library has migrated.
+            p.low_resource=nil
+            p.annotation_mode=nil
+            p.show_annotations=nil
+            local library=self.db:readSetting("library",{}) or {}
+            local now=os.time()
+            local ttl=tonumber(Config.ACCESS_VERIFY_TTL) or 10*60
+            local policy=tonumber(Config.ACCESS_POLICY_VERSION) or 2
+            local function migrate_record(record,access)
+                if type(record)~="table" then return end
+                record.access_policy_version=policy
+                record.ownership=record.ownership or access.ownership
+                record.verified_at=tonumber(record.verified_at) or tonumber(access.verified_at) or 0
+                if access.ownership=="purchased" or access.ownership=="personal_upload" then
+                    record.valid_until=0
+                else
+                    record.valid_until=tonumber(access.valid_until) or 0
+                end
+            end
+            for _,book in pairs(library) do
+                if type(book)=="table" then
+                    local access=type(book.access)=="table" and book.access or {
+                        ownership="unknown",access_scope="unknown",status="unverified",
+                        verified_at=0,valid_until=0,shelf_present=nil,
+                    }
+                    local ownership=tostring(access.ownership or "unknown")
+                    local verified=tonumber(access.verified_at) or 0
+                    access.policy_version=policy
+                    if ownership=="purchased" or ownership=="personal_upload" then
+                        access.valid_until=0
+                        access.status="allowed"
+                        access.lock_reason=""
+                    else
+                        local deadline=verified>0 and (verified+ttl) or 0
+                        access.valid_until=deadline>now and deadline or 0
+                        if access.status~="blocked" and access.status~="restricted" then
+                            access.status=access.valid_until>0 and "allowed" or "expired"
+                        end
+                    end
+                    book.access=access
+                    for _,record in pairs(book.variants or {}) do migrate_record(record,access) end
+                    for _,row in pairs(book.chapters or {}) do
+                        for _,record in pairs(row or {}) do migrate_record(record,access) end
+                    end
+                end
+            end
+            self.db:saveSetting("library",library)
+        end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)
     end
@@ -500,6 +566,35 @@ function Store:epub_identity(path)
     return nil
 end
 
+local function access_from_epub_meta(meta)
+    if type(meta)~="table" then return nil end
+    local ownership=tostring(meta.ownership or "")
+    local scope=tostring(meta.access_scope or "")
+    local verified=tonumber(meta.verified_at) or 0
+    local policy=tonumber(meta.access_policy_version or meta.policy_version) or 0
+    local current_policy=tonumber(Config.ACCESS_POLICY_VERSION) or 2
+    local permanent=ownership=="purchased" or ownership=="personal_upload"
+    local valid=tonumber(meta.valid_until) or 0
+    if not permanent and policy<current_policy then valid=0 end
+    if ownership=="" and scope=="" and verified==0 and valid==0 then return nil end
+    return {
+        ownership=ownership~="" and ownership or "unknown",
+        ownership_source=tostring(meta.ownership_source or "epub_metadata"),
+        access_scope=scope~="" and scope or "unknown",
+        account_vid=tostring(meta.account_vid or ""),
+        status=(permanent or valid>os.time()) and "allowed" or "unverified",
+        verified_at=verified,
+        valid_until=permanent and 0 or valid,
+        policy_version=current_policy,
+        shelf_present=true,
+        catalog_count=tonumber(meta.catalog_count) or 0,
+        readable_count=tonumber(meta.readable_count) or 0,
+        restricted_count=tonumber(meta.restricted_count) or 0,
+        guard_chapter_uid=meta.guard_chapter_uid,
+        lock_reason=scope=="preview" and "preview_only" or "",
+    }
+end
+
 function Store:identify_file(path,relink)
     if not path then return nil end
     local normalized=normalize_path(path)
@@ -534,6 +629,7 @@ function Store:identify_file(path,relink)
     end
 
     local meta=self:epub_identity(path)
+    local meta_access=access_from_epub_meta(meta)
     -- For older files without embedded identity, a harmless spacing-only rename
     -- can still be repaired. Relink only one unambiguous filename candidate.
     local wanted_name=filename_key(path)
@@ -572,12 +668,33 @@ function Store:identify_file(path,relink)
     local record
 
     if b then
+        if meta_access then
+            local existing=type(b.access)=="table" and b.access or {}
+            local current_policy=tonumber(Config.ACCESS_POLICY_VERSION) or 2
+            if tonumber(existing.policy_version or 0)<current_policy then
+                b.access=U.merge(existing,meta_access)
+            elseif (existing.ownership==nil or existing.ownership=="unknown")
+                and (meta_access.ownership=="purchased" or meta_access.ownership=="personal_upload") then
+                existing.ownership=meta_access.ownership
+                existing.valid_until=0
+                existing.status="allowed"
+                b.access=existing
+            end
+        end
         if standalone then
             local row=uid~="" and b.chapters and b.chapters[uid] or nil
             record=row and (row[kind] or row.notes or row.clean)
             if record then record.chapter_uid=uid end
         else
             record=b.variants and (b.variants[kind] or b.variants.notes or b.variants.clean)
+        end
+        if record and meta_access then
+            record.ownership=record.ownership or meta_access.ownership
+            record.access_scope=record.access_scope or meta_access.access_scope
+            record.account_vid=record.account_vid or meta_access.account_vid
+            record.verified_at=tonumber(record.verified_at) or meta_access.verified_at
+            record.valid_until=tonumber(record.valid_until) or meta_access.valid_until
+            record.guard_chapter_uid=record.guard_chapter_uid or meta_access.guard_chapter_uid
         end
         -- Metadata proves the book identity. If its old library row is missing,
         -- recover a minimal row instead of treating the EPUB as an external book.
@@ -587,6 +704,14 @@ function Store:identify_file(path,relink)
                 file=path,directory=path:match("^(.*)/[^/]+$"),variant=kind,
                 downloaded_at=tonumber(meta.generated_at) or os.time(),chapter_map=chapters,
                 chapter_count=#chapters,complete=meta.complete~=false,file_size=current_size,
+                ownership=meta_access and meta_access.ownership or nil,
+                ownership_source=meta_access and meta_access.ownership_source or nil,
+                access_policy_version=meta_access and meta_access.policy_version or nil,
+                access_scope=meta_access and meta_access.access_scope or nil,
+                account_vid=meta_access and meta_access.account_vid or nil,
+                verified_at=meta_access and meta_access.verified_at or nil,
+                valid_until=meta_access and meta_access.valid_until or nil,
+                guard_chapter_uid=meta_access and meta_access.guard_chapter_uid or nil,
             }
             if standalone and uid~="" then
                 record.chapter_uid=uid
@@ -600,12 +725,21 @@ function Store:identify_file(path,relink)
             book_id=id,title=meta.title or tostring(basename(path) or id):gsub("%.epub$",""),
             author=meta.author or "",variants={},chapters={},catalog=chapters,
             directory=path:match("^(.*)/[^/]+$"),updated_at=os.time(),recovered=true,
+            access=meta_access,
         }
         record={
             book_id=id,title=b.title,author=b.author,file=path,directory=b.directory,
             variant=kind,downloaded_at=tonumber(meta.generated_at) or os.time(),
             chapter_map=chapters,chapter_count=#chapters,complete=meta.complete~=false,
             file_size=current_size,recovered=true,
+            ownership=meta_access and meta_access.ownership or nil,
+            ownership_source=meta_access and meta_access.ownership_source or nil,
+            access_policy_version=meta_access and meta_access.policy_version or nil,
+            access_scope=meta_access and meta_access.access_scope or nil,
+            account_vid=meta_access and meta_access.account_vid or nil,
+            verified_at=meta_access and meta_access.verified_at or nil,
+            valid_until=meta_access and meta_access.valid_until or nil,
+            guard_chapter_uid=meta_access and meta_access.guard_chapter_uid or nil,
         }
         if standalone and uid~="" then
             record.chapter_uid=uid; b.chapters[uid]={[kind]=record}

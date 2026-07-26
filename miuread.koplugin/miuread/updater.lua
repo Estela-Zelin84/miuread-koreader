@@ -80,6 +80,12 @@ local function validate_manifest(m)
     if type(m)~="table" or type(m.version)~="string" or m.version=="" then
         return nil,"更新清单缺少版本号"
     end
+    local expected_channel=tostring(Config.UPDATE_CHANNEL or "stable")
+    local manifest_channel=tostring(m.channel or "")
+    if manifest_channel=="" and expected_channel=="stable" then manifest_channel="stable" end
+    if manifest_channel~=expected_channel then
+        return nil,"更新清单通道不匹配：当前为"..expected_channel.."，清单为"..(manifest_channel~="" and manifest_channel or "未标记")
+    end
     if m.package_type~=nil and tostring(m.package_type)~="full" then
         return nil,"更新清单不是全量包"
     end
@@ -191,6 +197,15 @@ function Updater:install(path,manifest)
     local incoming=unpacked.."/miuread.koplugin"
     if not U.file_exists(incoming.."/main.lua") or not U.file_exists(incoming.."/_meta.lua") then
         U.remove_tree(stage); return nil,"更新包缺少 miuread.koplugin 或插件文件不完整"
+    end
+    local incoming_config=U.read_file(incoming.."/miuread/config.lua",true) or ""
+    local incoming_version=incoming_config:match('VERSION%s*=%s*["\']([^"\']+)["\']')
+    local incoming_channel=incoming_config:match('UPDATE_CHANNEL%s*=%s*["\']([^"\']+)["\']') or "stable"
+    if tostring(incoming_version or "")~=tostring(manifest.version or "") then
+        U.remove_tree(stage); return nil,"更新包版本与清单不一致"
+    end
+    if tostring(incoming_channel)~=tostring(Config.UPDATE_CHANNEL or "stable") then
+        U.remove_tree(stage); return nil,"更新包通道不匹配，已拒绝安装"
     end
     local roots=U.list(unpacked)
     if #roots~=1 or roots[1]~=incoming then

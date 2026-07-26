@@ -203,8 +203,8 @@ local function record_state(row)
                 if is_final then
                     downloaded=true
                     total_size=total_size+(tonumber(U.file_size(file)) or 0)
-                    if kind=="clean" then has_clean=true end
-                    if kind=="notes" then has_notes=true end
+                    if kind=="clean" or kind=="preview_clean" then has_clean=true end
+                    if kind=="notes" or kind=="preview_notes" then has_notes=true end
                 else
                     partial_downloaded=true
                 end
@@ -265,6 +265,7 @@ function Library:local_books(library_snapshot,sessions_snapshot)
                 fileSize=state.file_size,
                 hasClean=state.has_clean,
                 hasNotes=state.has_notes,
+                access=U.copy(row.access or {}),
                 local_record=row,
             }
             if b.bookId~="" then
@@ -296,6 +297,7 @@ local function merge_local_metadata(remote,local_book)
     remote.fileSize=tonumber(local_book.fileSize or 0) or 0
     remote.hasClean=local_book.hasClean==true
     remote.hasNotes=local_book.hasNotes==true
+    remote.access=U.copy(local_book.access or {})
     remote.local_record=local_book.local_record
     if (tonumber(remote.progress or 0) or 0)<=0 then remote.progress=local_book.progress end
     return remote
