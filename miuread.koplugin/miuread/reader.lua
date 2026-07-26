@@ -590,38 +590,41 @@ function Reader:_recover_login_session()
     return false, result
 end
 
-function Reader:state(book_id, chapter_uid)
-    local url = Protocol.is_mp(book_id) and Protocol.mp_reader_url(book_id) or Protocol.reader_url(book_id, chapter_uid)
-    local html, _, final_url = self.http:download(url, {headers={Accept="text/html,application/xhtml+xml"}, retries=3})
-    local page_error = login_page_error(html, final_url)
+local function load_reader_context(self,book_id,chapter_uid,require_psvts)
+    local url=Protocol.is_mp(book_id) and Protocol.mp_reader_url(book_id) or Protocol.reader_url(book_id,chapter_uid)
+    local html,_,final_url=self.http:download(url,{headers={Accept="text/html,application/xhtml+xml"},retries=2})
+    local page_error=login_page_error(html,final_url)
     if page_error then error(page_error) end
-    -- Prefer the top-level reader-page fields when they are available.
-    -- exact path before recursively searching nested JSON nodes, which may
-    -- contain stale preview/session objects with different tokens.
-    local context = regex_context(html)
-    local raw = Util.extract_balanced_json(html, "window.__INITIAL_STATE__")
-        or Util.extract_balanced_json(html, "__INITIAL_STATE__")
+    local context=regex_context(html)
+    local raw=Util.extract_balanced_json(html,"window.__INITIAL_STATE__")
+        or Util.extract_balanced_json(html,"__INITIAL_STATE__")
     if raw then
-        local decoded, data = pcall(Json.decode, raw)
+        local decoded,data=pcall(Json.decode,raw)
         if decoded then
-            local parsed = find_context(data)
+            local parsed=find_context(data)
             if parsed then
-                context.psvts = optional_value(context.psvts) or parsed.psvts
-                context.pclts = optional_value(context.pclts) or parsed.pclts
-                context.token = optional_value(context.token) or parsed.token
-                context.book = parsed.book or context.book or {}
-                context.source = data
+                context.psvts=optional_value(context.psvts) or parsed.psvts
+                context.pclts=optional_value(context.pclts) or parsed.pclts
+                context.token=optional_value(context.token) or parsed.token
+                context.book=parsed.book or context.book or {}
+                context.source=data
             end
         end
     end
     if html:find("可永久阅读",1,true) then context.ownership_hint="可永久阅读" end
     if html:find("书币购买或活动领取",1,true) then context.ownership_hint="书币购买或活动领取" end
-    if html:find("个人上传",1,true) or html:find("用户上传",1,true) then
-        context.ownership_hint="个人上传"
-    end
-    context.url = url
-    if not optional_value(context.psvts) then error("reader.psvts not found") end
+    if html:find("个人上传",1,true) or html:find("用户上传",1,true) then context.ownership_hint="个人上传" end
+    context.url=url
+    if require_psvts and not optional_value(context.psvts) then error("reader.psvts not found") end
     return context
+end
+
+function Reader:state(book_id,chapter_uid)
+    return load_reader_context(self,book_id,chapter_uid,true)
+end
+
+function Reader:access_state(book_id)
+    return load_reader_context(self,book_id,nil,false)
 end
 
 function Reader:catalog(book_id)

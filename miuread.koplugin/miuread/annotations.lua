@@ -1,5 +1,6 @@
 local logger = require("logger")
 local Thoughts = require("miuread.thoughts")
+local Http = require("miuread.http")
 local ok_socket, socket = pcall(require, "socket")
 
 local Annotations = {}
@@ -26,16 +27,17 @@ local function call_with_retry(label, fn)
         local ok, value = pcall(fn)
         if ok and type(value) == "table" then return true, value, false end
         last = ok and (label .. " returned invalid data") or tostring(value)
+        if Http.is_forbidden_error(last) then return false,last,false,"forbidden" end
         local network_down=is_network_failure(last)
         local max_attempts=network_down and 2 or 3
         if attempt < max_attempts then
             logger.warn("[MiuRead][Annotations] retry", "label=", label, "attempt=", tostring(attempt), "error=", tostring(last))
             pause(attempt == 1 and 0.6 or 1.4)
         else
-            return false,last,network_down
+            return false,last,network_down,nil
         end
     end
-    return false,last,is_network_failure(last)
+    return false,last,is_network_failure(last),nil
 end
 
 local function str(v) return v == nil and "" or tostring(v) end
@@ -143,10 +145,12 @@ function Annotations:new(api) return setmetatable({api = api}, self) end
 function Annotations:fetch_chapter(book_id, uid, progress)
     local result = {book_id=str(book_id),chapter_uid=str(uid),underlines={},review_map={},review_groups={},underline_count=0,thought_count=0,thought_entry_count=0,errors={},underline_request_ok=false}
     progress = progress or function() end
-    local ok, data = call_with_retry("underlines", function() return self.api:underlines(book_id, uid) end)
+    local ok, data, _, error_kind = call_with_retry("underlines", function() return self.api:underlines(book_id, uid) end)
     if not ok then
         local err = str(data)
         result.errors[#result.errors + 1] = err
+        result.forbidden = error_kind=="forbidden"
+        result.error_kind = error_kind
         logger.warn("[MiuRead][Annotations] underlines failed", "book=", result.book_id, "chapter=", result.chapter_uid, "error=", err)
         return result
     end
@@ -170,7 +174,7 @@ function Annotations:fetch_chapter(book_id, uid, progress)
     local batches = self.api:review_batches(ranges, 5)
     for index, batch in ipairs(batches) do
         progress("thoughts", index, #batches, "")
-        local good, response, network_down = call_with_retry("thoughts batch " .. tostring(index), function()
+        local good, response, network_down, thought_error_kind = call_with_retry("thoughts batch " .. tostring(index), function()
             return self.api:readreviews(book_id, uid, batch)
         end)
         if good then
@@ -182,6 +186,13 @@ function Annotations:fetch_chapter(book_id, uid, progress)
                     "batch=", tostring(index), "count=", tostring(invalid))
             end
         else
+            if thought_error_kind=="forbidden" then
+                result.forbidden=true
+                result.error_kind="forbidden"
+                result.errors[#result.errors+1]=str(response)
+                logger.warn("[MiuRead][Annotations] thoughts forbidden","book=",result.book_id,"chapter=",result.chapter_uid)
+                return result
+            end
             if network_down then
                 local err="batch "..tostring(index)..": "..str(response)
                 result.errors[#result.errors+1]=err

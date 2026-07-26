@@ -16,15 +16,18 @@ jobs:
 
     steps:
       - name: Check out beta
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
-          ref: beta
           fetch-depth: 0
 
       - name: Read beta identity
         shell: bash
         run: |
           set -euo pipefail
+          if [ "${GITHUB_REF_NAME}" != "beta" ]; then
+            echo "::error::请从 beta 分支运行此工作流，当前分支为 ${GITHUB_REF_NAME}"
+            exit 1
+          fi
           python3 - <<'PY'
           from pathlib import Path
           import re, sys
@@ -113,7 +116,7 @@ jobs:
               ],
               "size": len(payload),
               "sha256": hashlib.sha256(payload).hexdigest(),
-              "notes": "内测版：修复微信读书永久权益识别与旧5天数据迁移；验证周期保持10分钟；删除阅读第一章、低资源模式及重复维护入口，并继续支持锁定书自动验证解锁。",
+              "notes": "内测版：重做普通用户菜单，隐藏开发诊断与权限倒计时；合并可自定义手势；修复到期书未走验证、批注403反复续期、旧验证数据和Android后台下载恢复。",
           }
           Path("dist/update-beta.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           print(f"已生成：{output}")

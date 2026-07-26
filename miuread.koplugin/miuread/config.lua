@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "1.1.48-beta.2",
-    SCHEMA = 39,
+    VERSION = "1.1.48-beta.3",
+    SCHEMA = 40,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
@@ -32,7 +32,7 @@ local C = {
     -- beta builds use ten minutes so testers can exercise
     -- expiry, lock and recovery without changing the device clock.
     ACCESS_VERIFY_TTL = 10 * 60,
-    ACCESS_POLICY_VERSION = 2,
+    ACCESS_POLICY_VERSION = 3,
 
     -- Coalesce page-turn control snapshots. Reading position stays in memory
     -- and is written at most once per window; suspend/close still flushes now.

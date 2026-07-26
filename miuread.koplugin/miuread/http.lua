@@ -221,6 +221,10 @@ local function is_auth_error(value)
         or text:find("登录状态已失效", 1, true) ~= nil
 end
 
+local function is_forbidden_error(value)
+    return tostring(value or ""):lower():find("http 403",1,true)~=nil
+end
+
 function Http:json(opt)
     local text, code, headers, url = self:request(opt)
     text = text or ""
@@ -269,5 +273,6 @@ end
 Http.auth_error_code = auth_error_code
 Http.auth_error_message = auth_error_message
 Http.is_auth_error = is_auth_error
+Http.is_forbidden_error = is_forbidden_error
 
 return Http

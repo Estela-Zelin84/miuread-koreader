@@ -8,7 +8,7 @@ local Store={}; Store.__index=Store
 local defaults={
  schema=Config.SCHEMA,
  auth={api_key="",cookies={},account={name="",vid="",logged_at=0}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=true,download_complete_notice=true,download_dir="",shelf_sort="read",shelf_scope="all",shelf_view="compact",shelf_filters={},shelf_section="account",account_shelf_kind="books",account_shelf_sort="read",account_shelf_scope="all",generated_shelf_sort="opened",generated_shelf_scope="all",thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=true,progress_enabled=true,progress_notice_mode="first",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_sort="read",shelf_scope="all",shelf_view="compact",shelf_filters={},shelf_section="account",account_shelf_kind="books",account_shelf_sort="read",account_shelf_scope="all",generated_shelf_sort="opened",generated_shelf_scope="all",thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
@@ -334,6 +334,51 @@ function Store:migrate()
                     for _,record in pairs(book.variants or {}) do migrate_record(record,access) end
                     for _,row in pairs(book.chapters or {}) do
                         for _,record in pairs(row or {}) do migrate_record(record,access) end
+                    end
+                end
+            end
+            self.db:saveSetting("library",library)
+        end
+        if schema<40 then
+            -- beta.3 removes developer-only controls and reapplies the current
+            -- access policy without rewriting EPUB or reader sidecar files.
+            p.low_resource=nil
+            p.annotation_mode=nil
+            p.show_annotations=nil
+            p.download_notice_enabled=false
+            p.sync=p.sync or {}
+            p.sync.time_notice_enabled=false
+            p.sync.progress_notice_mode="off"
+            local library=self.db:readSetting("library",{}) or {}
+            local now=os.time()
+            local ttl=tonumber(Config.ACCESS_VERIFY_TTL) or 10*60
+            local policy=tonumber(Config.ACCESS_POLICY_VERSION) or 3
+            local function apply_record(record,access)
+                if type(record)~="table" then return end
+                record.access_policy_version=policy
+                record.ownership=access.ownership
+                record.verified_at=tonumber(access.verified_at) or 0
+                record.valid_until=tonumber(access.valid_until) or 0
+            end
+            for _,book in pairs(library) do
+                if type(book)=="table" then
+                    local access=type(book.access)=="table" and book.access or {}
+                    access.policy_version=policy
+                    local ownership=tostring(access.ownership or "unknown")
+                    if ownership=="purchased" or ownership=="personal_upload" then
+                        access.status="allowed"; access.valid_until=0; access.lock_reason=""
+                    else
+                        local verified=tonumber(access.verified_at) or 0
+                        local deadline=verified>0 and verified+ttl or 0
+                        access.valid_until=deadline>now and deadline or 0
+                        if access.status~="blocked" and access.status~="restricted" then
+                            access.status=access.valid_until>0 and "allowed" or "expired"
+                        end
+                    end
+                    book.access=access
+                    for _,record in pairs(book.variants or {}) do apply_record(record,access) end
+                    for _,row in pairs(book.chapters or {}) do
+                        for _,record in pairs(row or {}) do apply_record(record,access) end
                     end
                 end
             end

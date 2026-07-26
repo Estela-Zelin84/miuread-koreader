@@ -103,7 +103,8 @@ function Api:call(name, params, request_options)
     end
 
     local ok, data = pcall(request_once)
-    if not ok and Http.is_auth_error(data) and self.reader then
+    local annotation_endpoint=tostring(name)=="/book/underlines" or tostring(name)=="/book/readreviews"
+    if not ok and not annotation_endpoint and Http.is_auth_error(data) and self.reader then
         local recovered, recover_error = self.reader:_recover_login_session()
         logger.warn("[MiuRead][API] authentication recovery",
             "api=", tostring(name), "ok=", tostring(recovered),

@@ -825,12 +825,18 @@ function Downloader:book(input, opt, progress)
         local cache = cache_new(self.store, book, opt, selected, format)
         session = cache.manifest.session
         local failure_map, restricted_map = {}, {}
+        local annotation_forbidden=false
         local function chapter_uid(chapter)
             return tostring(chapter and (chapter.chapterUid or chapter.uid) or "")
         end
 
         local function fetch_annotation(chapter, report_progress)
             local uid=chapter_uid(chapter)
+            if annotation_forbidden then
+                return {book_id=tostring(book.bookId),chapter_uid=uid,underlines={},review_map={},review_groups={},
+                    underline_count=0,thought_count=0,thought_entry_count=0,underline_request_ok=false,
+                    forbidden=true,error_kind="forbidden",errors={"ANNOTATION_FORBIDDEN"}}
+            end
             local ok,annotation=pcall(self.annotations.fetch_chapter,self.annotations,
                 book.bookId,chapter.chapterUid or chapter.uid,function(stage,current,total)
                     if report_progress then report_progress(stage,current,total) end
@@ -842,6 +848,7 @@ function Downloader:book(input, opt, progress)
                     underline_request_ok=false,errors={tostring(annotation)},
                 }
             end
+            if annotation.forbidden==true then annotation_forbidden=true end
             if annotation.underline_request_ok and #(annotation.errors or {})==0 then
                 Thoughts.save(self.store,book.bookId,chapter.chapterUid or chapter.uid,annotation.review_groups)
             end
@@ -960,6 +967,9 @@ function Downloader:book(input, opt, progress)
                 annotation = fetch_annotation(chapter,function(stage,current,total)
                     progress(stage,index,expected,chapter.title,{batch=current,batches=total})
                 end)
+                if annotation.forbidden==true then
+                    error("ANNOTATION_FORBIDDEN：划线与想法暂时无法获取，可改为生成纯净版")
+                end
                 if not annotation.underline_request_ok or #(annotation.errors or {}) > 0 then
                     entry.annotation_done = false
                     entry.annotation_error = table.concat(annotation.errors or {}, "; ")

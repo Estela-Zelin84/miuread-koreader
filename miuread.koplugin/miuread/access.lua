@@ -12,13 +12,18 @@ local LOCK_SUFFIX = ".miuread-locked"
 local PERSONAL_KEYS = {
     isupload=true, isuploaded=true, uploaded=true, isprivateupload=true,
     ispersonal=true, isownbook=true, isselfuploaded=true, fromupload=true,
-    personalupload=true, userupload=true, isimported=true, imported=true,
+    personalupload=true, ispersonalupload=true, userupload=true, isuserupload=true, isimported=true, imported=true,
 }
 local PURCHASE_KEYS = {
     isbought=true, bought=true, ispurchased=true, purchased=true,
     isowned=true, owned=true, haspurchased=true, purchaseok=true,
     isbuy=true, hasbuy=true, hasbought=true, bookbought=true,
     isbookbought=true, isbookpurchased=true, purchasedbook=true,
+}
+local CLAIM_KEYS = {
+    activityclaimed=true, isactivityclaimed=true, claimed=true, isclaimed=true,
+    redeemed=true, isredeemed=true, received=true, isreceived=true,
+    freeclaimed=true, permanentclaimed=true, exchangeowned=true,
 }
 local PERMANENT_KEYS = {
     ispermanent=true, permanent=true, permanentaccess=true,
@@ -94,7 +99,7 @@ local function scan_ownership(value, depth, seen, path)
         local lower = type(key) == "string" and key:lower() or ""
         local field_path = path .. tostring(key)
         if PERSONAL_KEYS[lower] and truthy(item) then return "personal_upload", field_path end
-        if (PURCHASE_KEYS[lower] or PERMANENT_KEYS[lower]) and truthy(item) then
+        if (PURCHASE_KEYS[lower] or PERMANENT_KEYS[lower] or CLAIM_KEYS[lower]) and truthy(item) then
             return "purchased", field_path
         end
         if PURCHASE_STATUS_KEYS[lower] and (type(item)=="string" or type(item)=="number") then
@@ -228,47 +233,6 @@ function Access:first_record(book_or_id,wanted_scope,locked_only)
     return found
 end
 
-function Access:expire(book_id)
-    book_id=tostring(book_id or "")
-    if book_id=="" then return nil end
-    return self:_save(book_id,{
-        valid_until=0,
-        status="expired",
-        last_verify_error="",
-    })
-end
-
-function Access:diagnostic(book_id,record)
-    book_id=tostring(book_id or "")
-    local book=self.store:book(book_id) or {}
-    local access=type(book.access)=="table" and book.access or {}
-    local scope=record_scope(record or self:first_record(book_id,nil,false))
-    local lines={
-        "bookId："..book_id,
-        "书名："..tostring(book.title or ""),
-        "当前账号 VID："..self:_account_vid(),
-        "绑定账号 VID："..tostring(access.account_vid or ""),
-        "所有权："..tostring(access.ownership or "unknown"),
-        "识别来源："..tostring(access.ownership_source or "—"),
-        "权限策略："..tostring(access.policy_version or 0),
-        "文件范围："..tostring(scope or "unknown"),
-        "当前范围："..tostring(access.access_scope or "unknown"),
-        "状态："..tostring(access.status or "unknown"),
-        "是否锁定："..tostring(self:is_locked(book_id)),
-        "最近验证："..U.now_text(access.verified_at),
-        "下次验证："..U.now_text(access.valid_until),
-        "目录章节："..tostring(access.catalog_count or 0),
-        "取得正文："..tostring(access.readable_count or 0),
-        "受限章节："..tostring(access.restricted_count or 0),
-        "失败章节："..tostring(access.failed_count or 0),
-        "试读类型："..tostring(access.preview_mode or "—"),
-        "锁定原因："..tostring(access.lock_reason or "—"),
-        "最近错误："..tostring(access.last_verify_error or "—"),
-        "内测验证周期："..tostring(math.floor(TTL/60)).."分钟",
-    }
-    return table.concat(lines,"\n")
-end
-
 function Access:classify_ownership(...)
     for i = 1, select("#", ...) do
         local candidate = select(i, ...)
@@ -340,8 +304,9 @@ function Access:prepare_download(book)
     local chapter_ok, chapter_value = pcall(self.api.chapters, self.api, id)
     if chapter_ok then chapter_detail = chapter_value end
     local reader_context
-    local state_ok, state_value = pcall(self.reader.state, self.reader, id)
-    if state_ok then reader_context = state_value end
+    local state_ok, state_value = pcall(self.reader.access_state, self.reader, id)
+    if state_ok then reader_context = state_value
+    else logger.warn("[MiuRead][Access] reader rights unavailable","book=",id,"error=",U.first_line(state_value,160)) end
     local existing = (self.store:book(id) or {}).access or {}
     local ownership, ownership_source = self:_ownership(row, detail, existing, chapter_detail, reader_context)
     local now = os.time()
@@ -492,15 +457,34 @@ function Access:_probe(book_id, access, record)
     return nil, error_kind(value), tostring(value)
 end
 
+function Access:needs_verification(book_id,record)
+    local book=self.store:book(book_id)
+    if not book then return false end
+    local access=type(book.access)=="table" and book.access or {}
+    if access.ownership=="purchased" or access.ownership=="personal_upload" then return false end
+    if self:is_locked(book) then return true end
+    local current_vid=self:_account_vid()
+    local bound_vid=tostring(access.account_vid or "")
+    if bound_vid~="" and current_vid~=bound_vid then return true end
+    local status=tostring(access.status or "unverified")
+    if status~="allowed" then return true end
+    local scope=record_scope(record)
+    if scope=="full" and tostring(access.access_scope or "")~="full" then return true end
+    return (tonumber(access.valid_until or 0) or 0)<os.time()
+end
+
 function Access:verify_open(book_id, force, record)
     book_id = tostring(book_id or "")
     local book = self.store:book(book_id)
     if not book then return true, {status="external"} end
     local access = type(book.access) == "table" and U.copy(book.access) or {}
     local target_scope = record_scope(record)
+    logger.info("[MiuRead][Access] verify start","book=",book_id,"force=",tostring(force==true),
+        "status=",tostring(access.status or "unknown"),"ownership=",tostring(access.ownership or "unknown"))
 
     if access.ownership == "purchased" or access.ownership == "personal_upload" then
         self:unlock_book(book_id, "all")
+        logger.info("[MiuRead][Access] verify allowed","book=",book_id,"ownership=",tostring(access.ownership))
         return true, access
     end
 
@@ -544,9 +528,12 @@ function Access:verify_open(book_id, force, record)
     local chapter_ok, chapter_value = pcall(self.api.chapters, self.api, book_id)
     if chapter_ok then chapter_detail = chapter_value end
     local reader_context
-    local state_ok, state_value = pcall(self.reader.state, self.reader, book_id)
-    if state_ok then reader_context = state_value end
+    local state_ok, state_value = pcall(self.reader.access_state, self.reader, book_id)
+    if state_ok then reader_context = state_value
+    else logger.warn("[MiuRead][Access] reader rights unavailable","book=",book_id,"error=",U.first_line(state_value,160)) end
     local ownership, ownership_source = self:_ownership(row, detail, access, chapter_detail, reader_context)
+    logger.info("[MiuRead][Access] ownership result","book=",book_id,
+        "ownership=",tostring(ownership),"source=",tostring(ownership_source))
     if ownership == "purchased" or ownership == "personal_upload" then
         local saved = self:_save(book_id, {
             ownership=ownership,
@@ -561,6 +548,8 @@ function Access:verify_open(book_id, force, record)
             last_verify_error="",
         })
         self:unlock_book(book_id, "all")
+        logger.info("[MiuRead][Access] ownership classified","book=",book_id,
+            "ownership=",tostring(ownership),"source=",tostring(ownership_source))
         return true, saved
     end
 
@@ -648,39 +637,26 @@ end
 
 function Access:status_text(book_or_id)
     local book
-    if type(book_or_id) == "table" then
-        book = book_or_id.local_record or self.store:book(book_or_id.bookId or book_or_id.book_id)
+    if type(book_or_id)=="table" then
+        book=book_or_id.local_record or self.store:book(book_or_id.bookId or book_or_id.book_id)
     else
-        book = self.store:book(book_or_id)
+        book=self.store:book(book_or_id)
     end
-    local access = book and book.access or nil
-    if type(access) ~= "table" then return nil end
-    if access.ownership == "purchased" then return "【永久】微信读书" end
-    if access.ownership == "personal_upload" then return "【永久】个人上传" end
-    if access.lock_reason == "preview_only" then return "【已锁定】当前仅可试读 · 点击重新验证" end
-    if access.status == "blocked" then return "【已锁定】" .. reason_text(access.lock_reason) .. " · 点击重新验证" end
-    if access.status == "pending" or access.status == "restricted" then return "【待验证】需要联网" end
-    if access.access_scope == "preview" then
+    local access=book and book.access or nil
+    if type(access)~="table" then return nil end
+    if access.ownership=="personal_upload" then return "个人上传" end
+    if access.access_scope=="preview" or access.lock_reason=="preview_only" then
         local readable=tonumber(access.readable_count or 0) or 0
         local catalog=tonumber(access.catalog_count or 0) or 0
-        if access.preview_mode=="info" then return "【试读信息】暂未取得正文" end
-        if access.preview_mode=="partial" then
-            return "【试读·部分】已收录 "..tostring(readable).."/"..tostring(catalog).."章"
-        end
-        if catalog>0 then return "【试读】已收录 "..tostring(readable).."/"..tostring(catalog).."章" end
-        return "【试读】"
+        if access.preview_mode=="info" then return "试读信息" end
+        if catalog>0 then return "试读 · "..tostring(readable).."/"..tostring(catalog).."章" end
+        return "试读"
     end
-    local valid_until = tonumber(access.valid_until or 0) or 0
-    if valid_until > os.time() then
-        local remain=valid_until-os.time()
-        local span
-        if remain<3600 then span=tostring(math.max(1,math.ceil(remain/60))).."分钟后验证"
-        elseif remain<86400 then span=tostring(math.max(1,math.ceil(remain/3600))).."小时后验证"
-        else span=tostring(math.max(1,math.ceil(remain/86400))).."天后验证" end
-        return "【临时】完整版 · "..span
+    if access.status=="blocked" then return "当前不可阅读" end
+    if self:needs_verification(book.book_id or book.bookId,self:first_record(book,nil,false)) then
+        return "需要联网确认"
     end
-    if access.verified_at then return "【待验证】完整版" end
-    return "【临时】完整版"
+    return "微信读书"
 end
 
 Access.error_kind = error_kind

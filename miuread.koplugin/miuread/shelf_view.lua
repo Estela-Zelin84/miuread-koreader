@@ -94,17 +94,6 @@ function ShelfItem:init()
     }
 
     local h = self.dimen.h
-    if self.entry and self.entry._miu_verify_row then
-        local face=Font:getFace("cfont",math.min(20,Screen:scaleBySize(17)))
-        self._underline=UnderlineContainer:new{
-            dimen=self.dimen:copy(),linesize=Size.line.thin,
-            color=Blitbuffer.COLOR_DARK_GRAY,padding=0,vertical_align="center",
-            CenterContainer:new{dimen=Geom:new{w=self.dimen.w,h=h},
-                TextWidget:new{text="验证全部锁定书籍",face=face,bold=true}},
-        }
-        self[1]=self._underline
-        return
-    end
     if self.entry and (self.entry._miu_action_row or self.entry._miu_tab_row) then
         local divider = TextWidget:new{
             text="│",
@@ -155,13 +144,7 @@ function ShelfItem:init()
     if show_cover and not cover then cover=placeholder(cover_w,cover_h) end
 
     local gap = show_cover and Size.padding.large or 0
-    local retry_w = self.entry and self.entry.revalidate_callback
-        and math.max(Screen:scaleBySize(72), math.floor(self.dimen.w * .22)) or 0
-    local retry_gap = retry_w>0 and Size.padding.small or 0
-    local text_w = math.max(Screen:scaleBySize(96), self.dimen.w - cover_w - gap - retry_w - retry_gap - side * 2)
-    if retry_w>0 then
-        self.entry._miu_revalidate_start=math.max(.60,(self.dimen.w-retry_w-side)/math.max(1,self.dimen.w))
-    end
+    local text_w = math.max(Screen:scaleBySize(96), self.dimen.w - cover_w - gap - side * 2)
     local title = TextBoxWidget:new{
         text=tostring(self.entry.title or "未命名"),
         face=Font:getFace("cfont", math.min(22, Screen:scaleBySize(18))),
@@ -202,17 +185,6 @@ function ShelfItem:init()
         table.insert(row, HorizontalSpan:new{width=gap})
     end
     table.insert(row, LeftContainer:new{dimen=Geom:new{w=text_w, h=h}, text_group})
-    if retry_w>0 then
-        table.insert(row,HorizontalSpan:new{width=retry_gap})
-        table.insert(row,FrameContainer:new{
-            width=retry_w,
-            bordersize=Size.border.thin,
-            padding=Size.padding.small,
-            margin=0,
-            CenterContainer:new{dimen=Geom:new{w=retry_w-Size.padding.small*2,h=math.max(1,h-Size.padding.small*2)},
-                TextWidget:new{text="重新验证",face=Font:getFace("cfont",math.min(18,Screen:scaleBySize(15))),bold=true}},
-        })
-    end
     table.insert(row, HorizontalSpan:new{width=side})
 
     self._underline = UnderlineContainer:new{
@@ -250,6 +222,7 @@ function ShelfItem:onUnfocus()
 end
 
 local ShelfMenu = Menu:extend{
+    on_select_callback = nil,
     on_page_changed = nil,
     on_close_callback = nil,
     on_rendered_callback = nil,
@@ -258,15 +231,6 @@ local ShelfMenu = Menu:extend{
 }
 
 function ShelfMenu:onMenuSelect(entry, pos)
-    if entry and entry._miu_verify_row then
-        if entry.verify_callback then entry.verify_callback() end
-        return true
-    end
-    if entry and entry.revalidate_callback and pos and tonumber(pos.x)
-        and pos.x>=tonumber(entry._miu_revalidate_start or .78) then
-        entry.revalidate_callback()
-        return true
-    end
     if entry and (entry._miu_action_row or entry._miu_tab_row) then
         local callback
         if entry._miu_tab_row then
@@ -285,6 +249,10 @@ function ShelfMenu:onMenuSelect(entry, pos)
             callback=entry.sort_callback or entry.search_callback
         end
         if callback then callback() end
+        return true
+    end
+    if entry and entry.book and self.on_select_callback then
+        self.on_select_callback(entry.book)
         return true
     end
     return Menu.onMenuSelect(self,entry)
@@ -369,10 +337,6 @@ function ShelfView.show(opts)
             sort_callback=opts.on_sort,
         }
     end
-    if opts.show_actions~=false and opts.on_verify_locked and (tonumber(opts.locked_count) or 0)>0 then
-        action_count=action_count+1
-        items[#items+1]={_miu_verify_row=true,verify_callback=opts.on_verify_locked}
-    end
     for _, book in ipairs(opts.books or {}) do
         items[#items + 1] = {
             book_id=book.bookId or book.book_id,
@@ -381,10 +345,7 @@ function ShelfView.show(opts)
             status=status_text(book),
             cover_path=book.cover_path,
             show_cover=opts.show_covers ~= false,
-            callback=function() if opts.on_select then opts.on_select(book) end end,
-            revalidate_callback=(book.revalidate_visible and opts.on_revalidate) and function()
-                opts.on_revalidate(book)
-            end or nil,
+            book=book,
         }
     end
     local page_callback
@@ -403,6 +364,7 @@ function ShelfView.show(opts)
         items_per_page=7+action_count,
         is_borderless=true,
         title_bar_fm_style=true,
+        on_select_callback=opts.on_select,
         on_page_changed=page_callback,
         on_close_callback=opts.on_close,
         on_rendered_callback=opts.on_rendered,
