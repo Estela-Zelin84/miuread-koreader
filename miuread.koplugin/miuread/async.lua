@@ -5,9 +5,18 @@ local UIManager=require("ui/uimanager")
 local Async={}; Async.__index=Async
 function Async:new(store, options)
     options = options or {}
-    return setmetatable({store=store,job=nil,poll=nil,poll_interval=tonumber(options.poll_interval) or .25},self)
+    return setmetatable({
+        store=store,job=nil,poll=nil,
+        poll_interval=tonumber(options.poll_interval) or .25,
+        allow_android=options.allow_android==true,
+    },self)
 end
-function Async:available() return type(FFIUtil.runInSubProcess)=="function" and type(FFIUtil.isSubProcessDone)=="function" and not (type(FFIUtil.isAndroid)=="function" and FFIUtil.isAndroid()) end
+function Async:available()
+    local android=type(FFIUtil.isAndroid)=="function" and FFIUtil.isAndroid()
+    return type(FFIUtil.runInSubProcess)=="function"
+        and type(FFIUtil.isSubProcessDone)=="function"
+        and (self.allow_android or not android)
+end
 function Async:busy() return self.job~=nil end
 function Async:_schedule()
     if self.poll then return end; local task; task=function() if self.poll~=task then return end; self.poll=nil; self:_check() end; self.poll=task; UIManager:scheduleIn(self.poll_interval,task)

@@ -1,16 +1,16 @@
 {
   "channel": "beta",
-  "version": "1.1.49-beta.1",
-  "name": "觅阅 · 微信读书助手 1.1.49-beta.1 内测版",
+  "version": "2.0.0-beta.1",
+  "name": "觅阅 · 微信读书助手 2.0.0-beta.1 内测版",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.49-beta.1/miuread-v1.1.49-beta.1-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.0.0-beta.1/miuread-v2.0.0-beta.1-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.49-beta.1/miuread-v1.1.49-beta.1-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.49-beta.1/miuread-v1.1.49-beta.1-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.49-beta.1/miuread-v1.1.49-beta.1-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.49-beta.1/miuread-v1.1.49-beta.1-full.zip"
+    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.0.0-beta.1/miuread-v2.0.0-beta.1-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.0.0-beta.1/miuread-v2.0.0-beta.1-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.0.0-beta.1/miuread-v2.0.0-beta.1-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.0.0-beta.1/miuread-v2.0.0-beta.1-full.zip"
   ],
-  "size": 192922,
-  "sha256": "264a28cffa3aaa0cd09cfb9df80e8c0b21610fe03a81de7c20fc466e6820b712",
-  "notes": "修复官方书架移除后的锁定与重新验证入口；恢复按章节下载和单章管理；修复文件浏览器中的六个通用手势并将关闭书籍限定为阅读器；精简重复菜单和无效设置。"
+  "size": 196840,
+  "sha256": "57e5b5f18895c43e1830b287a882cba0f9c9825d687bcb89c8da25f156c46c7d",
+  "notes": "2.0.0-beta.1：恢复已购买、永久领取与个人上传的永久权益识别；永久权益不定期验证，临时权益仅首次未验证或验证过期后联网复验，有效期内直接打开；网络失败保留上次有效结果且不锁书；单章权限与整本书分离，每个文件独立记录锁定状态；迁移修复旧版错误权益与锁定记录；重做书架并保持微信读书官方顺序，顶部提供搜索和刷新；恢复按章节下载；修复手势注册范围。手势仅完成代码与静态检查，仍需在实际设备上验证。"
 }

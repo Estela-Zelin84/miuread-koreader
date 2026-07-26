@@ -21,6 +21,7 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 
 local Screen = Device.screen
+local DIVIDER_COLOR = Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
 
 local function status_text(book)
     if book.status_text and tostring(book.status_text)~="" then return tostring(book.status_text) end
@@ -48,7 +49,9 @@ local function supported_image(path)
         or ext=="webp" or ext=="svg"
 end
 
-local function placeholder(cover_w,cover_h)
+local function placeholder(cover_w,cover_h,title)
+    local mark=tostring(title or "书"):gsub("^%s+",""):sub(1,1)
+    if mark=="" then mark="书" end
     return FrameContainer:new{
         width=cover_w,
         height=cover_h,
@@ -58,7 +61,7 @@ local function placeholder(cover_w,cover_h)
         background=Blitbuffer.COLOR_WHITE,
         CenterContainer:new{
             dimen=Geom:new{w=cover_w, h=cover_h},
-            TextWidget:new{text="", face=Font:getFace("smallinfofont", 12)},
+            TextWidget:new{text=mark, face=Font:getFace("cfont", math.min(20,Screen:scaleBySize(17)))},
         },
     }
 end
@@ -95,61 +98,50 @@ function ShelfItem:init()
 
     local h = self.dimen.h
     if self.entry and (self.entry._miu_action_row or self.entry._miu_tab_row) then
-        local divider = TextWidget:new{
-            text="│",
-            face=Font:getFace("smallinfofont", math.min(17, Screen:scaleBySize(15))),
-            padding=0,
-        }
-        local divider_w = divider:getSize().w
-        local half_w = math.max(1, math.floor((self.dimen.w - divider_w) / 2))
-        local action_face = Font:getFace("cfont", math.min(20, Screen:scaleBySize(17)))
-        local left_text="搜索书架"
-        local right_text="排序筛选"
+        local gap=math.max(Size.padding.small,Screen:scaleBySize(8))
+        local half_w=math.max(1,math.floor((self.dimen.w-gap)/2))
+        local face=Font:getFace("cfont",math.min(18,Screen:scaleBySize(self.entry._miu_tab_row and 16 or 15)))
+        local left_text,right_text,left_selected,right_selected
         if self.entry._miu_tab_row then
-            left_text=(self.entry.selected_tab=="account" and "● " or "").."账号书架"
-            right_text=(self.entry.selected_tab=="generated" and "● " or "").."已生成书籍"
+            left_selected=self.entry.selected_tab=="account"
+            right_selected=self.entry.selected_tab=="generated"
+            left_text=(left_selected and "●  " or "").."账号书架"
+            right_text=(right_selected and "●  " or "").."已生成书籍"
+        else
+            left_text="搜索书架"
+            right_text="刷新书架"
         end
-        local row = HorizontalGroup:new{
+        local row=HorizontalGroup:new{
             align="center",
-            CenterContainer:new{
-                dimen=Geom:new{w=half_w, h=h},
-                TextWidget:new{text=left_text, face=action_face, bold=true},
-            },
-            divider,
-            CenterContainer:new{
-                dimen=Geom:new{w=half_w, h=h},
-                TextWidget:new{text=right_text, face=action_face, bold=true},
-            },
+            CenterContainer:new{dimen=Geom:new{w=half_w,h=h},TextWidget:new{text=left_text,face=face,bold=left_selected==true}},
+            HorizontalSpan:new{width=gap},
+            CenterContainer:new{dimen=Geom:new{w=half_w,h=h},TextWidget:new{text=right_text,face=face,bold=right_selected==true}},
         }
-        self._underline = UnderlineContainer:new{
-            dimen=self.dimen:copy(),
-            linesize=Size.line.thin,
-            color=Blitbuffer.COLOR_DARK_GRAY,
-            padding=0,
-            vertical_align="center",
-            row,
+        self._underline=UnderlineContainer:new{
+            dimen=self.dimen:copy(),linesize=Size.line.thin,color=DIVIDER_COLOR,
+            padding=0,vertical_align="center",row,
         }
-        self[1] = self._underline
+        self[1]=self._underline
         return
     end
     local side = math.max(Size.padding.small, Screen:scaleBySize(4))
     local show_cover = self.entry.show_cover ~= false
-    local cover_h = math.max(Screen:scaleBySize(58), h - side * 2)
+    local cover_h = math.max(Screen:scaleBySize(52), h - side * 2)
     local cover_w = show_cover and math.max(1, math.floor(cover_h * 0.69)) or 0
     local cover
 
     if show_cover and self.entry.cover_path then
         cover=safe_cover(self.entry.cover_path,cover_w,cover_h,self.entry.book_id)
     end
-    if show_cover and not cover then cover=placeholder(cover_w,cover_h) end
+    if show_cover and not cover then cover=placeholder(cover_w,cover_h,self.entry.title) end
 
     local gap = show_cover and Size.padding.large or 0
     local text_w = math.max(Screen:scaleBySize(96), self.dimen.w - cover_w - gap - side * 2)
     local title = TextBoxWidget:new{
         text=tostring(self.entry.title or "未命名"),
-        face=Font:getFace("cfont", math.min(22, Screen:scaleBySize(18))),
+        face=Font:getFace("cfont", math.min(20, Screen:scaleBySize(17))),
         width=text_w,
-        height=math.floor(h * .52),
+        height=math.floor(h * .50),
         height_adjust=true,
         height_overflow_show_ellipsis=true,
         alignment="left",
@@ -161,9 +153,9 @@ function ShelfItem:init()
     details = details .. tostring(self.entry.status or "")
     local info = TextBoxWidget:new{
         text=details,
-        face=Font:getFace("smallinfofont", math.min(17, Screen:scaleBySize(14))),
+        face=Font:getFace("smallinfofont", math.min(16, Screen:scaleBySize(13))),
         width=text_w,
-        height=math.floor(h * .30),
+        height=math.floor(h * .28),
         height_adjust=true,
         height_overflow_show_ellipsis=true,
         alignment="left",
@@ -190,7 +182,7 @@ function ShelfItem:init()
     self._underline = UnderlineContainer:new{
         dimen=self.dimen:copy(),
         linesize=Size.line.thin,
-        color=Blitbuffer.COLOR_DARK_GRAY,
+        color=DIVIDER_COLOR,
         padding=0,
         vertical_align="center",
         row,
@@ -217,7 +209,7 @@ function ShelfItem:onFocus()
 end
 
 function ShelfItem:onUnfocus()
-    self._underline.color = Blitbuffer.COLOR_DARK_GRAY
+    self._underline.color = DIVIDER_COLOR
     return true
 end
 
@@ -242,11 +234,11 @@ function ShelfMenu:onMenuSelect(entry, pos)
                 callback=entry.account_callback or entry.generated_callback
             end
         elseif pos and tonumber(pos.x) and pos.x >= 0.5 then
-            callback=entry.sort_callback
+            callback=entry.refresh_callback
         elseif pos then
             callback=entry.search_callback
         else
-            callback=entry.sort_callback or entry.search_callback
+            callback=entry.refresh_callback or entry.search_callback
         end
         if callback then callback() end
         return true
@@ -329,12 +321,12 @@ function ShelfView.show(opts)
             generated_callback=opts.on_generated_tab,
         }
     end
-    if opts.show_actions~=false and (opts.on_search or opts.on_sort) then
+    if opts.show_actions~=false and (opts.on_search or opts.on_refresh) then
         action_count=action_count+1
         items[#items+1]={
             _miu_action_row=true,
             search_callback=opts.on_search,
-            sort_callback=opts.on_sort,
+            refresh_callback=opts.on_refresh,
         }
     end
     for _, book in ipairs(opts.books or {}) do
@@ -361,7 +353,7 @@ function ShelfView.show(opts)
     local menu = ShelfMenu:new{
         title=opts.title or "书架",
         item_table=items,
-        items_per_page=7+action_count,
+        items_per_page=8+action_count,
         is_borderless=true,
         title_bar_fm_style=true,
         on_select_callback=opts.on_select,

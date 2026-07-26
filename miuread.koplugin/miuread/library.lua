@@ -122,16 +122,10 @@ local function book(row,raw_index,archive_map)
 end
 
 local function order_cloud_rows(rows)
-    table.sort(rows,function(a,b)
-        if a.isTop~=b.isTop then return a.isTop==true end
-        local ao,bo=tonumber(a.explicitOrder),tonumber(b.explicitOrder)
-        if ao~=nil and bo~=nil and ao~=bo then return ao<bo end
-        local ar,br=tonumber(a.rawIndex) or 1000000000,tonumber(b.rawIndex) or 1000000000
-        if ar~=br then return ar<br end
-        return tostring(a.bookId)<tostring(b.bookId)
-    end)
-    for index,row in ipairs(rows) do row.cloudOrder=index end
-    logger.info("[MiuRead][ShelfOrder] normalized","count=",tostring(#rows))
+    -- The official shelf response already carries the order shown by WeRead.
+    -- Preserve that order exactly; do not re-sort by local timestamps or titles.
+    for index,row in ipairs(rows or {}) do row.cloudOrder=index end
+    logger.info("[MiuRead][ShelfOrder] official order preserved","count=",tostring(#(rows or {})))
     return rows
 end
 
@@ -373,89 +367,28 @@ function Library:combined(remote_books,remote_mp,library_snapshot,sessions_snaps
     return self:merge_books(remote_books,local_books),self:merge_books(remote_mp,local_mp)
 end
 
-local function less_text(a,b,field)
-    local av=tostring(a[field] or "")
-    local bv=tostring(b[field] or "")
-    if av~=bv then return av<bv end
-    return tostring(a.bookId or "")<tostring(b.bookId or "")
-end
-
 function Library:sort_filter(rows,options)
     options=options or {}
-    local p=self.store:preferences()
-    local section=tostring(options.section or p.shelf_section or "account")
-    local scope
-    local key
+    local section=tostring(options.section or "account")
+    local out=U.copy(rows or {})
     if section=="generated" then
-        scope=tostring(p.generated_shelf_scope or "all")
-        key=tostring(p.generated_shelf_sort or "opened")
-    else
-        scope=tostring(p.account_shelf_scope or "all")
-        key=tostring(p.account_shelf_sort or "read")
-        -- Migrate stale in-memory values defensively. Persistent migration is
-        -- handled by Store, but cached preferences can still survive briefly
-        -- during an OTA restart.
-        if key=="default" or key=="cloud" or key=="cloud_order" then key="read" end
-    end
-    local out={}
-    for _,b in ipairs(rows or {}) do
-        local pass=true
-        local prog=tonumber(b.progress or 0) or 0
-        if section=="generated" then
-            if scope=="in_account" and b.in_account_shelf~=true then pass=false end
-            if scope=="removed" and not (b.remote_status_known==true and b.in_account_shelf~=true) then pass=false end
-            if scope=="clean" and b.hasClean~=true then pass=false end
-            if scope=="notes" and b.hasNotes~=true then pass=false end
-        else
-            if scope=="generated" and b.downloaded~=true then pass=false end
-            if scope=="ungenerated" and b.downloaded==true then pass=false end
-            if scope=="top" and b.isTop~=true then pass=false end
-            if scope=="archive" and b.inArchive~=true then pass=false end
-        end
-        if pass then out[#out+1]=b end
-    end
-    table.sort(out,function(a,b)
-        if section=="generated" then
-            if key=="title" then return less_text(a,b,"title") end
-            if key=="author" then return less_text(a,b,"author") end
-            if key=="size" then
-                local av,bv=tonumber(a.fileSize or 0) or 0,tonumber(b.fileSize or 0) or 0
-                if av~=bv then return av>bv end
-            elseif key=="generated" then
-                local av,bv=tonumber(a.downloadedAt or 0) or 0,tonumber(b.downloadedAt or 0) or 0
-                if av~=bv then return av>bv end
+        table.sort(out,function(a,b)
+            local ai=a.in_account_shelf==true
+            local bi=b.in_account_shelf==true
+            if ai~=bi then return ai end
+            if ai then
+                local ao=tonumber(a.cloudOrder) or 1000000000
+                local bo=tonumber(b.cloudOrder) or 1000000000
+                if ao~=bo then return ao<bo end
             else
-                local av,bv=tonumber(a.lastReadTime or 0) or 0,tonumber(b.lastReadTime or 0) or 0
-                if av~=bv then return av>bv end
+                local ad=tonumber(a.downloadedAt or 0) or 0
+                local bd=tonumber(b.downloadedAt or 0) or 0
+                if ad~=bd then return ad>bd end
             end
-            local ad,bd=tonumber(a.downloadedAt or 0) or 0,tonumber(b.downloadedAt or 0) or 0
-            if ad~=bd then return ad>bd end
-            return less_text(a,b,"title")
-        end
-
-        if key=="title" then return less_text(a,b,"title") end
-        if key=="author" then return less_text(a,b,"author") end
-        if key=="progress" then
-            local av,bv=tonumber(a.progress or 0) or 0,tonumber(b.progress or 0) or 0
-            if av~=bv then return av>bv end
-        elseif key=="read" then
-            -- Match the long-proven mobile-like shelf order: explicit pinned
-            -- books first, then cloud readUpdateTime from newest to oldest.
-            -- Unread books have timestamp 0 and naturally stay behind read
-            -- books. rawIndex is the stable tie-breaker below.
-            if a.isTop~=b.isTop then return a.isTop==true end
-            local av,bv=tonumber(a.readUpdateTime or 0) or 0,tonumber(b.readUpdateTime or 0) or 0
-            if av~=bv then return av>bv end
-        elseif key=="update" then
-            local av,bv=tonumber(a.updateTime or 0) or 0,tonumber(b.updateTime or 0) or 0
-            if av~=bv then return av>bv end
-        end
-        local ar,br=tonumber(a.rawIndex or 0) or 0,tonumber(b.rawIndex or 0) or 0
-        if ar~=br then return ar<br end
-        return tostring(a.bookId or "")<tostring(b.bookId or "")
-    end)
-    logger.info("[MiuRead][ShelfSort] complete",
-        "count=",tostring(#out),"section=",tostring(section),"sort=",tostring(key))
+            return tostring(a.bookId or "")<tostring(b.bookId or "")
+        end)
+    end
+    logger.info("[MiuRead][ShelfOrder] prepared","count=",tostring(#out),"section=",section)
     return out
 end
 

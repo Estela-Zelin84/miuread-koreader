@@ -8,7 +8,7 @@ local Store={}; Store.__index=Store
 local defaults={
  schema=Config.SCHEMA,
  auth={api_key="",cookies={},account={name="",vid="",logged_at=0}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_sort="read",shelf_scope="all",shelf_view="compact",shelf_filters={},shelf_section="account",account_shelf_kind="books",account_shelf_sort="read",account_shelf_scope="all",generated_shelf_sort="opened",generated_shelf_scope="all",thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
@@ -379,6 +379,128 @@ function Store:migrate()
                     for _,record in pairs(book.variants or {}) do apply_record(record,access) end
                     for _,row in pairs(book.chapters or {}) do
                         for _,record in pairs(row or {}) do apply_record(record,access) end
+                    end
+                end
+            end
+            self.db:saveSetting("library",library)
+        end
+        if schema<42 then
+            -- 2.0.0-beta.1 removes obsolete shelf sort/filter settings and repairs
+            -- access data written by 1.1.49-beta.1. Permanent rights are restored
+            -- from surviving book or file records; temporary books keep their
+            -- files and are rechecked only when needed.
+            p.low_resource=nil
+            p.annotation_mode=nil
+            p.show_annotations=nil
+            p.shelf_sort=nil
+            p.shelf_scope=nil
+            p.shelf_view=nil
+            p.shelf_filters=nil
+            p.account_shelf_sort=nil
+            p.account_shelf_scope=nil
+            p.generated_shelf_sort=nil
+            p.generated_shelf_scope=nil
+
+            local library=self.db:readSetting("library",{}) or {}
+            local now=os.time()
+            local ttl=tonumber(Config.ACCESS_VERIFY_TTL) or 3*24*60*60
+            local policy=tonumber(Config.ACCESS_POLICY_VERSION) or 5
+            local lock_suffix=".miuread-locked"
+
+            local function permanent_kind(book)
+                local access=type(book.access)=="table" and book.access or {}
+                local own=tostring(access.ownership or "")
+                if own=="purchased" or own=="personal_upload" then return own end
+                local found
+                local function scan(record)
+                    if found or type(record)~="table" then return end
+                    local value=tostring(record.ownership or record.access_ownership or "")
+                    if value=="purchased" or value=="personal_upload" then found=value end
+                end
+                for _,record in pairs(book.variants or {}) do scan(record) end
+                for _,row in pairs(book.chapters or {}) do for _,record in pairs(row or {}) do scan(record) end end
+                return found
+            end
+
+            local function record_scope(kind,record)
+                local scope=tostring(record and record.access_scope or "")
+                if scope=="preview" or scope=="full" then return scope end
+                return tostring(kind or ""):sub(1,8)=="preview_" and "preview" or "full"
+            end
+
+            local function unlock_record(record)
+                if type(record)~="table" then return end
+                local path=tostring(record.file or "")
+                local target=tostring(record.original_file or path:gsub("%.miuread%-locked$", ""))
+                if path:sub(-#lock_suffix)==lock_suffix and target~="" then
+                    if U.file_exists(target) then
+                        record.file=target
+                        if path~=target and U.file_exists(path) then os.remove(path) end
+                    elseif U.file_exists(path) then
+                        local ok=os.rename(path,target)
+                        if ok then record.file=target end
+                    end
+                end
+                record.locked=nil
+                record.lock_reason=nil
+                record.locked_at=nil
+                record.original_file=nil
+                record.access_status="allowed"
+            end
+
+            for _,book in pairs(library) do
+                if type(book)=="table" then
+                    local access=type(book.access)=="table" and book.access or {}
+                    local permanent=permanent_kind(book)
+                    access.policy_version=policy
+                    access.stale=nil
+                    if permanent then
+                        access.ownership=permanent
+                        access.status="allowed"
+                        access.access_scope="full"
+                        access.valid_until=0
+                        access.lock_reason=""
+                    else
+                        if tostring(access.ownership or "")=="purchased" or tostring(access.ownership or "")=="personal_upload" then
+                            -- A permanent marker without surviving file evidence is
+                            -- still preserved; this path mostly covers old clean installs.
+                        elseif tostring(access.ownership_source or "")=="official_shelf_policy" then
+                            access.ownership="temporary"
+                            access.ownership_source="migration_from_1.1.49"
+                        elseif tostring(access.ownership or "")=="" then
+                            access.ownership="unknown"
+                        end
+                        local verified=tonumber(access.verified_at) or 0
+                        if access.status~="blocked" and access.status~="restricted" then
+                            local deadline=verified>0 and verified+ttl or 0
+                            access.valid_until=deadline>now and deadline or 0
+                            access.status=access.valid_until>0 and "allowed" or "expired"
+                        end
+                    end
+                    book.access=access
+
+                    local function migrate_record(kind,record)
+                        if type(record)~="table" then return end
+                        record.access_policy_version=policy
+                        record.access_scope=record_scope(kind,record)
+                        if permanent then
+                            record.ownership=permanent
+                            record.valid_until=0
+                            unlock_record(record)
+                        else
+                            record.ownership=record.ownership or access.ownership
+                            local path=tostring(record.file or "")
+                            if path:sub(-#lock_suffix)==lock_suffix then record.locked=true end
+                            if record.locked==true then
+                                record.access_status="blocked"
+                            elseif access.status=="allowed" then
+                                record.access_status="allowed"
+                            end
+                        end
+                    end
+                    for kind,record in pairs(book.variants or {}) do migrate_record(kind,record) end
+                    for _,row in pairs(book.chapters or {}) do
+                        for kind,record in pairs(row or {}) do migrate_record(kind,record) end
                     end
                 end
             end
