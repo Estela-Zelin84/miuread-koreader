@@ -116,7 +116,7 @@ jobs:
               ],
               "size": len(payload),
               "sha256": hashlib.sha256(payload).hexdigest(),
-              "notes": '2.0.0-beta.1：恢复已购买、永久领取与个人上传的永久权益识别；永久权益不定期验证，临时权益仅首次未验证或验证过期后联网复验，有效期内直接打开；网络失败保留上次有效结果且不锁书；单章权限与整本书分离，每个文件独立记录锁定状态；迁移修复旧版错误权益与锁定记录；重做书架并保持微信读书官方顺序，顶部提供搜索和刷新；恢复按章节下载；修复手势注册范围。手势仅完成代码与静态检查，仍需在实际设备上验证。',
+              "notes": '2.0.0-beta.2：取消本地书籍联网验证和锁定。已下载 EPUB 可直接打开；从微信读书书架移除、断网、退出登录或切换账号都不会影响本地文件。升级后会自动恢复此前被锁定的 EPUB。登录仍用于搜索、下载和同步。',
           }
           Path("dist/update-beta.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           print(f"已生成：{output}")

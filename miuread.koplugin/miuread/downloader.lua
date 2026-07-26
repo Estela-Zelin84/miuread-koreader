@@ -637,26 +637,13 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         "chapters=", tostring(#chapters), "assets=", tostring(#assets),
         "memory_kb=", tostring(math.floor(collectgarbage("count"))))
     local now=os.time()
-    local ownership=tostring(opt.access_ownership or book.access_ownership or "temporary")
     local access_scope=tostring(opt.access_scope or "full")
-    -- A single downloaded chapter never proves whole-book entitlement. Unless
-    -- ownership is already permanent, keep it in the controlled/preview scope
-    -- so it cannot unlock an older full EPUB.
-    if standalone and ownership~="purchased" and ownership~="personal_upload" then
-        access_scope="preview"
-    end
-    if access_scope=="preview" then ownership="temporary" end
     local storage_kind=(access_scope=="preview" and not standalone) and ("preview_"..kind) or kind
-    local valid_until=(ownership=="purchased" or ownership=="personal_upload") and nil
-        or (now+(tonumber(Config.ACCESS_VERIFY_TTL) or 10*60))
     local built, build_error = pcall(Epub.build, temp_path, book, chapters, css, assets, cover, {
         schema=7, book_id=book.bookId, title=book.title, author=book.author,
         variant=storage_kind, base_variant=kind, standalone=standalone, chapter_uid=opt.chapter_uid,
         chapters=map, generated_at=now, complete=true,
-        ownership=ownership, ownership_source=opt.access_ownership_source or book.access_ownership_source, access_scope=access_scope,
-        account_vid=opt.access_account_vid or book.access_account_vid,
-        verified_at=now, valid_until=valid_until,
-        access_policy_version=tonumber(Config.ACCESS_POLICY_VERSION) or 2,
+        access_scope=access_scope,
         catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
         readable_count=tonumber(opt.readable_chapter_count) or #chapters,
         restricted_count=tonumber(opt.restricted_chapter_count) or 0,
@@ -716,11 +703,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         restricted_chapter_count=tonumber(opt.restricted_chapter_count) or 0,
         failed_chapter_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
         preview_mode=access_scope=="preview" and preview_mode or nil,
-        access_scope=access_scope, ownership=ownership,
-        ownership_source=opt.access_ownership_source or book.access_ownership_source,
-        access_policy_version=tonumber(Config.ACCESS_POLICY_VERSION) or 2,
-        account_vid=opt.access_account_vid or book.access_account_vid,
-        verified_at=now, valid_until=valid_until,
+        access_scope=access_scope,
         guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
         chapter_map=map, failures=U.copy(failures or {}), complete=true, file_size=U.file_size(path) or U.file_size(pending_path),
         pending_install=defer_install or nil,
@@ -735,20 +718,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     self.store:save_book(book.bookId, {
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
         directory=dir, updated_at=now, catalog=map,
-        access={
-            ownership=ownership, ownership_source=opt.access_ownership_source or book.access_ownership_source, access_scope=access_scope,
-            account_vid=opt.access_account_vid or book.access_account_vid,
-            shelf_present=true, status="allowed", verified_at=now, valid_until=valid_until,
-            policy_version=tonumber(Config.ACCESS_POLICY_VERSION) or 2,
-            catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
-            readable_count=tonumber(opt.readable_chapter_count) or #chapters,
-            restricted_count=tonumber(opt.restricted_chapter_count) or 0,
-            failed_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
-            preview_mode=access_scope=="preview" and preview_mode or nil,
-            guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
-            lock_reason=nil,
-        },
     })
+    if type(self.store.clear_book_access)=="function" then self.store:clear_book_access(book.bookId) end
     if session then
         self.store:save_session(book.bookId, {
             psvts=session.psvts, pclts=session.pclts, token=session.token,

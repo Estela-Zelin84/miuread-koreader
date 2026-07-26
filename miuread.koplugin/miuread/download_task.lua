@@ -347,7 +347,6 @@ function DownloadTask:start(book, options, on_progress, on_done)
         local Api = require("miuread.api")
         local Reader = require("miuread.reader")
         local Library = require("miuread.library")
-        local Access = require("miuread.access")
         local Annotations = require("miuread.annotations")
         local Downloader = require("miuread.downloader")
         local JsonChild = require("miuread.json")
@@ -372,25 +371,13 @@ function DownloadTask:start(book, options, on_progress, on_done)
             local reader = Reader:new(http, store)
             local api = Api:new(http, store, reader)
             local library = Library:new(api, http, store)
-            local access = Access:new(library, api, reader, store)
             local annotations = Annotations:new(api)
             local downloader = Downloader:new(reader, api, annotations, store, http)
             clean_options.cancelled = function()
                 return UChild.file_exists(cancel_path)
             end
             emit{stage = "prepare", current = 0, total = 1, chapter = clean_book.title or "",
-                message = "正在确认官方书架状态"}
-            local prepared, access_error = access:prepare_download(clean_book)
-            if not prepared then
-                error(type(access_error) == "table" and access_error.message
-                    or tostring(access_error or "无法确认官方书架状态"))
-            end
-            clean_book = prepared
-            clean_options.access_ownership = prepared.access_ownership
-            clean_options.access_ownership_source = prepared.access_ownership_source
-            clean_options.access_account_vid = prepared.access_account_vid
-            emit{stage = "prepare", current = 0, total = 1, chapter = clean_book.title or "",
-                message = "官方书架验证通过，正在准备下载"}
+                message = "正在准备下载"}
             local record = downloader:book(clean_book, clean_options, function(stage, current, total, chapter, detail)
                 detail = detail or {}
                 local percent

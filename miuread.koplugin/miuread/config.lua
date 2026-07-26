@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "2.0.0-beta.1",
-    SCHEMA = 42,
+    VERSION = "2.0.0-beta.2",
+    SCHEMA = 43,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
@@ -27,15 +27,6 @@ local C = {
     READ_INTERVAL = 30,
     IDLE_TIMEOUT = 600,
     REMOTE_THRESHOLD = 2,
-
-    -- Reading access is rechecked every three days. Account changes and
-    -- manual recovery of a locked book always trigger an immediate check.
-    ACCESS_VERIFY_TTL = 3 * 24 * 60 * 60,
-    -- When a previously verified temporary book cannot be rechecked because
-    -- the network is unavailable, keep the last result for a short grace
-    -- period instead of prompting again on every open.
-    ACCESS_RETRY_GRACE = 6 * 60 * 60,
-    ACCESS_POLICY_VERSION = 5,
 
     -- Coalesce page-turn control snapshots. Reading position stays in memory
     -- and is written at most once per window; suspend/close still flushes now.
