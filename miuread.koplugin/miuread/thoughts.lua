@@ -281,16 +281,9 @@ end
 function Thoughts.paginate(group, level)
     if type(group) ~= "table" then return {} end
     local profile = Thoughts.font_profile(level)
-    local entries,seen = {},{}
+    local entries = {}
     for _, item in ipairs(group.texts or {}) do
-        local content=clean(item.content)
-        local author=clean(item.author)
-        local review_id=tostring(item.review_id or "")
-        local key=review_id~="" and ("id:"..review_id) or (author.."\0"..content)
-        if content~="" and not seen[key] then
-            seen[key]=true
-            for _, part in ipairs(split_entry(item, profile.chunk_chars)) do entries[#entries + 1] = part end
-        end
+        for _, part in ipairs(split_entry(item, profile.chunk_chars)) do entries[#entries + 1] = part end
     end
     local pages, page, weight = {}, {}, 0
     local function flush()
@@ -366,43 +359,6 @@ function Thoughts.page_html(page, page_index, page_count, abstract)
         if clean(item.content) ~= "" then rows[#rows + 1] = entry_html(item) end
     end
     return table.concat(rows)
-end
-
-function Thoughts.page_parts(group, level, page_index)
-    local pages=Thoughts.paginate(group,level)
-    if #pages==0 then pages={{}} end
-    page_index=math.max(1,math.min(#pages,tonumber(page_index) or 1))
-    local page=pages[page_index] or {}
-    local abstract=Thoughts.group_abstract(group)
-    local source_html=""
-    if abstract~="" then
-        source_html=panel_head_html("正文")..source_box_html(preview(abstract,72))
-    end
-    local body={}
-    if source_html=="" then body[#body+1]=panel_head_html("评论") end
-    local metrics={source_chars=0,source_units=0,comment_count=0,comment_chars={},comment_units={}}
-    if abstract~="" then
-        local source=preview(abstract,72)
-        metrics.source_chars=codepoint_len(source)
-        metrics.source_units=display_units(source)
-    end
-    for _,item in ipairs(page) do
-        local content=clean(item.content)
-        if content~="" then
-            metrics.comment_count=metrics.comment_count+1
-            metrics.comment_chars[#metrics.comment_chars+1]=codepoint_len(content)
-            metrics.comment_units[#metrics.comment_units+1]=display_units(content)
-            body[#body+1]=entry_html(item)
-        end
-    end
-    if metrics.comment_count==0 then body[#body+1]='<div class="miu-content">没有想法内容</div>' end
-    return {
-        source_html=source_html,
-        html=table.concat(body),
-        metrics=metrics,
-        page_index=page_index,
-        page_count=#pages,
-    }
 end
 
 function Thoughts.popup_parts(group)

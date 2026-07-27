@@ -11,7 +11,7 @@ local defaults={
      account={name="",vid="",logged_at=0}},
  preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
- pending_installs={},last_cleanup_result={},read_report_consumed={},external_epub_cache={},
+ pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
 local function public_documents_root(data_dir)
     local kindle_documents = "/mnt/us/documents"
@@ -647,10 +647,9 @@ function Store:migrate()
                 self:clear_download_state()
             end
         end
-        if schema<49 then
-            -- beta.6.0 remembers ordinary EPUB files by path, size and mtime.
-            -- Unchanged external books no longer need repeated ZIP inspection
-            -- after every KOReader restart.
+        if schema<50 then
+            -- beta.6.1 removes beta.6.0's persistent external-EPUB negative cache.
+            -- A temporary identification failure must not hide an existing book.
             self.db:saveSetting("external_epub_cache",{})
         end
         self.db:saveSetting("preferences",p)
@@ -908,60 +907,6 @@ local function access_from_epub_meta(_meta)
     return nil
 end
 
-local EXTERNAL_EPUB_CACHE_LIMIT=256
-local EXTERNAL_EPUB_CACHE_TTL=180*24*60*60
-local function external_epub_signature(path)
-    local attr=lfs.attributes(path)
-    if not attr or attr.mode~="file" then return nil end
-    return {size=tonumber(attr.size) or 0,mtime=tonumber(attr.modification) or 0}
-end
-function Store:is_external_epub_cached(path)
-    if not tostring(path or ""):lower():match("%.epub$") then return false end
-    local key=normalize_path(path)
-    if key=="" then return false end
-    local rows=self:get("external_epub_cache",{})
-    local row=rows[key]
-    local sig=external_epub_signature(path)
-    if type(row)=="table" and sig
-        and tonumber(row.size)==sig.size and tonumber(row.mtime)==sig.mtime then
-        row.checked_at=os.time()
-        return true
-    end
-    if row~=nil then rows[key]=nil; self:set("external_epub_cache",rows) end
-    return false
-end
-function Store:remember_external_epub(path)
-    if not tostring(path or ""):lower():match("%.epub$") then return false end
-    local key=normalize_path(path)
-    local sig=external_epub_signature(path)
-    if key=="" or not sig then return false end
-    local rows=self:get("external_epub_cache",{})
-    local now=os.time()
-    rows[key]={size=sig.size,mtime=sig.mtime,checked_at=now}
-    local ordered={}
-    for item,row in pairs(rows) do
-        local at=tonumber(type(row)=="table" and row.checked_at or 0) or 0
-        if now-at>EXTERNAL_EPUB_CACHE_TTL or not external_epub_signature(item) then
-            rows[item]=nil
-        else
-            ordered[#ordered+1]={key=item,at=at}
-        end
-    end
-    table.sort(ordered,function(a,b) return a.at>b.at end)
-    for index=#ordered,EXTERNAL_EPUB_CACHE_LIMIT+1,-1 do rows[ordered[index].key]=nil end
-    self:set("external_epub_cache",rows)
-    return true
-end
-function Store:forget_external_epub(path)
-    local key=normalize_path(path)
-    if key=="" then return false end
-    local rows=self:get("external_epub_cache",{})
-    if rows[key]==nil then return false end
-    rows[key]=nil
-    self:set("external_epub_cache",rows)
-    return true
-end
-
 function Store:identify_file(path,relink)
     if not path then return nil end
     local normalized=normalize_path(path)
@@ -982,22 +927,18 @@ function Store:identify_file(path,relink)
     end
     for _,b in pairs(all) do
         for kind,r in pairs(b.variants or {}) do
-            if match_record(r) then self:forget_external_epub(path); relink_record(b,r); return b,r,kind end
+            if match_record(r) then relink_record(b,r); return b,r,kind end
         end
         for uid,row in pairs(b.chapters or {}) do
             for kind,r in pairs(row or {}) do
                 if match_record(r) then
                     r.chapter_uid=uid
-                    self:forget_external_epub(path)
                     relink_record(b,r)
                     return b,r,kind
                 end
             end
         end
     end
-
-    if not normalized:lower():match("%.epub$") then return nil,nil,nil,"external_type" end
-    if self:is_external_epub_cached(path) then return nil,nil,nil,"external_cached" end
 
     local meta=self:epub_identity(path)
     -- For older files without embedded identity, a harmless spacing-only rename
@@ -1022,14 +963,13 @@ function Store:identify_file(path,relink)
         if #matches==1 then
             local found=matches[1]
             if found.uid then found.record.chapter_uid=found.uid end
-            self:forget_external_epub(path)
             relink_record(found.book,found.record)
             return found.book,found.record,found.kind
         end
     end
 
     local id=meta and tostring(meta.book_id or "") or ""
-    if id=="" then self:remember_external_epub(path); return nil,nil,nil,"external" end
+    if id=="" then return nil end
     local kind=tostring(meta.variant or "")
     if kind=="" then kind="notes" end
     local b=all[id]
@@ -1086,7 +1026,6 @@ function Store:identify_file(path,relink)
         all[id]=b
     end
 
-    self:forget_external_epub(path)
     if record and relink then relink_record(b,record) end
     return b,record,kind
 end

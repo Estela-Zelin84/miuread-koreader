@@ -1,0 +1,16 @@
+觅阅 2.0.0-beta.6.1 静态测试报告
+
+已完成：
+1. 全部 Lua 文件语法检查通过。
+2. thought_popup.lua 与 thoughts.lua 已恢复 beta.5.9 原实现。
+3. 已确认安装包中不存在“上一页”“下一页”及 page_loader 分页代码。
+4. 已确认 beta.6.0 external_epub_cache 运行逻辑已移除。
+5. 已确认升级迁移会清空 external_epub_cache。
+6. 已确认 Android 书架、搜索和封面任务保留后台优先，同时恢复失败回退。
+7. _meta.lua 与 config.lua 版本一致。
+8. 插件目录不包含 .md、日志、EPUB、设置文件或临时文件。
+
+尚未完成：
+1. Kindle、Kobo 和 Android 真实设备上的电子墨水屏残影回归测试。
+2. 大量评论下的连续点击翻页实机测试。
+3. beta.6.0 升级后已有下载书架自动恢复的全设备验证。

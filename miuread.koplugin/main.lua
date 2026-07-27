@@ -88,7 +88,6 @@ function Plugin:init()
     self._last_shelf_section="account"
     self._shelf_refresh_generation=0
     self._shelf_main_busy=false
-    self._cover_start_failures=0
     self._downloads_menu=nil
     self._download_book_menu=nil
     self._cache_cleanup_dialog=nil
@@ -297,10 +296,6 @@ function Plugin:_refresh_shelf_async(on_ready,silent)
         logger.info("[MiuRead][Shelf] refresh completed","mode=",tostring(mode),
             "books=",tostring(#books),"mp=",tostring(#mp))
         if on_ready then on_ready(books,mp,nil) end
-    end
-
-    if not async_available and self.shelf_async and self.shelf_async:is_android() then
-        return fail("Android 后台书架任务无法启动，请稍后重试。")
     end
 
     if not async_available then
@@ -565,7 +560,6 @@ function Plugin:show_shelf_search_dialog(mp_mode,source_rows,section)
 end
 function Plugin:_cancel_cover_loading()
     self._cover_generation=(tonumber(self._cover_generation) or 0)+1
-    self._cover_start_failures=0
     if self.cover_async then self.cover_async:cancel("shelf page changed") end
     if self._cover_refresh_task then
         UIManager:unschedule(self._cover_refresh_task)
@@ -629,12 +623,6 @@ function Plugin:_cache_shelf_page_covers(rows,view,page,first,last,generation,in
         return
     end
     local background_available=self.cover_async:available()
-    if not background_available and self.cover_async:is_android() then
-        logger.warn("[MiuRead][Cover] Android background worker unavailable; skipping uncached cover",
-            "book_id=",tostring(book.bookId))
-        self:_schedule_cover_continue(rows,view,page,first,last,generation,index+1,.04)
-        return
-    end
     local download_options=background_available
         and {retries=1,timeout={8,15}}
         or {retries=0,timeout={4,7}}
@@ -680,17 +668,7 @@ function Plugin:_cache_shelf_page_covers(rows,view,page,first,last,generation,in
         self:_schedule_cover_continue(rows,view,page,first,last,generation,index+1,background_available and .06 or .18)
     end,background_available and 35 or 14)
     if not started then
-        self._cover_start_failures=(tonumber(self._cover_start_failures) or 0)+1
-        logger.warn("[MiuRead][Cover] worker start failed",
-            "book_id=",tostring(book.bookId),"count=",tostring(self._cover_start_failures))
-        if self._cover_start_failures>=2 then
-            self._cover_start_failures=0
-            self:_schedule_cover_continue(rows,view,page,first,last,generation,index+1,.08)
-        else
-            self:_schedule_cover_continue(rows,view,page,first,last,generation,index,.35)
-        end
-    else
-        self._cover_start_failures=0
+        self:_schedule_cover_continue(rows,view,page,first,last,generation,index,.3)
     end
 end
 function Plugin:_on_shelf_page(rows,view,page,first,last)
@@ -1058,11 +1036,7 @@ function Plugin:search(q)
     end
 
     if not self.search_async or not self.search_async:available() then
-        if self.search_async and self.search_async:is_android() then
-            finish({ok=false,error="Android 后台搜索任务不可用，请稍后重试。"})
-        else
-            run_on_main_thread()
-        end
+        run_on_main_thread()
         return
     end
 
@@ -1079,12 +1053,8 @@ function Plugin:search(q)
         return api:search(q,0,40)
     end,finish,32)
     if not started then
-        logger.warn("[MiuRead][Search] async unavailable",tostring(err or "worker busy"))
-        if self.search_async and self.search_async:is_android() then
-            finish({ok=false,error="Android 后台搜索任务无法启动，请稍后重试。"})
-        else
-            run_on_main_thread()
-        end
+        logger.warn("[MiuRead][Search] async unavailable; falling back",tostring(err or "worker busy"))
+        run_on_main_thread()
     end
 end
 function Plugin:_variant_exists(book_id,kind)
@@ -3081,26 +3051,25 @@ function Plugin:_show_thought_href(href)
         local group,err,token=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
         if not group then self:info(tostring(err or "没有想法内容")); return end
         local prefs=self.store:preferences().thoughts or {}
-        local first_page=Thoughts.page_parts(group,prefs.font,1)
-        if not first_page or tostring(first_page.html or "")=="" then self:info("没有想法内容"); return end
+        local source_html,html,metrics,html_cache_hit=Thoughts.popup_parts_cached(
+            self.store,info.book_id,info.chapter_uid,info.range,group,token
+        )
+        if html=="" then self:info("没有想法内容"); return end
         ThoughtPopup.show{
-            source_html=first_page.source_html,
-            html=first_page.html,
+            source_html=source_html,
+            html=html,
             font_size=self:_thought_font_size(prefs.font),
             font_name=self:_thought_font_name(),
             width_ratio=tonumber(prefs.width_ratio) or 0.91,
             height_ratio=tonumber(prefs.height_ratio) or 0.60,
             css=Thoughts.popup_css(),
-            metrics=first_page.metrics,
-            page_index=first_page.page_index,
-            page_count=first_page.page_count,
-            page_loader=function(index) return Thoughts.page_parts(group,prefs.font,index) end,
+            metrics=metrics,
         }
         logger.info("[MiuRead][ThoughtPopup] opened",
             "book=",tostring(info.book_id),"chapter=",tostring(info.chapter_uid),
-            "comments=",tostring(#(group.texts or {})),
-            "pages=",tostring(first_page.page_count or 1),
+            "comments=",tostring(metrics and metrics.comment_count or 0),
             "chapter_cache=",token and token.cache_hit and "hit" or "miss",
+            "html_cache=",html_cache_hit and "hit" or "miss",
             "elapsed_ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
     end,debug.traceback)
     self._thought_popup_busy=false
