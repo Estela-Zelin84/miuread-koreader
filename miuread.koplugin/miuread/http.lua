@@ -85,15 +85,68 @@ local function body_rate_limit(text)
 end
 
 local RATE_LIMIT_DELAYS = {15, 30, 60, 90}
+local SHARED_RATE_LIMIT_DEFAULT = 300
 
 function Http:new(store)
+    local data_dir=tostring(store and store.data_dir or "")
+    local temp_dir=tostring(store and store.temp_dir or "")
+    local base=data_dir~="" and data_dir or temp_dir
     return setmetatable({
         store = store,
         user_agent = Protocol.USER_AGENT,
         last_weread_request_at = 0,
         rate_limit_until = 0,
         min_weread_interval = 0.35,
+        shared_rate_limit_path = base~="" and (base.."/weread-rate-limit.json") or nil,
     }, self)
+end
+
+function Http:_rate_limit_path(scope)
+    local path=tostring(self.shared_rate_limit_path or "")
+    if path=="" then return "" end
+    scope=tostring(scope or "global"):gsub("[^%w%-_]","-")
+    if scope=="" or scope=="global" then return path end
+    return path:gsub("%.json$","").."-"..scope..".json"
+end
+
+function Http:_shared_rate_limit(scope)
+    local path=self:_rate_limit_path(scope)
+    if path=="" then return 0,nil end
+    local raw=Util.read_file(path,true)
+    if not raw then return 0,nil end
+    local ok,state=pcall(Json.decode,raw)
+    if not ok or type(state)~="table" then
+        os.remove(path)
+        return 0,nil
+    end
+    local until_at=tonumber(state.until_at or 0) or 0
+    local remaining=math.max(0,math.ceil(until_at-os.time()))
+    if remaining<=0 then
+        os.remove(path)
+        return 0,nil
+    end
+    return remaining,state
+end
+
+function Http:_set_shared_rate_limit(seconds,code,url,scope)
+    local path=self:_rate_limit_path(scope)
+    seconds=math.max(1,math.floor(tonumber(seconds) or SHARED_RATE_LIMIT_DEFAULT))
+    if path=="" then return seconds end
+    local current=self:_shared_rate_limit(scope)
+    local until_at=os.time()+math.max(seconds,tonumber(current) or 0)
+    local payload={
+        until_at=until_at,
+        code=tostring(code or "rate_limit"),
+        source=tostring(url or ""),
+        scope=tostring(scope or "global"),
+        updated_at=os.time(),
+    }
+    local ok,encoded=pcall(Json.encode,payload)
+    if ok then
+        local wrote,err=Util.atomic_write(path,encoded,true)
+        if not wrote then logger.warn("[MiuRead][HTTP] shared rate-limit state write failed",tostring(err)) end
+    end
+    return math.max(1,until_at-os.time())
 end
 
 function Http:_cancelled()
@@ -270,6 +323,18 @@ function Http:request(opt)
         rate_retries = is_weread_api_url(opt.url) and tonumber(self.rate_limit_retries) or 0
     end
     rate_retries = math.max(0, math.min(#RATE_LIMIT_DELAYS, rate_retries))
+    local rate_limit_scope=tostring(opt.rate_limit_scope or "global")
+    local shared_remaining,shared_state=self:_shared_rate_limit(rate_limit_scope)
+    if shared_remaining>0 then
+        local code=shared_state and shared_state.code or "rate_limit"
+        if opt.rate_limit_fail_fast==true then
+            error("请求频率暂时受限 [MiuReadRateLimit] error_code="..tostring(code)
+                .." wait_seconds="..tostring(shared_remaining).."：已暂停附加内容请求，请稍后补全。")
+        end
+        logger.warn("[MiuRead][HTTP] respecting shared rate-limit cooldown",
+            "wait=",tostring(shared_remaining),"code=",tostring(code),"url=",tostring(opt.url or ""))
+        self:_wait_rate_limit(shared_remaining,0,math.max(1,rate_retries),code)
+    end
     local rate_attempt = 0
     local last_text, last_code, last_headers, last_url, last_error
 
@@ -296,13 +361,17 @@ function Http:request(opt)
             error("network request failed: " .. tostring(last_error or "unknown"))
         end
 
+        local retry_after = tonumber(hget(last_headers, "retry-after"))
         if rate_attempt >= rate_retries then
+            local cooldown=tonumber(opt.rate_limit_cooldown) or retry_after or SHARED_RATE_LIMIT_DEFAULT
+            cooldown=math.max(30,math.min(1800,cooldown))
+            local remaining=self:_set_shared_rate_limit(cooldown,limited_code,last_url or opt.url,rate_limit_scope)
             error("请求频率仍受限 [MiuReadRateLimit] error_code=" .. tostring(limited_code)
-                .. "：自动等待后仍未恢复，已完成进度会保留，请稍后继续。")
+                .. " wait_seconds="..tostring(remaining)
+                .. "：已停止继续请求，正文和下载断点会保留，请稍后补全。")
         end
 
         rate_attempt = rate_attempt + 1
-        local retry_after = tonumber(hget(last_headers, "retry-after"))
         local wait = RATE_LIMIT_DELAYS[rate_attempt] or RATE_LIMIT_DELAYS[#RATE_LIMIT_DELAYS]
         if retry_after then wait = math.max(wait, math.min(180, retry_after)) end
         logger.warn("[MiuRead][HTTP] rate limited; cooling down",

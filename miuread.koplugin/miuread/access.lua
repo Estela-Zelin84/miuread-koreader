@@ -154,7 +154,7 @@ function Access:first_record(book_or_id,wanted_scope,_locked_only)
     local book=type(book_or_id)=="table" and book_or_id
         or (self.store and self.store:book(tostring(book_or_id or "")))
     if type(book)~="table" then return nil end
-    local preferred={"notes","clean","preview_notes","preview_clean"}
+    local preferred={"notes","clean","range_notes","range_clean","preview_notes","preview_clean"}
     for _,kind in ipairs(preferred) do
         local record=book.variants and book.variants[kind]
         if record and (not wanted_scope or wanted_scope=="all" or record_scope(record,kind)==wanted_scope) then return record end

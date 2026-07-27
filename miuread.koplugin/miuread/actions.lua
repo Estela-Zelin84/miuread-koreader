@@ -10,6 +10,7 @@ local general_actions={
     {"miuread_downloads","ShowMiuReadDownloads","觅阅：下载管理"},
     {"miuread_sync_status","ShowMiuReadSyncStatus","觅阅：同步状态"},
     {"miuread_qr_login","MiuReadQRLogin","觅阅：扫码登录"},
+    {"miuread_logout","MiuReadLogout","觅阅：退出登录"},
 }
 
 function Actions.register()

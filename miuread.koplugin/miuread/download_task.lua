@@ -155,6 +155,7 @@ function DownloadTask:descriptor()
         recovery_path=job.recovery_path,diagnostic_path=job.diagnostic_path,
         cancel_path=job.cancel_path,worker_settings_path=job.worker_settings_path,
         started_at=job.started_at,owner_token=self.owner_token,task_token=job.task_token,
+        restart_count=tonumber(job.restart_count) or 0,
     }
 end
 
@@ -329,6 +330,51 @@ function DownloadTask:_finish(job, forced_error)
     end
 end
 
+function DownloadTask:_restart_interrupted(job)
+    if not job or job.cancel_requested_at then return false end
+    local count=tonumber(job.restart_count) or 0
+    if count>=2 or type(job.restart_book)~="table" or tostring(job.restart_book.bookId or "")=="" then
+        return false
+    end
+    local book=serializable_copy(job.restart_book)
+    local options=serializable_copy(job.restart_options or {}) or {}
+    local on_progress,on_done=job.on_progress,job.on_done
+    local state=U.copy(job.last_progress_state or {})
+    state.stage="restart"
+    state.message="后台下载进程被系统中断，正在从断点自动恢复（"..tostring(count+1).."/2）"
+    state.updated_at=os.time()
+    state.restart_count=count+1
+    if on_progress then pcall(on_progress,state) end
+
+    diagnostic_append(job.diagnostic_path,{
+        "time="..tostring(os.date("%Y-%m-%d %H:%M:%S")),
+        "event=automatic_restart",
+        "pid="..tostring(job.pid or ""),
+        "stage="..tostring((job.last_progress_state or {}).stage or "unknown"),
+        "restart_count="..tostring(count+1),
+    })
+    os.remove(job.progress_path)
+    os.remove(job.result_path)
+    if job.recovery_path then os.remove(job.recovery_path) end
+    os.remove(job.cancel_path)
+    if job.worker_settings_path then os.remove(job.worker_settings_path) end
+    if self:_owns_job() then os.remove(self.owner_path) end
+    self.job=nil
+    self:_release_awake()
+    local ok,err=self:start(book,options,on_progress,on_done,count+1)
+    if not ok then
+        logger.warn("[MiuRead][DownloadTask] automatic restart failed",tostring(err))
+        if on_done then
+            on_done({ok=false,error="后台下载进程被系统中断，自动恢复失败："..tostring(err).."。断点仍已保留。"})
+        end
+        return true
+    end
+    if on_progress then pcall(on_progress,state) end
+    logger.warn("[MiuRead][DownloadTask] worker restarted from checkpoint",
+        "attempt=",tostring(count+1),"book=",tostring(book.bookId or ""))
+    return true
+end
+
 function DownloadTask:_poll()
     local job = self.job
     if not job then return end
@@ -440,9 +486,10 @@ function DownloadTask:_poll()
         state.updated_at=now
         if job.on_progress then job.on_progress(state) end
     end
-    -- Do not turn a short /proc race into an error. A real dead worker must
-    -- remain absent for 60 seconds and make no progress for at least 30.
-    if now-job.dead_seen_at<60 or idle<30 then self:_schedule(); return end
+    -- Do not turn a short /proc race into a duplicate worker. A real dead
+    -- process must remain absent for 30 seconds and make no progress for 20.
+    if now-job.dead_seen_at<30 or idle<20 then self:_schedule(); return end
+    if self:_restart_interrupted(job) then return end
     self:_finish(job)
 end
 
@@ -453,7 +500,7 @@ function DownloadTask:cancel()
     U.atomic_write(job.cancel_path, "1", true)
 end
 
-function DownloadTask:attach(descriptor,on_progress,on_done)
+function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart_options)
     if self.job then return false,"已有下载任务正在运行" end
     if not self:available() then return false,"当前 KOReader 不支持下载子进程" end
     descriptor=type(descriptor)=="table" and descriptor or nil
@@ -473,6 +520,9 @@ function DownloadTask:attach(descriptor,on_progress,on_done)
         last_progress_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,
         unknown_seen_at=nil,waiting_notified=false,rechecking_notified=false,
         task_token=descriptor.task_token,
+        restart_count=tonumber(descriptor.restart_count) or 0,
+        restart_book=serializable_copy(restart_book),
+        restart_options=serializable_copy(restart_options),
     }
     self.backgrounded=true
     self:_read_progress(self.job)
@@ -502,7 +552,7 @@ function DownloadTask:attach(descriptor,on_progress,on_done)
     return true
 end
 
-function DownloadTask:start(book, options, on_progress, on_done)
+function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     if self.job then return false, "已有下载任务正在运行" end
     if not self:available() then return false, "当前 KOReader 不支持下载子进程" end
 
@@ -621,7 +671,7 @@ function DownloadTask:start(book, options, on_progress, on_done)
             end
             if raw:find("[MiuReadRateLimit]", 1, true)
                 or raw:lower():find("hit api rate limit", 1, true) then
-                return "微信读书暂时限制了请求频率。插件已自动分段等待并重试，但仍未恢复；已完成章节和断点都已保留，请稍后继续下载。"
+                return "微信读书暂时限制了请求频率。插件已停止继续请求；已完成章节和断点都已保留，请稍后继续下载。"
             end
             return display
         end
@@ -776,6 +826,9 @@ function DownloadTask:start(book, options, on_progress, on_done)
         waiting_notified = false,
         rechecking_notified = false,
         task_token = task_token,
+        restart_count = tonumber(restart_count) or 0,
+        restart_book = serializable_copy(book),
+        restart_options = serializable_copy(options),
         started_at = os.time(),
     }
     self:_claim(pid)

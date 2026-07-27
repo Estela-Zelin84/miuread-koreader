@@ -8,8 +8,16 @@ local Store={}; Store.__index=Store
 local defaults={
  schema=Config.SCHEMA,
  auth={api_key="",cookies={},wr_ticket="",wr_wrpa="",ticket_updated_at=0,
-     account={name="",vid="",logged_at=0}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+     account={name="",vid="",logged_at=0},
+     health={state="unknown",last_checked_at=0,last_ok_at=0,last_error_at=0,
+         last_error_code="",last_error_message="",last_error_channel="",notice_pending=false,
+         channels={
+             shelf={state="unknown",checked_at=0,error="",code=""},
+             progress={state="unknown",checked_at=0,error="",code=""},
+             download={state="unknown",checked_at=0,error="",code=""},
+             read_report={state="unknown",checked_at=0,error="",code=""},
+         }}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
@@ -660,6 +668,38 @@ function Store:migrate()
             if p.thoughts.follow_body_font==nil then p.thoughts.follow_body_font=false end
             if p.thoughts.font_face==nil then p.thoughts.font_face="" end
         end
+        if schema<52 then
+            -- beta.6.5 separates locally saved credentials from the server-side
+            -- health of each feature. Existing logins start as unknown and are
+            -- verified by the next real request instead of being shown as fully
+            -- healthy merely because cookies still exist on disk.
+            local auth=self.db:readSetting("auth",{}) or {}
+            auth.health=U.merge(defaults.auth.health,auth.health or {})
+            local has_local=tostring(auth.api_key or "")~="" and next(auth.cookies or {})~=nil
+            if not has_local then auth.health.state="logged_out" end
+            self.db:saveSetting("auth",U.merge(defaults.auth,auth))
+        end
+        if schema<53 then
+            -- beta.6.6 adds a shared request-cooldown file and automatic worker
+            -- restart. No user preference changes are required; old download
+            -- checkpoints remain compatible and are reused in place.
+        end
+        if schema<54 then
+            -- 2.3 adds passive automatic update checks. Checks only run while
+            -- KOReader is already open and online, so they never wake Wi-Fi.
+            p.update=U.merge(defaults.preferences.update,p.update or {})
+            p.update.manifest=Config.UPDATE_MANIFEST
+            if p.update.auto_check==nil then p.update.auto_check=true end
+            if not tonumber(p.update.interval) or tonumber(p.update.interval)<21600 then
+                p.update.interval=Config.AUTO_UPDATE_INTERVAL
+            end
+            p.update.last_attempt_at=tonumber(p.update.last_attempt_at) or 0
+            p.update.last_success_at=tonumber(p.update.last_success_at) or 0
+            p.update.last_prompted_version=tostring(p.update.last_prompted_version or "")
+            if p.update.restart_mode~="auto" and p.update.restart_mode~="never" then
+                p.update.restart_mode="ask"
+            end
+        end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)
     end
@@ -677,6 +717,17 @@ local function sanitized_auth(value)
 end
 function Store:auth() return sanitized_auth(self:get("auth",{})) end
 function Store:save_auth(v) self:set("auth",sanitized_auth(v)) end
+function Store:auth_health()
+    local auth=self:auth()
+    return U.merge(defaults.auth.health,auth.health or {})
+end
+function Store:update_auth_health(patch)
+    local auth=self:auth()
+    auth.health=U.merge(defaults.auth.health,auth.health or {})
+    auth.health=U.merge(auth.health,patch or {})
+    self:save_auth(auth)
+    return auth.health
+end
 function Store:clear_auth() self:set("auth",U.copy(defaults.auth)) end
 function Store:preferences() return U.merge(defaults.preferences,self:get("preferences",{})) end
 function Store:save_preferences(v) self:set("preferences",U.merge(defaults.preferences,v or {})) end
@@ -1003,6 +1054,9 @@ function Store:identify_file(path,relink)
                 content_type=meta.content_type,sync_enabled=meta.sync_enabled,read_report_enabled=meta.read_report_enabled,
                 downloaded_at=tonumber(meta.generated_at) or os.time(),chapter_map=chapters,
                 chapter_count=#chapters,complete=meta.complete~=false,file_size=current_size,
+                partial_range=meta.partial_range==true,range_start_index=tonumber(meta.range_start_index),
+                range_end_index=tonumber(meta.range_end_index),range_start_title=meta.range_start_title,
+                range_end_title=meta.range_end_title,
             }
             if standalone and uid~="" then
                 record.chapter_uid=uid
@@ -1025,6 +1079,9 @@ function Store:identify_file(path,relink)
             downloaded_at=tonumber(meta.generated_at) or os.time(),
             chapter_map=chapters,chapter_count=#chapters,complete=meta.complete~=false,
             file_size=current_size,recovered=true,
+            partial_range=meta.partial_range==true,range_start_index=tonumber(meta.range_start_index),
+            range_end_index=tonumber(meta.range_end_index),range_start_title=meta.range_start_title,
+            range_end_title=meta.range_end_title,
         }
         if standalone and uid~="" then
             record.chapter_uid=uid; b.chapters[uid]={[kind]=record}

@@ -1,14 +1,12 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "2.0.0-beta.6.4",
-    SCHEMA = 51,
+    VERSION = "2.3.0-beta.1",
+    SCHEMA = 54,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
-    -- 更新清单固定保存在仓库根目录；清单中的下载地址指向
-    -- GitHub Release 全量包。旧版本仍可通过备用地址升级到本版本。
-    -- This package is permanently bound to the beta channel. Installing a
-    -- stable full package is the only supported way to return to stable.
+    -- 更新清单固定保存在对应发布分支的仓库根目录；清单中的下载地址
+    -- 指向 GitHub Release 全量包。安装另一通道的全量包可切换更新通道。
     UPDATE_CHANNEL = "beta",
     UPDATE_CHANNEL_LABEL = "内测",
     UPDATE_MANIFEST = "https://raw.githubusercontent.com/miumiupy98-art/miuread-koreader/beta/update-beta.json",
@@ -23,6 +21,9 @@ local C = {
         "https://gh-proxy.com/",
         "https://ghproxy.net/",
     },
+
+    AUTO_UPDATE_INTERVAL = 24 * 60 * 60,
+    AUTO_UPDATE_RETRY_INTERVAL = 6 * 60 * 60,
 
     READ_INTERVAL = 30,
     IDLE_TIMEOUT = 600,

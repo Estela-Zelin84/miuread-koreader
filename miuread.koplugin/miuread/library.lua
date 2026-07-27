@@ -249,8 +249,8 @@ local function record_state(row)
                     downloaded=true
                     total_size=total_size+(tonumber(U.file_size(file)) or 0)
                     content_type=record.content_type or content_type
-                    if kind=="clean" or kind=="preview_clean" then has_clean=true end
-                    if kind=="notes" or kind=="preview_notes" then has_notes=true end
+                    if kind=="clean" or kind=="range_clean" or kind=="preview_clean" then has_clean=true end
+                    if kind=="notes" or kind=="range_notes" or kind=="preview_notes" then has_notes=true end
                 else
                     partial_downloaded=true
                 end

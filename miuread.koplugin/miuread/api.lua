@@ -164,7 +164,7 @@ function Api:web_progress(id)
     return data
 end
 
-function Api:_chapter_call(name, id, chapter_uid, extra)
+function Api:_chapter_call(name, id, chapter_uid, extra, request_options)
     local last
     local candidates = unique_candidates(chapter_uid)
     if #candidates == 0 then error(name .. ": invalid chapterUid") end
@@ -172,7 +172,7 @@ function Api:_chapter_call(name, id, chapter_uid, extra)
         local payload = U.copy(extra or {})
         payload.bookId = tostring(id)
         payload.chapterUid = uid
-        local ok, value = pcall(self.call, self, name, payload)
+        local ok, value = pcall(self.call, self, name, payload, request_options)
         if ok then return value end
         last = value
         if not tostring(value):lower():find("params error%(node%)") then error(value) end
@@ -180,8 +180,17 @@ function Api:_chapter_call(name, id, chapter_uid, extra)
     error(last or (name .. ": params error(node)"))
 end
 
+local ANNOTATION_REQUEST_OPTIONS={
+    retries=0,
+    rate_limit_retries=0,
+    rate_limit_fail_fast=true,
+    rate_limit_cooldown=300,
+    rate_limit_scope="annotations",
+    timeout={10,18},
+}
+
 function Api:underlines(id, chapter_uid)
-    return self:_chapter_call("/book/underlines", id, chapter_uid)
+    return self:_chapter_call("/book/underlines", id, chapter_uid, nil, ANNOTATION_REQUEST_OPTIONS)
 end
 
 function Api:review_batches(ranges, batch_size)
@@ -199,7 +208,8 @@ function Api:review_batches(ranges, batch_size)
 end
 
 function Api:readreviews(id, chapter_uid, batch)
-    return self:_chapter_call("/book/readreviews", id, chapter_uid, {reviews=sanitize(batch or {})})
+    return self:_chapter_call("/book/readreviews", id, chapter_uid,
+        {reviews=sanitize(batch or {})}, ANNOTATION_REQUEST_OPTIONS)
 end
 
 Api._scalar = scalar

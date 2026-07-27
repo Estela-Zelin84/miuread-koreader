@@ -121,16 +121,29 @@ function Auth:_finish(data)
         wr_ticket=tostring(header_value(renewal_headers,"x-wr-ticket") or "")
         wr_wrpa=tostring(header_value(renewal_headers,"x-wrpa-0") or "")
     else
-        logger.warn("[MiuRead][Auth] QR-session public-account renewal failed",U.first_line(tostring(renewal),160))
+        logger.warn("[MiuRead][Auth] QR-session public-account renewal failed",Util.first_line(tostring(renewal),160))
     end
 
     -- Persist only the proven long-lived cookie boundary. Browser-only session
     -- cookies are discarded after the immediate renewal attempt.
     local jar=Cookies.sanitize(session)
+    local now=os.time()
+    local ok_channel={state="ok",checked_at=now,error="",code=""}
+    local pending_channel={state="unknown",checked_at=now,error="",code=""}
+    local web_ready=renewal_ok and renewal_succ
     self.store:save_auth({
         api_key=api_key,cookies=jar,wr_ticket=wr_ticket,wr_wrpa=wr_wrpa,
-        ticket_updated_at=(wr_ticket~="" or wr_wrpa~="") and os.time() or 0,
-        account={name=account_name,vid=vid,logged_at=os.time()},
+        ticket_updated_at=(wr_ticket~="" or wr_wrpa~="") and now or 0,
+        account={name=account_name,vid=vid,logged_at=now},
+        health={
+            state=web_ready and "ok" or "unknown",last_checked_at=now,last_ok_at=now,last_error_at=0,
+            last_error_code="",last_error_message="",last_error_channel="",notice_pending=false,
+            channels={
+                shelf=Util.copy(ok_channel),progress=Util.copy(ok_channel),
+                download=Util.copy(web_ready and ok_channel or pending_channel),
+                read_report=Util.copy(web_ready and ok_channel or pending_channel),
+            },
+        },
     })
     logger.info("[MiuRead][Auth] QR session finalized",
         "session_cookies=",tostring(cookie_count(session)),
@@ -261,7 +274,11 @@ function Auth:_schedule(uid,gen,otp)
                 local name=self:_finish(data)
                 logger.info("[MiuRead][Auth] QR login completed")
                 self:cancel()
-                self.host:info(_("Logged in")..": "..tostring(name))
+                if self.host.on_auth_success then
+                    pcall(self.host.on_auth_success,self.host,name)
+                else
+                    self.host:info(_("Logged in")..": "..tostring(name))
+                end
             end)
             return
         end

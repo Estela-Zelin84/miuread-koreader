@@ -163,7 +163,9 @@ local function option_key(opt)
     return table.concat({
         opt.annotations and "notes" or "clean",
         opt.images == false and "no-images" or "images",
-        opt.chapter_uid and ("chapter-" .. U.id_name(opt.chapter_uid)) or "book",
+        opt.chapter_uid and ("chapter-" .. U.id_name(opt.chapter_uid))
+            or ((opt.range_start_index and opt.range_end_index)
+                and ("range-" .. tostring(opt.range_start_index) .. "-" .. tostring(opt.range_end_index)) or "book"),
     }, "-")
 end
 
@@ -618,14 +620,16 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     local suffix = kind == "notes" and "划线与想法版" or "纯净版"
     local dir = self.store:epub_root()
     local standalone = opt.chapter_uid ~= nil
+    local partial_range = not standalone and opt.range_start_index ~= nil and opt.range_end_index ~= nil
     local chapter_name = standalone and (" - " .. U.safe_name(chapters[1] and chapters[1].title or "章节")) or ""
+    local range_name = partial_range and "【章节版】" or ""
     local preview_name=""
     if not standalone and opt.access_scope=="preview" then
         if preview_mode=="info" then preview_name="【试读信息版】"
         elseif preview_mode=="partial" then preview_name="【试读版·部分内容】"
         else preview_name="【试读版】" end
     end
-    local filename = U.safe_name(book.title, "book") .. preview_name .. chapter_name .. " [" .. suffix .. "].epub"
+    local filename = U.safe_name(book.title, "book") .. preview_name .. range_name .. chapter_name .. " [" .. suffix .. "].epub"
     local path = self.store:epub_path(filename)
     local map = {}
     for index, chapter in ipairs(chapters) do
@@ -646,13 +650,17 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         "memory_kb=", tostring(math.floor(collectgarbage("count"))))
     local now=os.time()
     local access_scope=tostring(opt.access_scope or "full")
-    local storage_kind=(access_scope=="preview" and not standalone) and ("preview_"..kind) or kind
+    local storage_kind=partial_range and ("range_"..kind)
+        or ((access_scope=="preview" and not standalone) and ("preview_"..kind) or kind)
     local built, build_error = pcall(Epub.build, temp_path, book, chapters, css, assets, cover, {
         schema=7, book_id=book.bookId, title=book.title, author=book.author,
         variant=storage_kind, base_variant=kind, standalone=standalone, chapter_uid=opt.chapter_uid,
+        partial_range=partial_range,range_start_index=tonumber(opt.range_start_index),
+        range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
+        range_end_title=opt.range_end_title,
         content_type="book",
-        sync_enabled=true,
-        read_report_enabled=true,
+        sync_enabled=not partial_range,
+        read_report_enabled=not partial_range,
         chapters=map, generated_at=now, complete=true,
         access_scope=access_scope,
         catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
@@ -718,8 +726,11 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
         file=path, directory=dir, variant=storage_kind, base_variant=kind, downloaded_at=now,
         content_type="book",
-        sync_enabled=true,
-        read_report_enabled=true,
+        sync_enabled=not partial_range,
+        read_report_enabled=not partial_range,
+        partial_range=partial_range,range_start_index=tonumber(opt.range_start_index),
+        range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
+        range_end_title=opt.range_end_title,
         chapter_count=#chapters, expected_chapter_count=expected_chapter_count,
         catalog_chapter_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
         readable_chapter_count=tonumber(opt.readable_chapter_count) or #chapters,
@@ -744,7 +755,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     end
     self.store:save_book(book.bookId, {
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
-        directory=dir, updated_at=now, catalog=map,
+        directory=dir, updated_at=now, catalog=(type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map),
         content_type="book",
     })
     if type(self.store.clear_book_access)=="function" then self.store:clear_book_access(book.bookId) end
@@ -793,11 +804,33 @@ function Downloader:book(input, opt, progress)
 
     progress("catalog", 0, 1, book.title)
     local catalog, all = self:catalog(book.bookId)
+    local full_catalog_map={}
+    for index,chapter in ipairs(all or {}) do
+        full_catalog_map[#full_catalog_map+1]={
+            uid=chapter.chapterUid or chapter.uid,
+            index=tonumber(chapter.chapterIdx or chapter.index) or index,
+            title=chapter.title,
+            word_count=tonumber(chapter.wordCount or chapter.word_count) or 0,
+            structural=chapter.structural==true,
+        }
+    end
+    opt.full_catalog_map=full_catalog_map
     local selected = {}
     if opt.chapter_uid then
         for _, chapter in ipairs(all) do
             if tostring(chapter.chapterUid or chapter.uid) == tostring(opt.chapter_uid) then selected[1] = chapter; break end
         end
+    elseif opt.range_start_index and opt.range_end_index then
+        local first=math.max(1,tonumber(opt.range_start_index) or 1)
+        local last=math.min(#all,tonumber(opt.range_end_index) or first)
+        if last<first then first,last=last,first end
+        for index,chapter in ipairs(all) do
+            if index>=first and index<=last then selected[#selected+1]=chapter end
+        end
+        opt.range_start_index=first
+        opt.range_end_index=last
+        opt.range_start_title=opt.range_start_title or (all[first] and all[first].title)
+        opt.range_end_title=opt.range_end_title or (all[last] and all[last].title)
     else
         for index, chapter in ipairs(all) do
             if not opt.limit or index <= tonumber(opt.limit) then selected[#selected + 1] = chapter end

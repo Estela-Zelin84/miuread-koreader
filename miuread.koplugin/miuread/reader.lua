@@ -554,40 +554,48 @@ function Reader:_recover_login_session()
     local ok, result = pcall(function()
         local renewed, meta = self:renew()
         if type(renewed) ~= "table" then error("续期接口返回无效数据") end
-
-        -- A successful HTTP response alone is not enough: verify the renewed
-        -- web cookies against userInfo and refresh the Skills API key before
-        -- allowing the failed request to retry.
-        local verified
-        local last_error
-        for attempt = 1, 2 do
-            local verify_ok, verify_result = pcall(self.repair_login_session, self)
-            if verify_ok then
-                verified = verify_result
-                break
-            end
-            last_error = verify_result
-            if attempt < 2 then pause(0.4) end
+        if renewed.succ == false or tostring(renewed.succ or "") == "0" then
+            error("微信读书未接受本次登录续期")
         end
-        if not verified then error("续期后的账户验证失败：" .. tostring(last_error)) end
+
+        -- Ordinary book reading and downloads only need the renewed Web
+        -- session. Refreshing the Skills API key is useful for other features,
+        -- but a failure there must not invalidate an otherwise usable book
+        -- session or stop a long background download.
+        local skills_ok, skills_result = pcall(self.repair_login_session, self)
+        if not skills_ok then
+            logger.warn("[MiuRead][Reader] optional Skills credential refresh failed",
+                tostring(skills_result))
+        end
 
         local after = self.store:auth()
         local after_vid = tostring((after.account or {}).vid or (after.cookies or {}).wr_vid or "")
+        local after_skey = tostring((after.cookies or {}).wr_skey or "")
+        if after_vid == "" or after_skey == "" then
+            error("续期后仍缺少正文下载所需的登录凭据")
+        end
         if before_vid ~= "" and after_vid ~= "" and before_vid ~= after_vid then
             self.store:save_auth(before)
             error("续期返回了不同账户，已保留原账户凭据")
         end
-        return {meta=meta, verified=verified, vid=after_vid}
+        return {meta=meta, verified=true, skills_verified=skills_ok, vid=after_vid}
     end)
 
     self._renewing_session = false
     if ok then
         logger.info("[MiuRead][Reader] login session renewed and verified",
+            "skills=", tostring(result.skills_verified == true),
             "vid_unchanged=", tostring(before_vid == "" or before_vid == tostring(result.vid or "")))
         return true, result
     end
     logger.warn("[MiuRead][Reader] login session recovery failed", tostring(result))
     return false, result
+end
+
+function Reader:check_login_session()
+    local ok, result = self:_recover_login_session()
+    if not ok then error(result) end
+    return result
 end
 
 local function load_reader_context(self,book_id,chapter_uid,require_psvts)
