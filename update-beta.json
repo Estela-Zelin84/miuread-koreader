@@ -1,0 +1,16 @@
+{
+  "channel": "beta",
+  "version": "2.3.1-beta.1",
+  "name": "觅阅 · 微信读书助手 2.3.1-beta.1 内测版",
+  "package_type": "full",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.3.1-beta.1/miuread-v2.3.1-beta.1-full.zip",
+  "package_urls": [
+    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.3.1-beta.1/miuread-v2.3.1-beta.1-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.3.1-beta.1/miuread-v2.3.1-beta.1-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.3.1-beta.1/miuread-v2.3.1-beta.1-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.3.1-beta.1/miuread-v2.3.1-beta.1-full.zip"
+  ],
+  "size": 223176,
+  "sha256": "64a0ec3e7fbd0018c787702acd2e55e40796083ef61bb638152463d111d70082",
+  "notes": "2.3.1 更新内容\n\n1. 恢复在菜单中直接显示“已登录 + 账号名称”，点击后可查看完整账号状态。\n2. 下载完成提示结束后自动清除顶部下载状态，不再长期显示“某书下载完成”；已完成书籍仍保留在下载管理中。\n3. 更新设置直接显示检查频率、安装后的重启方式、当前运行版本和更新通道。\n4. 修正更新说明发布流程，更新弹窗使用当前版本内容，并替换旧设备可能无法显示的项目符号。\n5. 书架单击直接打开上次阅读的版本，长按打开完整书籍菜单。\n6. 阅读中增加下载当前章、当前章及后续 5 章、当前章及后续 10 章。\n7. 章节版可以继续追加后续章节，并复用已下载章节的断点。\n8. 公众号阅读中增加“当前文章”，可重新下载或删除本篇缓存。\n9. 保留自动检查更新、安装后询问或自动重启，以及“觅阅：退出登录”手势。"
+}
