@@ -1,0 +1,21 @@
+觅阅 2.0.0-beta.6.0 GitHub 发布说明
+
+1. 解压本仓库源码包。
+2. 将解压后的全部内容上传到 GitHub 仓库 main 分支根目录。
+3. 确认目录结构中存在：
+   .github/workflows/release.yml
+   miuread.koplugin/
+   update.json
+4. 打开 GitHub 仓库的 Actions 页面。
+5. 选择“Release full package”。
+6. 点击“Run workflow”。
+7. tag 输入：v2.0.0-beta.6.0
+8. 工作流会自动：
+   - 检查版本号；
+   - 生成 miuread-v2.0.0-beta.6.0-full.zip；
+   - 创建或更新 GitHub prerelease；
+   - Release 中只保留一个完整安装包；
+   - 校验公开下载地址与 SHA-256；
+   - 更新仓库根目录 update.json。
+
+注意：不要只上传 miuread.koplugin 目录，否则 GitHub Actions 不会出现发布流程。

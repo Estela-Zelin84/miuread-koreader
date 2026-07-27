@@ -7,10 +7,11 @@ local U=require("miuread.util")
 local Store={}; Store.__index=Store
 local defaults={
  schema=Config.SCHEMA,
- auth={api_key="",cookies={},account={name="",vid="",logged_at=0}},
+ auth={api_key="",cookies={},wr_ticket="",wr_wrpa="",ticket_updated_at=0,
+     account={name="",vid="",logged_at=0}},
  preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
- pending_installs={},last_cleanup_result={},read_report_consumed={},
+ pending_installs={},last_cleanup_result={},read_report_consumed={},external_epub_cache={},
 }
 local function public_documents_root(data_dir)
     local kindle_documents = "/mnt/us/documents"
@@ -27,10 +28,11 @@ end
 function Store:new(options)
     options=options or {}
     local data=options.data_dir or (DataStorage:getFullDataDir().."/"..Config.DATA_DIR)
-    U.mkdir(data); U.mkdir(data.."/books"); U.mkdir(data.."/covers"); U.mkdir(data.."/temp"); U.mkdir(data.."/updates")
+    U.mkdir(data); U.mkdir(data.."/books"); U.mkdir(data.."/mp"); U.mkdir(data.."/covers"); U.mkdir(data.."/temp"); U.mkdir(data.."/updates")
     local o=setmetatable({
         data_dir=data,
         cache_books_dir=data.."/books",
+        mp_dir=data.."/mp",
         default_books_dir=public_documents_root(data),
         covers_dir=data.."/covers",
         temp_dir=data.."/temp",
@@ -570,20 +572,116 @@ function Store:migrate()
             end
             self.db:saveSetting("library",library)
         end
+        if schema<44 then
+            -- 2.0.0-beta.3 restores the WeRead app shelf order. beta.2 cached
+            -- the raw API array order, so discard that cache once and remove
+            -- obsolete user-sort fields before the next shelf load.
+            p.shelf_sort=nil; p.shelf_scope=nil; p.shelf_filters=nil
+            p.account_shelf_sort=nil; p.account_shelf_scope=nil
+            p.generated_shelf_sort=nil; p.generated_shelf_scope=nil
+            self.db:saveSetting("shelf_cache",U.copy(defaults.shelf_cache))
+        end
+        if schema<45 then
+            -- 2.0.0-beta.5 stores public-account lists and articles outside the
+            -- global settings file. Existing books, checkpoints and EPUB files
+            -- are intentionally left untouched.
+            local auth=self.db:readSetting("auth",{}) or {}
+            if auth.wr_ticket==nil then auth.wr_ticket="" end
+            if auth.wr_wrpa==nil then auth.wr_wrpa="" end
+            if auth.ticket_updated_at==nil then auth.ticket_updated_at=0 end
+            self.db:saveSetting("auth",U.merge(defaults.auth,auth))
+        end
+        if schema<48 then
+            -- 2.0.0-beta.5.8 replaces the old browser-authorized public-account
+            -- implementation with QR-login + MP_WXS article reading. Existing
+            -- article HTML caches remain on disk, but obsolete collection records
+            -- and queued collection downloads are detached so they cannot return.
+            local auth=self.db:readSetting("auth",{}) or {}
+            auth.mp_cookie_header=nil
+            auth.mp_extra_headers=nil
+            auth.mp_referer=nil
+            auth.mp_auth_source=nil
+            auth.mp_authorized_at=nil
+            self.db:saveSetting("auth",U.merge(defaults.auth,auth))
+
+            local function is_mp_id(id)
+                id=tostring(id or "")
+                return id:sub(1,7)=="MP_WXS_" or id:lower()=="mpbook"
+            end
+
+            local library=self.db:readSetting("library",{}) or {}
+            local sessions=self.db:readSetting("sessions",{}) or {}
+            local library_changed,sessions_changed=false,false
+            for id,row in pairs(library) do
+                if is_mp_id(id) or (type(row)=="table" and tostring(row.content_type or "")=="mp_collection") then
+                    library[id]=nil
+                    library_changed=true
+                    if sessions[tostring(id)]~=nil then sessions[tostring(id)]=nil; sessions_changed=true end
+                end
+            end
+            if library_changed then self.db:saveSetting("library",library) end
+            if sessions_changed then self.db:saveSetting("sessions",sessions) end
+
+            local kept_queue={}
+            for _,job in ipairs(self.db:readSetting("download_queue",{}) or {}) do
+                local book=type(job.book)=="table" and job.book or {}
+                local options=type(job.options)=="table" and job.options or {}
+                local id=book.bookId or book.book_id
+                local obsolete=is_mp_id(id) or options.mp_collection==true
+                    or tostring(options.content_type or "")=="mp_collection"
+                    or tostring(book.content_type or "")=="mp_collection"
+                if not obsolete then kept_queue[#kept_queue+1]=job end
+            end
+            self.db:saveSetting("download_queue",kept_queue)
+
+            local shelf=self.db:readSetting("shelf_cache",{}) or {}
+            shelf.mp={}
+            self.db:saveSetting("shelf_cache",U.merge(defaults.shelf_cache,shelf))
+
+            local state=self:download_state()
+            local state_book=type(state.book)=="table" and state.book or {}
+            local state_options=type(state.options)=="table" and state.options or {}
+            if is_mp_id(state.book_id or state_book.bookId or state_book.book_id)
+                or state_options.mp_collection==true
+                or tostring(state_options.content_type or "")=="mp_collection" then
+                self:clear_download_state()
+            end
+        end
+        if schema<49 then
+            -- beta.6.0 remembers ordinary EPUB files by path, size and mtime.
+            -- Unchanged external books no longer need repeated ZIP inspection
+            -- after every KOReader restart.
+            self.db:saveSetting("external_epub_cache",{})
+        end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end
 function Store:get(k,d) local v=self.db:readSetting(k,nil); return v==nil and U.copy(d) or v end
 function Store:set(k,v) self.db:saveSetting(k,v); self.db:flush() end
-function Store:auth() return U.merge(defaults.auth,self:get("auth",{})) end
-function Store:save_auth(v) self:set("auth",U.merge(defaults.auth,v or {})) end
+local function sanitized_auth(value)
+    local auth=U.merge(defaults.auth,value or {})
+    auth.mp_cookie_header=nil
+    auth.mp_extra_headers=nil
+    auth.mp_referer=nil
+    auth.mp_auth_source=nil
+    auth.mp_authorized_at=nil
+    return auth
+end
+function Store:auth() return sanitized_auth(self:get("auth",{})) end
+function Store:save_auth(v) self:set("auth",sanitized_auth(v)) end
 function Store:clear_auth() self:set("auth",U.copy(defaults.auth)) end
 function Store:preferences() return U.merge(defaults.preferences,self:get("preferences",{})) end
 function Store:save_preferences(v) self:set("preferences",U.merge(defaults.preferences,v or {})) end
 function Store:books_root() local p=self:preferences().download_dir; if p=="" then p=self.default_books_dir end; U.mkdir(p); return p end
 function Store:epub_root() return self:books_root() end
 function Store:book_cache_path(id) return self.cache_books_dir.."/"..U.id_name(id) end
+function Store:mp_account_dir(id)
+    local path=self.mp_dir.."/"..U.id_name(id)
+    U.mkdir(self.mp_dir); U.mkdir(path)
+    return path
+end
+function Store:mp_root() U.mkdir(self.mp_dir); return self.mp_dir end
 function Store:book_dir(id) local p=self:book_cache_path(id); U.mkdir(p); return p end
 function Store:epub_path(filename) local p=self:epub_root().."/"..tostring(filename); U.mkdir(self:epub_root()); return p end
 
@@ -798,6 +896,7 @@ function Store:epub_identity(path)
             return {
                 book_id=id,
                 variant=tail:match('"variant"%s*:%s*"([^"]+)"'),
+                content_type=tail:match('"content_type"%s*:%s*"([^"]+)"'),
                 standalone=tail:match('"standalone"%s*:%s*true')~=nil,
             }
         end
@@ -807,6 +906,60 @@ end
 
 local function access_from_epub_meta(_meta)
     return nil
+end
+
+local EXTERNAL_EPUB_CACHE_LIMIT=256
+local EXTERNAL_EPUB_CACHE_TTL=180*24*60*60
+local function external_epub_signature(path)
+    local attr=lfs.attributes(path)
+    if not attr or attr.mode~="file" then return nil end
+    return {size=tonumber(attr.size) or 0,mtime=tonumber(attr.modification) or 0}
+end
+function Store:is_external_epub_cached(path)
+    if not tostring(path or ""):lower():match("%.epub$") then return false end
+    local key=normalize_path(path)
+    if key=="" then return false end
+    local rows=self:get("external_epub_cache",{})
+    local row=rows[key]
+    local sig=external_epub_signature(path)
+    if type(row)=="table" and sig
+        and tonumber(row.size)==sig.size and tonumber(row.mtime)==sig.mtime then
+        row.checked_at=os.time()
+        return true
+    end
+    if row~=nil then rows[key]=nil; self:set("external_epub_cache",rows) end
+    return false
+end
+function Store:remember_external_epub(path)
+    if not tostring(path or ""):lower():match("%.epub$") then return false end
+    local key=normalize_path(path)
+    local sig=external_epub_signature(path)
+    if key=="" or not sig then return false end
+    local rows=self:get("external_epub_cache",{})
+    local now=os.time()
+    rows[key]={size=sig.size,mtime=sig.mtime,checked_at=now}
+    local ordered={}
+    for item,row in pairs(rows) do
+        local at=tonumber(type(row)=="table" and row.checked_at or 0) or 0
+        if now-at>EXTERNAL_EPUB_CACHE_TTL or not external_epub_signature(item) then
+            rows[item]=nil
+        else
+            ordered[#ordered+1]={key=item,at=at}
+        end
+    end
+    table.sort(ordered,function(a,b) return a.at>b.at end)
+    for index=#ordered,EXTERNAL_EPUB_CACHE_LIMIT+1,-1 do rows[ordered[index].key]=nil end
+    self:set("external_epub_cache",rows)
+    return true
+end
+function Store:forget_external_epub(path)
+    local key=normalize_path(path)
+    if key=="" then return false end
+    local rows=self:get("external_epub_cache",{})
+    if rows[key]==nil then return false end
+    rows[key]=nil
+    self:set("external_epub_cache",rows)
+    return true
 end
 
 function Store:identify_file(path,relink)
@@ -829,18 +982,22 @@ function Store:identify_file(path,relink)
     end
     for _,b in pairs(all) do
         for kind,r in pairs(b.variants or {}) do
-            if match_record(r) then relink_record(b,r); return b,r,kind end
+            if match_record(r) then self:forget_external_epub(path); relink_record(b,r); return b,r,kind end
         end
         for uid,row in pairs(b.chapters or {}) do
             for kind,r in pairs(row or {}) do
                 if match_record(r) then
                     r.chapter_uid=uid
+                    self:forget_external_epub(path)
                     relink_record(b,r)
                     return b,r,kind
                 end
             end
         end
     end
+
+    if not normalized:lower():match("%.epub$") then return nil,nil,nil,"external_type" end
+    if self:is_external_epub_cached(path) then return nil,nil,nil,"external_cached" end
 
     local meta=self:epub_identity(path)
     -- For older files without embedded identity, a harmless spacing-only rename
@@ -865,13 +1022,14 @@ function Store:identify_file(path,relink)
         if #matches==1 then
             local found=matches[1]
             if found.uid then found.record.chapter_uid=found.uid end
+            self:forget_external_epub(path)
             relink_record(found.book,found.record)
             return found.book,found.record,found.kind
         end
     end
 
     local id=meta and tostring(meta.book_id or "") or ""
-    if id=="" then return nil end
+    if id=="" then self:remember_external_epub(path); return nil,nil,nil,"external" end
     local kind=tostring(meta.variant or "")
     if kind=="" then kind="notes" end
     local b=all[id]
@@ -894,6 +1052,7 @@ function Store:identify_file(path,relink)
             record={
                 book_id=id,title=meta.title or b.title or basename(path),author=meta.author or b.author or "",
                 file=path,directory=path:match("^(.*)/[^/]+$"),variant=kind,
+                content_type=meta.content_type,sync_enabled=meta.sync_enabled,read_report_enabled=meta.read_report_enabled,
                 downloaded_at=tonumber(meta.generated_at) or os.time(),chapter_map=chapters,
                 chapter_count=#chapters,complete=meta.complete~=false,file_size=current_size,
             }
@@ -908,11 +1067,14 @@ function Store:identify_file(path,relink)
         b={
             book_id=id,title=meta.title or tostring(basename(path) or id):gsub("%.epub$",""),
             author=meta.author or "",variants={},chapters={},catalog=chapters,
+            content_type=meta.content_type,
             directory=path:match("^(.*)/[^/]+$"),updated_at=os.time(),recovered=true,
         }
         record={
             book_id=id,title=b.title,author=b.author,file=path,directory=b.directory,
-            variant=kind,downloaded_at=tonumber(meta.generated_at) or os.time(),
+            variant=kind,content_type=meta.content_type,
+            sync_enabled=meta.sync_enabled,read_report_enabled=meta.read_report_enabled,
+            downloaded_at=tonumber(meta.generated_at) or os.time(),
             chapter_map=chapters,chapter_count=#chapters,complete=meta.complete~=false,
             file_size=current_size,recovered=true,
         }
@@ -924,6 +1086,7 @@ function Store:identify_file(path,relink)
         all[id]=b
     end
 
+    self:forget_external_epub(path)
     if record and relink then relink_record(b,record) end
     return b,record,kind
 end

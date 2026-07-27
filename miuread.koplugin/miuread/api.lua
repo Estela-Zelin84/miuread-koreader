@@ -122,6 +122,21 @@ function Api:shelf(options)
         timeout=options.timeout or {10,18},
     })
 end
+function Api:notebooks(count, last_sort)
+    local params={count=tonumber(count) or 100}
+    if tonumber(last_sort or 0) and tonumber(last_sort or 0)~=0 then
+        params.lastSort=tonumber(last_sort)
+    end
+    return self:call("/user/notebooks", params, {retries=1, timeout={10,18}})
+end
+function Api:bookmark_list(id)
+    return self:call("/book/bookmarklist", {bookId=tostring(id or "")}, {retries=1, timeout={10,18}})
+end
+function Api:review_list_mine(id, synckey, count)
+    return self:call("/review/list/mine", {
+        bookid=tostring(id or ""), count=tonumber(count) or 100, synckey=tonumber(synckey) or 0,
+    }, {retries=1, timeout={10,18}})
+end
 function Api:search(q, offset, count)
     return self:call("/store/search", {keyword=tostring(q or ""), scope=10, maxIdx=offset or 0, count=count or 30}, {retries=1, timeout={10, 18}})
 end

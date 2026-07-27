@@ -16,6 +16,8 @@ local Http=require("miuread.http")
 local Api=require("miuread.api")
 local Auth=require("miuread.auth")
 local Reader=require("miuread.reader")
+local Protocol=require("miuread.protocol")
+local MP=require("miuread.mp")
 local Access=require("miuread.access")
 local Annotations=require("miuread.annotations")
 local Downloader=require("miuread.downloader")
@@ -59,6 +61,7 @@ function Plugin:init()
     self.http=Http:new(self.store)
     self.reader=Reader:new(self.http,self.store)
     self.api=Api:new(self.http,self.store,self.reader)
+    self.mp=MP:new(self.reader,self.http,self.store,self.api)
     self.annotations=Annotations:new(self.api)
     self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http)
     self.download_task=DownloadTask:new(self.store)
@@ -66,9 +69,10 @@ function Plugin:init()
     self.library=Library:new(self.api,self.http,self.store)
     self.access=Access:new(self.library,self.api,self.reader,self.store)
     self.async=Async:new(self.store)
-    self.search_async=Async:new(self.store,{poll_interval=.4})
-    self.shelf_async=Async:new(self.store,{poll_interval=.4})
-    self.cover_async=Async:new(self.store)
+    self.mp_async=Async:new(self.store,{poll_interval=.35,allow_android=true})
+    self.search_async=Async:new(self.store,{poll_interval=.4,allow_android=true})
+    self.shelf_async=Async:new(self.store,{poll_interval=.4,allow_android=true})
+    self.cover_async=Async:new(self.store,{poll_interval=.30,allow_android=true})
     self.auth_flow=Auth:new(self.http,self.store,self)
     self.sync=Sync:new(self.reader,self.api,self.store,self,self.async)
     self.updater=Updater:new(self.http,self.store,self.version,ROOT)
@@ -84,6 +88,7 @@ function Plugin:init()
     self._last_shelf_section="account"
     self._shelf_refresh_generation=0
     self._shelf_main_busy=false
+    self._cover_start_failures=0
     self._downloads_menu=nil
     self._download_book_menu=nil
     self._cache_cleanup_dialog=nil
@@ -125,7 +130,7 @@ function Plugin:status_toast(title,text,timeout)
         self:toast(tostring(title or "").." · "..tostring(text or ""):gsub("%s+"," "),timeout or 3)
     end
 end
-function Plugin:_legacy_weread_plugin_present()
+function Plugin:_original_weread_plugin_present()
     local plugins_root=ROOT:match("^(.*)/[^/]+$") or "."
     return lfs.attributes(plugins_root.."/weread.koplugin","mode")=="directory"
 end
@@ -165,7 +170,6 @@ function Plugin:require_login() if not self:logged_in() then self:info(_("Not lo
 function Plugin:home_menu()
     local out={
         {text="我的书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)},
-        {text="公众号",callback=self:safe("mp-shelf",function() self:show_shelf(true,false,"account") end)},
         {text="搜索书籍",callback=self:safe("search",function() self:search_dialog() end)},
         {text="下载管理",callback=self:safe("downloads",function() self:show_downloads() end)},
         {text="阅读同步",sub_item_table_func=function() return self:sync_menu() end},
@@ -178,12 +182,24 @@ function Plugin:home_menu()
 end
 
 function Plugin:reader_menu()
-    local out={
-        {text="返回我的书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)},
-        {text="阅读同步",sub_item_table_func=function() return self:sync_menu() end},
-        {text="生成／更新当前书籍",callback=self:safe("redownload",function() self:redownload_current() end)},
-        {text="设置",sub_item_table_func=function() return self:settings_menu() end},
-    }
+    local current_path=self:_current_document_path()
+    local mp_context=self.mp and self.mp:identify_path(current_path) or nil
+    local out
+    if mp_context then
+        out={
+            {text="返回文章列表",callback=self:safe("mp-back",function() self:open_mp_account_by_id(mp_context.bookId,mp_context.account_title) end)},
+            {text="上一篇",callback=self:safe("mp-prev",function() self:open_mp_neighbor(-1) end)},
+            {text="下一篇",callback=self:safe("mp-next",function() self:open_mp_neighbor(1) end)},
+            {text="设置",sub_item_table_func=function() return self:settings_menu() end},
+        }
+    else
+        out={
+            {text="返回我的书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)},
+            {text="阅读同步",sub_item_table_func=function() return self:sync_menu() end},
+            {text="生成／更新当前书籍",callback=self:safe("redownload",function() self:redownload_current() end)},
+            {text="设置",sub_item_table_func=function() return self:settings_menu() end},
+        }
+    end
     if self:_has_download_status() then
         table.insert(out,1,{text=self:_download_status_label(),callback=function() self:show_download_status() end})
     end
@@ -229,13 +245,26 @@ end
 function Plugin:_friendly_remote_error(err, context)
     local text=tostring(err or "未知错误")
     local lower=text:lower()
+    if text:find("[MiuReadMPNoAccount]",1,true) then
+        return "微信读书书架暂时没有返回可用的公众号。"
+    end
+    if text:find("[MiuReadMPInvalidAccount]",1,true) then
+        return "公众号信息无效，请刷新微信读书书架。"
+    end
+    if lower:find("参数格式错误",1,true) or lower:find("params error",1,true)
+        or lower:find("parameter format",1,true) then
+        return "公众号数据暂时无法读取，请刷新后重试。"
+    end
     if Http.is_auth_error(text) or lower:find("api key",1,true)
         or lower:find("authorization",1,true) then
         return "登录凭证已失效或被拒绝，请在账户设置中重新扫码登录。"
     end
     if lower:find("timeout",1,true) then return "网络请求超时，请检查 Wi-Fi 后重试。" end
     if lower:find("network request failed",1,true) then return "网络连接失败，请检查 Wi-Fi 后重试。" end
-    return tostring(context or "请求").."失败：\n"..U.first_line(text,180)
+    if lower:find("%.lua:%d+:") or lower:find("stack traceback",1,true) then
+        return tostring(context or "请求").."失败，请稍后重试。"
+    end
+    return tostring(context or "请求").."失败：\n"..U.first_line(text,120)
 end
 
 function Plugin:_refresh_shelf_async(on_ready,silent)
@@ -268,6 +297,10 @@ function Plugin:_refresh_shelf_async(on_ready,silent)
         logger.info("[MiuRead][Shelf] refresh completed","mode=",tostring(mode),
             "books=",tostring(#books),"mp=",tostring(#mp))
         if on_ready then on_ready(books,mp,nil) end
+    end
+
+    if not async_available and self.shelf_async and self.shelf_async:is_android() then
+        return fail("Android 后台书架任务无法启动，请稍后重试。")
     end
 
     if not async_available then
@@ -375,7 +408,9 @@ function Plugin:_shelf_rows(section,mp_mode,remote_books,remote_mp,remote_status
     local local_books,local_mp=self.library:local_books(library_snapshot,sessions)
     section=section=="generated" and "generated" or "account"
     if section=="generated" then
-        local rows=self.library:generated_rows(remote_books or {},remote_mp or {},local_books,local_mp,remote_status_known)
+        -- Public-account articles are standalone HTML files and no longer
+        -- participate in the generated EPUB shelf.
+        local rows=self.library:generated_rows(remote_books or {},{},local_books,{},remote_status_known)
         for _,row in ipairs(rows) do row.shelf_section="generated" end
         return rows
     end
@@ -441,6 +476,7 @@ end
 
 function Plugin:_shelf_status_text(b)
     if b.download_status and b.download_status~="" then return b.download_status end
+    if tostring(b.content_type or "")=="mp_account" then return "公众号" end
     local state
     if b.shelf_section=="generated" then
         if b.remote_status_known~=true then state="本地书籍"
@@ -462,6 +498,7 @@ end
 function Plugin:_shelf_select(b)
     local id=tostring(b and (b.bookId or b.book_id) or "")
     if id=="" then return end
+    if Protocol.is_mp_account(id) then self:mp_account(b); return end
     local available={}
     for _,kind in ipairs({"notes","clean","preview_notes","preview_clean"}) do
         local r=self.store:variant(id,kind)
@@ -528,6 +565,7 @@ function Plugin:show_shelf_search_dialog(mp_mode,source_rows,section)
 end
 function Plugin:_cancel_cover_loading()
     self._cover_generation=(tonumber(self._cover_generation) or 0)+1
+    self._cover_start_failures=0
     if self.cover_async then self.cover_async:cancel("shelf page changed") end
     if self._cover_refresh_task then
         UIManager:unschedule(self._cover_refresh_task)
@@ -591,6 +629,12 @@ function Plugin:_cache_shelf_page_covers(rows,view,page,first,last,generation,in
         return
     end
     local background_available=self.cover_async:available()
+    if not background_available and self.cover_async:is_android() then
+        logger.warn("[MiuRead][Cover] Android background worker unavailable; skipping uncached cover",
+            "book_id=",tostring(book.bookId))
+        self:_schedule_cover_continue(rows,view,page,first,last,generation,index+1,.04)
+        return
+    end
     local download_options=background_available
         and {retries=1,timeout={8,15}}
         or {retries=0,timeout={4,7}}
@@ -636,7 +680,17 @@ function Plugin:_cache_shelf_page_covers(rows,view,page,first,last,generation,in
         self:_schedule_cover_continue(rows,view,page,first,last,generation,index+1,background_available and .06 or .18)
     end,background_available and 35 or 14)
     if not started then
-        self:_schedule_cover_continue(rows,view,page,first,last,generation,index,.3)
+        self._cover_start_failures=(tonumber(self._cover_start_failures) or 0)+1
+        logger.warn("[MiuRead][Cover] worker start failed",
+            "book_id=",tostring(book.bookId),"count=",tostring(self._cover_start_failures))
+        if self._cover_start_failures>=2 then
+            self._cover_start_failures=0
+            self:_schedule_cover_continue(rows,view,page,first,last,generation,index+1,.08)
+        else
+            self:_schedule_cover_continue(rows,view,page,first,last,generation,index,.35)
+        end
+    else
+        self._cover_start_failures=0
     end
 end
 function Plugin:_on_shelf_page(rows,view,page,first,last)
@@ -644,10 +698,17 @@ function Plugin:_on_shelf_page(rows,view,page,first,last)
     local generation=self._cover_generation
     self:_cache_shelf_page_covers(rows,view,page,first,last,generation,first)
 end
+function Plugin:_cancel_shelf_refresh(reason)
+    self._shelf_refresh_generation=(tonumber(self._shelf_refresh_generation) or 0)+1
+    self._shelf_main_busy=false
+    if self.shelf_async then self.shelf_async:cancel(reason or "shelf closed") end
+end
+
 function Plugin:_close_current_shelf()
     local view=self._shelf_view
     self._shelf_view=nil
     self:_cancel_cover_loading()
+    self:_cancel_shelf_refresh("shelf replaced")
     if view and not view._miu_closed then pcall(function() UIManager:close(view) end) end
 end
 function Plugin:_reopen_shelf(mp_mode,section,force_remote)
@@ -659,12 +720,183 @@ function Plugin:_reopen_shelf(mp_mode,section,force_remote)
     end)
 end
 
+function Plugin:_shelf_tabs(selected)
+    return {
+        {id="books",label="书籍",callback=function()
+            if selected~="books" then self:_reopen_shelf(false,"account") end
+        end},
+        {id="mp",label="公众号",callback=function()
+            if selected~="mp" then self:_reopen_shelf(true,"account") end
+        end},
+        {id="generated",label="已生成",callback=function()
+            if selected~="generated" then self:_reopen_shelf(false,"generated") end
+        end},
+    }
+end
+
+function Plugin:_refresh_mp_accounts(on_done,silent)
+    if not self:logged_in() then
+        if not silent then self.auth_flow:start() end
+        if on_done then on_done(nil,"尚未登录") end
+        return false
+    end
+    if not self:is_online() then
+        if on_done then on_done(nil,"网络不可用") end
+        if not silent then self:info(_("Network unavailable")) end
+        return false
+    end
+    if self.mp_async:busy() then
+        if on_done then on_done(nil,"另一项公众号任务正在进行中") end
+        if not silent then self:info("另一项公众号任务正在进行中。") end
+        return false
+    end
+    if not silent then self:status_toast("公众号","正在获取公众号列表",2) end
+    local started,err=self.mp_async:run("mp-accounts",function()
+        return self.mp:accounts({force=true})
+    end,function(result)
+        self.store:reload()
+        if result and result.ok and type(result.value)=="table" then
+            if on_done then on_done(result.value,nil) end
+        else
+            local cached=self.mp:cached_accounts()
+            local message=result and result.error or "公众号列表加载失败"
+            logger.warn("[MiuRead][MP] account list refresh failed",tostring(message))
+            if on_done then on_done(#cached>0 and cached or nil,message) end
+        end
+    end,60)
+    if not started then
+        if on_done then on_done(nil,err or "无法启动公众号列表任务") end
+        if not silent then self:info(self:_friendly_remote_error(err or "无法启动公众号列表任务","公众号列表加载")) end
+    end
+    return started
+end
+
+function Plugin:show_mp_shelf(force_remote)
+    self:_save_shelf_context("account", true)
+
+    local function render(accounts, remote_error)
+        accounts = type(accounts) == "table" and accounts or {}
+        local rows = {}
+        for _, account in ipairs(accounts) do
+            local row = self:_mp_normalize_book(account)
+            if Protocol.is_mp_account(row.bookId) then
+                row.content_type = "mp_account"
+                row.author = row.author ~= "" and row.author or "公众号"
+                row.status_text = "点击查看文章"
+                row.show_cover = false
+                rows[#rows + 1] = row
+            end
+        end
+
+        local function refresh()
+            self:_refresh_mp_accounts(function(value, err)
+                if value then self:show_mp_shelf(false)
+                elseif err then self:info(self:_friendly_remote_error(err, "公众号列表加载")) end
+            end, false)
+        end
+
+        local function search()
+            local dialog
+            dialog = InputDialog:new{
+                title="搜索公众号", input="",
+                buttons={{
+                    {text=_("Cancel"), id="close", callback=function() UIManager:close(dialog) end},
+                    {text=_("Search"), is_enter_default=true, callback=function()
+                        local query=U.trim(dialog:getInputText()):lower()
+                        UIManager:close(dialog)
+                        if query=="" then return end
+                        local found={}
+                        for _, row in ipairs(rows) do
+                            local hay=(tostring(row.title or "").." "..tostring(row.author or "")):lower()
+                            if hay:find(query,1,true) then found[#found+1]=row end
+                        end
+                        if #found==0 then self:info("没有找到相关公众号")
+                        elseif #found==1 then self:mp_account(found[1])
+                        else
+                            local items={}
+                            for _, row in ipairs(found) do
+                                local account=row
+                                items[#items+1]={text=account.title,post_text=account.author,callback=function() self:mp_account(account) end}
+                            end
+                            self:list("公众号 · 搜索结果",items)
+                        end
+                    end},
+                }},
+            }
+            UIManager:show(dialog)
+            dialog:onShowKeyboard()
+        end
+
+        if #rows == 0 then
+            local items={
+                {text="书籍",callback=function() self:_reopen_shelf(false,"account") end},
+                {text="公众号",enabled=false},
+                {text="已生成",callback=function() self:_reopen_shelf(false,"generated") end},
+                {text="刷新公众号",enabled=self:logged_in(),callback=refresh},
+            }
+            if not self:logged_in() then
+                items[#items+1]={text="扫码登录",callback=function() self.auth_flow:start() end}
+            end
+            if remote_error then
+                items[#items+1]={text=self:_friendly_remote_error(remote_error,"公众号列表加载"),enabled=false}
+            else
+                items[#items+1]={text="仅显示微信读书书架返回的公众号",enabled=false}
+            end
+            self:list("我的书架 · 公众号",items,"暂未识别到公众号")
+            return
+        end
+
+        local ok, view = pcall(ShelfView.show, {
+            title="我的书架 · 公众号 · "..tostring(#rows).."个",
+            books=rows, selected_tab="mp", tabs=self:_shelf_tabs("mp"),
+            show_covers=false, on_search=search, on_refresh=refresh,
+            on_select=function(book) self:mp_account(book) end,
+            on_close=function(current)
+                if self._shelf_view==current then self._shelf_view=nil end
+            end,
+        })
+        if ok and view then self._shelf_view=view; return end
+        logger.warn("[MiuRead][MP] shelf view unavailable",tostring(view))
+        local items={
+            {text="书籍",callback=function() self:_reopen_shelf(false,"account") end},
+            {text="公众号",enabled=false},
+            {text="已生成",callback=function() self:_reopen_shelf(false,"generated") end},
+            {text="搜索",callback=search},
+            {text="刷新公众号",callback=refresh},
+        }
+        for _,row in ipairs(rows) do
+            local account=row
+            items[#items+1]={text=account.title,post_text=account.author,callback=function() self:mp_account(account) end}
+        end
+        self:list("我的书架 · 公众号",items)
+    end
+
+    local cached=self.mp:cached_accounts()
+    if not force_remote and #cached>0 then
+        render(cached,nil)
+        if self.mp:accounts_stale() and self:logged_in() and self:is_online() and not self.mp_async:busy() then
+            self:_refresh_mp_accounts(function(value)
+                if value and self._shelf_view and not self._shelf_view._miu_closed then
+                    self:_reopen_shelf(true,"account")
+                end
+            end,true)
+        end
+        return
+    end
+    self:_refresh_mp_accounts(function(value,err)
+        if value then render(value,err) else render(cached,err) end
+    end,false)
+end
+
 function Plugin:show_shelf(mp_mode,force_remote,section)
     local prefs=self.store:preferences()
     section=section or prefs.shelf_section or "account"
     section=section=="generated" and "generated" or "account"
     if mp_mode==nil then mp_mode=tostring(prefs.account_shelf_kind or "books")=="mp" end
     self:_save_shelf_context(section,mp_mode)
+    if section=="account" and mp_mode==true then
+        return self:show_mp_shelf(force_remote==true)
+    end
     self:load_shelf(function(remote_books,remote_mp,remote_error)
         local remote_known=remote_error==nil and (self:logged_in() or (#remote_books+#remote_mp)>0)
         local all_rows=self:_shelf_rows(section,mp_mode,remote_books,remote_mp,remote_known)
@@ -687,8 +919,9 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
         end
         if #rows==0 then
             local items={
-                {text=(section=="account" and "✓ " or "").."账号书架",callback=open_account},
-                {text=(section=="generated" and "✓ " or "").."已生成书籍",callback=open_generated},
+                {text=(section=="account" and "✓ " or "").."书籍",callback=open_account},
+                {text="公众号",callback=function() self:_reopen_shelf(true,"account") end},
+                {text=(section=="generated" and "✓ " or "").."已生成",callback=open_generated},
                 {text="搜索",callback=function() self:show_shelf_search_dialog(mp_mode,all_rows,section) end},
                 {text="刷新书架",enabled=self:logged_in(),callback=refresh},
             }
@@ -699,8 +932,10 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
         end
         if show_covers then self:_begin_cover_guard("shelf_open") end
         local ok,view=pcall(ShelfView.show,{
-            title=title.." · "..tostring(#rows).."本",books=rows,selected_tab=section,
-            show_covers=show_covers,on_account_tab=open_account,on_generated_tab=open_generated,
+            title="我的书架 · "..(section=="generated" and "已生成" or "书籍").." · "..tostring(#rows).."本",
+            books=rows,selected_tab=section=="generated" and "generated" or "books",
+            tabs=self:_shelf_tabs(section=="generated" and "generated" or "books"),
+            show_covers=show_covers,
             on_search=function() self:show_shelf_search_dialog(mp_mode,all_rows,section) end,
             on_refresh=refresh,on_select=function(b) self:_shelf_select(b) end,
             on_page_changed=function(page,first,last,current)
@@ -709,15 +944,16 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
             on_rendered=function() self:_clear_cover_guard() end,
             on_close=function(current)
                 if self._shelf_view==current then self._shelf_view=nil end
-                self:_cancel_cover_loading(); collectgarbage("step",160)
+                self:_cancel_cover_loading(); self:_cancel_shelf_refresh("shelf closed"); collectgarbage("step",160)
             end,
         })
         if ok and view then self._shelf_view=view; return end
         self:_clear_cover_guard()
         logger.warn("[MiuRead][Shelf] custom view unavailable",tostring(view))
         local items={
-            {text=(section=="account" and "✓ " or "").."账号书架",callback=open_account},
-            {text=(section=="generated" and "✓ " or "").."已生成书籍",callback=open_generated},
+            {text=(section=="account" and "✓ " or "").."书籍",callback=open_account},
+            {text="公众号",callback=function() self:_reopen_shelf(true,"account") end},
+            {text=(section=="generated" and "✓ " or "").."已生成",callback=open_generated},
             {text="搜索",callback=function() self:show_shelf_search_dialog(mp_mode,all_rows,section) end},
             {text="刷新书架",enabled=self:logged_in(),callback=refresh},
         }
@@ -822,7 +1058,11 @@ function Plugin:search(q)
     end
 
     if not self.search_async or not self.search_async:available() then
-        run_on_main_thread()
+        if self.search_async and self.search_async:is_android() then
+            finish({ok=false,error="Android 后台搜索任务不可用，请稍后重试。"})
+        else
+            run_on_main_thread()
+        end
         return
     end
 
@@ -839,8 +1079,12 @@ function Plugin:search(q)
         return api:search(q,0,40)
     end,finish,32)
     if not started then
-        logger.warn("[MiuRead][Search] async unavailable; falling back",tostring(err or "worker busy"))
-        run_on_main_thread()
+        logger.warn("[MiuRead][Search] async unavailable",tostring(err or "worker busy"))
+        if self.search_async and self.search_async:is_android() then
+            finish({ok=false,error="Android 后台搜索任务无法启动，请稍后重试。"})
+        else
+            run_on_main_thread()
+        end
     end
 end
 function Plugin:_variant_exists(book_id,kind)
@@ -887,9 +1131,238 @@ function Plugin:reverify_book_and_open(book_id,preferred_path)
     else self:info("本地 EPUB 不存在，请重新生成本书。") end
 end
 
+
+local function mp_date(value)
+    value=tonumber(value or 0) or 0
+    return value>0 and os.date("%Y-%m-%d",value) or ""
+end
+
+function Plugin:_mp_normalize_book(book)
+    local original=type(book)=="table" and book or {}
+    local normalized=U.merge(original,normalize(original))
+    normalized.bookId=tostring(normalized.bookId or normalized.book_id or "")
+    return normalized
+end
+
+function Plugin:_refresh_mp_articles(book,silent,on_done)
+    book=self:_mp_normalize_book(book)
+    if not self:logged_in() then
+        if not silent then self.auth_flow:start() end
+        if on_done then on_done(nil,"尚未登录") end
+        return false
+    end
+    if not self:is_online() then
+        if not silent then self:info(_("Network unavailable")) end
+        if on_done then on_done(nil,"网络不可用") end
+        return false
+    end
+    if self.mp_async:busy() then
+        if not silent then self:info("另一项公众号任务正在进行中。") end
+        return false
+    end
+    if not silent then self:status_toast("公众号","正在刷新文章列表",2) end
+    local book_copy=U.copy(book)
+    local started,err=self.mp_async:run("mp-articles",function()
+        return self.mp:articles(book_copy.bookId,{force=true,title=book_copy.title})
+    end,function(result)
+        self.store:reload()
+        if result and result.ok and type(result.value)=="table" then
+            if on_done then on_done(result.value,nil) end
+            if not silent then self:show_mp_articles(book_copy,result.value) end
+        else
+            local cached=self.mp:cached_articles(book_copy.bookId)
+            local message=result and result.error or "文章列表刷新失败"
+            logger.warn("[MiuRead][MP] article list refresh failed",tostring(message))
+            if on_done then on_done(#cached>0 and cached or nil,message) end
+            if not silent then
+                if #cached>0 then self:toast("刷新失败，继续显示本地文章列表",3); self:show_mp_articles(book_copy,cached)
+                else self:info(self:_friendly_remote_error(message,"公众号文章列表加载")) end
+            end
+        end
+    end,75)
+    if not started and not silent then self:info(self:_friendly_remote_error(err or "无法启动文章列表任务","公众号文章列表加载")) end
+    return started
+end
+
+function Plugin:mp_account(book)
+    book=self:_mp_normalize_book(book)
+    if not Protocol.is_mp_account(book.bookId) then
+        self:info("微信读书书架没有返回可用的公众号。")
+        return
+    end
+    book.content_type="mp_account"
+    self.store:save_book(book.bookId,{
+        book_id=book.bookId,title=book.title,author=book.author,cover=book.cover,
+        content_type="mp_account",updated_at=os.time(),
+    })
+    local cached=self.mp:cached_articles(book.bookId)
+    if #cached>0 then
+        self:show_mp_articles(book,cached)
+        if self.mp:list_stale(book.bookId) and self:logged_in() and self:is_online() and not self.mp_async:busy() then
+            self:_refresh_mp_articles(book,true)
+        end
+    else
+        self:_refresh_mp_articles(book,false)
+    end
+end
+
+function Plugin:open_mp_account_by_id(book_id,title)
+    local found
+    local accounts=self.mp:cached_accounts()
+    for _,book in ipairs(accounts or {}) do
+        if tostring(book.bookId or book.book_id)==tostring(book_id) then found=book; break end
+    end
+    if not found then
+        local _,cached_mp=self.library:cached()
+        for _,book in ipairs(cached_mp or {}) do
+            if tostring(book.bookId or book.book_id)==tostring(book_id) then found=book; break end
+        end
+    end
+    found=found or {bookId=book_id,title=title or "公众号",author="公众号",content_type="mp_account"}
+    self:mp_account(found)
+end
+
+function Plugin:show_mp_articles(book,articles,title_suffix)
+    book=self:_mp_normalize_book(book)
+    articles=type(articles)=="table" and articles or {}
+    local items={
+        {text="搜索文章",callback=function() self:mp_search_dialog(book,articles) end},
+        {text="刷新文章列表",post_text="最近 100 篇",callback=function() self:_refresh_mp_articles(book,false) end},
+        {text="管理本号缓存",sub_item_table_func=function() return self:mp_cache_menu(book,articles) end},
+    }
+    for _,row in ipairs(articles) do
+        local article=U.copy(row)
+        local record=self.mp:article_record(book.bookId,article)
+        local post=mp_date(article.createTime)
+        if record then post=(post~="" and (post.." · ") or "").."已缓存" end
+        items[#items+1]={
+            text=tostring(article.title or "文章"),post_text=post,
+            callback=function() self:open_or_download_mp_article(book,article) end,
+        }
+    end
+    local title=tostring(book.title or "公众号").." · "..tostring(#articles).."篇"
+    if title_suffix then title=title.." · "..tostring(title_suffix) end
+    self:list(title,items,"暂无文章")
+end
+
+function Plugin:mp_search_dialog(book,articles)
+    local dialog
+    dialog=InputDialog:new{
+        title="搜索本号文章",input="",
+        buttons={{
+            {text=_("Cancel"),id="close",callback=function() UIManager:close(dialog) end},
+            {text=_("Search"),is_enter_default=true,callback=function()
+                local query=U.trim(dialog:getInputText()):lower()
+                UIManager:close(dialog)
+                if query=="" then return end
+                local results={}
+                for _,article in ipairs(articles or {}) do
+                    if tostring(article.title or ""):lower():find(query,1,true) then results[#results+1]=article end
+                end
+                if #results==0 then self:info("没有找到相关文章") else self:show_mp_articles(book,results,"搜索结果") end
+            end},
+        }},
+    }
+    UIManager:show(dialog); dialog:onShowKeyboard()
+end
+
+function Plugin:open_or_download_mp_article(book,article,force)
+    local record=self.mp:article_record(book.bookId,article)
+    if record and force~=true then self:open_file(record.file); return end
+    if not self:require_login() then return end
+    if not self:is_online() then
+        if record then self:open_file(record.file) else self:info(_("Network unavailable")) end
+        return
+    end
+    if self.mp_async:busy() then self:info("另一项公众号任务正在进行中。") return end
+    self:status_toast("公众号",tostring(article.title or "文章").."正在下载",2)
+    local book_copy,article_copy=U.copy(book),U.copy(article)
+    local prefs=self.store:preferences()
+    local started,err=self.mp_async:run("mp-article",function()
+        return self.mp:fetch_article(book_copy,article_copy,{images=prefs.mp_images==true,force=force==true})
+    end,function(result)
+        self.store:reload()
+        if result and result.ok and type(result.value)=="table" and result.value.file then
+            self:open_file(result.value.file)
+        else
+            local fallback=self.mp:article_record(book_copy.bookId,article_copy)
+            if fallback then self:open_file(fallback.file)
+            else
+                logger.warn("[MiuRead][MP] article download failed",tostring(result and result.error))
+                self:info("文章下载失败，请稍后重试。")
+            end
+        end
+    end,120)
+    if not started then self:info("无法启动文章下载：\n"..tostring(err)) end
+end
+
+function Plugin:mp_cache_menu(book,articles)
+    local items={}
+    local cached_count=0
+    for _,article in ipairs(articles or {}) do
+        if self.mp:article_record(book.bookId,article) then cached_count=cached_count+1 end
+    end
+    items[#items+1]={text="已缓存文章",post_text=tostring(cached_count).." 篇",enabled=false}
+    for _,row in ipairs(articles or {}) do
+        local article=U.copy(row)
+        if self.mp:article_record(book.bookId,article) then
+            items[#items+1]={text=tostring(article.title or "文章"),post_text=mp_date(article.createTime),callback=function()
+                self:mp_article_cache_menu(book,article)
+            end}
+        end
+    end
+    items[#items+1]={text="清理本号文章缓存",callback=function()
+        UIManager:show(ConfirmBox:new{text="清理《"..tostring(book.title or "公众号").."》的文章列表和单篇缓存？",ok_callback=function()
+            self.mp:clear_account(book.bookId)
+            self:toast("已清理")
+        end})
+    end}
+    return items
+end
+
+function Plugin:mp_article_cache_menu(book,article)
+    local items={
+        {text="打开文章",callback=function() self:open_or_download_mp_article(book,article) end},
+        {text="重新下载文章",callback=function() self:open_or_download_mp_article(book,article,true) end},
+        {text="删除单篇缓存",callback=function()
+            UIManager:show(ConfirmBox:new{text="删除《"..tostring(article.title or "文章").."》的单篇缓存？",ok_callback=function()
+                self.mp:clear_article(book.bookId,article); self:toast("已清理")
+            end})
+        end},
+    }
+    self:list(article.title or "文章",items)
+end
+
+function Plugin:mp_global_cache_menu()
+    return {
+        {text="清理全部公众号缓存",callback=function()
+            UIManager:show(ConfirmBox:new{text="清理全部公众号列表和单篇文章缓存？",ok_callback=function()
+                U.remove_tree(self.store:mp_root())
+                U.mkdir(self.store:mp_root())
+                self:toast("已清理")
+            end})
+        end},
+    }
+end
+
+function Plugin:open_mp_neighbor(delta)
+    local context=self.mp:identify_path(self:_current_document_path())
+    if not context then self:info("当前不是觅阅公众号文章。") return end
+    local articles=self.mp:cached_articles(context.bookId)
+    local index
+    for i,article in ipairs(articles or {}) do
+        if tostring(article.reviewId or article.originalId)==tostring(context.reviewId) then index=i; break end
+    end
+    if not index then self:info("本地文章列表中找不到当前位置。") return end
+    local target=articles[index+(tonumber(delta) or 0)]
+    if not target then self:toast((delta or 0)<0 and "已经是第一篇" or "已经是最后一篇",2); return end
+    self:open_or_download_mp_article({bookId=context.bookId,title=context.account_title or "公众号",author="公众号"},target)
+end
+
 function Plugin:book_menu(b)
     local original=type(b)=="table" and b or {}
     b=U.merge(original,normalize(original))
+    if Protocol.is_mp_account(b.bookId) then self:mp_account(b); return end
     local items={}
     local records={{kind="clean",label="纯净版"},{kind="notes",label="划线与想法版"},
         {kind="preview_clean",label="试读版 · 纯净版"},{kind="preview_notes",label="试读版 · 划线与想法版"}}
@@ -914,13 +1387,22 @@ end
 function Plugin:choose_download_mode(b,opt,open_after)
     local dialog
     local function start(background)
-        UIManager:close(dialog)
-        if background then
-            self:status_toast("觅阅",tostring(b and b.title or "未命名").."正在启动后台下载",2)
+        if self._download_launch_pending or (self.download_task and self.download_task:busy()) then
+            self:toast("已有下载任务正在准备或运行",2)
+            return
         end
+        self._download_launch_pending=true
+        UIManager:close(dialog)
+        self:status_toast("觅阅",tostring(b and b.title or "未命名")..
+            (background and "正在准备后台下载" or "正在准备下载"),2)
         -- Close and repaint the menu before starting the child process. This
         -- avoids the Android screen looking frozen after the download button.
         UIManager:scheduleIn(.20,function()
+            self._download_launch_pending=false
+            if self.download_task and self.download_task:busy() then
+                self:toast("已有下载任务正在运行",2)
+                return
+            end
             self:download(b,opt,open_after,nil,background)
         end)
     end
@@ -962,7 +1444,10 @@ function Plugin:_download_summary(rec,opt)
         if preview_mode=="info" then lines[#lines+1]="本文件只包含书籍信息和权限说明，不含试读正文。"
         elseif preview_mode=="partial" then lines[#lines+1]="未成功取得的试读章节未写入文件，可稍后重新生成。" end
     end
-    if opt and opt.annotations then
+    if rec and rec.annotation_pending==true then
+        lines[#lines+1]="划线与想法暂时无法完整获取，已生成正文完整的纯净版。"
+        lines[#lines+1]="正文断点已保留；下次重新生成划线与想法版时不会重新下载正文。"
+    elseif opt and opt.annotations then
         local a=rec.annotation_summary or {}
         lines[#lines+1]="划线："..tostring(a.underlines or 0)
         lines[#lines+1]="含想法的划线："..tostring(a.thoughts or 0)
@@ -1067,11 +1552,14 @@ function Plugin:_finish_download_runtime(runtime,result)
     end
     self:_refresh_local_files()
     local pending=rec.pending_install==true and rec.pending_file and U.file_exists(rec.pending_file)
-    self:_update_open_shelf_download_status(b.bookId,pending and "等待关闭后更新" or "已生成")
+    self:_update_open_shelf_download_status(b.bookId,pending and "等待关闭后更新"
+        or (rec.annotation_pending==true and "正文已生成 · 批注待补" or "已生成"))
     self:_write_download_state(pending and "pending_install" or "completed",{
         title=b.title,book_id=b.bookId,book=U.copy(b),options=U.copy(opt),file=rec.file,
         pending_file=rec.pending_file,pending_install=pending or nil,seen=false,percent=1,
         current=rec.chapter_count,total=rec.expected_chapter_count,completed_at=os.time(),
+        annotation_pending=rec.annotation_pending==true or nil,
+        annotation_error_kind=rec.annotation_error_kind,
     },true)
     if done then done(rec,was_background); self:_start_next_queued_download(); return end
     if pending then
@@ -1079,7 +1567,8 @@ function Plugin:_finish_download_runtime(runtime,result)
         if was_background then self:status_toast("觅阅",text,5) else self:info(text) end
     elseif was_background then
         if self.store:preferences().download_complete_notice~=false then
-            self:status_toast("觅阅",tostring(b.title or "未命名").."下载完成",5)
+            self:status_toast("觅阅",tostring(b.title or "未命名")..
+                (rec.annotation_pending==true and "正文下载完成，批注待补全" or "下载完成"),5)
         end
     elseif open_after and rec.file then
         self.store:clear_download_state(); self:open_file(rec.file)
@@ -1230,14 +1719,40 @@ function Plugin:_merge_download_result(result,book,opt)
     self.store:reload()
     if type(result.auth)=="table" then
         local current=self.store:auth()
-        local merged_cookies=U.copy(current.cookies or {})
-        for name,value in pairs(result.auth.cookies or {}) do merged_cookies[name]=value end
-        merged_cookies=Cookies.sanitize(merged_cookies)
-        current.cookies=merged_cookies
-        if tostring(result.auth.api_key or "")~="" then current.api_key=result.auth.api_key end
-        local child_account=result.auth.account or {}
-        if tonumber(child_account.logged_at or 0)>tonumber((current.account or {}).logged_at or 0) then current.account=U.copy(child_account) end
-        self.store:save_auth(current)
+        local current_account=type(current.account)=="table" and current.account or {}
+        local child_account=type(result.auth.account)=="table" and result.auth.account or {}
+        local snapshot=type(result.auth_snapshot)=="table" and result.auth_snapshot or {}
+        local snapshot_vid=tostring(snapshot.vid or child_account.vid or "")
+        local snapshot_logged=tonumber(snapshot.logged_at or child_account.logged_at or 0) or 0
+        local same_login=snapshot_vid~=""
+            and snapshot_vid==tostring(current_account.vid or "")
+            and snapshot_logged==tonumber(current_account.logged_at or 0)
+        if same_login then
+            local merged_cookies=U.copy(current.cookies or {})
+            local core={wr_vid=true,wr_skey=true,wr_rt=true}
+            local child_ticket_time=tonumber(result.auth.ticket_updated_at or 0) or 0
+            local current_ticket_time=tonumber(current.ticket_updated_at or 0) or 0
+            for name,value in pairs(result.auth.cookies or {}) do
+                if not core[name] or child_ticket_time>=current_ticket_time then
+                    merged_cookies[name]=value
+                end
+            end
+            merged_cookies=Cookies.sanitize(merged_cookies)
+            current.cookies=merged_cookies
+            if tostring(result.auth.api_key or "")~="" then current.api_key=result.auth.api_key end
+            if child_ticket_time>=current_ticket_time then
+                if tostring(result.auth.wr_ticket or "")~="" then current.wr_ticket=result.auth.wr_ticket end
+                if tostring(result.auth.wr_wrpa or "")~="" then current.wr_wrpa=result.auth.wr_wrpa end
+                if child_ticket_time>current_ticket_time then current.ticket_updated_at=child_ticket_time end
+            end
+            self.store:save_auth(current)
+        else
+            logger.warn("[MiuRead][Download] child authentication merge skipped",
+                "snapshot_vid=",snapshot_vid,
+                "current_vid=",tostring(current_account.vid or ""),
+                "snapshot_logged_at=",tostring(snapshot_logged),
+                "current_logged_at=",tostring(current_account.logged_at or 0))
+        end
     end
 
     local rec=result.value or {}
@@ -1252,6 +1767,7 @@ function Plugin:_merge_download_result(result,book,opt)
     self.store:save_book(book.bookId,{
         book_id=tostring(book.bookId),title=book.title,author=book.author,cover=book.cover,
         directory=rec.directory,updated_at=os.time(),catalog=rec.chapter_map,access=nil,
+        content_type=book.content_type,
     })
     if type(self.store.clear_book_access)=="function" then self.store:clear_book_access(book.bookId) end
     self.access:unlock_book(book.bookId,"all")
@@ -1287,6 +1803,9 @@ function Plugin:show_download_status()
     lines[#lines+1]="《"..title.."》"
     if state.current and state.total and tonumber(state.total)>0 then lines[#lines+1]="章节 "..tostring(state.current).." / "..tostring(state.total) end
     if state.error and state.error~="" then lines[#lines+1]="\n"..U.first_line(state.error) end
+    if state.annotation_pending==true then
+        lines[#lines+1]="\n正文已完整生成；划线与想法将在下次重新生成时补全。"
+    end
     if state.status=="pending_install" then lines[#lines+1]="\n关闭当前书籍后会自动安装新版本。" end
     local buttons={}
     local dialog
@@ -1372,7 +1891,8 @@ end
 
 function Plugin:_download_job_key(book,opt)
     opt=opt or {}
-    return table.concat({tostring(book and book.bookId or ""),opt.annotations and "notes" or "clean",tostring(opt.chapter_uid or "full")},":")
+    local kind=opt.annotations and "notes" or "clean"
+    return table.concat({tostring(book and book.bookId or ""),kind,tostring(opt.chapter_uid or "full"),tostring(opt.limit or "all")},":")
 end
 function Plugin:_queue_download(book,opt,open_after)
     local key=self:_download_job_key(book,opt)
@@ -1435,9 +1955,12 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
         return self:_queue_download(b,opt,open_after)
     end
     if self.cache_cleanup_task and self.cache_cleanup_task:busy() then self:info("缓存正在清理，完成后再开始下载。"); return end
-    if b and b.bookId and tostring(b.bookId)~="" then self.store:save_book(b.bookId,{book_id=tostring(b.bookId),title=b.title,author=b.author,updated_at=os.time()}) end
+    if b and b.bookId and tostring(b.bookId)~="" then
+        self.store:save_book(b.bookId,{book_id=tostring(b.bookId),title=b.title,author=b.author,
+            content_type=b.content_type,updated_at=os.time()})
+    end
     local prefs=self.store:preferences()
-    opt.images=tostring(b.bookId):sub(1,7)=="MP_WXS_" and prefs.mp_images or prefs.images
+    opt.images=prefs.images
     opt.active_document_path=self:_current_document_path()
     local runtime={book=U.copy(b),options=U.copy(opt),last_state={stage="prepare",current=0,total=1,percent=0,chapter=b.title or ""},background=start_in_background==true,dialog=nil,started_at=os.time(),open_after=open_after==true,done=done,notified_milestones={}}
     self._download_runtime=runtime
@@ -1958,8 +2481,8 @@ function Plugin:toggle_time_sync()
         else
             self.sync:start("enabled")
         end
-        if self:_legacy_weread_plugin_present() then
-            self:info("阅读时间同步已开启。\n\n检测到旧版 weread.koplugin 仍然存在。两套插件会同时监听阅读状态，建议在 KOReader 插件管理中停用旧版 WeRead，只保留觅阅。")
+        if self:_original_weread_plugin_present() then
+            self:info("阅读时间同步已开启。\n\n检测到原作者 WeRead 插件目录（weread.koplugin）。它与觅阅是两个独立插件；若两边都开启阅读时间同步，可能重复上报。可按自己的需要在插件管理中关闭其中一边。")
         else
             self:status_toast("阅读时间同步","已开启",3)
         end
@@ -2363,6 +2886,8 @@ function Plugin:settings_menu()
     return {
         {text="显示书架封面",checked_func=function() return self.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("shelf_covers") end},
         {text="想法字体大小",sub_item_table_func=function() return self:thought_font_menu() end},
+        {text="下载公众号文章图片",checked_func=function() return self.store:preferences().mp_images==true end,keep_menu_open=true,callback=function() self:_toggle_preference("mp_images") end},
+        {text="公众号缓存",sub_item_table_func=function() return self:mp_global_cache_menu() end},
         {text="下载关键进度提示",checked_func=function() return self.store:preferences().download_notice_enabled~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_notice_enabled") end},
         {text="下载完成提醒",checked_func=function() return self.store:preferences().download_complete_notice~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_complete_notice") end},
         {text="下载目录",post_text=self:_download_dir_label(),callback=function() self:directory_dialog() end},
@@ -2556,25 +3081,26 @@ function Plugin:_show_thought_href(href)
         local group,err,token=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
         if not group then self:info(tostring(err or "没有想法内容")); return end
         local prefs=self.store:preferences().thoughts or {}
-        local source_html,html,metrics,html_cache_hit=Thoughts.popup_parts_cached(
-            self.store,info.book_id,info.chapter_uid,info.range,group,token
-        )
-        if html=="" then self:info("没有想法内容"); return end
+        local first_page=Thoughts.page_parts(group,prefs.font,1)
+        if not first_page or tostring(first_page.html or "")=="" then self:info("没有想法内容"); return end
         ThoughtPopup.show{
-            source_html=source_html,
-            html=html,
+            source_html=first_page.source_html,
+            html=first_page.html,
             font_size=self:_thought_font_size(prefs.font),
             font_name=self:_thought_font_name(),
             width_ratio=tonumber(prefs.width_ratio) or 0.91,
             height_ratio=tonumber(prefs.height_ratio) or 0.60,
             css=Thoughts.popup_css(),
-            metrics=metrics,
+            metrics=first_page.metrics,
+            page_index=first_page.page_index,
+            page_count=first_page.page_count,
+            page_loader=function(index) return Thoughts.page_parts(group,prefs.font,index) end,
         }
         logger.info("[MiuRead][ThoughtPopup] opened",
             "book=",tostring(info.book_id),"chapter=",tostring(info.chapter_uid),
-            "comments=",tostring(metrics and metrics.comment_count or 0),
+            "comments=",tostring(#(group.texts or {})),
+            "pages=",tostring(first_page.page_count or 1),
             "chapter_cache=",token and token.cache_hit and "hit" or "miss",
-            "html_cache=",html_cache_hit and "hit" or "miss",
             "elapsed_ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
     end,debug.traceback)
     self._thought_popup_busy=false
@@ -2614,7 +3140,7 @@ function Plugin:on_sync_record_ready(current)
     end
 end
 function Plugin:on_sync_record_missing()
-    logger.warn("[MiuRead][Sync] current EPUB could not be identified after retries")
+    logger.dbg("[MiuRead][Sync] external EPUB ignored")
 end
 function Plugin:onReaderReady()
     logger.info("[MiuRead][Sync] reader ready")

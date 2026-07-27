@@ -842,30 +842,25 @@ function Reader:chapter(book, chapter, format, opt)
     error(last or "chapter download failed")
 end
 
-function Reader:mp_articles(book_id)
-    local all, offset = {}, 0
-    for _ = 1, 30 do
-        local data = self.http:get_json(BASE .. "/web/mp/articles?bookId=" .. Protocol.escape(book_id) .. "&offset=" .. tostring(offset), {headers={Referer=Protocol.mp_reader_url(book_id)}, retries=3})
-        local groups = data.reviews or {}
-        if #groups == 0 then break end
-        for _, group in ipairs(groups) do
-            for _, item in ipairs(group.subReviews or {}) do
-                local review = item.review or item
-                local mp = review.mpInfo or {}
-                all[#all + 1] = {reviewId=review.reviewId, title=mp.title or "文章", cover=mp.pic_url, createTime=review.createTime}
-            end
-        end
-        offset = offset + #groups
-        if #groups < 10 then break end
+function Reader:mp_content(review_id, book_id, options)
+    options = options or {}
+    local auth = self.store:auth()
+    local headers = {
+        Referer = book_id and Protocol.mp_reader_url(book_id) or BASE .. "/",
+        Accept = "text/html,application/xhtml+xml,*/*",
+    }
+    if options.skip_mp_auth_headers ~= true then
+        if tostring(auth.wr_ticket or "") ~= "" then headers["x-wr-ticket"] = tostring(auth.wr_ticket) end
+        if tostring(auth.wr_wrpa or "") ~= "" then headers["x-wrpa-0"] = tostring(auth.wr_wrpa) end
     end
-    return all
-end
-
-function Reader:mp_content(review_id)
-    local html, _, final_url = self.http:download(BASE .. "/web/mp/content?reviewId=" .. Protocol.escape(review_id), {headers={Referer=BASE .. "/"}, retries=3})
+    local html, _, final_url = self.http:download(BASE .. "/web/mp/content?reviewId=" .. Protocol.escape(review_id), {
+        auth=true, headers=headers, retries=3,
+    })
     local page_error = login_page_error(html, final_url)
     if page_error then error(page_error) end
-    return Codec.mp_body(html)
+    local service_error = raw_service_auth_error(html)
+    if service_error then error(service_error) end
+    return html
 end
 
 local function response_header(headers, name)

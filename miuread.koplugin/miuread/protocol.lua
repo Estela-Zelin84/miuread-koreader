@@ -80,5 +80,13 @@ function P.read_fields(opt)
         and t.sg ~= nil and t.s ~= nil and t.pc ~= nil and t.pc ~= "" and t.ps ~= ""
     return t, sources
 end
-function P.is_mp(id) return tostring(id or ""):sub(1,7)=="MP_WXS_" end
+function P.is_mp_account(id)
+    return tostring(id or ""):sub(1,7)=="MP_WXS_"
+end
+function P.is_mp_portal(id)
+    return tostring(id or ""):lower()=="mpbook"
+end
+function P.is_mp(id)
+    return P.is_mp_account(id) or P.is_mp_portal(id)
+end
 return P

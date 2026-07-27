@@ -38,7 +38,10 @@ end
 
 local function transient_status(code)
     code = tonumber(code)
-    return code == 408 or code == 425 or code == 429 or code == 500
+    -- 429/499 are explicit rate-limit responses. Retrying them inside the
+    -- generic HTTP loop only amplifies the request burst, so callers receive
+    -- them immediately and apply one task-level cooldown instead.
+    return code == 408 or code == 425 or code == 500
         or code == 502 or code == 503 or code == 504
 end
 
@@ -72,6 +75,30 @@ function Http:_save_jar(jar)
         auth.cookies = cleaned
         self.store:save_auth(auth)
     end
+end
+
+function Http:_save_response_auth_headers(headers)
+    local ticket = hget(headers, "x-wr-ticket")
+    local wrpa = hget(headers, "x-wrpa-0")
+    if (ticket == nil or tostring(ticket) == "") and (wrpa == nil or tostring(wrpa) == "") then return false end
+    local auth = self.store:auth()
+    local changed = false
+    if ticket ~= nil and tostring(ticket) ~= "" and tostring(auth.wr_ticket or "") ~= tostring(ticket) then
+        auth.wr_ticket = tostring(ticket)
+        auth.ticket_updated_at = os.time()
+        changed = true
+    end
+    if wrpa ~= nil and tostring(wrpa) ~= "" and tostring(auth.wr_wrpa or "") ~= tostring(wrpa) then
+        auth.wr_wrpa = tostring(wrpa)
+        auth.ticket_updated_at = os.time()
+        changed = true
+    end
+    if changed then
+        self.store:save_auth(auth)
+        logger.info("[MiuRead][HTTP] public-account credential refreshed",
+            "ticket=", tostring(auth.wr_ticket ~= ""), "wrpa=", tostring(auth.wr_wrpa ~= ""))
+    end
+    return changed
 end
 
 function Http:_request_once(opt)
@@ -126,6 +153,9 @@ function Http:_request_once(opt)
             if not Cookies.same(before, jar) then self:_save_jar(jar) end
             headers["Cookie"] = Cookies.header(jar)
         end
+        if opt.auth ~= false and is_weread_url(current) then
+            self:_save_response_auth_headers(resp_headers)
+        end
 
         local location = hget(resp_headers, "location")
         if code >= 300 and code < 400 and location and hop < redirects then
@@ -171,6 +201,7 @@ function Http:request(opt)
 end
 
 local AUTH_ERROR_MARKER = "[MiuReadAuth]"
+local RATE_LIMIT_MARKER = "[MiuReadRateLimit]"
 
 local function auth_error_message(code, message)
     local suffix = tostring(message or ""):gsub("[%c]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
@@ -183,7 +214,12 @@ local function service_error(data, url)
     local code = data.errCode or data.errcode or data.code
     local message = tostring(data.errMsg or data.errmsg or data.message or data.msg or code or "")
     local lower = message:lower()
-    if tonumber(code) == -2012 or lower:find("login timeout", 1, true)
+    if tonumber(code) == -2014 or message:find("请求频率超限", 1, true)
+        or lower:find("rate limit", 1, true) or lower:find("too many requests", 1, true) then
+        return "请求频率受限 " .. RATE_LIMIT_MARKER .. " error_code=" .. tostring(code or "rate_limit")
+            .. (message ~= "" and (": " .. message) or "")
+    end
+    if tonumber(code) == -2012 or tonumber(code) == -2041 or lower:find("login timeout", 1, true)
         or message:find("登录超时", 1, true) then
         -- -2012 means the current web session can no longer be used. It does
         -- not prove that another device replaced this one, so keep the real
@@ -207,6 +243,7 @@ local function is_auth_error(value)
     local lower = text:lower()
     return text:find(AUTH_ERROR_MARKER, 1, true) ~= nil
         or tonumber(auth_error_code(text)) == -2012
+        or tonumber(auth_error_code(text)) == -2041
         or lower:find("http 401", 1, true) ~= nil
         or lower:find("http 403", 1, true) ~= nil
         or lower:find("login expired", 1, true) ~= nil
@@ -225,6 +262,19 @@ local function is_forbidden_error(value)
     return tostring(value or ""):lower():find("http 403",1,true)~=nil
 end
 
+local function is_rate_limit_error(value)
+    local text = tostring(value or "")
+    local lower = text:lower()
+    return text:find(RATE_LIMIT_MARKER, 1, true) ~= nil
+        or lower:find("http 429", 1, true) ~= nil
+        or lower:find("http 499", 1, true) ~= nil
+        or lower:find("error_code=-2014", 1, true) ~= nil
+        or lower:find("rate limit", 1, true) ~= nil
+        or lower:find("too many requests", 1, true) ~= nil
+        or text:find("请求频率超限", 1, true) ~= nil
+        or text:find("请求频率受限", 1, true) ~= nil
+end
+
 function Http:json(opt)
     local text, code, headers, url = self:request(opt)
     text = text or ""
@@ -234,7 +284,14 @@ function Http:json(opt)
         local message = "HTTP " .. tostring(code or "nil")
             .. ", content_type=" .. tostring(content_type)
             .. ", body_bytes=" .. tostring(#text)
+        local retry_after = hget(headers, "retry-after")
+        if retry_after ~= nil and tostring(retry_after) ~= "" then
+            message = message .. ", retry_after=" .. tostring(retry_after)
+        end
         if preview ~= "" then message = message .. ": " .. preview end
+        if tonumber(code) == 429 or tonumber(code) == 499 then
+            message = "请求频率受限 " .. RATE_LIMIT_MARKER .. ": " .. message
+        end
         error(message)
     end
     local ok, data = pcall(Json.decode, text)
@@ -274,5 +331,6 @@ Http.auth_error_code = auth_error_code
 Http.auth_error_message = auth_error_message
 Http.is_auth_error = is_auth_error
 Http.is_forbidden_error = is_forbidden_error
+Http.is_rate_limit_error = is_rate_limit_error
 
 return Http

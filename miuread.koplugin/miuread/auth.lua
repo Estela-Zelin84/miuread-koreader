@@ -31,7 +31,14 @@ function Auth:new(http,store,host)
     },self)
 end
 local function merge_auth_headers(jar,vid,key)
-    return {Accept="application/json, text/plain, */*",Referer=BASE.."/r/weread-skills",Cookie=Cookies.header(jar),["X-Vid"]=vid,["X-Skey"]=key}
+    return {Accept="application/json, text/plain, */*",Referer=BASE.."/r/weread-skills",Cookie=Cookies.session_header(jar),["X-Vid"]=vid,["X-Skey"]=key}
+end
+local function cookie_count(jar)
+    local count=0
+    for k,v in pairs(jar or {}) do
+        if type(k)=="string" and v~=nil and tostring(v)~="" then count=count+1 end
+    end
+    return count
 end
 local function skill_api_key(value)
     if type(value)~="table" or type(value.apikey)~="string" then return "" end
@@ -58,42 +65,82 @@ end
 function Auth:_uid()
     local _,code,h=self.http:request{url=BASE.."/r/weread-skills",method="GET",auth=false,headers={Referer=BASE.."/"}}
     if code<200 or code>=400 then error("login page HTTP "..tostring(code)) end
-    self.jar=Cookies.absorb({},header_value(h,"set-cookie"))
-    local data,headers=self.http:get_json(BASE.."/api/auth/getLoginUid",{auth=false,headers={Referer=BASE.."/r/weread-skills",Cookie=Cookies.header(self.jar)}})
-    self.jar=Cookies.absorb(self.jar,header_value(headers,"set-cookie"))
+    self.jar=Cookies.session_absorb({},header_value(h,"set-cookie"))
+    local data,headers=self.http:get_json(BASE.."/api/auth/getLoginUid",{auth=false,headers={Referer=BASE.."/r/weread-skills",Cookie=Cookies.session_header(self.jar)}})
+    self.jar=Cookies.session_absorb(self.jar,header_value(headers,"set-cookie"))
     if type(data.uid)~="string" or data.uid=="" then error("login UID missing") end
     return data.uid
 end
 function Auth:_poll(uid,otp)
     local url=BASE.."/api/auth/getLoginInfo?uid="..Protocol.escape(uid).."&otp"
     if type(otp)=="string" and otp~="" then url=url.."="..Protocol.escape(otp) end
-    local data,headers=self.http:get_json(url,{auth=false,timeout={5,9},headers={Referer=BASE.."/r/weread-skills",Cookie=Cookies.header(self.jar)}})
-    self.jar=Cookies.absorb(self.jar,header_value(headers,"set-cookie"))
+    local data,headers=self.http:get_json(url,{auth=false,timeout={5,9},headers={Referer=BASE.."/r/weread-skills",Cookie=Cookies.session_header(self.jar)}})
+    self.jar=Cookies.session_absorb(self.jar,header_value(headers,"set-cookie"))
     return data
 end
 function Auth:_finish(data)
     local vid=tostring(data.webLoginVid or ""); local key=tostring(data.accessToken or ""); local refresh=tostring(data.refreshToken or "")
     if vid=="" or key=="" then error("login credentials missing") end
-    local jar=Cookies.sanitize(self.jar)
-    jar.wr_vid=vid; jar.wr_skey=key; jar.wr_ql="0"; if refresh~="" then jar.wr_rt=Protocol.escape(refresh) end
-    -- Persist only the stable reporting-cookie set. QR-page and
-    -- browser-session cookies remain temporary and are never saved.
-    local user,user_headers=self.http:get_json(BASE.."/api/userInfo?userVid="..Protocol.escape(vid),{auth=false,headers=merge_auth_headers(jar,vid,key)})
-    jar=Cookies.absorb(jar,header_value(user_headers,"set-cookie"))
-    local skill,skill_headers=self.http:get_json(BASE.."/api/skills/apikeyGet?only_show=1",{auth=false,headers=merge_auth_headers(jar,vid,key)})
-    jar=Cookies.absorb(jar,header_value(skill_headers,"set-cookie"))
+
+    -- Keep the complete QR/browser session in memory until account verification
+    -- and the first public-account credential renewal have both finished.
+    local session=Cookies.session_absorb(self.jar,nil)
+    session.wr_vid=vid; session.wr_skey=key; session.wr_ql="0"
+    if refresh~="" then session.wr_rt=Protocol.escape(refresh) end
+
+    local user,user_headers=self.http:get_json(BASE.."/api/userInfo?userVid="..Protocol.escape(vid),{auth=false,headers=merge_auth_headers(session,vid,key)})
+    session=Cookies.session_absorb(session,header_value(user_headers,"set-cookie"))
+    local skill,skill_headers=self.http:get_json(BASE.."/api/skills/apikeyGet?only_show=1",{auth=false,headers=merge_auth_headers(session,vid,key)})
+    session=Cookies.session_absorb(session,header_value(skill_headers,"set-cookie"))
     local api_key=skill_api_key(skill)
     if api_key=="" then
         -- only_show=1 does not create a key for first-time Skills users.
-        skill,skill_headers=self.http:get_json(BASE.."/api/skills/apikeyGet",{auth=false,headers=merge_auth_headers(jar,vid,key)})
-        jar=Cookies.absorb(jar,header_value(skill_headers,"set-cookie"))
+        skill,skill_headers=self.http:get_json(BASE.."/api/skills/apikeyGet",{auth=false,headers=merge_auth_headers(session,vid,key)})
+        session=Cookies.session_absorb(session,header_value(skill_headers,"set-cookie"))
         api_key=skill_api_key(skill)
     end
     if api_key=="" then error("No WeRead Skill API key returned") end
-    self.store:save_auth({api_key=api_key,cookies=jar,account={name=tostring(user.name or ""),vid=vid,logged_at=os.time()}})
-    logger.info("[MiuRead][Auth] stable cookies saved", "names=", table.concat(Cookies.names(jar), ","))
+
+    -- Try once while the QR/browser session is still intact. Failure here must
+    -- not invalidate the ordinary WeRead login. Only presence flags are logged.
+    local renewal_ok,renewal,renewal_headers=pcall(function()
+        return self.http:post_json(BASE.."/web/login/renewal",{rq="%2Fweb%2Fbook%2Fread",ql=false},{
+            auth=false,retries=1,timeout={10,20},
+            headers={
+                Origin=BASE,Referer=BASE.."/",Accept="application/json, text/plain, */*",
+                Cookie=Cookies.session_header(session),
+            },
+        })
+    end)
+    local renewal_succ=false
+    local wr_ticket,wr_wrpa="",""
+    if renewal_ok then
+        session=Cookies.session_absorb(session,header_value(renewal_headers,"set-cookie"))
+        renewal_succ=type(renewal)=="table" and (renewal.succ==true or tostring(renewal.succ)=="1")
+        wr_ticket=tostring(header_value(renewal_headers,"x-wr-ticket") or "")
+        wr_wrpa=tostring(header_value(renewal_headers,"x-wrpa-0") or "")
+    else
+        logger.warn("[MiuRead][Auth] QR-session public-account renewal failed",U.first_line(tostring(renewal),160))
+    end
+
+    -- Persist only the proven long-lived cookie boundary. Browser-only session
+    -- cookies are discarded after the immediate renewal attempt.
+    local jar=Cookies.sanitize(session)
+    self.store:save_auth({
+        api_key=api_key,cookies=jar,wr_ticket=wr_ticket,wr_wrpa=wr_wrpa,
+        ticket_updated_at=(wr_ticket~="" or wr_wrpa~="") and os.time() or 0,
+        account={name=tostring(user.name or ""),vid=vid,logged_at=os.time()},
+    })
+    logger.info("[MiuRead][Auth] QR session finalized",
+        "session_cookies=",tostring(cookie_count(session)),
+        "persistent_cookies=",tostring(#Cookies.names(jar)),
+        "renewal_ok=",tostring(renewal_ok),
+        "renewal_succ=",tostring(renewal_succ),
+        "ticket=",tostring(wr_ticket~=""),
+        "wrpa=",tostring(wr_wrpa~=""))
     return user.name or vid
 end
+
 function Auth:_show_retry(message)
     self.active=false
     self:_close_dialog()

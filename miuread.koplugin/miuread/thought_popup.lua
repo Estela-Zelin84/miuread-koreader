@@ -1,14 +1,19 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local Button = require("ui/widget/button")
+local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
+local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local HorizontalGroup = require("ui/widget/horizontalgroup")
+local HorizontalSpan = require("ui/widget/horizontalspan")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
 local Size = require("ui/size")
 local UIManager = require("ui/uimanager")
+local TextWidget = require("ui/widget/textwidget")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Screen = Device.screen
@@ -48,6 +53,9 @@ local Popup = InputContainer:extend{
     height_ratio = nil,
     css = "",
     metrics = nil,
+    page_loader = nil,
+    page_index = 1,
+    page_count = 1,
     dialog = nil,
     on_close_callback = nil,
     closing = false,
@@ -122,7 +130,20 @@ function Popup:_book_font_css()
     return cache_font_css(font_name, css)
 end
 
+function Popup:_load_page(index)
+    if type(self.page_loader)~="function" then return true end
+    local ok,value=pcall(self.page_loader,math.max(1,tonumber(index) or 1))
+    if not ok or type(value)~="table" then return false,tostring(value or "page load failed") end
+    self.page_count=math.max(1,tonumber(value.page_count) or 1)
+    self.page_index=math.max(1,math.min(self.page_count,tonumber(value.page_index) or tonumber(index) or 1))
+    self.html=tostring(value.html or "")
+    self.source_html=tostring(value.source_html or "")
+    self.metrics=type(value.metrics)=="table" and value.metrics or {}
+    return true
+end
+
 function Popup:init()
+    if self.page_loader then self:_load_page(self.page_index or 1) end
     self.html = tostring(self.html or "")
     self.source_html = tostring(self.source_html or "")
     if self.html == "" then self.html = "<p>没有想法内容</p>" end
@@ -173,9 +194,15 @@ function Popup:_free_widgets()
     if self.sourcewidget then pcall(function() self.sourcewidget:free() end) end
     if self.htmlwidget then pcall(function() self.htmlwidget:free() end) end
     if self.close_button then pcall(function() self.close_button:free() end) end
+    if self.prev_button then pcall(function() self.prev_button:free() end) end
+    if self.next_button then pcall(function() self.next_button:free() end) end
+    if self.page_label then pcall(function() self.page_label:free() end) end
     self.sourcewidget = nil
     self.htmlwidget = nil
     self.close_button = nil
+    self.prev_button = nil
+    self.next_button = nil
+    self.page_label = nil
 end
 
 function Popup:_new_html_widget(width, height, html, scrollable)
@@ -267,7 +294,9 @@ function Popup:_build()
     local close_size = math.max(Screen:scaleBySize(18), math.floor(self.font_size * 0.62))
     local close_inset = math.max(4, Screen:scaleBySize(5))
     local inner_w = self.width - padding * 2 - border * 2
-    local max_inner_h = self.max_height - padding * 2 - border * 2
+    local nav_h = self.page_count>1 and math.max(Screen:scaleBySize(30),math.floor(self.font_size*1.35)) or 0
+    local nav_gap = nav_h>0 and math.max(2,Screen:scaleBySize(3)) or 0
+    local max_inner_h = self.max_height - padding * 2 - border * 2 - nav_h - nav_gap
     local gap = 0
     local source_h = 0
 
@@ -307,19 +336,54 @@ function Popup:_build()
         true
     )
 
-    local body_content
+    local content_group
     if self.sourcewidget then
-        body_content = VerticalGroup:new{
+        content_group = VerticalGroup:new{
             align = "left",
             self.sourcewidget,
             VerticalSpan:new{width=gap},
             self.htmlwidget,
         }
     else
-        body_content = self.htmlwidget
+        content_group = self.htmlwidget
     end
 
-    local inner_h = source_h + gap + self.comments_height
+    local body_content=content_group
+    if self.page_count>1 then
+        local nav_spacing=math.max(2,Screen:scaleBySize(4))
+        local button_w=math.max(Screen:scaleBySize(42),math.min(Screen:scaleBySize(72),math.floor(inner_w*0.22)))
+        local label_w=math.max(Screen:scaleBySize(40),inner_w-button_w*2-nav_spacing*2)
+        self.prev_button=Button:new{
+            text="上一页",width=button_w,height=nav_h,margin=0,padding=0,
+            enabled=self.page_index>1,show_parent=self,
+            callback=function() self:_change_page(-1) end,
+        }
+        self.next_button=Button:new{
+            text="下一页",width=button_w,height=nav_h,margin=0,padding=0,
+            enabled=self.page_index<self.page_count,show_parent=self,
+            callback=function() self:_change_page(1) end,
+        }
+        self.page_label=TextWidget:new{
+            text=tostring(self.page_index).." / "..tostring(self.page_count),
+            face=Font:getFace("cfont",math.max(12,math.floor(self.font_size*0.58))),
+        }
+        local nav=HorizontalGroup:new{
+            align="center",
+            self.prev_button,
+            HorizontalSpan:new{width=nav_spacing},
+            CenterContainer:new{dimen=Geom:new{w=label_w,h=nav_h},self.page_label},
+            HorizontalSpan:new{width=nav_spacing},
+            self.next_button,
+        }
+        body_content=VerticalGroup:new{
+            align="left",
+            content_group,
+            VerticalSpan:new{width=nav_gap},
+            CenterContainer:new{dimen=Geom:new{w=inner_w,h=nav_h},nav},
+        }
+    end
+
+    local inner_h = source_h + gap + self.comments_height + nav_gap + nav_h
     self.height = inner_h + padding * 2 + border * 2
     self.popup_dimen = Geom:new{
         x = math.floor((screen_w - self.width) / 2),
@@ -401,6 +465,19 @@ function Popup:onCloseWidget()
     dirty_region(nil, old_dimen)
 end
 
+function Popup:_change_page(delta)
+    if self.closing or self.page_count<=1 then return true end
+    local target=math.max(1,math.min(self.page_count,self.page_index+(tonumber(delta) or 0)))
+    if target==self.page_index then return true end
+    local old_dimen=self.popup_dimen and self.popup_dimen:copy() or nil
+    local ok=self:_load_page(target)
+    if not ok then return true end
+    self:_build()
+    dirty_region(self,old_dimen)
+    dirty_region(self,self.popup_dimen)
+    return true
+end
+
 function Popup:_request_close()
     if self.closing then return true end
     self.closing = true
@@ -427,14 +504,16 @@ end
 function Popup:onClose() return self:_request_close() end
 
 function Popup:onScrollDown()
-    if self.closing or not self.htmlwidget then return true end
-    self.htmlwidget:onScrollDown()
+    if self.closing then return true end
+    if self.page_count>1 then return self:_change_page(1) end
+    if self.htmlwidget then self.htmlwidget:onScrollDown() end
     return true
 end
 
 function Popup:onScrollUp()
-    if self.closing or not self.htmlwidget then return true end
-    self.htmlwidget:onScrollUp()
+    if self.closing then return true end
+    if self.page_count>1 then return self:_change_page(-1) end
+    if self.htmlwidget then self.htmlwidget:onScrollUp() end
     return true
 end
 
@@ -467,6 +546,9 @@ function M.show(opts)
         height_ratio = opts.height_ratio,
         css = opts.css or "",
         metrics = opts.metrics,
+        page_loader = opts.page_loader,
+        page_index = opts.page_index or 1,
+        page_count = opts.page_count or 1,
         on_close_callback = opts.on_close,
     })
 end

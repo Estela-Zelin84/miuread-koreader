@@ -11,8 +11,11 @@ function Async:new(store, options)
         allow_android=options.allow_android==true,
     },self)
 end
+function Async:is_android()
+    return type(FFIUtil.isAndroid)=="function" and FFIUtil.isAndroid()==true
+end
 function Async:available()
-    local android=type(FFIUtil.isAndroid)=="function" and FFIUtil.isAndroid()
+    local android=self:is_android()
     return type(FFIUtil.runInSubProcess)=="function"
         and type(FFIUtil.isSubProcessDone)=="function"
         and (self.allow_android or not android)
@@ -29,7 +32,12 @@ function Async:_check()
     if j.callback then j.callback(result) end
 end
 function Async:cancel(reason)
-    if not self.job then return end; self.job.callback=nil; pcall(FFIUtil.terminateSubProcess,self.job.pid); os.remove(self.job.path); self.job=nil
+    if self.poll then UIManager:unschedule(self.poll); self.poll=nil end
+    if not self.job then return end
+    self.job.callback=nil
+    pcall(FFIUtil.terminateSubProcess,self.job.pid)
+    os.remove(self.job.path); os.remove(self.job.path..".tmp")
+    self.job=nil
 end
 function Async:run(label,fn,callback,timeout)
     if self.job then return false,"worker busy" end

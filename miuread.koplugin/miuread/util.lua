@@ -57,6 +57,69 @@ function U.list(p)
     local o={}; if lfs.attributes(p,"mode")~="directory" then return o end
     for x in lfs.dir(p) do if x~="." and x~=".." then o[#o+1]=p.."/"..x end end; table.sort(o); return o
 end
+function U.copy_file_stream(a,b,chunk_size)
+    local input,open_error=io.open(a,"rb")
+    if not input then return nil,open_error end
+    local output,write_open_error=io.open(b,"wb")
+    if not output then input:close(); return nil,write_open_error end
+    local ok,err=true,nil
+    local chunk=math.max(64*1024,tonumber(chunk_size) or 256*1024)
+    while true do
+        local data=input:read(chunk)
+        if not data then break end
+        local written,write_error=output:write(data)
+        if not written then ok=false; err=write_error; break end
+    end
+    if ok then
+        local flushed,flush_error=output:flush()
+        if flushed==nil then ok=false; err=flush_error end
+    end
+    input:close(); output:close()
+    if not ok then os.remove(b); return nil,err or "copy failed" end
+    local source_size,target_size=U.file_size(a),U.file_size(b)
+    if source_size and target_size~=source_size then
+        os.remove(b)
+        return nil,"copied file size mismatch"
+    end
+    return true
+end
+function U.move_file_safe(source,target,validator)
+    source=tostring(source or "")
+    target=tostring(target or "")
+    if source=="" or target=="" then return nil,"invalid path" end
+    local moved,move_error=os.rename(source,target)
+    if moved then return true,"rename" end
+    local stage=target..".miuread-copying-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
+    os.remove(stage)
+    local copied,copy_error=U.copy_file_stream(source,stage)
+    if not copied then return nil,"rename failed: "..tostring(move_error).."; copy failed: "..tostring(copy_error) end
+    if validator then
+        local called,valid,validation_error=pcall(validator,stage)
+        if not called or valid~=true then
+            os.remove(stage)
+            return nil,"copied file validation failed: "..tostring(called and validation_error or valid)
+        end
+    end
+    local target_exists=U.file_exists(target)
+    local old_backup=target..".miuread-old-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
+    if target_exists then
+        os.remove(old_backup)
+        local backed_up,backup_error=os.rename(target,old_backup)
+        if not backed_up then
+            os.remove(stage)
+            return nil,"existing target backup failed: "..tostring(backup_error)
+        end
+    end
+    local installed,install_error=os.rename(stage,target)
+    if not installed then
+        if target_exists then os.rename(old_backup,target) end
+        os.remove(stage)
+        return nil,"copied file install failed: "..tostring(install_error)
+    end
+    if target_exists then os.remove(old_backup) end
+    os.remove(source)
+    return true,"copy"
+end
 function U.copy_file(a,b) local d,e=U.read_file(a,true); if not d then return nil,e end return U.atomic_write(b,d,true) end
 function U.copy_tree(a,b)
     local m=lfs.attributes(a,"mode"); if m=="file" then return U.copy_file(a,b) end; if m~="directory" then return nil,"source missing" end

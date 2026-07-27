@@ -337,6 +337,13 @@ function DownloadTask:start(book, options, on_progress, on_done)
     local task_token = stamp .. "-" .. tostring(math.random(100000,999999))
     local clean_book = serializable_copy(book)
     local clean_options = serializable_copy(options or {})
+    local start_auth=self.store:auth()
+    local start_account=type(start_auth.account)=="table" and start_auth.account or {}
+    local auth_snapshot={
+        vid=tostring(start_account.vid or ""),
+        logged_at=tonumber(start_account.logged_at or 0) or 0,
+        ticket_updated_at=tonumber(start_auth.ticket_updated_at or 0) or 0,
+    }
     self.keep_awake_enabled = self.store:preferences().download_keep_awake ~= false
     clean_options.cancelled = nil
 
@@ -424,6 +431,7 @@ function DownloadTask:start(book, options, on_progress, on_done)
                 ok = true,
                 value = serializable_copy(value and value.record),
                 auth = serializable_copy(value and value.auth),
+                auth_snapshot = serializable_copy(auth_snapshot),
                 session = serializable_copy(value and value.session),
             }
         else

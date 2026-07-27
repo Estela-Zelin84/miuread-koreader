@@ -98,25 +98,29 @@ function ShelfItem:init()
 
     local h = self.dimen.h
     if self.entry and (self.entry._miu_action_row or self.entry._miu_tab_row) then
-        local gap=math.max(Size.padding.small,Screen:scaleBySize(8))
-        local half_w=math.max(1,math.floor((self.dimen.w-gap)/2))
         local face=Font:getFace("cfont",math.min(18,Screen:scaleBySize(self.entry._miu_tab_row and 16 or 15)))
-        local left_text,right_text,left_selected,right_selected
+        local row=HorizontalGroup:new{align="center"}
         if self.entry._miu_tab_row then
-            left_selected=self.entry.selected_tab=="account"
-            right_selected=self.entry.selected_tab=="generated"
-            left_text=(left_selected and "●  " or "").."账号书架"
-            right_text=(right_selected and "●  " or "").."已生成书籍"
+            local tabs=type(self.entry.tabs)=="table" and self.entry.tabs or {}
+            local count=math.max(1,#tabs)
+            local gap=count>1 and math.max(Size.padding.small,Screen:scaleBySize(5)) or 0
+            local width=math.max(1,math.floor((self.dimen.w-gap*(count-1))/count))
+            for index,tab in ipairs(tabs) do
+                local selected=tostring(self.entry.selected_tab or "")==tostring(tab.id or index)
+                local text=(selected and "●  " or "")..tostring(tab.label or tab.id or index)
+                table.insert(row,CenterContainer:new{
+                    dimen=Geom:new{w=width,h=h},
+                    TextWidget:new{text=text,face=face,bold=selected},
+                })
+                if index<count then table.insert(row,HorizontalSpan:new{width=gap}) end
+            end
         else
-            left_text="搜索书架"
-            right_text="刷新书架"
+            local gap=math.max(Size.padding.small,Screen:scaleBySize(8))
+            local half_w=math.max(1,math.floor((self.dimen.w-gap)/2))
+            table.insert(row,CenterContainer:new{dimen=Geom:new{w=half_w,h=h},TextWidget:new{text="搜索书架",face=face}})
+            table.insert(row,HorizontalSpan:new{width=gap})
+            table.insert(row,CenterContainer:new{dimen=Geom:new{w=half_w,h=h},TextWidget:new{text="刷新书架",face=face}})
         end
-        local row=HorizontalGroup:new{
-            align="center",
-            CenterContainer:new{dimen=Geom:new{w=half_w,h=h},TextWidget:new{text=left_text,face=face,bold=left_selected==true}},
-            HorizontalSpan:new{width=gap},
-            CenterContainer:new{dimen=Geom:new{w=half_w,h=h},TextWidget:new{text=right_text,face=face,bold=right_selected==true}},
-        }
         self._underline=UnderlineContainer:new{
             dimen=self.dimen:copy(),linesize=Size.line.thin,color=DIVIDER_COLOR,
             padding=0,vertical_align="center",row,
@@ -226,12 +230,14 @@ function ShelfMenu:onMenuSelect(entry, pos)
     if entry and (entry._miu_action_row or entry._miu_tab_row) then
         local callback
         if entry._miu_tab_row then
-            if pos and tonumber(pos.x) and pos.x >= 0.5 then
-                callback=entry.generated_callback
-            elseif pos then
-                callback=entry.account_callback
-            else
-                callback=entry.account_callback or entry.generated_callback
+            local tabs=type(entry.tabs)=="table" and entry.tabs or {}
+            if #tabs>0 then
+                local x=pos and tonumber(pos.x) or 0
+                local index=math.floor(math.max(0,math.min(.999999,x))*#tabs)+1
+                callback=tabs[index] and tabs[index].callback or nil
+                if not callback then
+                    for _,tab in ipairs(tabs) do if tab.callback then callback=tab.callback; break end end
+                end
             end
         elseif pos and tonumber(pos.x) and pos.x >= 0.5 then
             callback=entry.refresh_callback
@@ -312,13 +318,19 @@ function ShelfView.show(opts)
     opts=opts or {}
     local items={}
     local action_count=0
-    if opts.show_tabs~=false and (opts.on_account_tab or opts.on_generated_tab) then
+    local tabs=opts.tabs
+    if type(tabs)~="table" and (opts.on_account_tab or opts.on_generated_tab) then
+        tabs={
+            {id="account",label="账号书架",callback=opts.on_account_tab},
+            {id="generated",label="已生成书籍",callback=opts.on_generated_tab},
+        }
+    end
+    if opts.show_tabs~=false and type(tabs)=="table" and #tabs>0 then
         action_count=action_count+1
         items[#items+1]={
             _miu_tab_row=true,
-            selected_tab=opts.selected_tab or "account",
-            account_callback=opts.on_account_tab,
-            generated_callback=opts.on_generated_tab,
+            selected_tab=opts.selected_tab or tostring(tabs[1].id or 1),
+            tabs=tabs,
         }
     end
     if opts.show_actions~=false and (opts.on_search or opts.on_refresh) then
