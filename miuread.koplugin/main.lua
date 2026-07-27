@@ -109,12 +109,20 @@ function Plugin:init()
         self.store:save_cover_guard({active=false,started_at=0,stage="",version=Config.VERSION})
     end
 
+    local startup_download_state=self.store:download_state()
+    if startup_download_state.status=="completed" then
+        self.store:clear_download_state()
+    end
     local recovered=self:_recover_download_state()
     if not recovered then UIManager:scheduleIn(1.0,function() self:_start_next_queued_download() end) end
     Actions.register()
     self.ui.menu:registerToMainMenu(self)
     local state=self.updater:startup()
-    if state=="updated" then UIManager:scheduleIn(1,function() self:toast(_("Update installed"),3) end) end
+    if state=="updated" then
+        UIManager:scheduleIn(1,function() self:status_toast("更新完成","当前运行版本 "..tostring(self.version),4) end)
+    elseif state=="mismatch" then
+        UIManager:scheduleIn(1,function() self:info("更新文件已经替换，但当前运行版本与目标版本不一致。\n\n请完整退出并重新启动 KOReader。\n当前运行："..tostring(self.version)) end)
+    end
     UIManager:scheduleIn(.8,function() if not self:_current_document_path() then self:_install_pending_downloads(false) end end)
     UIManager:scheduleIn(1.2,function() self:_show_auth_notice() end)
     UIManager:scheduleIn(5.0,function() self:maybe_auto_check_update(false) end)
@@ -320,7 +328,7 @@ function Plugin:_show_auth_notice()
     UIManager:show(dialog)
 end
 function Plugin:_account_status_label()
-    if not self:logged_in() then return "未登录" end
+    if not self:logged_in() then return "未登录 · 点击扫码" end
     local auth=self.store:auth()
     local health=self:_auth_health()
     local name=U.trim(tostring((auth.account or {}).name or ""))
@@ -476,21 +484,24 @@ function Plugin:on_auth_success(name)
         ..(resumed and " · 正在恢复后台任务" or (web_ready and "" or " · 正文会话等待检查"))
     self:status_toast(title,detail,5)
 end
-function Plugin:_download_menu_post_text()
+function Plugin:_download_menu_text()
     if self:_has_download_status() then
-        return tostring(self:_download_status_label()):gsub("^后台下载%s*·%s*","")
+        return "下载管理 · "..tostring(self:_download_status_label()):gsub("^后台下载%s*[：·]?%s*","")
     end
     local queue=self.store:download_queue()
-    return #queue>0 and (tostring(#queue).." 项等待") or "空闲"
+    return #queue>0 and ("下载管理 · "..tostring(#queue).." 项等待") or "下载管理"
+end
+function Plugin:_sync_menu_text()
+    return "阅读同步 · "..tostring(self:progress_sync_label())
 end
 function Plugin:home_menu()
     self:maybe_auto_check_update(false)
-    local account={text="账号",post_text=self:_account_status_label(),callback=function() self:show_account_status() end}
+    local account={text=self:_account_status_label(),callback=function() self:show_account_status() end}
     local out={
         {text="我的书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)},
         {text="搜索书籍",callback=self:safe("search",function() self:search_dialog() end)},
-        {text="下载管理",post_text=self:_download_menu_post_text(),callback=self:safe("downloads",function() self:show_downloads() end)},
-        {text="阅读同步",post_text=self:progress_sync_label(),sub_item_table_func=function() return self:sync_menu() end},
+        {text=self:_download_menu_text(),callback=self:safe("downloads",function() self:show_downloads() end)},
+        {text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end},
         account,
         {text="设置与关于",sub_item_table_func=function() return self:settings_menu() end},
     }
@@ -505,12 +516,41 @@ function Plugin:current_book_menu()
     local r=self:_current_book_record()
     if not r or not r.book then return {{text="未识别当前觅阅书籍",enabled=false}} end
     local b={bookId=r.book.book_id,title=r.book.title,author=r.book.author,cover=r.book.cover}
-    return {
+    local items={
         {text="重新生成纯净版",callback=function() self:choose_download_mode(b,{annotations=false},false) end},
         {text="重新生成划线与想法版",callback=function() self:choose_download_mode(b,{annotations=true},false) end},
-        {text="章节下载",callback=function() self:chapters(b) end},
-        {text="管理本书文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end},
-        {text="书籍详情",callback=function() self:book_details(b) end},
+        {text="下载当前章",callback=function() self:download_current_chapters(1) end},
+        {text="下载当前章及后续 5 章",callback=function() self:download_current_chapters(6) end},
+        {text="下载当前章及后续 10 章",callback=function() self:download_current_chapters(11) end},
+        {text="选择章节范围",callback=function() self:chapters(b) end},
+    }
+    if self:_has_range_variant(b.bookId) then
+        items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(b) end}
+    end
+    items[#items+1]={text="管理本书文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end}
+    items[#items+1]={text="书籍详情",callback=function() self:book_details(b) end}
+    return items
+end
+
+function Plugin:current_mp_article_menu(mp_context)
+    local account={bookId=mp_context.bookId,title=mp_context.account_title or "公众号",author="公众号"}
+    local target
+    for _,article in ipairs(self.mp:cached_articles(mp_context.bookId) or {}) do
+        if tostring(article.reviewId or article.originalId or "")==tostring(mp_context.reviewId or "") then
+            target=article; break
+        end
+    end
+    if not target then return {{text="当前文章信息不可用",enabled=false}} end
+    local article=U.copy(target)
+    return {
+        {text="重新下载文章",callback=function() self:open_or_download_mp_article(account,article,true) end},
+        {text="删除本篇缓存",callback=function()
+            UIManager:show(ConfirmBox:new{text="删除《"..tostring(article.title or "文章").."》的本地缓存？",ok_callback=function()
+                self.mp:clear_article(account.bookId,article)
+                self:toast("本篇缓存已删除")
+            end})
+        end},
+        {text="公众号缓存管理",sub_item_table_func=function() return self:mp_cache_menu(account,self.mp:cached_articles(account.bookId)) end},
     }
 end
 
@@ -523,17 +563,18 @@ function Plugin:reader_menu()
             {text="返回文章列表",callback=self:safe("mp-back",function() self:open_mp_account_by_id(mp_context.bookId,mp_context.account_title) end)},
             {text="上一篇",callback=self:safe("mp-prev",function() self:open_mp_neighbor(-1) end)},
             {text="下一篇",callback=self:safe("mp-next",function() self:open_mp_neighbor(1) end)},
-            {text="下载管理",post_text=self:_download_menu_post_text(),callback=function() self:show_downloads() end},
-            {text="账号",post_text=self:_account_status_label(),callback=function() self:show_account_status() end},
+            {text="当前文章",sub_item_table_func=function() return self:current_mp_article_menu(mp_context) end},
+            {text=self:_download_menu_text(),callback=function() self:show_downloads() end},
+            {text=self:_account_status_label(),callback=function() self:show_account_status() end},
             {text="设置与关于",sub_item_table_func=function() return self:settings_menu() end},
         }
     end
     return {
         {text="返回书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)},
         {text="当前书籍",sub_item_table_func=function() return self:current_book_menu() end},
-        {text="阅读同步",post_text=self:progress_sync_label(),sub_item_table_func=function() return self:sync_menu() end},
-        {text="下载管理",post_text=self:_download_menu_post_text(),callback=function() self:show_downloads() end},
-        {text="账号",post_text=self:_account_status_label(),callback=function() self:show_account_status() end},
+        {text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end},
+        {text=self:_download_menu_text(),callback=function() self:show_downloads() end},
+        {text=self:_account_status_label(),callback=function() self:show_account_status() end},
         {text="设置与关于",sub_item_table_func=function() return self:settings_menu() end},
     }
 end
@@ -820,12 +861,18 @@ function Plugin:_shelf_select(b)
     local id=tostring(b and (b.bookId or b.book_id) or "")
     if id=="" then return end
     if Protocol.is_mp_account(id) then self:mp_account(b); return end
-    local available={}
-    for _,kind in ipairs({"notes","clean","range_notes","range_clean","preview_notes","preview_clean"}) do
-        local r=self.store:variant(id,kind)
-        if r and r.file and U.file_exists(r.file) then available[#available+1]=r end
+    local record=self:_preferred_record(id)
+    if record and record.file and U.file_exists(record.file) then
+        self:open_file(record.file)
+    else
+        self:book_menu(b)
     end
-    if #available==1 then self:open_file(available[1].file) else self:book_menu(b) end
+end
+function Plugin:_shelf_hold(b)
+    local id=tostring(b and (b.bookId or b.book_id) or "")
+    if id=="" then return end
+    if Protocol.is_mp_account(id) then self:mp_account(b); return end
+    self:book_menu(b)
 end
 
 function Plugin:show_shelf_search_dialog(mp_mode,source_rows,section)
@@ -856,6 +903,7 @@ function Plugin:show_shelf_search_dialog(mp_mode,source_rows,section)
                     show_tabs=false,
                     show_covers=show_covers,
                     on_select=function(b) self:_shelf_select(b) end,
+                    on_hold=function(b) self:_shelf_hold(b) end,
                     on_page_changed=function(page,first,last,current)
                         if show_covers then self:_on_shelf_page(results,current,page,first,last) end
                     end,
@@ -1242,6 +1290,7 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
             show_covers=show_covers,
             on_search=function() self:show_shelf_search_dialog(mp_mode,all_rows,section) end,
             on_refresh=refresh,on_select=function(b) self:_shelf_select(b) end,
+            on_hold=function(b) self:_shelf_hold(b) end,
             on_page_changed=function(page,first,last,current)
                 if show_covers then self:_on_shelf_page(rows,current,page,first,last) end
             end,
@@ -1671,6 +1720,9 @@ function Plugin:book_menu(b)
     end
     items[#items+1]={text="生成／更新书籍",callback=function() self:choose_download(b,nil,false) end}
     items[#items+1]={text="按章节下载",callback=function() self:chapters(b) end}
+    if self:_has_range_variant(b.bookId) then
+        items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(b) end}
+    end
     if self:_book_has_cache(b.bookId) or self.store:book_has_partial_cache(b.bookId) then
         items[#items+1]={text="管理本书文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end}
     end
@@ -1885,13 +1937,17 @@ function Plugin:_finish_download_runtime(runtime,result)
     local pending=rec.pending_install==true and rec.pending_file and U.file_exists(rec.pending_file)
     self:_update_open_shelf_download_status(b.bookId,pending and "等待关闭后更新"
         or (rec.annotation_pending==true and "正文已生成 · 批注待补" or "已生成"))
-    self:_write_download_state(pending and "pending_install" or "completed",{
-        title=b.title,book_id=b.bookId,book=U.copy(b),options=U.copy(opt),file=rec.file,
-        pending_file=rec.pending_file,pending_install=pending or nil,seen=false,percent=1,
-        current=rec.chapter_count,total=rec.expected_chapter_count,completed_at=os.time(),
-        annotation_pending=rec.annotation_pending==true or nil,
-        annotation_error_kind=rec.annotation_error_kind,
-    },true)
+    if pending then
+        self:_write_download_state("pending_install",{
+            title=b.title,book_id=b.bookId,book=U.copy(b),options=U.copy(opt),file=rec.file,
+            pending_file=rec.pending_file,pending_install=true,percent=1,
+            current=rec.chapter_count,total=rec.expected_chapter_count,completed_at=os.time(),
+            annotation_pending=rec.annotation_pending==true or nil,
+            annotation_error_kind=rec.annotation_error_kind,
+        },true)
+    else
+        self.store:clear_download_state()
+    end
     if done then done(rec,was_background); self:_start_next_queued_download(); return end
     if pending then
         local text=tostring(b.title or "未命名").."新版本已下载，关闭当前书籍后更新"
@@ -1967,7 +2023,7 @@ end
 function Plugin:_has_download_status()
     if self.download_task and self.download_task:busy() then return true end
     local state=self.store:download_state()
-    if state.status=="completed" then return state.seen~=true end
+    if state.status=="completed" then self.store:clear_download_state(); return false end
     return state.status=="failed" or state.status=="interrupted" or state.status=="pending_install"
 end
 function Plugin:_download_status_label()
@@ -2128,7 +2184,7 @@ end
 function Plugin:_show_download_complete(rec,opt)
     local dialog
     dialog=ButtonDialog:new{title=self:_download_summary(rec,opt),title_align="center",buttons={
-        {{text="立即阅读",callback=function() UIManager:close(dialog); self.store:clear_download_state(); self:open_file(rec.file) end}},
+        {{text="立即阅读",callback=function() UIManager:close(dialog); self:open_file(rec.file) end}},
         {{text="关闭",callback=function() UIManager:close(dialog) end}},
     }}
     UIManager:show(dialog)
@@ -2137,7 +2193,11 @@ function Plugin:show_download_status()
     if self.download_task and self.download_task:busy() then self:_show_active_download_dialog(); return end
     local state=self.store:download_state()
     if not state.status or state.status=="" then self:info("当前没有后台下载记录。") return end
-    if state.status=="completed" then state.seen=true; self.store:save_download_state(state) end
+    if state.status=="completed" then
+        self.store:clear_download_state()
+        self:info("下载已经完成，记录已自动清除。\n\n可在下载管理的已完成列表中打开书籍。")
+        return
+    end
     local title=tostring(state.title or "未命名")
     local lines={}
     if state.status=="completed" then lines[#lines+1]="下载完成"
@@ -2358,6 +2418,84 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
 end
 
 
+
+function Plugin:_range_variant(book_id,kind)
+    local record=self.store:variant(book_id,kind)
+    if record and record.file and U.file_exists(record.file) and record.partial_range==true then return record end
+end
+function Plugin:_has_range_variant(book_id)
+    return self:_range_variant(book_id,"range_notes")~=nil or self:_range_variant(book_id,"range_clean")~=nil
+end
+function Plugin:range_extend_menu(b)
+    local items={}
+    local clean=self:_range_variant(b.bookId,"range_clean")
+    local notes=self:_range_variant(b.bookId,"range_notes")
+    if clean then items[#items+1]={text="扩展章节版 · 纯净版",callback=function() self:show_range_extend_options(b,false,clean) end} end
+    if notes then items[#items+1]={text="扩展章节版 · 划线与想法版",callback=function() self:show_range_extend_options(b,true,notes) end} end
+    if #items==0 then return {{text="当前没有可扩展的章节版",enabled=false}} end
+    return items
+end
+function Plugin:show_range_extend_options(b,annotations,record)
+    self:online("range-extend",function()
+        local _,rows=self.downloader:catalog(b.bookId)
+        rows=rows or {}
+        local first=math.max(1,tonumber(record.range_start_index) or 1)
+        local last=math.min(#rows,tonumber(record.range_end_index) or first)
+        local items={}
+        for _,count in ipairs({5,10,20}) do
+            local target=math.min(#rows,last+count)
+            items[#items+1]={text="追加后续 "..tostring(math.max(0,target-last)).." 章",enabled=target>last,
+                callback=function()
+                    self:choose_download_mode(b,{annotations=annotations,range_start_index=first,range_end_index=target,
+                        range_start_title=rows[first] and rows[first].title,range_end_title=rows[target] and rows[target].title},false)
+                end}
+        end
+        items[#items+1]={text="扩展到指定章节",enabled=last<#rows,callback=function()
+            self:_chapter_list_menu(b,rows,"选择新的结束章节",function(target)
+                self:choose_download_mode(b,{annotations=annotations,range_start_index=first,range_end_index=target,
+                    range_start_title=rows[first] and rows[first].title,range_end_title=rows[target] and rows[target].title},false)
+            end,last+1)
+        end}
+        items[#items+1]={text="重新选择章节范围",callback=function() self:chapters(b) end}
+        self:list("扩展章节版 · 当前 "..tostring(last-first+1).." 章",items)
+    end)
+end
+function Plugin:_current_catalog_index(record,rows)
+    if not record or not record.record then return nil end
+    local local_map=record.record.chapter_map or {}
+    if #local_map==0 then return nil end
+    local ratio=self.sync:local_ratio() or 0
+    local position=self.sync:position(record,ratio,local_map)
+    local uid=tostring(position and position.chapter_uid or "")
+    if uid=="" then
+        local local_index=math.max(1,math.min(#local_map,math.floor(ratio*#local_map)+1))
+        local chapter=local_map[local_index] or {}
+        uid=tostring(chapter.uid or chapter.chapterUid or chapter.chapter_uid or "")
+    end
+    if uid~="" then
+        for index,chapter in ipairs(rows or {}) do
+            if tostring(chapter.chapterUid or chapter.uid or "")==uid then return index end
+        end
+    end
+    local local_index=math.max(1,math.min(#local_map,math.floor(ratio*#local_map)+1))
+    local hinted=tonumber(local_map[local_index] and local_map[local_index].index)
+    if hinted and rows and rows[hinted] then return hinted end
+    return nil
+end
+function Plugin:download_current_chapters(count)
+    local record=self:_current_book_record()
+    if not record or not record.book then self:info("当前不是觅阅生成的书籍。") return end
+    local b={bookId=record.book.book_id,title=record.book.title,author=record.book.author,cover=record.book.cover}
+    local wanted=math.max(1,tonumber(count) or 1)
+    self:online("current-chapter-download",function()
+        local _,rows=self.downloader:catalog(b.bookId)
+        rows=rows or {}
+        local first=self:_current_catalog_index(record,rows)
+        if not first or not rows[first] then self:info("暂时无法确定当前章节，请使用“选择章节范围”。") return end
+        local last=math.min(#rows,first+wanted-1)
+        self:_choose_range_version(b,rows,first,last,false)
+    end)
+end
 
 function Plugin:_chapter_state_text(book_id,chapter)
     local uid=tostring(chapter.chapterUid or chapter.uid or "")
@@ -3541,10 +3679,11 @@ function Plugin:update_settings_menu()
         end,keep_menu_open=true,callback=function()
             local _,u=self:_update_preferences(); u.auto_check=u.auto_check==false; self:_save_update_preferences(u)
         end},
-        {text="检查频率",post_text=self:_update_interval_label(update.interval),sub_item_table_func=function() return self:update_frequency_menu() end},
-        {text="安装完成后",post_text=update.restart_mode=="auto" and "自动重启" or (update.restart_mode=="never" and "手动重启" or "询问"),sub_item_table_func=function() return self:update_restart_menu() end},
+        {text="检查频率 · "..self:_update_interval_label(update.interval),sub_item_table_func=function() return self:update_frequency_menu() end},
+        {text="安装完成后 · "..(update.restart_mode=="auto" and "自动重启" or (update.restart_mode=="never" and "稍后手动重启" or "询问是否重启")),sub_item_table_func=function() return self:update_restart_menu() end},
         {text="检查"..tostring(Config.UPDATE_CHANNEL_LABEL).."更新",callback=self:safe("update",function() self:check_update(false) end)},
-        {text="当前版本 · "..tostring(self.version),enabled=false},
+        {text="当前运行版本 · "..tostring(self.version),enabled=false},
+        {text="更新通道 · "..tostring(Config.UPDATE_CHANNEL_LABEL),enabled=false},
     }
 end
 function Plugin:_restart_koreader()
@@ -3583,7 +3722,7 @@ function Plugin:_after_update_installed(manifest)
         UIManager:scheduleIn(.8,function() self:_restart_koreader() end)
     else
         UIManager:show(ConfirmBox:new{
-            text="觅阅已更新至 "..version.."。\n\n需要重启 KOReader 才能使用新版本。",
+            text="更新文件已安装："..version.."。\n\n当前仍在运行 "..tostring(self.version).."，重启 KOReader 后才会切换到新版本。",
             ok_text="立即重启",cancel_text="稍后重启",ok_callback=function() self:_restart_koreader() end,
         })
     end

@@ -164,8 +164,7 @@ local function option_key(opt)
         opt.annotations and "notes" or "clean",
         opt.images == false and "no-images" or "images",
         opt.chapter_uid and ("chapter-" .. U.id_name(opt.chapter_uid))
-            or ((opt.range_start_index and opt.range_end_index)
-                and ("range-" .. tostring(opt.range_start_index) .. "-" .. tostring(opt.range_end_index)) or "book"),
+            or ((opt.range_start_index and opt.range_end_index) and "range" or "book"),
     }, "-")
 end
 

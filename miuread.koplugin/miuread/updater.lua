@@ -76,6 +76,14 @@ local function file_bytes(path)
     return data
 end
 
+local function clean_notes(value)
+    local text=tostring(value or "")
+    text=text:gsub("\r\n","\n"):gsub("\r","\n")
+    text=text:gsub("[•●▪◦]","-")
+    text=text:gsub("[%z\1-\8\11\12\14-\31]","")
+    return text
+end
+
 local function validate_manifest(m)
     if type(m)~="table" or type(m.version)~="string" or m.version=="" then
         return nil,"更新清单缺少版本号"
@@ -108,8 +116,9 @@ function Updater:check()
             if valid then
                 logger.info("[MiuRead][Updater] manifest loaded",url,"version=",tostring(m.version))
                 if not U.semver_newer(m.version,self.version) then
-                    return {current=true,version=m.version,name=m.name,notes=m.notes}
+                    return {current=true,version=m.version,name=m.name,notes=clean_notes(m.notes)}
                 end
+                m.notes=clean_notes(m.notes)
                 return m
             end
             errors[#errors+1]=reason

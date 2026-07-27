@@ -700,6 +700,11 @@ function Store:migrate()
                 p.update.restart_mode="ask"
             end
         end
+        if schema<55 then
+            -- 2.3.1 keeps account and critical status text in the main label,
+            -- auto-clears obsolete completed download records, and enables
+            -- reusable checkpoints for an expanding chapter-range EPUB.
+        end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)
     end
