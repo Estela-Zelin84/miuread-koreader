@@ -9,11 +9,21 @@ local lfs = require("libs/libkoreader-lfs")
 local DownloadTask = {}
 DownloadTask.__index = DownloadTask
 
+local function is_android()
+    if type(FFIUtil.isAndroid) ~= "function" then return false end
+    local ok, value = pcall(FFIUtil.isAndroid)
+    return ok and value == true
+end
+
 local function lower_worker_priority()
+    -- KOReader already lowers subprocess priority. Android workers are more
+    -- vulnerable to background scheduling, so do not lower them a second time.
+    if is_android() then return false end
     local ok,ffi=pcall(require,"ffi")
-    if not ok or not ffi then return end
+    if not ok or not ffi then return false end
     pcall(ffi.cdef,"int setpriority(int which, int who, int prio);")
-    pcall(function() ffi.C.setpriority(0,0,10) end)
+    local called = pcall(function() ffi.C.setpriority(0,0,10) end)
+    return called
 end
 
 local function serializable_copy(value, seen)
@@ -78,10 +88,51 @@ local function process_exists(pid)
     local proc="/proc/"..tostring(pid)
     if lfs.attributes("/proc","mode")~="directory" then return nil end
     if lfs.attributes(proc,"mode")~="directory" then return false end
-    local status=U.read_file(proc.."/status",true) or ""
+    local status,status_error=U.read_file(proc.."/status",true)
+    if not status then
+        logger.warn("[MiuRead][DownloadTask] process status unavailable",
+            "pid=",tostring(pid),"error=",tostring(status_error))
+        return nil
+    end
     local state=status:match("[\r\n]State:%s*([A-Z])") or status:match("^State:%s*([A-Z])")
     if state=="Z" or state=="X" then return false end
     return true
+end
+
+local function usable_recovery_result(result)
+    if type(result)~="table" or result.ok~=true or type(result.value)~="table" then return false end
+    local record=result.value
+    local path=record.pending_install==true and record.pending_file or record.file
+    if not path or not file_exists(path) then return false end
+    local size=U.file_size(path)
+    return size==nil or size>0
+end
+
+local function diagnostic_append(path, lines)
+    if not path or path=="" then return false end
+    local parent=path:match("^(.*)/[^/]+$")
+    if parent then U.mkdir(parent) end
+    local file=io.open(path,"ab")
+    if not file then return false end
+    local text=type(lines)=="table" and table.concat(lines,"\n") or tostring(lines or "")
+    local written=file:write(text,"\n")
+    file:flush()
+    file:close()
+    return written~=nil
+end
+
+local function prune_diagnostics(directory, keep)
+    keep=math.max(1,tonumber(keep) or 5)
+    local rows={}
+    if lfs.attributes(directory,"mode")~="directory" then return end
+    for name in lfs.dir(directory) do
+        if name:match("^download%-diagnostic%-.+%.txt$") then
+            local path=directory.."/"..name
+            rows[#rows+1]={path=path,mtime=file_mtime(path) or 0}
+        end
+    end
+    table.sort(rows,function(a,b) return a.mtime>b.mtime end)
+    for index=keep+1,#rows do os.remove(rows[index].path) end
 end
 
 function DownloadTask:_claim(pid)
@@ -101,8 +152,10 @@ function DownloadTask:descriptor()
     if not job then return nil end
     return {
         pid=job.pid,progress_path=job.progress_path,result_path=job.result_path,
+        recovery_path=job.recovery_path,diagnostic_path=job.diagnostic_path,
         cancel_path=job.cancel_path,worker_settings_path=job.worker_settings_path,
         started_at=job.started_at,owner_token=self.owner_token,task_token=job.task_token,
+        restart_count=tonumber(job.restart_count) or 0,
     }
 end
 
@@ -183,28 +236,143 @@ function DownloadTask:_finish(job, forced_error)
     self:_read_progress(job)
     local raw = U.read_file(job.result_path, true)
     local result
+    local result_source="none"
+
     if forced_error then
         result = {ok = false, error = forced_error}
-    elseif not raw then
-        local stage = job.last_progress_state and job.last_progress_state.stage
-        if stage == "package" then
-            result = {ok = false, error = "EPUB 生成进程异常退出；原有完整书未被覆盖，已下载章节仍保存在断点缓存。请再次下载继续。"}
-        else
-            result = {ok = false, error = "下载子进程异常退出；已完成的下载进度会继续保留。"}
-        end
+        result_source="forced"
     else
-        local ok, decoded = pcall(Json.decode, raw)
-        result = ok and decoded or {ok = false, error = "下载结果无法解析"}
+        if raw then
+            local decoded_ok,decoded=pcall(Json.decode,raw)
+            if decoded_ok and type(decoded)=="table" then
+                result=decoded
+                result_source="result"
+            else
+                result_source="invalid_result"
+            end
+        end
+        if not result then
+            local recovery_raw=job.recovery_path and U.read_file(job.recovery_path,true) or nil
+            if recovery_raw then
+                local recovery_ok,recovered=pcall(Json.decode,recovery_raw)
+                if recovery_ok and usable_recovery_result(recovered) then
+                    result=recovered
+                    result.recovered=true
+                    result_source="recovery_file"
+                end
+            end
+        end
+        if not result then
+            local state=job.last_progress_state
+            local recovered=state and state.recovery_result
+            if usable_recovery_result(recovered) then
+                result=U.copy(recovered)
+                result.recovered=true
+                result_source="progress_recovery"
+            end
+        end
+        if not result then
+            local stage = job.last_progress_state and job.last_progress_state.stage
+            local diagnostic=job.diagnostic_path and U.read_file(job.diagnostic_path,true) or ""
+            if diagnostic:find("result_write_failed",1,true) then
+                result = {ok = false, error = "无法保存下载结果，请检查设备剩余空间和存储权限。已完成的章节断点仍会保留。"}
+            elseif diagnostic:find("child_fatal",1,true) then
+                result = {ok = false, error = "下载进程发生内部异常，诊断信息已保留。已完成的章节断点不会丢失。"}
+            elseif stage == "package" then
+                result = {ok = false, error = "EPUB 生成进程被中断；原有完整书未被覆盖，已下载章节仍保存在断点缓存。请再次下载继续。"}
+            elseif stage == "done" then
+                result = {ok = false, error = "EPUB 已完成生成，但下载记录未能恢复。请检查存储空间后重新打开书架；断点与已生成文件不会主动删除。"}
+            elseif result_source=="invalid_result" then
+                result = {ok = false, error = "下载结果写入不完整，诊断信息已保留；已完成的章节断点不会丢失。"}
+            else
+                result = {ok = false, error = "下载进程被系统中断；已完成的下载进度会继续保留。"}
+            end
+        end
     end
 
-    os.remove(job.progress_path)
+    local succeeded=type(result)=="table" and result.ok==true
+    local cancelled=forced_error=="下载已取消"
+    if succeeded or cancelled then
+        os.remove(job.progress_path)
+        if job.diagnostic_path then os.remove(job.diagnostic_path) end
+    else
+        local state=job.last_progress_state or {}
+        diagnostic_append(job.diagnostic_path,{
+            "time="..tostring(os.date("%Y-%m-%d %H:%M:%S")),
+            "event=parent_finish",
+            "pid="..tostring(job.pid or ""),
+            "result_source="..tostring(result_source),
+            "stage="..tostring(state.stage or "unknown"),
+            "message="..tostring(state.message or ""),
+            "started_at="..tostring(job.started_at or ""),
+            "last_progress_at="..tostring(job.last_progress_at or ""),
+            "result_exists="..tostring(file_exists(job.result_path)),
+            "recovery_exists="..tostring(job.recovery_path and file_exists(job.recovery_path) or false),
+            "error="..tostring(type(result)=="table" and result.error or result or "unknown"),
+        })
+        prune_diagnostics(self.store.temp_dir,5)
+        os.remove(job.progress_path)
+    end
+
+    -- Result/recovery/settings files may contain account state. Always remove
+    -- them after the parent has consumed the result; only the sanitized text
+    -- diagnostic is kept for failed jobs.
     os.remove(job.result_path)
+    if job.recovery_path then os.remove(job.recovery_path) end
     os.remove(job.cancel_path)
     if job.worker_settings_path then os.remove(job.worker_settings_path) end
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job = nil
     self:_release_awake()
-    if job.on_done then job.on_done(result) end
+    if job.on_done then
+        local callback_ok,callback_error=xpcall(function() job.on_done(result) end,debug.traceback)
+        if not callback_ok then logger.warn("[MiuRead][DownloadTask] completion callback failed",tostring(callback_error)) end
+    end
+end
+
+function DownloadTask:_restart_interrupted(job)
+    if not job or job.cancel_requested_at then return false end
+    local count=tonumber(job.restart_count) or 0
+    if count>=2 or type(job.restart_book)~="table" or tostring(job.restart_book.bookId or "")=="" then
+        return false
+    end
+    local book=serializable_copy(job.restart_book)
+    local options=serializable_copy(job.restart_options or {}) or {}
+    local on_progress,on_done=job.on_progress,job.on_done
+    local state=U.copy(job.last_progress_state or {})
+    state.stage="restart"
+    state.message="后台下载进程被系统中断，正在从断点自动恢复（"..tostring(count+1).."/2）"
+    state.updated_at=os.time()
+    state.restart_count=count+1
+    if on_progress then pcall(on_progress,state) end
+
+    diagnostic_append(job.diagnostic_path,{
+        "time="..tostring(os.date("%Y-%m-%d %H:%M:%S")),
+        "event=automatic_restart",
+        "pid="..tostring(job.pid or ""),
+        "stage="..tostring((job.last_progress_state or {}).stage or "unknown"),
+        "restart_count="..tostring(count+1),
+    })
+    os.remove(job.progress_path)
+    os.remove(job.result_path)
+    if job.recovery_path then os.remove(job.recovery_path) end
+    os.remove(job.cancel_path)
+    if job.worker_settings_path then os.remove(job.worker_settings_path) end
+    if self:_owns_job() then os.remove(self.owner_path) end
+    self.job=nil
+    self:_release_awake()
+    local ok,err=self:start(book,options,on_progress,on_done,count+1)
+    if not ok then
+        logger.warn("[MiuRead][DownloadTask] automatic restart failed",tostring(err))
+        if on_done then
+            on_done({ok=false,error="后台下载进程被系统中断，自动恢复失败："..tostring(err).."。断点仍已保留。"})
+        end
+        return true
+    end
+    if on_progress then pcall(on_progress,state) end
+    logger.warn("[MiuRead][DownloadTask] worker restarted from checkpoint",
+        "attempt=",tostring(count+1),"book=",tostring(book.bookId or ""))
+    return true
 end
 
 function DownloadTask:_poll()
@@ -222,7 +390,7 @@ function DownloadTask:_poll()
         self:_finish(job,"后台下载任务身份不匹配；断点已保留，请重新开始下载。")
         return
     end
-    if file_exists(job.result_path) then self:_finish(job); return end
+    if read_json(job.result_path) then self:_finish(job); return end
 
     local now=os.time()
     if not job.last_keepalive or now-job.last_keepalive>=5 then
@@ -235,21 +403,29 @@ function DownloadTask:_poll()
     local done_ok,done=pcall(FFIUtil.isSubProcessDone,job.pid,false)
     if not done_ok then
         logger.warn("[MiuRead][DownloadTask] poll failed",tostring(done))
-        if alive~=false then self:_schedule(); return end
     end
 
-    -- On Android a recreated KOReader UI may report waitpid() as done even
-    -- while the original worker is still alive. /proc and the result file are
-    -- therefore authoritative; waitpid() is only a fallback.
-    if alive==true or (alive==nil and done_ok and done==false) then
+    local activity=tonumber(job.last_progress_at or file_mtime(job.progress_path) or job.started_at) or now
+    local idle=math.max(0,now-activity)
+    local final_state=job.last_progress_state
+    local recovery_ready=job.recovery_path and read_json(job.recovery_path) or nil
+    local snapshot_ready=final_state and usable_recovery_result(final_state.recovery_result)
+    if final_state and final_state.stage=="done" and idle>=3
+        and (usable_recovery_result(recovery_ready) or snapshot_ready) then
+        self:_finish(job)
+        return
+    end
+    local running=alive==true or (alive==nil and done_ok and done==false)
+
+    if running then
         job.dead_seen_at=nil
+        job.unknown_seen_at=nil
+        job.rechecking_notified=false
         if job.cancel_requested_at and now-job.cancel_requested_at>=8 then
             pcall(FFIUtil.terminateSubProcess,job.pid)
             self:_finish(job,"下载已取消")
             return
         end
-        local activity=tonumber(job.last_progress_at or job.started_at) or now
-        local idle=math.max(0,now-activity)
         if idle>=120 and not job.waiting_notified then
             job.waiting_notified=true
             local state=U.copy(job.last_progress_state or {})
@@ -266,8 +442,54 @@ function DownloadTask:_poll()
         return
     end
 
+    if job.cancel_requested_at then
+        pcall(FFIUtil.terminateSubProcess,job.pid)
+        self:_finish(job,"下载已取消")
+        return
+    end
+
+    -- A completed recovery file or a completed progress snapshot is accepted
+    -- only after the worker is no longer confirmed alive. This prevents a
+    -- transient result-file failure from turning a completed EPUB into an
+    -- error while avoiding premature cleanup of a still-running worker.
+    if usable_recovery_result(recovery_ready) then
+        self:_finish(job)
+        return
+    end
+    if job.last_progress_state and job.last_progress_state.stage=="done" and idle>=3 then
+        self:_finish(job)
+        return
+    end
+
+    if alive==nil then
+        job.unknown_seen_at=job.unknown_seen_at or now
+        if not job.rechecking_notified then
+            job.rechecking_notified=true
+            local state=U.copy(job.last_progress_state or {})
+            state.message="正在重新确认下载任务状态"
+            state.updated_at=now
+            if job.on_progress then job.on_progress(state) end
+        end
+        -- Unknown means unknown: Android may temporarily deny /proc status,
+        -- and a recreated UI may no longer own waitpid(). Give both the last
+        -- progress heartbeat and the process-state check enough time.
+        if idle<60 or now-job.unknown_seen_at<120 then self:_schedule(); return end
+        self:_finish(job)
+        return
+    end
+
     job.dead_seen_at=job.dead_seen_at or now
-    if now-job.dead_seen_at<8 then self:_schedule(); return end
+    if not job.rechecking_notified then
+        job.rechecking_notified=true
+        local state=U.copy(job.last_progress_state or {})
+        state.message="下载进程已停止，正在检查已完成内容"
+        state.updated_at=now
+        if job.on_progress then job.on_progress(state) end
+    end
+    -- Do not turn a short /proc race into a duplicate worker. A real dead
+    -- process must remain absent for 30 seconds and make no progress for 20.
+    if now-job.dead_seen_at<30 or idle<20 then self:_schedule(); return end
+    if self:_restart_interrupted(job) then return end
     self:_finish(job)
 end
 
@@ -278,7 +500,7 @@ function DownloadTask:cancel()
     U.atomic_write(job.cancel_path, "1", true)
 end
 
-function DownloadTask:attach(descriptor,on_progress,on_done)
+function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart_options)
     if self.job then return false,"已有下载任务正在运行" end
     if not self:available() then return false,"当前 KOReader 不支持下载子进程" end
     descriptor=type(descriptor)=="table" and descriptor or nil
@@ -286,12 +508,21 @@ function DownloadTask:attach(descriptor,on_progress,on_done)
     if not pid or not descriptor.progress_path or not descriptor.result_path
         or not descriptor.cancel_path then return false,"下载任务记录不完整" end
     self.keep_awake_enabled=self.store:preferences().download_keep_awake~=false
+    local recovery_path=descriptor.recovery_path
+        or tostring(descriptor.result_path):gsub("download%-result%-","download-recovery-")
+    local diagnostic_path=descriptor.diagnostic_path
+        or tostring(descriptor.result_path):gsub("download%-result%-","download-diagnostic-"):gsub("%.json$",".txt")
     self.job={
         pid=pid,progress_path=descriptor.progress_path,result_path=descriptor.result_path,
+        recovery_path=recovery_path,diagnostic_path=diagnostic_path,
         cancel_path=descriptor.cancel_path,worker_settings_path=descriptor.worker_settings_path,
         on_progress=on_progress,on_done=on_done,last_progress_raw=nil,last_progress_state=nil,
-        last_progress_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,waiting_notified=false,
+        last_progress_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,
+        unknown_seen_at=nil,waiting_notified=false,rechecking_notified=false,
         task_token=descriptor.task_token,
+        restart_count=tonumber(descriptor.restart_count) or 0,
+        restart_book=serializable_copy(restart_book),
+        restart_options=serializable_copy(restart_options),
     }
     self.backgrounded=true
     self:_read_progress(self.job)
@@ -302,32 +533,34 @@ function DownloadTask:attach(descriptor,on_progress,on_done)
     local done_ok,done=pcall(FFIUtil.isSubProcessDone,pid,false)
     local alive=process_exists(pid)
     if not done_ok and alive==nil then
-        self.job=nil
-        return false,"无法接管后台下载："..tostring(done)
+        logger.warn("[MiuRead][DownloadTask] attached with unknown process state",
+            "pid=",tostring(pid),"error=",tostring(done))
     end
     self:_claim(pid)
     self:_hold_awake()
     logger.info("[MiuRead][DownloadTask] attached","pid=",tostring(pid),
         "done=",tostring(done_ok and done or "unknown"),"alive=",tostring(alive))
-    if file_exists(self.job.result_path) then
+    if read_json(self.job.result_path) then
         local attached_job=self.job
         UIManager:scheduleIn(0,function()
             if self.job==attached_job and self:_owns_job() then self:_finish(attached_job) end
         end)
     else
-        if alive==false and done_ok and done==true then self.job.dead_seen_at=os.time() end
+        if alive==false then self.job.dead_seen_at=os.time() end
         self:_schedule()
     end
     return true
 end
 
-function DownloadTask:start(book, options, on_progress, on_done)
+function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     if self.job then return false, "已有下载任务正在运行" end
     if not self:available() then return false, "当前 KOReader 不支持下载子进程" end
 
     local stamp = tostring(os.time()) .. "-" .. tostring(math.random(10000, 99999))
     local progress_path = self.store.temp_dir .. "/download-progress-" .. stamp .. ".json"
     local result_path = self.store.temp_dir .. "/download-result-" .. stamp .. ".json"
+    local recovery_path = self.store.temp_dir .. "/download-recovery-" .. stamp .. ".json"
+    local diagnostic_path = self.store.temp_dir .. "/download-diagnostic-" .. stamp .. ".txt"
     local cancel_path = self.store.temp_dir .. "/download-cancel-" .. stamp
     local worker_settings_path = self.store.temp_dir .. "/download-settings-" .. stamp .. ".lua"
     self.store:flush()
@@ -337,6 +570,13 @@ function DownloadTask:start(book, options, on_progress, on_done)
     local task_token = stamp .. "-" .. tostring(math.random(100000,999999))
     local clean_book = serializable_copy(book)
     local clean_options = serializable_copy(options or {})
+    local start_auth=self.store:auth()
+    local start_account=type(start_auth.account)=="table" and start_auth.account or {}
+    local auth_snapshot={
+        vid=tostring(start_account.vid or ""),
+        logged_at=tonumber(start_account.logged_at or 0) or 0,
+        ticket_updated_at=tonumber(start_auth.ticket_updated_at or 0) or 0,
+    }
     self.keep_awake_enabled = self.store:preferences().download_keep_awake ~= false
     clean_options.cancelled = nil
 
@@ -347,113 +587,218 @@ function DownloadTask:start(book, options, on_progress, on_done)
         local Api = require("miuread.api")
         local Reader = require("miuread.reader")
         local Library = require("miuread.library")
-        local Access = require("miuread.access")
         local Annotations = require("miuread.annotations")
         local Downloader = require("miuread.downloader")
         local JsonChild = require("miuread.json")
         local UChild = require("miuread.util")
         local LoggerChild = require("logger")
+        local current_stage="bootstrap"
+
+        local function write_direct(path,data)
+            local file,open_error=io.open(path,"wb")
+            if not file then return nil,open_error end
+            local written,write_error=file:write(data or "")
+            local flushed,flush_error=file:flush()
+            file:close()
+            if not written then return nil,write_error end
+            if flushed==nil then return nil,flush_error end
+            local size=UChild.file_size(path)
+            if size and size~=#(data or "") then return nil,"written file size mismatch" end
+            return true
+        end
+
+        local function write_safely(path,data)
+            local errors={}
+            for attempt=1,2 do
+                local ok,err=UChild.atomic_write(path,data,true)
+                if ok and UChild.file_exists(path) then return true,"atomic" end
+                errors[#errors+1]="atomic"..tostring(attempt)..":"..tostring(err or "missing after write")
+            end
+            local ok,err=write_direct(path,data)
+            if ok then return true,"direct" end
+            errors[#errors+1]="direct:"..tostring(err)
+            return nil,table.concat(errors,"; ")
+        end
+
+        local function append_diagnostic(event,message)
+            local file=io.open(diagnostic_path,"ab")
+            if not file then return false end
+            file:write("time=",tostring(os.date("%Y-%m-%d %H:%M:%S")),"\n")
+            file:write("event=",tostring(event or "unknown"),"\n")
+            file:write("stage=",tostring(current_stage or "unknown"),"\n")
+            local pid_value=""
+            if type(FFIUtil.getpid)=="function" then
+                local pid_ok,pid_or_error=pcall(FFIUtil.getpid)
+                if pid_ok then pid_value=pid_or_error end
+            end
+            file:write("pid=",tostring(pid_value or ""),"\n")
+            file:write("message=",tostring(message or ""):gsub("[\r\n]+"," | "),"\n---\n")
+            file:flush()
+            file:close()
+            return true
+        end
+
+        local function write_json(path,value,label)
+            local encoded_ok,encoded=pcall(JsonChild.encode,value)
+            if not encoded_ok then
+                append_diagnostic(tostring(label).."_encode_failed",encoded)
+                return nil,"JSON encode failed: "..tostring(encoded)
+            end
+            local wrote,mode_or_error=write_safely(path,encoded)
+            if not wrote then
+                append_diagnostic(tostring(label).."_write_failed",mode_or_error)
+                return nil,mode_or_error
+            end
+            return true,mode_or_error
+        end
 
         local function emit(state)
             state = state or {}
+            current_stage=tostring(state.stage or current_stage)
             state.task_token = task_token
             state.updated_at = os.time()
-            local ok, encoded = pcall(JsonChild.encode, state)
-            if ok then UChild.atomic_write(progress_path, encoded, true) end
+            local wrote,write_error=write_json(progress_path,state,"progress")
+            if not wrote then LoggerChild.warn("[MiuRead][DownloadTask] progress write failed",tostring(write_error)) end
+            return wrote
         end
 
-        local ok, value = xpcall(function()
-            local store = Store:new{
-                settings_path = worker_settings_path,
-                data_dir = worker_data_dir,
-                isolated = true,
-            }
-            local http = Http:new(store)
-            local reader = Reader:new(http, store)
-            local api = Api:new(http, store, reader)
-            local library = Library:new(api, http, store)
-            local access = Access:new(library, api, reader, store)
-            local annotations = Annotations:new(api)
-            local downloader = Downloader:new(reader, api, annotations, store, http)
-            clean_options.cancelled = function()
-                return UChild.file_exists(cancel_path)
+        local function display_error(raw)
+            raw=tostring(raw or "未知下载错误")
+            local display=raw:match("^(.-)\nstack traceback:") or raw
+            display=display:gsub("^.-%.lua:%d+:%s*", "")
+            if raw:lower():find("not enough memory", 1, true) then
+                return "设备内存不足，未生成新的 EPUB。原有完整书未被覆盖，已完成章节仍保存在断点缓存；再次下载时会继续。"
             end
-            emit{stage = "prepare", current = 0, total = 1, chapter = clean_book.title or "",
-                message = "正在确认官方书架状态"}
-            local prepared, access_error = access:prepare_download(clean_book)
-            if not prepared then
-                error(type(access_error) == "table" and access_error.message
-                    or tostring(access_error or "无法确认官方书架状态"))
+            if raw:find("[MiuReadRateLimit]", 1, true)
+                or raw:lower():find("hit api rate limit", 1, true) then
+                return "微信读书暂时限制了请求频率。插件已停止继续请求；已完成章节和断点都已保留，请稍后继续下载。"
             end
-            clean_book = prepared
-            clean_options.access_ownership = prepared.access_ownership
-            clean_options.access_ownership_source = prepared.access_ownership_source
-            clean_options.access_account_vid = prepared.access_account_vid
-            emit{stage = "prepare", current = 0, total = 1, chapter = clean_book.title or "",
-                message = "官方书架验证通过，正在准备下载"}
-            local record = downloader:book(clean_book, clean_options, function(stage, current, total, chapter, detail)
-                detail = detail or {}
-                local percent
-                if stage == "package" then
-                    percent = 0.96
-                elseif total and total > 0 then
-                    local base = (math.max(1, current) - 1) / total
-                    local step = 0
-                    if stage == "resume" then step = 0.90
-                    elseif stage == "content" then step = 0.08
-                    elseif stage == "underlines" then step = 0.35
-                    elseif stage == "thoughts" then step = 0.55
-                    elseif stage == "footnotes" then step = 0.75
-                    elseif stage == "images" then step = 0.88 end
-                    percent = math.min(0.94, base * 0.94 + step / total)
-                end
-                if stage == "package" then
-                    detail.message = detail.message or "正在低内存生成并验证 EPUB"
-                end
-                emit{
-                    stage = stage,
-                    current = current,
-                    total = total,
-                    chapter = chapter,
-                    batch = detail.batch,
-                    batch_total = detail.batches,
-                    underlines = detail.underlines,
-                    thoughts = detail.thoughts,
-                    percent = percent,
-                    message = detail.message,
+            return display
+        end
+
+        local function run_download()
+            local ok, value = xpcall(function()
+                local store = Store:new{
+                    settings_path = worker_settings_path,
+                    data_dir = worker_data_dir,
+                    isolated = true,
                 }
-            end)
-            return {
-                record = record,
-                auth = store:auth(),
-                session = store:session(clean_book.bookId),
-            }
-        end, debug.traceback)
+                local http = Http:new(store)
+                local reader = Reader:new(http, store)
+                local api = Api:new(http, store, reader)
+                local library = Library:new(api, http, store)
+                local annotations = Annotations:new(api)
+                local downloader = Downloader:new(reader, api, annotations, store, http)
+                clean_options.cancelled = function()
+                    return UChild.file_exists(cancel_path)
+                end
+                http.cancelled = clean_options.cancelled
+                http.rate_limit_retries = 3
+                http.min_weread_interval = 0.45
+                local last_progress_percent = 0
+                http.on_rate_limit = function(remaining, attempt, maximum, code)
+                    emit{
+                        stage = "rate_limit",
+                        current = 0,
+                        total = 0,
+                        percent = last_progress_percent,
+                        chapter = clean_book.title or "",
+                        message = "微信读书请求过快，等待 " .. tostring(remaining)
+                            .. " 秒后自动继续（" .. tostring(attempt) .. "/" .. tostring(maximum) .. "）",
+                        rate_limit_code = tostring(code or ""),
+                        wait_seconds = tonumber(remaining),
+                    }
+                end
+                emit{stage = "prepare", current = 0, total = 1, chapter = clean_book.title or "",
+                    message = "正在准备下载"}
+                local record = downloader:book(clean_book, clean_options, function(stage, current, total, chapter, detail)
+                    detail = detail or {}
+                    local percent
+                    if stage == "package" then
+                        percent = 0.96
+                    elseif total and total > 0 then
+                        local base = (math.max(1, current) - 1) / total
+                        local step = 0
+                        if stage == "resume" then step = 0.90
+                        elseif stage == "content" then step = 0.08
+                        elseif stage == "underlines" then step = 0.35
+                        elseif stage == "thoughts" then step = 0.55
+                        elseif stage == "footnotes" then step = 0.75
+                        elseif stage == "images" then step = 0.88 end
+                        percent = math.min(0.94, base * 0.94 + step / total)
+                    end
+                    if stage == "package" then
+                        detail.message = detail.message or "正在低内存生成并验证 EPUB"
+                    end
+                    if percent ~= nil then last_progress_percent = percent end
+                    emit{
+                        stage = stage,
+                        current = current,
+                        total = total,
+                        chapter = chapter,
+                        batch = detail.batch,
+                        batch_total = detail.batches,
+                        underlines = detail.underlines,
+                        thoughts = detail.thoughts,
+                        percent = percent,
+                        message = detail.message,
+                    }
+                end)
+                return {
+                    record = record,
+                    auth = store:auth(),
+                    session = store:session(clean_book.bookId),
+                }
+            end, debug.traceback)
 
-        local payload
-        if ok then
-            emit{stage = "done", current = 1, total = 1, percent = 1, chapter = clean_book.title or ""}
-            payload = {
-                ok = true,
-                value = serializable_copy(value and value.record),
-                auth = serializable_copy(value and value.auth),
-                session = serializable_copy(value and value.session),
-            }
-        else
-            local raw_error = tostring(value)
-            LoggerChild.warn("[MiuRead][DownloadTask] child failed", raw_error)
-            local display_error = raw_error:match("^(.-)\nstack traceback:") or raw_error
-            -- File paths and line numbers are useful in logs but confusing in
-            -- the download dialog. Keep the actual reason only.
-            display_error = display_error:gsub("^.-%.lua:%d+:%s*", "")
-            if raw_error:lower():find("not enough memory", 1, true) then
-                display_error = "设备内存不足，未生成新的 EPUB。原有完整书未被覆盖，已完成章节仍保存在断点缓存；再次下载时会继续。"
+            local payload
+            if ok then
+                payload = {
+                    ok = true,
+                    value = serializable_copy(value and value.record),
+                    auth = serializable_copy(value and value.auth),
+                    auth_snapshot = serializable_copy(auth_snapshot),
+                    session = serializable_copy(value and value.session),
+                }
+                -- Save the same completed payload independently before the
+                -- normal result file. The parent can recover from either file
+                -- or from the final progress snapshot.
+                local recovery_ok,recovery_error=write_json(recovery_path,payload,"recovery")
+                emit{stage = "done", current = 1, total = 1, percent = 1,
+                    chapter = clean_book.title or "",
+                    recovery_result = {ok=true,value=payload.value},
+                    recovery_saved = recovery_ok==true, recovery_error = recovery_ok and nil or tostring(recovery_error)}
+            else
+                local raw_error = tostring(value)
+                LoggerChild.warn("[MiuRead][DownloadTask] child failed", raw_error)
+                local friendly=display_error(raw_error)
+                emit{stage = UChild.file_exists(cancel_path) and "cancelled" or "error", message = friendly}
+                payload = {ok = false, error = friendly}
+                append_diagnostic("download_failed",raw_error)
             end
-            emit{stage = UChild.file_exists(cancel_path) and "cancelled" or "error", message = display_error}
-            payload = {ok = false, error = display_error}
+
+            local result_ok,result_error=write_json(result_path,payload,"result")
+            if not result_ok then
+                append_diagnostic("result_write_failed",result_error)
+                if payload.ok==true then
+                    emit{stage = "done", current = 1, total = 1, percent = 1,
+                        chapter = clean_book.title or "",
+                        recovery_result = {ok=true,value=payload.value},
+                        result_write_failed = true, message = "正在恢复已完成的下载结果"}
+                else
+                    emit{stage = "error", message = payload.error, result_write_failed = true}
+                end
+            end
         end
-        local encoded = JsonChild.encode(payload)
-        UChild.atomic_write(result_path, encoded, true)
+
+        local child_ok,child_error=xpcall(run_download,debug.traceback)
+        if not child_ok then
+            local friendly=display_error(child_error)
+            LoggerChild.warn("[MiuRead][DownloadTask] child fatal",tostring(child_error))
+            append_diagnostic("child_fatal",child_error)
+            write_json(result_path,{ok=false,error=friendly},"emergency_result")
+            emit{stage="error",message=friendly,fatal=true}
+        end
     end
 
     local ok, pid, err = pcall(FFIUtil.runInSubProcess, child, false, false)
@@ -466,6 +811,8 @@ function DownloadTask:start(book, options, on_progress, on_done)
         pid = pid,
         progress_path = progress_path,
         result_path = result_path,
+        recovery_path = recovery_path,
+        diagnostic_path = diagnostic_path,
         cancel_path = cancel_path,
         worker_settings_path = worker_settings_path,
         on_progress = on_progress,
@@ -475,8 +822,13 @@ function DownloadTask:start(book, options, on_progress, on_done)
         last_progress_at = nil,
         last_keepalive = 0,
         dead_seen_at = nil,
+        unknown_seen_at = nil,
         waiting_notified = false,
+        rechecking_notified = false,
         task_token = task_token,
+        restart_count = tonumber(restart_count) or 0,
+        restart_book = serializable_copy(book),
+        restart_options = serializable_copy(options),
         started_at = os.time(),
     }
     self:_claim(pid)

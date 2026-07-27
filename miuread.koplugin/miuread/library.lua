@@ -121,17 +121,61 @@ local function book(row,raw_index,archive_map)
     }
 end
 
-local function order_cloud_rows(rows)
-    table.sort(rows,function(a,b)
-        if a.isTop~=b.isTop then return a.isTop==true end
+local function official_shelf_less(a,b)
+    if a.isTop~=b.isTop then return a.isTop==true end
+    local ar,br=tonumber(a.readUpdateTime or 0) or 0,tonumber(b.readUpdateTime or 0) or 0
+    if ar>0 and br>0 and ar~=br then return ar>br end
+    local ao,bo=tonumber(a.explicitOrder),tonumber(b.explicitOrder)
+    if ao~=nil and bo~=nil and ao~=bo then return ao<bo end
+    local ai,bi=tonumber(a.rawIndex) or 1000000000,tonumber(b.rawIndex) or 1000000000
+    if ai~=bi then return ai<bi end
+    return tostring(a.bookId or "")<tostring(b.bookId or "")
+end
+
+local function shelf_order_plan(rows)
+    local count=#(rows or {})
+    local read_fields,explicit_fields,top_count=0,0,0
+    for _,row in ipairs(rows or {}) do
+        if (tonumber(row.readUpdateTime or 0) or 0)>0 then read_fields=read_fields+1 end
+        if tonumber(row.explicitOrder)~=nil then explicit_fields=explicit_fields+1 end
+        if row.isTop==true then top_count=top_count+1 end
+    end
+    local threshold=math.max(2,math.ceil(count*0.60))
+    local mode="api"
+    if count>=2 and read_fields>=threshold then mode="read_time"
+    elseif count>=2 and explicit_fields>=threshold then mode="explicit" end
+    return {mode=mode,count=count,read_fields=read_fields,explicit_fields=explicit_fields,top_count=top_count}
+end
+
+local function planned_shelf_less(mode,a,b)
+    if a.isTop~=b.isTop then return a.isTop==true end
+    if mode=="read_time" then
+        local ar,br=tonumber(a.readUpdateTime or 0) or 0,tonumber(b.readUpdateTime or 0) or 0
+        if (ar>0)~=(br>0) then return ar>0 end
+        if ar~=br then return ar>br end
+    elseif mode=="explicit" then
         local ao,bo=tonumber(a.explicitOrder),tonumber(b.explicitOrder)
+        if (ao~=nil)~=(bo~=nil) then return ao~=nil end
         if ao~=nil and bo~=nil and ao~=bo then return ao<bo end
-        local ar,br=tonumber(a.rawIndex) or 1000000000,tonumber(b.rawIndex) or 1000000000
-        if ar~=br then return ar<br end
-        return tostring(a.bookId)<tostring(b.bookId)
-    end)
-    for index,row in ipairs(rows) do row.cloudOrder=index end
-    logger.info("[MiuRead][ShelfOrder] normalized","count=",tostring(#rows))
+    end
+    local ai,bi=tonumber(a.rawIndex) or 1000000000,tonumber(b.rawIndex) or 1000000000
+    if ai~=bi then return ai<bi end
+    return tostring(a.bookId or "")<tostring(b.bookId or "")
+end
+
+local function order_cloud_rows(rows)
+    rows=rows or {}
+    local plan=shelf_order_plan(rows)
+    table.sort(rows,function(a,b) return planned_shelf_less(plan.mode,a,b) end)
+    for index,row in ipairs(rows) do
+        row.cloudOrder=index
+        row.shelfOrderMode=plan.mode
+    end
+    logger.info("[MiuRead][ShelfOrder] resolved",
+        "mode=",plan.mode,"count=",tostring(plan.count),
+        "read_fields=",tostring(plan.read_fields),
+        "explicit_fields=",tostring(plan.explicit_fields),
+        "top=",tostring(plan.top_count))
     return rows
 end
 
@@ -147,9 +191,9 @@ function Library:normalize(data)
         raw_index=raw_index+1
         local b=book(r,raw_index,archive_map)
         if b.bookId~="" then
-            if Protocol.is_mp(b.bookId) then
+            if Protocol.is_mp_account(b.bookId) then
                 if not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
-            elseif not seen_books[b.bookId] then
+            elseif not Protocol.is_mp(b.bookId) and not seen_books[b.bookId] then
                 books[#books+1]=b; seen_books[b.bookId]=true
             end
         end
@@ -161,12 +205,12 @@ function Library:normalize(data)
                 for _,r in ipairs(x) do
                     raw_index=raw_index+1
                     local b=book(r,raw_index,archive_map)
-                    if b.bookId~="" and not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
+                    if Protocol.is_mp_account(b.bookId) and not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
                 end
             else
                 raw_index=raw_index+1
                 local b=book(x,raw_index,archive_map)
-                if b.bookId~="" and not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
+                if Protocol.is_mp_account(b.bookId) and not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
             end
         end
     end
@@ -192,6 +236,7 @@ local function record_state(row)
     local total_size=0
     local has_clean=false
     local has_notes=false
+    local content_type=nil
     local function scan(record,kind,is_final)
         if type(record)~="table" then return end
         local file=tostring(record.file or "")
@@ -203,8 +248,9 @@ local function record_state(row)
                 if is_final then
                     downloaded=true
                     total_size=total_size+(tonumber(U.file_size(file)) or 0)
-                    if kind=="clean" or kind=="preview_clean" then has_clean=true end
-                    if kind=="notes" or kind=="preview_notes" then has_notes=true end
+                    content_type=record.content_type or content_type
+                    if kind=="clean" or kind=="range_clean" or kind=="preview_clean" then has_clean=true end
+                    if kind=="notes" or kind=="range_notes" or kind=="preview_notes" then has_notes=true end
                 else
                     partial_downloaded=true
                 end
@@ -225,6 +271,7 @@ local function record_state(row)
         file_size=total_size,
         has_clean=has_clean,
         has_notes=has_notes,
+        content_type=content_type,
     }
 end
 
@@ -266,10 +313,15 @@ function Library:local_books(library_snapshot,sessions_snapshot)
                 hasClean=state.has_clean,
                 hasNotes=state.has_notes,
                 access=U.copy(row.access or {}),
+                content_type=state.content_type or row.content_type,
                 local_record=row,
             }
             if b.bookId~="" then
-                if Protocol.is_mp(b.bookId) then mp[#mp+1]=b else books[#books+1]=b end
+                if Protocol.is_mp_account(b.bookId) then
+                    mp[#mp+1]=b
+                elseif not Protocol.is_mp(b.bookId) then
+                    books[#books+1]=b
+                end
             end
         end
     end
@@ -298,6 +350,7 @@ local function merge_local_metadata(remote,local_book)
     remote.hasClean=local_book.hasClean==true
     remote.hasNotes=local_book.hasNotes==true
     remote.access=U.copy(local_book.access or {})
+    remote.content_type=remote.content_type or local_book.content_type
     remote.local_record=local_book.local_record
     if (tonumber(remote.progress or 0) or 0)<=0 then remote.progress=local_book.progress end
     return remote
@@ -373,89 +426,38 @@ function Library:combined(remote_books,remote_mp,library_snapshot,sessions_snaps
     return self:merge_books(remote_books,local_books),self:merge_books(remote_mp,local_mp)
 end
 
-local function less_text(a,b,field)
-    local av=tostring(a[field] or "")
-    local bv=tostring(b[field] or "")
-    if av~=bv then return av<bv end
-    return tostring(a.bookId or "")<tostring(b.bookId or "")
-end
-
 function Library:sort_filter(rows,options)
     options=options or {}
-    local p=self.store:preferences()
-    local section=tostring(options.section or p.shelf_section or "account")
-    local scope
-    local key
-    if section=="generated" then
-        scope=tostring(p.generated_shelf_scope or "all")
-        key=tostring(p.generated_shelf_sort or "opened")
-    else
-        scope=tostring(p.account_shelf_scope or "all")
-        key=tostring(p.account_shelf_sort or "read")
-        -- Migrate stale in-memory values defensively. Persistent migration is
-        -- handled by Store, but cached preferences can still survive briefly
-        -- during an OTA restart.
-        if key=="default" or key=="cloud" or key=="cloud_order" then key="read" end
-    end
-    local out={}
-    for _,b in ipairs(rows or {}) do
-        local pass=true
-        local prog=tonumber(b.progress or 0) or 0
-        if section=="generated" then
-            if scope=="in_account" and b.in_account_shelf~=true then pass=false end
-            if scope=="removed" and not (b.remote_status_known==true and b.in_account_shelf~=true) then pass=false end
-            if scope=="clean" and b.hasClean~=true then pass=false end
-            if scope=="notes" and b.hasNotes~=true then pass=false end
-        else
-            if scope=="generated" and b.downloaded~=true then pass=false end
-            if scope=="ungenerated" and b.downloaded==true then pass=false end
-            if scope=="top" and b.isTop~=true then pass=false end
-            if scope=="archive" and b.inArchive~=true then pass=false end
-        end
-        if pass then out[#out+1]=b end
-    end
-    table.sort(out,function(a,b)
-        if section=="generated" then
-            if key=="title" then return less_text(a,b,"title") end
-            if key=="author" then return less_text(a,b,"author") end
-            if key=="size" then
-                local av,bv=tonumber(a.fileSize or 0) or 0,tonumber(b.fileSize or 0) or 0
-                if av~=bv then return av>bv end
-            elseif key=="generated" then
-                local av,bv=tonumber(a.downloadedAt or 0) or 0,tonumber(b.downloadedAt or 0) or 0
-                if av~=bv then return av>bv end
+    local section=tostring(options.section or "account")
+    local out=U.copy(rows or {})
+    if section=="account" then
+        -- normalize() already selected the best available server ordering.
+        -- Preserve that decision instead of guessing again when fields are
+        -- missing on most rows.
+        table.sort(out,function(a,b)
+            local ao,bo=tonumber(a.cloudOrder),tonumber(b.cloudOrder)
+            if ao~=nil and bo~=nil and ao~=bo then return ao<bo end
+            return official_shelf_less(a,b)
+        end)
+    elseif section=="generated" then
+        table.sort(out,function(a,b)
+            local ai=a.in_account_shelf==true
+            local bi=b.in_account_shelf==true
+            if ai~=bi then return ai end
+            if ai then
+                local ao=tonumber(a.cloudOrder) or 1000000000
+                local bo=tonumber(b.cloudOrder) or 1000000000
+                if ao~=bo then return ao<bo end
+                return official_shelf_less(a,b)
             else
-                local av,bv=tonumber(a.lastReadTime or 0) or 0,tonumber(b.lastReadTime or 0) or 0
-                if av~=bv then return av>bv end
+                local ad=tonumber(a.downloadedAt or 0) or 0
+                local bd=tonumber(b.downloadedAt or 0) or 0
+                if ad~=bd then return ad>bd end
             end
-            local ad,bd=tonumber(a.downloadedAt or 0) or 0,tonumber(b.downloadedAt or 0) or 0
-            if ad~=bd then return ad>bd end
-            return less_text(a,b,"title")
-        end
-
-        if key=="title" then return less_text(a,b,"title") end
-        if key=="author" then return less_text(a,b,"author") end
-        if key=="progress" then
-            local av,bv=tonumber(a.progress or 0) or 0,tonumber(b.progress or 0) or 0
-            if av~=bv then return av>bv end
-        elseif key=="read" then
-            -- Match the long-proven mobile-like shelf order: explicit pinned
-            -- books first, then cloud readUpdateTime from newest to oldest.
-            -- Unread books have timestamp 0 and naturally stay behind read
-            -- books. rawIndex is the stable tie-breaker below.
-            if a.isTop~=b.isTop then return a.isTop==true end
-            local av,bv=tonumber(a.readUpdateTime or 0) or 0,tonumber(b.readUpdateTime or 0) or 0
-            if av~=bv then return av>bv end
-        elseif key=="update" then
-            local av,bv=tonumber(a.updateTime or 0) or 0,tonumber(b.updateTime or 0) or 0
-            if av~=bv then return av>bv end
-        end
-        local ar,br=tonumber(a.rawIndex or 0) or 0,tonumber(b.rawIndex or 0) or 0
-        if ar~=br then return ar<br end
-        return tostring(a.bookId or "")<tostring(b.bookId or "")
-    end)
-    logger.info("[MiuRead][ShelfSort] complete",
-        "count=",tostring(#out),"section=",tostring(section),"sort=",tostring(key))
+            return tostring(a.bookId or "")<tostring(b.bookId or "")
+        end)
+    end
+    logger.info("[MiuRead][ShelfOrder] prepared","count=",tostring(#out),"section=",section)
     return out
 end
 
@@ -564,7 +566,7 @@ function Library:clear_covers() U.remove_tree(self.store.covers_dir); U.mkdir(se
 function Library:reader_link(url)
     local id=tostring(url or ""):match("/web/reader/([^/?#]+)") or tostring(url or ""):match("bookId=([^&#]+)")
     if not id then return nil end
-    if id:match("^%d+$") or id:match("^MP_WXS_") then return id end
+    if id:match("^%d+$") or Protocol.is_mp_account(id) then return id end
     return nil
 end
 return Library

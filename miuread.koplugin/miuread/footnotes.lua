@@ -2,7 +2,7 @@
 书籍脚注处理：
 - 微信读书 qqreader-footnote 图片注脚
 - EPUB3 epub:type="noteref" / role="doc-noteref"
-- <sup><a href="#note">…</a></sup> 与跨章节尾注链接
+- <sup><a href="#note">…</a></sup>、返回正文链接与跨章节尾注链接
 - 单/双引号、多 class、同章与跨章锚点
 
 所有已解析注释转换为章节内 EPUB3 footnote aside；解析失败时保留原链接，
@@ -340,6 +340,16 @@ function Footnotes.index_anchors(html)
     return map
 end
 
+local function collect_anchor_presence(html)
+    local present = {}
+    if type(html) ~= "string" or html == "" then return present end
+    for tag in html:gmatch("<[%a][^>]*>") do
+        local anchor = get_attr(tag, "id") or get_attr(tag, "name")
+        if anchor and anchor ~= "" then present[anchor] = true end
+    end
+    return present
+end
+
 local function img_is_footnote(attrs)
     local class = get_attr(attrs, "class") or ""
     local lower = class:lower()
@@ -387,6 +397,16 @@ local function looks_like_footnote_ref(attrs, href, inner)
     local epub_type = (get_attr(attrs, "epub:type") or ""):lower()
     local role = (get_attr(attrs, "role") or ""):lower()
     local class = (get_attr(attrs, "class") or ""):lower()
+
+    -- EPUB return links are navigation helpers, not new footnote references.
+    -- A number of books reuse the generic "footnote" class on both directions,
+    -- so explicit backlink signals must win before the broad class check below.
+    if epub_type:find("backlink", 1, true) or role:find("doc-backlink", 1, true)
+        or class:find("backlink", 1, true) or class:find("backref", 1, true)
+        or class:find("footnote-back", 1, true) or class:find("note-back", 1, true) then
+        return false
+    end
+
     if epub_type:find("noteref", 1, true) or role:find("doc-noteref", 1, true)
         or class:find("noteref", 1, true) or class:find("footnote", 1, true)
         or class:find("fn-ref", 1, true) then
@@ -399,7 +419,7 @@ local function looks_like_footnote_ref(attrs, href, inner)
     local anchor_hint = lower_anchor:find("note", 1, true) or lower_anchor:find("foot", 1, true)
         or lower_anchor:find("fn", 1, true) or lower_anchor:match("^n[_%-]?%d+")
         or lower_anchor:match("^[wr][_%-%d]*%d+")
-        or lower_anchor:match("^ref[_%-]?%d+") or lower_anchor:match("^back[_%-]?%d+")
+        or lower_anchor:match("^ref[_%-]?%d+")
     local file_hint = tostring(file or ""):lower():find("note", 1, true)
     return marker and (anchor_hint or file_hint or file == "") and true or false
 end
@@ -602,18 +622,26 @@ local function build_footnote_section(img_notes, anchor_notes)
 end
 
 function Footnotes.process(html, meta)
-    local empty_stats={refs=0,converted=0,image_notes=0,unresolved=0,deferred=0,missing_anchors={},missing_targets={}}
+    local empty_stats={
+        candidates=0,refs=0,converted=0,backlinks=0,image_notes=0,
+        unresolved=0,deferred=0,missing_anchors={},missing_targets={},fallback=false,
+    }
     if type(html) ~= "string" or html == "" or (meta and meta.is_txt) then return html, "", empty_stats end
     meta=type(meta)=="table" and meta or {}
     local local_index = Footnotes.index_anchors(html)
+    local local_presence = collect_anchor_presence(html)
     local refs = Footnotes.collect_footnote_refs(html)
     local missing_refs, ref_files, missing_seen, file_seen = {}, {}, {}, {}
     for _, ref in ipairs(refs) do
-        if not local_index[ref.anchor] and not missing_seen[ref.key] then
+        -- A present target with only a marker is normally the source reference
+        -- reached by a footnote return link. It must never be fetched as note
+        -- content or counted as a missing footnote.
+        local is_local_backlink=local_presence[ref.anchor] and not local_index[ref.anchor]
+        if not local_index[ref.anchor] and not is_local_backlink and not missing_seen[ref.key] then
             missing_seen[ref.key]=true
             missing_refs[#missing_refs+1]=ref
         end
-        if ref.file and ref.file~="" and not file_seen[ref.file] then
+        if not is_local_backlink and ref.file and ref.file~="" and not file_seen[ref.file] then
             file_seen[ref.file]=true
             ref_files[#ref_files+1]=ref.file
         end
@@ -623,10 +651,13 @@ function Footnotes.process(html, meta)
     if not meta.defer_cross_file then
         remote=Footnotes.fetch_missing_anchors(meta,missing_refs,ref_files)
     end
-    local anchor_texts, unresolved, deferred, unresolved_seen = {}, {}, {}, {}
+    local anchor_texts, unresolved, deferred, backlinks = {}, {}, {}, {}
+    local unresolved_seen, backlink_seen = {}, {}
     for _,ref in ipairs(refs) do
         local local_content=local_index[ref.anchor]
         local content=local_content or remote[ref.key] or remote[ref.anchor]
+        local target_present=local_presence[ref.anchor] == true
+
         -- Cross-file links whose target is already present in the final chapter
         -- are deliberately kept as page links. The post-download link repairer
         -- will rewrite the stale filename while preserving comments and return
@@ -635,25 +666,53 @@ function Footnotes.process(html, meta)
             anchor_texts[ref.key]=content
             if ref.file=="" then anchor_texts[ref.anchor]=content end
         end
-        if not content and not unresolved_seen[ref.key] then
-            unresolved_seen[ref.key]=true
-            if meta.defer_cross_file and ref.file~="" then
-                deferred[#deferred+1]=ref.key
-            else
-                unresolved[#unresolved+1]=ref.key
+
+        if not content then
+            if target_present then
+                if not backlink_seen[ref.key] then
+                    backlink_seen[ref.key]=true
+                    backlinks[#backlinks+1]=ref.key
+                end
+            elseif not unresolved_seen[ref.key] then
+                unresolved_seen[ref.key]=true
+                if meta.defer_cross_file and ref.file~="" then
+                    deferred[#deferred+1]=ref.key
+                else
+                    unresolved[#unresolved+1]=ref.key
+                end
             end
         end
     end
 
     local html1,img_notes=Footnotes.convert_img_footnotes(html)
     local html2,anchor_notes=convert_anchor_refs(html1,anchor_texts,#img_notes)
+
+    -- Some WeRead books omit the source-reference id while still emitting one
+    -- reverse link for every note. The resulting signature is exact pairing:
+    -- N resolved note targets plus N marker-only reverse targets. Treat only
+    -- that strict one-to-one pattern as backlinks; unknown unmatched targets
+    -- remain unresolved and will be preserved by the downloader fallback.
+    local inferred_backlinks=0
+    if #unresolved>0 and #deferred==0 and #anchor_notes>0
+        and #unresolved==#anchor_notes
+        and #refs==(#anchor_notes+#unresolved+#backlinks) then
+        for _,key in ipairs(unresolved) do backlinks[#backlinks+1]=key end
+        inferred_backlinks=#unresolved
+        unresolved={}
+    end
+
     local section=build_footnote_section(img_notes,anchor_notes)
     local stats={
-        refs=#refs,converted=#anchor_notes,image_notes=#img_notes,
+        candidates=#refs,
+        refs=math.max(0,#refs-#backlinks),
+        converted=#anchor_notes,backlinks=#backlinks,inferred_backlinks=inferred_backlinks,image_notes=#img_notes,
         unresolved=#unresolved,deferred=#deferred,
-        missing_anchors=unresolved,missing_targets=deferred,
+        missing_anchors=unresolved,missing_targets=deferred,backlink_targets=backlinks,
+        fallback=false,
     }
-    log_info("refs=",tostring(stats.refs),"converted=",tostring(stats.converted),
+    log_info("candidates=",tostring(stats.candidates),"refs=",tostring(stats.refs),
+        "converted=",tostring(stats.converted),"backlinks=",tostring(stats.backlinks),
+        "inferred_backlinks=",tostring(stats.inferred_backlinks),
         "images=",tostring(stats.image_notes),"missing=",tostring(stats.unresolved),
         "deferred=",tostring(stats.deferred))
     if stats.unresolved>0 then
@@ -666,28 +725,18 @@ end
 
 function Footnotes.validate(html)
     if type(html)~="string" then return nil,"章节正文无效" end
-    local ids,anchor_depth={},0
+    local ids={}
     for raw in html:gmatch("<[^>]+>") do
-        local slash,name=raw:match("^<%s*(/?)%s*([%w:_%-]+)")
-        name=tostring(name or ""):lower()
-        local closing=slash=="/"
-        local self_closing=raw:match("/%s*>$")~=nil
-        if closing and name=="a" then
-            anchor_depth=math.max(0,anchor_depth-1)
-        elseif not closing and not self_closing and name=="a" then
-            if anchor_depth>0 then return nil,"检测到链接嵌套" end
-            anchor_depth=anchor_depth+1
-        end
+        local closing=raw:match("^<%s*/")~=nil
         if not closing then
             local id=get_attr(raw,"id")
             if id and id~="" then
                 local generated=id:match("^wt_") or id:match("^wtref_")
                 if generated and ids[id] then return nil,"检测到重复脚注目标："..tostring(id) end
-                ids[id]=true
+                if generated then ids[id]=true end
             end
         end
     end
-    if anchor_depth~=0 then return nil,"链接标签未正确闭合" end
     for attrs in html:gmatch("<[aA]([^>]*)>") do
         local href=get_attr(attrs,"href")
         local target=href and (href:match("^#(wt_[%w_%-%.]+)$") or href:match("^#(wtref_[%w_%-%.]+)$"))
@@ -700,4 +749,5 @@ Footnotes._sanitize_note_html=sanitize_note_html
 Footnotes._note_content=note_content
 Footnotes._normalize_ref_path=normalize_ref_path
 Footnotes._ref_key=ref_key
+Footnotes._collect_anchor_presence=collect_anchor_presence
 return Footnotes

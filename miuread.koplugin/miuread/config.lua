@@ -1,19 +1,17 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "1.1.48-beta.2",
-    SCHEMA = 39,
+    VERSION = "2.3.0",
+    SCHEMA = 54,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
-    -- 更新清单固定保存在仓库根目录；清单中的下载地址指向
-    -- GitHub Release 全量包。旧版本仍可通过备用地址升级到本版本。
-    -- This package is permanently bound to the beta channel. Installing a
-    -- stable full package is the only supported way to return to stable.
-    UPDATE_CHANNEL = "beta",
-    UPDATE_CHANNEL_LABEL = "内测",
-    UPDATE_MANIFEST = "https://raw.githubusercontent.com/miumiupy98-art/miuread-koreader/beta/update-beta.json",
+    -- 更新清单固定保存在对应发布分支的仓库根目录；清单中的下载地址
+    -- 指向 GitHub Release 全量包。安装另一通道的全量包可切换更新通道。
+    UPDATE_CHANNEL = "stable",
+    UPDATE_CHANNEL_LABEL = "正式",
+    UPDATE_MANIFEST = "https://raw.githubusercontent.com/miumiupy98-art/miuread-koreader/main/update.json",
     UPDATE_MANIFESTS = {
-        "https://raw.githubusercontent.com/miumiupy98-art/miuread-koreader/beta/update-beta.json",
+        "https://raw.githubusercontent.com/miumiupy98-art/miuread-koreader/main/update.json",
     },
 
     -- 仅作为 GitHub 官方资源访问失败时的回退入口。
@@ -24,15 +22,12 @@ local C = {
         "https://ghproxy.net/",
     },
 
+    AUTO_UPDATE_INTERVAL = 3 * 24 * 60 * 60,
+    AUTO_UPDATE_RETRY_INTERVAL = 6 * 60 * 60,
+
     READ_INTERVAL = 30,
     IDLE_TIMEOUT = 600,
     REMOTE_THRESHOLD = 2,
-
-    -- Beta-only accelerated validation window. Stable builds use three days;
-    -- beta builds use ten minutes so testers can exercise
-    -- expiry, lock and recovery without changing the device clock.
-    ACCESS_VERIFY_TTL = 10 * 60,
-    ACCESS_POLICY_VERSION = 2,
 
     -- Coalesce page-turn control snapshots. Reading position stays in memory
     -- and is written at most once per window; suspend/close still flushes now.

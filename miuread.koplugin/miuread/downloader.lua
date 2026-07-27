@@ -6,6 +6,7 @@ local InternalLinks = require("miuread.internal_links")
 local Thoughts = require("miuread.thoughts")
 local Epub = require("miuread.epub")
 local Json = require("miuread.json")
+local Http = require("miuread.http")
 local U = require("miuread.util")
 local logger = require("logger")
 local ok_socket, socket = pcall(require, "socket")
@@ -18,6 +19,7 @@ local Downloader = {}
 Downloader.__index = Downloader
 
 local CACHE_SCHEMA = 9
+local FOOTNOTE_TRANSFORM_VERSION = 2
 
 local BASE_CSS = [[
 body { line-height: 1.75; margin: 5%; }
@@ -161,7 +163,9 @@ local function option_key(opt)
     return table.concat({
         opt.annotations and "notes" or "clean",
         opt.images == false and "no-images" or "images",
-        opt.chapter_uid and ("chapter-" .. U.id_name(opt.chapter_uid)) or "book",
+        opt.chapter_uid and ("chapter-" .. U.id_name(opt.chapter_uid))
+            or ((opt.range_start_index and opt.range_end_index)
+                and ("range-" .. tostring(opt.range_start_index) .. "-" .. tostring(opt.range_end_index)) or "book"),
     }, "-")
 end
 
@@ -356,10 +360,16 @@ local function cache_save_final(cache, chapter, body, annotation, style, footnot
     entry.underlines = annotation and (annotation.underline_count or 0) or 0
     entry.thoughts = annotation and (annotation.thought_count or 0) or 0
     entry.thought_entries = annotation and (annotation.thought_entry_count or 0) or 0
+    entry.footnote_transform_version = FOOTNOTE_TRANSFORM_VERSION
+    entry.footnote_candidates = footnote_stats and tonumber(footnote_stats.candidates or footnote_stats.refs or 0) or 0
     entry.footnote_refs = footnote_stats and tonumber(footnote_stats.refs or 0) or 0
     entry.footnotes_converted = footnote_stats and tonumber(footnote_stats.converted or 0) or 0
+    entry.footnotes_backlinks = footnote_stats and tonumber(footnote_stats.backlinks or 0) or 0
+    entry.footnotes_inferred_backlinks = footnote_stats and tonumber(footnote_stats.inferred_backlinks or 0) or 0
     entry.footnotes_missing = footnote_stats and tonumber(footnote_stats.unresolved or 0) or 0
     entry.footnotes_deferred = footnote_stats and tonumber(footnote_stats.deferred or 0) or 0
+    entry.footnotes_fallback = footnote_stats and footnote_stats.fallback == true or false
+    entry.footnotes_fallback_reason = footnote_stats and footnote_stats.fallback_reason or nil
     cache_save(cache)
     return entry
 end
@@ -610,14 +620,16 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     local suffix = kind == "notes" and "划线与想法版" or "纯净版"
     local dir = self.store:epub_root()
     local standalone = opt.chapter_uid ~= nil
+    local partial_range = not standalone and opt.range_start_index ~= nil and opt.range_end_index ~= nil
     local chapter_name = standalone and (" - " .. U.safe_name(chapters[1] and chapters[1].title or "章节")) or ""
+    local range_name = partial_range and "【章节版】" or ""
     local preview_name=""
     if not standalone and opt.access_scope=="preview" then
         if preview_mode=="info" then preview_name="【试读信息版】"
         elseif preview_mode=="partial" then preview_name="【试读版·部分内容】"
         else preview_name="【试读版】" end
     end
-    local filename = U.safe_name(book.title, "book") .. preview_name .. chapter_name .. " [" .. suffix .. "].epub"
+    local filename = U.safe_name(book.title, "book") .. preview_name .. range_name .. chapter_name .. " [" .. suffix .. "].epub"
     local path = self.store:epub_path(filename)
     local map = {}
     for index, chapter in ipairs(chapters) do
@@ -637,32 +649,29 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         "chapters=", tostring(#chapters), "assets=", tostring(#assets),
         "memory_kb=", tostring(math.floor(collectgarbage("count"))))
     local now=os.time()
-    local ownership=tostring(opt.access_ownership or book.access_ownership or "temporary")
     local access_scope=tostring(opt.access_scope or "full")
-    -- A single downloaded chapter never proves whole-book entitlement. Unless
-    -- ownership is already permanent, keep it in the controlled/preview scope
-    -- so it cannot unlock an older full EPUB.
-    if standalone and ownership~="purchased" and ownership~="personal_upload" then
-        access_scope="preview"
-    end
-    if access_scope=="preview" then ownership="temporary" end
-    local storage_kind=(access_scope=="preview" and not standalone) and ("preview_"..kind) or kind
-    local valid_until=(ownership=="purchased" or ownership=="personal_upload") and nil
-        or (now+(tonumber(Config.ACCESS_VERIFY_TTL) or 10*60))
+    local storage_kind=partial_range and ("range_"..kind)
+        or ((access_scope=="preview" and not standalone) and ("preview_"..kind) or kind)
     local built, build_error = pcall(Epub.build, temp_path, book, chapters, css, assets, cover, {
         schema=7, book_id=book.bookId, title=book.title, author=book.author,
         variant=storage_kind, base_variant=kind, standalone=standalone, chapter_uid=opt.chapter_uid,
+        partial_range=partial_range,range_start_index=tonumber(opt.range_start_index),
+        range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
+        range_end_title=opt.range_end_title,
+        content_type="book",
+        sync_enabled=not partial_range,
+        read_report_enabled=not partial_range,
         chapters=map, generated_at=now, complete=true,
-        ownership=ownership, ownership_source=opt.access_ownership_source or book.access_ownership_source, access_scope=access_scope,
-        account_vid=opt.access_account_vid or book.access_account_vid,
-        verified_at=now, valid_until=valid_until,
-        access_policy_version=tonumber(Config.ACCESS_POLICY_VERSION) or 2,
+        access_scope=access_scope,
         catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
         readable_count=tonumber(opt.readable_chapter_count) or #chapters,
         restricted_count=tonumber(opt.restricted_chapter_count) or 0,
         preview_mode=access_scope=="preview" and preview_mode or nil,
         failed_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
         guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
+        annotation_requested=opt.annotation_requested==true or opt.annotations==true,
+        annotation_pending=opt.annotation_pending==true or nil,
+        annotation_error_kind=opt.annotation_error_kind,
         internal_links={links=link_stats.links or 0, rewritten=link_stats.rewritten or 0,
             unresolved=link_stats.unresolved or 0, critical=link_stats.unresolved_critical or 0},
     })
@@ -682,11 +691,14 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     if defer_install then
         pending_path = path .. ".miuread-pending"
         os.remove(pending_path)
-        local staged, stage_error = os.rename(temp_path, pending_path)
+        local staged, stage_mode_or_error = U.move_file_safe(temp_path, pending_path, function(candidate)
+            return validate_epub(candidate, #chapters)
+        end)
         if not staged then
             os.remove(temp_path)
-            error("无法暂存当前正在阅读书籍的新版本：" .. tostring(stage_error))
+            error("无法暂存当前正在阅读书籍的新版本：" .. tostring(stage_mode_or_error))
         end
+        logger.info("[MiuRead][Download] pending EPUB installed","mode=",tostring(stage_mode_or_error))
     else
         local backup_path = path .. ".miuread-backup"
         os.remove(backup_path)
@@ -698,33 +710,42 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
                 error("无法保护原 EPUB：" .. tostring(backup_error))
             end
         end
-        local installed, install_error = os.rename(temp_path, path)
+        local installed, install_mode_or_error = U.move_file_safe(temp_path, path, function(candidate)
+            return validate_epub(candidate, #chapters)
+        end)
         if not installed then
             if had_previous then os.rename(backup_path, path) end
             os.remove(temp_path)
-            error("无法安装新 EPUB：" .. tostring(install_error))
+            error("无法安装新 EPUB：" .. tostring(install_mode_or_error))
         end
+        logger.info("[MiuRead][Download] EPUB installed","mode=",tostring(install_mode_or_error))
         if had_previous then os.remove(backup_path) end
     end
 
     local record = {
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
         file=path, directory=dir, variant=storage_kind, base_variant=kind, downloaded_at=now,
+        content_type="book",
+        sync_enabled=not partial_range,
+        read_report_enabled=not partial_range,
+        partial_range=partial_range,range_start_index=tonumber(opt.range_start_index),
+        range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
+        range_end_title=opt.range_end_title,
         chapter_count=#chapters, expected_chapter_count=expected_chapter_count,
         catalog_chapter_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
         readable_chapter_count=tonumber(opt.readable_chapter_count) or #chapters,
         restricted_chapter_count=tonumber(opt.restricted_chapter_count) or 0,
         failed_chapter_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
         preview_mode=access_scope=="preview" and preview_mode or nil,
-        access_scope=access_scope, ownership=ownership,
-        ownership_source=opt.access_ownership_source or book.access_ownership_source,
-        access_policy_version=tonumber(Config.ACCESS_POLICY_VERSION) or 2,
-        account_vid=opt.access_account_vid or book.access_account_vid,
-        verified_at=now, valid_until=valid_until,
+        access_scope=access_scope,
         guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
         chapter_map=map, failures=U.copy(failures or {}), complete=true, file_size=U.file_size(path) or U.file_size(pending_path),
         pending_install=defer_install or nil,
         pending_file=pending_path,
+        annotation_requested=opt.annotation_requested==true or opt.annotations==true,
+        annotation_pending=opt.annotation_pending==true or nil,
+        annotation_error_kind=opt.annotation_error_kind,
+        annotation_errors=U.copy(opt.annotation_errors or {}),
     }
     if standalone then
         record.chapter_uid = tostring(opt.chapter_uid)
@@ -734,21 +755,10 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     end
     self.store:save_book(book.bookId, {
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
-        directory=dir, updated_at=now, catalog=map,
-        access={
-            ownership=ownership, ownership_source=opt.access_ownership_source or book.access_ownership_source, access_scope=access_scope,
-            account_vid=opt.access_account_vid or book.access_account_vid,
-            shelf_present=true, status="allowed", verified_at=now, valid_until=valid_until,
-            policy_version=tonumber(Config.ACCESS_POLICY_VERSION) or 2,
-            catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
-            readable_count=tonumber(opt.readable_chapter_count) or #chapters,
-            restricted_count=tonumber(opt.restricted_chapter_count) or 0,
-            failed_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
-            preview_mode=access_scope=="preview" and preview_mode or nil,
-            guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
-            lock_reason=nil,
-        },
+        directory=dir, updated_at=now, catalog=(type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map),
+        content_type="book",
     })
+    if type(self.store.clear_book_access)=="function" then self.store:clear_book_access(book.bookId) end
     if session then
         self.store:save_session(book.bookId, {
             psvts=session.psvts, pclts=session.pclts, token=session.token,
@@ -789,335 +799,471 @@ function Downloader:book(input, opt, progress)
     local session, expected = nil, 0
 
     if Protocol.is_mp(book.bookId) then
-        local list = self.reader:mp_articles(book.bookId)
-        expected = math.min(#list, tonumber(opt.limit) or #list)
-        for index, article in ipairs(list) do
-            if index > expected then break end
-            if opt.cancelled and opt.cancelled() then error("download cancelled") end
-            progress("content", index, expected, article.title)
-            local ok, body = pcall(self.reader.mp_content, self.reader, article.reviewId)
-            if ok then
-                body = localize(self.http, body, assets, opt.images)
-                local foot_body, foot_section = Footnotes.process(body, {is_txt=false})
-                body = prepare_chapter_body(foot_body .. (foot_section or ""), article.title)
-                if foot_section and foot_section ~= "" then css_add(css_list, css_seen, Footnotes.FOOTNOTES_CSS) end
-                chapters[#chapters + 1] = {title=article.title, body=body, uid=article.reviewId, index=index, word_count=#plain(body)}
-            else
-                failures[#failures + 1] = {uid=article.reviewId, title=article.title, error=tostring(body)}
-            end
+        error("公众号文章请在公众号文章列表中单篇打开")
+    end
+
+    progress("catalog", 0, 1, book.title)
+    local catalog, all = self:catalog(book.bookId)
+    local full_catalog_map={}
+    for index,chapter in ipairs(all or {}) do
+        full_catalog_map[#full_catalog_map+1]={
+            uid=chapter.chapterUid or chapter.uid,
+            index=tonumber(chapter.chapterIdx or chapter.index) or index,
+            title=chapter.title,
+            word_count=tonumber(chapter.wordCount or chapter.word_count) or 0,
+            structural=chapter.structural==true,
+        }
+    end
+    opt.full_catalog_map=full_catalog_map
+    local selected = {}
+    if opt.chapter_uid then
+        for _, chapter in ipairs(all) do
+            if tostring(chapter.chapterUid or chapter.uid) == tostring(opt.chapter_uid) then selected[1] = chapter; break end
         end
+    elseif opt.range_start_index and opt.range_end_index then
+        local first=math.max(1,tonumber(opt.range_start_index) or 1)
+        local last=math.min(#all,tonumber(opt.range_end_index) or first)
+        if last<first then first,last=last,first end
+        for index,chapter in ipairs(all) do
+            if index>=first and index<=last then selected[#selected+1]=chapter end
+        end
+        opt.range_start_index=first
+        opt.range_end_index=last
+        opt.range_start_title=opt.range_start_title or (all[first] and all[first].title)
+        opt.range_end_title=opt.range_end_title or (all[last] and all[last].title)
     else
-        progress("catalog", 0, 1, book.title)
-        local catalog, all = self:catalog(book.bookId)
-        local selected = {}
-        if opt.chapter_uid then
-            for _, chapter in ipairs(all) do
-                if tostring(chapter.chapterUid or chapter.uid) == tostring(opt.chapter_uid) then selected[1] = chapter; break end
+        for index, chapter in ipairs(all) do
+            if not opt.limit or index <= tonumber(opt.limit) then selected[#selected + 1] = chapter end
+        end
+    end
+    if #selected == 0 then error("no readable chapter") end
+    expected = #selected
+    local format = catalog.format == "txt" and "txt" or "epub"
+    local cache = cache_new(self.store, book, opt, selected, format)
+    session = cache.manifest.session
+    local failure_map, restricted_map = {}, {}
+    local requested_annotations=opt.annotations==true
+    local annotation_blocked=false
+    local annotation_degraded=false
+    local annotation_error_kind=nil
+    local annotation_errors={}
+    local annotation_recovery_attempted=false
+    local function chapter_uid(chapter)
+        return tostring(chapter and (chapter.chapterUid or chapter.uid) or "")
+    end
+
+    local function fetch_annotation(chapter, report_progress)
+        local uid=chapter_uid(chapter)
+        if annotation_blocked then
+            return {book_id=tostring(book.bookId),chapter_uid=uid,underlines={},review_map={},review_groups={},
+                underline_count=0,thought_count=0,thought_entry_count=0,underline_request_ok=false,
+                disabled=true,error_kind=annotation_error_kind or "disabled",errors={}}
+        end
+        local ok,annotation=pcall(self.annotations.fetch_chapter,self.annotations,
+            book.bookId,chapter.chapterUid or chapter.uid,function(stage,current,total)
+                if report_progress then report_progress(stage,current,total) end
+            end)
+        if not ok or type(annotation)~="table" then
+            annotation={
+                book_id=tostring(book.bookId),chapter_uid=uid,underlines={},review_map={},review_groups={},
+                underline_count=0,thought_count=0,thought_entry_count=0,
+                underline_request_ok=false,errors={tostring(annotation)},
+            }
+        end
+        if annotation.forbidden==true and not annotation_recovery_attempted
+            and self.reader and type(self.reader._recover_login_session)=="function" then
+            annotation_recovery_attempted=true
+            local recovered,recover_error=self.reader:_recover_login_session()
+            logger.warn("[MiuRead][Download] annotation authentication recovery",
+                "ok=",tostring(recovered),"book=",tostring(book.bookId),
+                "error=",recovered and "" or tostring(recover_error))
+            if recovered then
+                local retry_ok,retry_annotation=pcall(self.annotations.fetch_chapter,self.annotations,
+                    book.bookId,chapter.chapterUid or chapter.uid,function(stage,current,total)
+                        if report_progress then report_progress(stage,current,total) end
+                    end)
+                if retry_ok and type(retry_annotation)=="table" then annotation=retry_annotation
+                else
+                    annotation.errors=annotation.errors or {}
+                    annotation.errors[#annotation.errors+1]=tostring(retry_annotation)
+                end
+            else
+                annotation.errors=annotation.errors or {}
+                annotation.errors[#annotation.errors+1]="自动续期失败："..tostring(recover_error)
             end
+        end
+        if annotation.forbidden==true or annotation.rate_limited==true then annotation_blocked=true end
+        if annotation.underline_request_ok and #(annotation.errors or {})==0 then
+            Thoughts.save(self.store,book.bookId,chapter.chapterUid or chapter.uid,annotation.review_groups)
+        end
+        return annotation
+    end
+
+    local function mark_failure(chapter, message)
+        local uid = tostring(chapter.chapterUid or chapter.uid)
+        local item = {uid=uid, title=chapter.title, error=tostring(message)}
+        failure_map[uid] = item
+        local failed_entry = cache.manifest.chapters[uid] or {uid=uid, title=chapter.title}
+        failed_entry.error = tostring(message)
+        failed_entry.complete = false
+        cache.manifest.chapters[uid] = failed_entry
+        cache_save(cache)
+        return false
+    end
+
+    local function mark_restricted(chapter, message)
+        local uid=tostring(chapter.chapterUid or chapter.uid)
+        restricted_map[uid]={uid=uid,title=chapter.title,error=tostring(message)}
+        failure_map[uid]=nil
+        local entry=cache.manifest.chapters[uid] or {uid=uid,title=chapter.title}
+        entry.restricted=true
+        entry.restricted_error=tostring(message)
+        entry.error=nil
+        entry.complete=false
+        cache.manifest.chapters[uid]=entry
+        cache_save(cache)
+        logger.info("[MiuRead][Download] chapter limited by official preview",
+            "chapter=",uid,"title=",tostring(chapter.title or ""))
+        return true
+    end
+
+    local function finalize_chapter(chapter,index,entry,body,style,annotation,detail_message)
+        local uid=tostring(chapter.chapterUid or chapter.uid)
+        if detail_message then
+            progress("resume",index,expected,chapter.title,{message=detail_message})
+        end
+        progress("footnotes", index, expected, chapter.title)
+        local content_format = entry and entry.content_format or format
+        local original_body = body
+        local original_style = style
+        local foot_stats
+        local processed, foot_body, foot_section, stats_or_error = pcall(Footnotes.process, body, {
+            is_txt=content_format == "txt" or format == "txt",
+            book_dir=cache.root,
+            current_chapter_uid=uid,
+            defer_cross_file=true,
+        })
+
+        if not processed then
+            foot_stats={
+                candidates=0,refs=0,converted=0,backlinks=0,image_notes=0,
+                unresolved=0,deferred=0,fallback=true,fallback_reason="process_error",
+            }
+            body=original_body
+            style=original_style
+            logger.warn("[MiuRead][Download] footnote transform fallback",
+                "chapter=",uid,"reason=process_error","error=",tostring(foot_body))
         else
-            for index, chapter in ipairs(all) do
-                if not opt.limit or index <= tonumber(opt.limit) then selected[#selected + 1] = chapter end
-            end
-        end
-        if #selected == 0 then error("no readable chapter") end
-        expected = #selected
-        local format = catalog.format == "txt" and "txt" or "epub"
-        local cache = cache_new(self.store, book, opt, selected, format)
-        session = cache.manifest.session
-        local failure_map, restricted_map = {}, {}
-        local function chapter_uid(chapter)
-            return tostring(chapter and (chapter.chapterUid or chapter.uid) or "")
-        end
-
-        local function fetch_annotation(chapter, report_progress)
-            local uid=chapter_uid(chapter)
-            local ok,annotation=pcall(self.annotations.fetch_chapter,self.annotations,
-                book.bookId,chapter.chapterUid or chapter.uid,function(stage,current,total)
-                    if report_progress then report_progress(stage,current,total) end
-                end)
-            if not ok or type(annotation)~="table" then
-                annotation={
-                    book_id=tostring(book.bookId),chapter_uid=uid,underlines={},review_map={},review_groups={},
-                    underline_count=0,thought_count=0,thought_entry_count=0,
-                    underline_request_ok=false,errors={tostring(annotation)},
-                }
-            end
-            if annotation.underline_request_ok and #(annotation.errors or {})==0 then
-                Thoughts.save(self.store,book.bookId,chapter.chapterUid or chapter.uid,annotation.review_groups)
-            end
-            return annotation
-        end
-
-        local function mark_failure(chapter, message)
-            local uid = tostring(chapter.chapterUid or chapter.uid)
-            local item = {uid=uid, title=chapter.title, error=tostring(message)}
-            failure_map[uid] = item
-            local failed_entry = cache.manifest.chapters[uid] or {uid=uid, title=chapter.title}
-            failed_entry.error = tostring(message)
-            failed_entry.complete = false
-            cache.manifest.chapters[uid] = failed_entry
-            cache_save(cache)
-            return false
-        end
-
-        local function mark_restricted(chapter, message)
-            local uid=tostring(chapter.chapterUid or chapter.uid)
-            restricted_map[uid]={uid=uid,title=chapter.title,error=tostring(message)}
-            failure_map[uid]=nil
-            local entry=cache.manifest.chapters[uid] or {uid=uid,title=chapter.title}
-            entry.restricted=true
-            entry.restricted_error=tostring(message)
-            entry.error=nil
-            entry.complete=false
-            cache.manifest.chapters[uid]=entry
-            cache_save(cache)
-            logger.info("[MiuRead][Download] chapter limited by official preview",
-                "chapter=",uid,"title=",tostring(chapter.title or ""))
-            return true
-        end
-
-        local function process_one(chapter, index, retry_round)
-            if opt.cancelled and opt.cancelled() then error("download cancelled") end
-            local uid = tostring(chapter.chapterUid or chapter.uid)
-            local entry = cache.manifest.chapters[uid]
-            local body, style, new_assets
-
-            if entry then
-                local current_title = tostring(chapter.title or "")
-                local current_words = tonumber(chapter.wordCount or chapter.word_count or 0) or 0
-                local cached_words = tonumber(entry.word_count or 0) or 0
-                if current_words > 0 and current_words ~= cached_words then
-                    logger.info("[MiuRead][Download] chapter metadata changed; refreshing checkpoint",
-                        "chapter=", uid, "old_words=", tostring(cached_words), "new_words=", tostring(current_words))
-                    cache_reset_entry(cache, uid)
-                    entry = nil
-                elseif current_title ~= "" and current_title ~= tostring(entry.title or "") then
-                    -- The base body is still reusable; only rebuild the final
-                    -- chapter wrapper so the latest title is reflected.
-                    entry.title = current_title
-                    entry.complete = false
-                    entry.error = nil
-                    cache_save(cache)
-                end
-            end
-
-            if retry_round and retry_round > 0 then
-                progress("resume", index, expected, chapter.title, {
-                    message="正在补全失败项目（第 " .. tostring(retry_round) .. " 轮）",
-                })
-            end
-
-            if entry and entry.complete then
-                local cached_path, cached_style = cache_load_final_source(cache, entry)
-                if cached_path then
-                    local valid,validation_error=validate_cached_chapter(cached_path)
-                    if valid then
-                        failure_map[uid] = nil
-                        restricted_map[uid] = nil
-                        return true
+            foot_stats=type(stats_or_error)=="table" and stats_or_error or {}
+            local unresolved=tonumber(foot_stats.unresolved or 0) or 0
+            if unresolved>0 then
+                foot_stats.fallback=true
+                foot_stats.fallback_reason="unresolved_targets"
+                body=original_body
+                style=original_style
+                logger.warn("[MiuRead][Download] footnote transform fallback",
+                    "chapter=",uid,"reason=unresolved_targets",
+                    "candidates=",tostring(foot_stats.candidates or foot_stats.refs or 0),
+                    "missing=",tostring(unresolved))
+            else
+                local transformed=tostring(foot_body or "")..tostring(foot_section or "")
+                local footnote_valid,footnote_error=Footnotes.validate(transformed)
+                if footnote_valid then
+                    body=transformed
+                    if foot_section and foot_section ~= "" then
+                        style=tostring(style or "").."\n"..Footnotes.FOOTNOTES_CSS
                     end
-                    cached_style="完成章节结构无效："..tostring(validation_error)
+                else
+                    foot_stats.fallback=true
+                    foot_stats.fallback_reason="validation_error"
+                    body=original_body
+                    style=original_style
+                    logger.warn("[MiuRead][Download] footnote transform fallback",
+                        "chapter=",uid,"reason=validation_error",
+                        "error=",tostring(footnote_error))
                 end
-                logger.warn("[MiuRead][Download] completed checkpoint invalid", "chapter=", uid, "error=", tostring(cached_style))
+            end
+        end
+        progress("images", index, expected, chapter.title)
+        local fallback_title = "第 " .. tostring(index) .. " 节"
+        body = prepare_chapter_body(body, chapter.title and chapter.title ~= "" and chapter.title or fallback_title)
+        return cache_save_final(cache, chapter, body, annotation, style, foot_stats)
+    end
+
+    local function process_one(chapter, index, retry_round)
+        if opt.cancelled and opt.cancelled() then error("download cancelled") end
+        local uid = tostring(chapter.chapterUid or chapter.uid)
+        local entry = cache.manifest.chapters[uid]
+        local body, style, new_assets
+
+        if entry then
+            local current_title = tostring(chapter.title or "")
+            local current_words = tonumber(chapter.wordCount or chapter.word_count or 0) or 0
+            local cached_words = tonumber(entry.word_count or 0) or 0
+            if current_words > 0 and current_words ~= cached_words then
+                logger.info("[MiuRead][Download] chapter metadata changed; refreshing checkpoint",
+                    "chapter=", uid, "old_words=", tostring(cached_words), "new_words=", tostring(current_words))
+                cache_reset_entry(cache, uid)
+                entry = nil
+            elseif current_title ~= "" and current_title ~= tostring(entry.title or "") then
+                -- The base body is still reusable; only rebuild the final
+                -- chapter wrapper so the latest title is reflected.
+                entry.title = current_title
+                entry.complete = false
+                entry.error = nil
+                cache_save(cache)
+            end
+        end
+
+        if retry_round and retry_round > 0 then
+            progress("resume", index, expected, chapter.title, {
+                message="正在补全失败项目（第 " .. tostring(retry_round) .. " 轮）",
+            })
+        end
+
+        if entry and entry.complete
+            and tonumber(entry.footnote_transform_version or 0) ~= FOOTNOTE_TRANSFORM_VERSION then
+            -- Rebuild only the derived chapter file. The downloaded body and
+            -- image checkpoints remain intact, so upgrading never redownloads
+            -- chapters merely because the footnote transformer changed.
+            entry.complete = false
+            entry.error = nil
+            cache_save(cache)
+            logger.info("[MiuRead][Download] rebuilding cached chapter for footnote transformer",
+                "chapter=",uid,"from=",tostring(entry.footnote_transform_version or 0),
+                "to=",tostring(FOOTNOTE_TRANSFORM_VERSION))
+        end
+
+        if entry and entry.complete and not (requested_annotations and entry.annotation_pending==true) then
+            local cached_path, cached_style = cache_load_final_source(cache, entry)
+            if cached_path then
+                local valid,validation_error=validate_cached_chapter(cached_path)
+                if valid then
+                    failure_map[uid] = nil
+                    restricted_map[uid] = nil
+                    return true
+                end
+                cached_style="完成章节结构无效："..tostring(validation_error)
+            end
+            logger.warn("[MiuRead][Download] completed checkpoint invalid", "chapter=", uid, "error=", tostring(cached_style))
+            cache_reset_entry(cache, uid)
+            entry = nil
+        end
+
+        if entry and entry.content_done then
+            body, style, new_assets = cache_load_base(cache, entry)
+            if body then
+                progress("resume", index, expected, chapter.title, {message="正文已完成，继续补全附加内容"})
+            else
+                logger.warn("[MiuRead][Download] content checkpoint invalid", "chapter=", uid, "error=", tostring(style))
                 cache_reset_entry(cache, uid)
                 entry = nil
             end
+        end
 
-            if entry and entry.content_done then
-                body, style, new_assets = cache_load_base(cache, entry)
-                if body then
-                    progress("resume", index, expected, chapter.title, {message="正文已完成，继续补全附加内容"})
-                else
-                    logger.warn("[MiuRead][Download] content checkpoint invalid", "chapter=", uid, "error=", tostring(style))
-                    cache_reset_entry(cache, uid)
-                    entry = nil
+        if not body then
+            progress("content", index, expected, chapter.title)
+            local ok, downloaded, downloaded_style, downloaded_assets, state = pcall(
+                self.reader.chapter, self.reader, book, chapter, format, {images=opt.images})
+            if not ok then
+                if Http.is_rate_limit_error(downloaded) then error(downloaded) end
+                if not opt.chapter_uid and type(self.reader.is_access_denied_error)=="function"
+                    and self.reader.is_access_denied_error(downloaded) then
+                    return mark_restricted(chapter, downloaded)
                 end
+                return mark_failure(chapter, downloaded)
             end
-
-            if not body then
-                progress("content", index, expected, chapter.title)
-                local ok, downloaded, downloaded_style, downloaded_assets, state = pcall(
-                    self.reader.chapter, self.reader, book, chapter, format, {images=opt.images})
-                if not ok then
-                    if not opt.chapter_uid and type(self.reader.is_access_denied_error)=="function"
-                        and self.reader.is_access_denied_error(downloaded) then
-                        return mark_restricted(chapter, downloaded)
-                    end
-                    return mark_failure(chapter, downloaded)
-                end
-                if state and (state.psvts or state.pclts or state.token or state.url) then
-                    session = state
-                end
-                body = Codec.body(downloaded)
-                body, new_assets = namespace_assets(body, downloaded_assets, uid)
-                style = downloaded_style
-                entry = cache_save_base(cache, chapter, body, style, new_assets, state)
+            if state and (state.psvts or state.pclts or state.token or state.url) then
+                session = state
             end
+            body = Codec.body(downloaded)
+            body, new_assets = namespace_assets(body, downloaded_assets, uid)
+            style = downloaded_style
+            entry = cache_save_base(cache, chapter, body, style, new_assets, state)
+        end
 
-            local annotation
-            if opt.annotations then
-                progress("underlines", index, expected, chapter.title)
-                annotation = fetch_annotation(chapter,function(stage,current,total)
-                    progress(stage,index,expected,chapter.title,{batch=current,batches=total})
-                end)
-                if not annotation.underline_request_ok or #(annotation.errors or {}) > 0 then
-                    entry.annotation_done = false
-                    entry.annotation_error = table.concat(annotation.errors or {}, "; ")
-                    cache_save(cache)
-                    return mark_failure(chapter, "批注数据未完整获取" ..
-                        (entry.annotation_error ~= "" and ("：" .. entry.annotation_error) or ""))
-                end
-                entry.annotation_done = true
-                entry.annotation_error = nil
+        local annotation
+        if requested_annotations and not annotation_blocked then
+            progress("underlines", index, expected, chapter.title)
+            annotation = fetch_annotation(chapter,function(stage,current,total)
+                progress(stage,index,expected,chapter.title,{batch=current,batches=total})
+            end)
+            if annotation.forbidden==true or annotation.rate_limited==true
+                or not annotation.underline_request_ok or #(annotation.errors or {}) > 0 then
+                annotation_degraded=true
+                annotation_blocked=true
+                annotation_error_kind=annotation.error_kind or (annotation.forbidden and "forbidden")
+                    or (annotation.rate_limited and "rate_limit") or "incomplete"
+                local message=table.concat(annotation.errors or {}, "; ")
+                if message=="" then message="批注数据未完整获取" end
+                annotation_errors[#annotation_errors+1]={uid=uid,title=chapter.title,error=message}
+                entry.annotation_done=false
+                entry.annotation_pending=true
+                entry.annotation_error=message
+                cache_save(cache)
+                annotation=nil
+                logger.warn("[MiuRead][Download] annotations downgraded to clean EPUB",
+                    "book=",tostring(book.bookId),"chapter=",uid,
+                    "kind=",tostring(annotation_error_kind),"error=",U.first_line(message,160))
+            else
+                entry.annotation_done=true
+                entry.annotation_pending=nil
+                entry.annotation_error=nil
                 local extra_css
                 body, extra_css = self.annotations:apply(body, annotation)
                 style = tostring(style or "") .. "\n" .. tostring(extra_css or "")
             end
-
-            progress("footnotes", index, expected, chapter.title)
-            local content_format = entry and entry.content_format or format
-            local foot_body, foot_section, foot_stats = Footnotes.process(body, {
-                is_txt=content_format == "txt" or format == "txt",
-                book_dir=cache.root,
-                current_chapter_uid=uid,
-                defer_cross_file=true,
-            })
-            body = foot_body .. (foot_section or "")
-            if foot_stats and tonumber(foot_stats.unresolved or 0)>0 then
-                local sample={}
-                for missing_index,anchor in ipairs(foot_stats.missing_anchors or {}) do
-                    if missing_index>5 then break end
-                    sample[#sample+1]=tostring(anchor)
-                end
-                entry.footnotes_missing=tonumber(foot_stats.unresolved or 0) or 0
-                cache_save(cache)
-                return mark_failure(chapter,"尾注处理未完成：发现 "..tostring(foot_stats.refs or 0)
-                    .." 个引用，缺失 "..tostring(foot_stats.unresolved or 0)
-                    .." 个正文"..(#sample>0 and ("（"..table.concat(sample,", ").."）") or ""))
-            end
-            if foot_section and foot_section ~= "" then
-                style = tostring(style or "") .. "\n" .. Footnotes.FOOTNOTES_CSS
-            end
-            local footnote_valid,footnote_error=Footnotes.validate(body)
-            if not footnote_valid then return mark_failure(chapter,"尾注链接检查失败："..tostring(footnote_error)) end
-            progress("images", index, expected, chapter.title)
-
-            local fallback_title = "第 " .. tostring(index) .. " 节"
-            body = prepare_chapter_body(body, chapter.title and chapter.title ~= "" and chapter.title or fallback_title)
-            entry = cache_save_final(cache, chapter, body, annotation, style, foot_stats)
-            local final_path, final_error = cache_load_final_source(cache, entry)
-            if not final_path then return mark_failure(chapter, final_error) end
-            failure_map[uid] = nil
-            restricted_map[uid] = nil
-            body, annotation, new_assets = nil, nil, nil
-            collectgarbage("collect")
-            return true
+        elseif requested_annotations then
+            entry.annotation_done=false
+            entry.annotation_pending=true
+            cache_save(cache)
         end
 
-        for index, chapter in ipairs(selected) do process_one(chapter, index, 0) end
+        entry = finalize_chapter(chapter,index,entry,body,style,annotation)
+        local final_path, final_error = cache_load_final_source(cache, entry)
+        if not final_path then return mark_failure(chapter, final_error) end
+        failure_map[uid] = nil
+        restricted_map[uid] = nil
+        body, annotation, new_assets = nil, nil, nil
+        collectgarbage("collect")
+        return true
+    end
 
-        -- Retry only unresolved items. Successful checkpoints are never fetched
-        -- again, and a later success removes the earlier failure state.
-        for retry_round = 1, 2 do
-            local pending = {}
-            for index, chapter in ipairs(selected) do
-                local uid = tostring(chapter.chapterUid or chapter.uid)
-                if failure_map[uid] then pending[#pending + 1] = {chapter=chapter, index=index} end
-            end
-            if #pending == 0 then break end
-            pause(retry_round == 1 and 1.5 or 3.0)
-            for _, item in ipairs(pending) do process_one(item.chapter, item.index, retry_round) end
-        end
+    for index, chapter in ipairs(selected) do process_one(chapter, index, 0) end
 
-        -- Rebuild in catalog order from verified checkpoints. This avoids wrong
-        -- ordering when a failed item succeeds in a later retry round.
-        chapters, assets = {}, {}
-        css_list, css_seen = {}, {}
-        css_add(css_list, css_seen, BASE_CSS)
-        annotation_summary = {underlines=0, thoughts=0, chapters_ok=0, chapters_failed=0, errors={}}
+    -- Retry only unresolved items. Successful checkpoints are never fetched
+    -- again, and a later success removes the earlier failure state.
+    for retry_round = 1, 2 do
+        local pending = {}
         for index, chapter in ipairs(selected) do
             local uid = tostring(chapter.chapterUid or chapter.uid)
-            local entry = cache.manifest.chapters[uid]
-            local final_path, final_style, final_assets = cache_load_final_source(cache, entry)
-            if restricted_map[uid] then
-                -- Official preview limits are intentionally omitted. They are
-                -- not download failures and must not create empty chapters.
-            elseif final_path then
-                append_entry(chapters, assets, css_list, css_seen, entry, {path=final_path}, final_style, final_assets, index)
-                if opt.annotations then
-                    annotation_summary.chapters_ok = annotation_summary.chapters_ok + 1
-                    annotation_summary.underlines = annotation_summary.underlines + (tonumber(entry.underlines) or 0)
-                    annotation_summary.thoughts = annotation_summary.thoughts + (tonumber(entry.thoughts) or 0)
+            if failure_map[uid] then pending[#pending + 1] = {chapter=chapter, index=index} end
+        end
+        if #pending == 0 then break end
+        pause(retry_round == 1 and 1.5 or 3.0)
+        for _, item in ipairs(pending) do process_one(item.chapter, item.index, retry_round) end
+    end
+
+    if requested_annotations and annotation_degraded then
+        -- Some earlier chapters may already contain injected marks. Rebuild every
+        -- completed chapter from its pristine正文 checkpoint so the fallback is a
+        -- genuinely clean EPUB, while preserving any existing complete notes EPUB.
+        for index,chapter in ipairs(selected) do
+            local uid=tostring(chapter.chapterUid or chapter.uid)
+            if not restricted_map[uid] then
+                local entry=cache.manifest.chapters[uid]
+                local clean_body,clean_style=cache_load_base(cache,entry)
+                if clean_body then
+                    entry.annotation_done=false
+                    entry.annotation_pending=true
+                    entry.annotation_error=entry.annotation_error or "批注待补全"
+                    finalize_chapter(chapter,index,entry,clean_body,clean_style,nil,
+                        "批注暂不可用，正在生成纯净版")
+                    failure_map[uid]=nil
+                else
+                    failure_map[uid]=failure_map[uid] or {
+                        uid=uid,title=chapter.title,error="无法读取正文断点以生成纯净版",
+                    }
                 end
-            else
-                failure_map[uid] = failure_map[uid] or {uid=uid, title=chapter.title, error=tostring(final_style)}
             end
         end
+        opt.annotations=false
+        opt.annotation_requested=true
+        opt.annotation_pending=true
+        opt.annotation_error_kind=annotation_error_kind
+        opt.annotation_errors=U.copy(annotation_errors)
+    end
 
-        failures = {}
-        for _, chapter in ipairs(selected) do
-            local uid = tostring(chapter.chapterUid or chapter.uid)
-            if failure_map[uid] then failures[#failures + 1] = failure_map[uid] end
+    -- Rebuild in catalog order from verified checkpoints. This avoids wrong
+    -- ordering when a failed item succeeds in a later retry round.
+    chapters, assets = {}, {}
+    css_list, css_seen = {}, {}
+    css_add(css_list, css_seen, BASE_CSS)
+    annotation_summary = {underlines=0, thoughts=0, chapters_ok=0, chapters_failed=0, errors={}}
+    for index, chapter in ipairs(selected) do
+        local uid = tostring(chapter.chapterUid or chapter.uid)
+        local entry = cache.manifest.chapters[uid]
+        local final_path, final_style, final_assets = cache_load_final_source(cache, entry)
+        if restricted_map[uid] then
+            -- Official preview limits are intentionally omitted. They are
+            -- not download failures and must not create empty chapters.
+        elseif final_path then
+            append_entry(chapters, assets, css_list, css_seen, entry, {path=final_path}, final_style, final_assets, index)
+            if opt.annotations then
+                annotation_summary.chapters_ok = annotation_summary.chapters_ok + 1
+                annotation_summary.underlines = annotation_summary.underlines + (tonumber(entry.underlines) or 0)
+                annotation_summary.thoughts = annotation_summary.thoughts + (tonumber(entry.thoughts) or 0)
+            end
+        else
+            failure_map[uid] = failure_map[uid] or {uid=uid, title=chapter.title, error=tostring(final_style)}
         end
-        annotation_summary.chapters_failed = opt.annotations and #failures or 0
+    end
+
+    failures = {}
+    for _, chapter in ipairs(selected) do
+        local uid = tostring(chapter.chapterUid or chapter.uid)
+        if failure_map[uid] then failures[#failures + 1] = failure_map[uid] end
+    end
+    annotation_summary.chapters_failed = requested_annotations and #annotation_errors or 0
+    annotation_summary.pending = annotation_degraded==true
+    annotation_summary.error_kind = annotation_error_kind
+    annotation_summary.errors = U.copy(annotation_errors)
+    if requested_annotations and not annotation_degraded then
         for _, item in ipairs(failures) do annotation_summary.errors[#annotation_summary.errors + 1] = item end
+    end
 
-        local restricted_count=0
-        for _ in pairs(restricted_map) do restricted_count=restricted_count+1 end
-        local accessible_expected=expected-restricted_count
-        local preview=restricted_count>0
-        local readable_count=#chapters
-        local guard_uid=chapters[#chapters] and chapters[#chapters].uid or nil
-        local preview_mode="complete"
+    local restricted_count=0
+    for _ in pairs(restricted_map) do restricted_count=restricted_count+1 end
+    local accessible_expected=expected-restricted_count
+    local preview=restricted_count>0
+    local readable_count=#chapters
+    local guard_uid=chapters[#chapters] and chapters[#chapters].uid or nil
+    local preview_mode="complete"
 
-        if not preview then
-            if #chapters ~= accessible_expected or #failures > 0 then
-                error(failure_message(failures, accessible_expected, #chapters, true))
-            end
-        elseif readable_count<accessible_expected or #failures>0 then
-            preview_mode=readable_count>0 and "partial" or "info"
-            local body,title=preview_information_chapter(book,preview_mode,expected,readable_count,restricted_count,failures)
-            chapters[#chapters+1]={
-                title=title,body=body,uid="miuread-preview-info",index=expected+1,
-                word_count=#plain(body),structural=true,
-            }
-        elseif readable_count<=0 then
-            preview_mode="info"
-            local body,title=preview_information_chapter(book,preview_mode,expected,0,restricted_count,failures)
-            chapters[#chapters+1]={
-                title=title,body=body,uid="miuread-preview-info",index=expected+1,
-                word_count=#plain(body),structural=true,
-            }
+    if not preview then
+        if #chapters ~= accessible_expected or #failures > 0 then
+            error(failure_message(failures, accessible_expected, #chapters, true))
         end
-
-        progress("package", #chapters, math.max(1,accessible_expected), book.title, {
-            message=preview and (preview_mode=="info" and "正在生成试读信息版"
-                or (preview_mode=="partial" and ("正在生成部分试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章")
-                or ("正在生成官方试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章"))) or nil,
-        })
-        opt.expected_chapter_count = accessible_expected
-        opt.catalog_chapter_count = expected
-        opt.readable_chapter_count = readable_count
-        opt.restricted_chapter_count = restricted_count
-        opt.failed_chapter_count = #failures
-        opt.access_scope = preview and "preview" or "full"
-        opt.preview_mode = preview and preview_mode or nil
-        opt.guard_chapter_uid = guard_uid
-        opt.checkpointed = true
-        local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session)
-        record.annotation_summary = annotation_summary
-        U.remove_tree(cache.root)
-        return record
+    elseif readable_count<accessible_expected or #failures>0 then
+        preview_mode=readable_count>0 and "partial" or "info"
+        local body,title=preview_information_chapter(book,preview_mode,expected,readable_count,restricted_count,failures)
+        chapters[#chapters+1]={
+            title=title,body=body,uid="miuread-preview-info",index=expected+1,
+            word_count=#plain(body),structural=true,
+        }
+    elseif readable_count<=0 then
+        preview_mode="info"
+        local body,title=preview_information_chapter(book,preview_mode,expected,0,restricted_count,failures)
+        chapters[#chapters+1]={
+            title=title,body=body,uid="miuread-preview-info",index=expected+1,
+            word_count=#plain(body),structural=true,
+        }
     end
 
-    if #chapters ~= expected or #failures > 0 then
-        error(failure_message(failures, expected, #chapters, false))
-    end
-    progress("package", #chapters, expected, book.title)
-    opt.expected_chapter_count = expected
-    opt.checkpointed = false
+    progress("package", #chapters, math.max(1,accessible_expected), book.title, {
+        message=preview and (preview_mode=="info" and "正在生成试读信息版"
+            or (preview_mode=="partial" and ("正在生成部分试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章")
+            or ("正在生成官方试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章"))) or nil,
+    })
+    opt.expected_chapter_count = accessible_expected
+    opt.catalog_chapter_count = expected
+    opt.readable_chapter_count = readable_count
+    opt.restricted_chapter_count = restricted_count
+    opt.failed_chapter_count = #failures
+    opt.access_scope = preview and "preview" or "full"
+    opt.preview_mode = preview and preview_mode or nil
+    opt.guard_chapter_uid = guard_uid
+    opt.checkpointed = true
     local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session)
     record.annotation_summary = annotation_summary
+    if opt.annotation_pending==true then
+        cache.manifest.annotation_pending=true
+        cache.manifest.annotation_error_kind=opt.annotation_error_kind
+        cache.manifest.annotation_errors=U.copy(opt.annotation_errors or {})
+        cache_save(cache)
+    else
+        U.remove_tree(cache.root)
+    end
     return record
 end
 

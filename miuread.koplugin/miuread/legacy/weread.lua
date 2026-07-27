@@ -173,7 +173,8 @@ function WeRead.make_read_payload(opts)
 end
 
 function WeRead.is_mp_book(book_id)
-    return tostring(book_id or ""):sub(1, 7) == "MP_WXS_"
+    local id=tostring(book_id or "")
+    return id:sub(1, 7) == "MP_WXS_" or id:lower()=="mpbook"
 end
 
 function WeRead.reader_url(book_id, chapter_uid)

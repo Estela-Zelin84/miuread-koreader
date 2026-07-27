@@ -35,26 +35,21 @@ jobs:
           cv = re.search(r'\bVERSION\s*=\s*["\'](' + pattern + r')["\']', config)
           mv = re.search(r'\bversion\s*=\s*["\'](' + pattern + r')["\']', meta)
           channel = re.search(r'\bUPDATE_CHANNEL\s*=\s*["\']([^"\']+)["\']', config)
-          if not cv or not mv:
-              print("::error::无法读取内测版本号")
-              sys.exit(1)
-          if cv.group(1) != mv.group(1):
-              print(f"::error::版本号不一致：{cv.group(1)} / {mv.group(1)}")
-              sys.exit(1)
-          if not channel or channel.group(1) != "beta":
-              print("::error::当前代码未固定到 beta 通道")
+          if not cv or not mv or cv.group(1) != mv.group(1):
+              print("::error::无法读取一致的内测版本号")
               sys.exit(1)
           version = cv.group(1)
-          if "-beta." not in version:
-              print(f"::error::内测版本号格式错误：{version}")
+          if not channel or channel.group(1) != "beta" or "-beta." not in version:
+              print(f"::error::内测通道或版本格式错误：{version}")
+              sys.exit(1)
+          changelog = Path(f"CHANGELOG-{version}.txt")
+          if not changelog.is_file() or not changelog.read_text(encoding="utf-8").strip():
+              print(f"::error::缺少当前版本更新说明：{changelog}")
               sys.exit(1)
           Path("release.env").write_text(
-              f"VERSION={version}\n"
-              f"RELEASE_TAG=v{version}\n"
-              f"PACKAGE_NAME=miuread-v{version}-full.zip\n",
+              f"VERSION={version}\nRELEASE_TAG=v{version}\nPACKAGE_NAME=miuread-v{version}-full.zip\n",
               encoding="utf-8",
           )
-          print(f"准备发布内测版：v{version}")
           PY
           cat release.env >> "$GITHUB_ENV"
 
@@ -74,14 +69,15 @@ jobs:
           root = Path("miuread.koplugin")
           output = Path("dist") / package_name
           fixed_time = (2020, 1, 1, 0, 0, 0)
+          excluded_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
+          excluded_suffixes = {".md", ".epub", ".log"}
+
+          def excluded(path):
+              return "__MACOSX" in path.parts or path.name in excluded_names or path.suffix.lower() in excluded_suffixes
+
           if not root.is_dir():
               print("::error::缺少 miuread.koplugin")
               sys.exit(1)
-
-          excluded_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
-          excluded_suffixes = {".md", ".epub", ".log"}
-          def excluded(path):
-              return "__MACOSX" in path.parts or path.name in excluded_names or path.suffix.lower() in excluded_suffixes
 
           with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
               directories = [root] + sorted([p for p in root.rglob("*") if p.is_dir()], key=lambda p: p.as_posix())
@@ -99,65 +95,47 @@ jobs:
 
           payload = output.read_bytes()
           official = f"https://github.com/{repo}/releases/download/v{version}/{package_name}"
+          notes = Path(f"CHANGELOG-{version}.txt").read_text(encoding="utf-8").strip()
           manifest = {
               "channel": "beta",
               "version": version,
               "name": f"觅阅 · 微信读书助手 {version} 内测版",
               "package_type": "full",
               "package_url": official,
-              "package_urls": [
-                  official,
-                  f"https://ghfast.top/{official}",
-                  f"https://gh-proxy.com/{official}",
-                  f"https://ghproxy.net/{official}",
-              ],
+              "package_urls": [official, f"https://ghfast.top/{official}", f"https://gh-proxy.com/{official}", f"https://ghproxy.net/{official}"],
               "size": len(payload),
               "sha256": hashlib.sha256(payload).hexdigest(),
-              "notes": "内测版：修复微信读书永久权益识别与旧5天数据迁移；验证周期保持10分钟；删除阅读第一章、低资源模式及重复维护入口，并继续支持锁定书自动验证解锁。",
+              "notes": notes,
           }
           Path("dist/update-beta.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-          print(f"已生成：{output}")
-          print(f"大小：{len(payload)}")
-          print(f"SHA-256：{manifest['sha256']}")
           PY
 
-      - name: Verify beta package
+      - name: Verify beta package and notes
         shell: bash
         run: |
           set -euo pipefail
+          unzip -t "dist/$PACKAGE_NAME"
           python3 - <<'PY'
           from pathlib import Path
           from zipfile import ZipFile
-          import json, os, re, sys
+          import json, os, sys
 
           package = Path("dist") / os.environ["PACKAGE_NAME"]
           manifest = json.loads(Path("dist/update-beta.json").read_text(encoding="utf-8"))
-          required = {
-              "miuread.koplugin/_meta.lua",
-              "miuread.koplugin/main.lua",
-              "miuread.koplugin/miuread/config.lua",
-          }
-          forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
-          forbidden_suffixes = {".md", ".epub", ".log"}
+          notes = Path(f"CHANGELOG-{os.environ['VERSION']}.txt").read_text(encoding="utf-8").strip()
           with ZipFile(package) as archive:
               names = archive.namelist()
               bad = archive.testzip()
-              config = archive.read("miuread.koplugin/miuread/config.lua").decode("utf-8")
           errors = []
           if bad: errors.append(f"ZIP 文件损坏：{bad}")
-          errors.extend(f"缺少文件：{x}" for x in sorted(required.difference(names)))
-          for name in names:
-              path = Path(name)
-              if not name.startswith("miuread.koplugin/"): errors.append(f"根目录错误：{name}")
-              if path.name in forbidden_names or path.suffix.lower() in forbidden_suffixes or "__MACOSX" in path.parts:
-                  errors.append(f"不应进入安装包：{name}")
-          if 'UPDATE_CHANNEL = "beta"' not in config: errors.append("安装包未固定到 beta 通道")
-          if manifest.get("channel") != "beta": errors.append("内测清单通道错误")
-          if manifest.get("version") != os.environ["VERSION"]: errors.append("内测清单版本错误")
+          for required in ("miuread.koplugin/_meta.lua", "miuread.koplugin/main.lua", "miuread.koplugin/miuread/config.lua"):
+              if required not in names: errors.append(f"缺少文件：{required}")
+          if manifest.get("version") != os.environ["VERSION"]: errors.append("清单版本错误")
+          if manifest.get("notes") != notes: errors.append("线上更新说明未使用当前 CHANGELOG")
+          if "验证周期保持10分钟" in manifest.get("notes", ""): errors.append("仍包含废弃的旧更新说明")
           if errors:
               for error in errors: print(f"::error::{error}")
               sys.exit(1)
-          print(f"内测安装包检查通过，共 {len(names)} 个条目。")
           PY
 
       - name: Create or update prerelease
@@ -167,19 +145,18 @@ jobs:
         run: |
           set -euo pipefail
           FILE="dist/$PACKAGE_NAME"
+          NOTES_FILE="CHANGELOG-$VERSION.txt"
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             while IFS= read -r asset; do
               [ -n "$asset" ] || continue
               gh release delete-asset "$RELEASE_TAG" "$asset" --yes
             done < <(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
             gh release upload "$RELEASE_TAG" "$FILE"
-            gh release edit "$RELEASE_TAG" --prerelease --target beta --title "觅阅 · 微信读书助手 $VERSION 内测版"
+            gh release edit "$RELEASE_TAG" --prerelease --target beta \
+              --title "觅阅 · 微信读书助手 $VERSION 内测版" --notes-file "$NOTES_FILE"
           else
-            gh release create "$RELEASE_TAG" "$FILE" \
-              --target beta \
-              --title "觅阅 · 微信读书助手 $VERSION 内测版" \
-              --notes "内测全量包，仅供内测用户安装。" \
-              --prerelease
+            gh release create "$RELEASE_TAG" "$FILE" --target beta \
+              --title "觅阅 · 微信读书助手 $VERSION 内测版" --notes-file "$NOTES_FILE" --prerelease
           fi
 
       - name: Update beta manifest

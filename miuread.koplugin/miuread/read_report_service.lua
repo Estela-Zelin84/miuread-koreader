@@ -67,6 +67,31 @@ local function write_status(path, value)
     return U.atomic_write(path, Json.encode(value), true)
 end
 
+local function classify_error(kind,value)
+    kind=tostring(kind or "")
+    local text=tostring(value or ""):lower()
+    if kind=="authentication" or kind=="context" or kind=="transport" or kind=="server" then
+        return kind
+    end
+    if text:find("login",1,true) or text:find("authentication",1,true)
+        or text:find("登录",1,true) or text:find("用户不存在",1,true) then
+        return "authentication"
+    end
+    if text:find("context",1,true) or text:find("chapter",1,true)
+        or text:find("章节",1,true) then return "context" end
+    if text:find("network",1,true) or text:find("timeout",1,true)
+        or text:find("connection",1,true) then return "transport" end
+    return "server"
+end
+
+local function retry_delay(kind,failures,interval)
+    failures=math.min(10,math.max(1,tonumber(failures) or 1))
+    interval=math.max(10,tonumber(interval) or 30)
+    if kind=="transport" then return math.min(30*60,math.max(interval,30)*(2^(failures-1))) end
+    if kind=="server" then return math.min(30*60,math.max(120,interval*2)*(2^(failures-1))) end
+    return 0
+end
+
 local function public_result(result)
     result = type(result) == "table" and result or {}
     return {
@@ -112,10 +137,14 @@ function Service.run(job)
     local last_control_state = nil
     local last_report_at = 0
     local last_flush_seq = 0
+    local consecutive_failures = 0
+    local blocked_kind = nil
+    local carry_elapsed = 0
 
     local function run_report(control, elapsed, final_flush, reason)
         local interval = math.max(10, tonumber(current_job.interval) or 30)
-        elapsed = math.max(1, math.floor(tonumber(elapsed) or interval))
+        local carried = math.max(0, math.floor(tonumber(carry_elapsed) or 0))
+        elapsed = math.max(1, math.floor(tonumber(elapsed) or interval)) + carried
         sequence = sequence + 1
         local report_job = {
             book_id = tostring(current_job.book_id or ""),
@@ -146,30 +175,60 @@ function Service.run(job)
             if result.wr_wrpa_changed then auth.wr_wrpa = result.wr_wrpa or "" end
 
             local out = public_result(result)
+            local kind = result.accepted and nil or classify_error(result.error_kind,result.error)
+            local delay = 0
+            if result.accepted then
+                consecutive_failures = 0
+                blocked_kind = nil
+                carry_elapsed = 0
+            else
+                consecutive_failures = consecutive_failures + 1
+                carry_elapsed = elapsed
+                if kind=="authentication" or kind=="context" then
+                    blocked_kind=kind
+                else
+                    delay=retry_delay(kind,consecutive_failures,interval)
+                end
+            end
             out.generation = generation
             out.seq = sequence
-            out.state = result.accepted and "waiting" or "error"
+            out.state = result.accepted and "waiting" or ((blocked_kind and "paused") or "error")
+            out.error_kind = kind or result.error_kind
+            out.paused = blocked_kind ~= nil
+            out.retry_delay = delay
             out.attempted_at = attempted_at
             out.completed_at = completed_at
             out.elapsed_seconds = elapsed
+            out.carry_elapsed = carried
+            out.carry_consumed = result.accepted and carried > 0
+            out.pending_elapsed = result.accepted and 0 or carry_elapsed
             out.final_flush = final_flush == true
             out.flush_reason = reason
-            out.next_due = final_flush and 0 or (completed_at + interval)
+            out.next_due = final_flush and 0 or (blocked_kind and 0 or (completed_at + (delay>0 and delay or interval)))
             out.book_id = tostring(current_job.book_id or "")
             write_status(status_path, out)
             return out.next_due
         end
 
-        local due = final_flush and 0 or (completed_at + interval)
+        consecutive_failures = consecutive_failures + 1
+        carry_elapsed = elapsed
+        local kind=classify_error(nil,result)
+        local delay=retry_delay(kind,consecutive_failures,interval)
+        local due = final_flush and 0 or (completed_at + delay)
         write_status(status_path, {
             generation = generation,
             seq = sequence,
             state = "error",
             accepted = false,
             error = tostring(result or "read report service failed"),
+            error_kind = kind,
+            retry_delay = delay,
             attempted_at = attempted_at,
             completed_at = completed_at,
             elapsed_seconds = elapsed,
+            carry_elapsed = carried,
+            carry_consumed = false,
+            pending_elapsed = carry_elapsed,
             final_flush = final_flush == true,
             flush_reason = reason,
             next_due = due,
@@ -205,6 +264,9 @@ function Service.run(job)
                 last_report_at = now
                 last_flush_seq = 0
                 last_control_state = nil
+                consecutive_failures = 0
+                blocked_kind = nil
+                carry_elapsed = math.max(0,math.floor(tonumber(loaded.carry_elapsed) or 0))
                 U.atomic_write(context_path, Json.encode(book), true)
                 write_status(status_path, {
                     generation = generation,
@@ -213,6 +275,7 @@ function Service.run(job)
                     next_due = next_due,
                     book_id = tostring(loaded.book_id or ""),
                     first_delay = first_delay,
+                    carry_elapsed = carry_elapsed,
                     service_version = tonumber(job.service_version) or 0,
                 })
             end
@@ -267,7 +330,7 @@ function Service.run(job)
                         book_id = tostring(current_job.book_id or ""),
                     })
                 end
-            elseif active then
+            elseif active and not blocked_kind then
                 local now = os.time()
                 local interval = math.max(10, tonumber(current_job.interval) or 30)
                 local idle_timeout = math.max(interval, tonumber(current_job.idle_timeout) or 600)

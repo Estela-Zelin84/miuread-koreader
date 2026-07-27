@@ -103,6 +103,55 @@ local function split_set_cookie(raw)
     return out
 end
 
+-- Keep the complete browser cookie set only while a QR login is active.
+-- This temporary jar is never persisted to the long-lived account settings.
+function Cookies.session_header(jar)
+    local keys, out = {}, {}
+    for k, v in pairs(jar or {}) do
+        local value_type = type(v)
+        if type(k) == "string"
+            and not reserved[k:lower()]
+            and (value_type == "string" or value_type == "number")
+            and tostring(v) ~= "" then
+            keys[#keys + 1] = k
+        end
+    end
+    table.sort(keys)
+    for _, k in ipairs(keys) do
+        out[#out + 1] = k .. "=" .. tostring(jar[k])
+    end
+    return table.concat(out, "; ")
+end
+
+function Cookies.session_absorb(jar, raw)
+    local out = {}
+    for k, v in pairs(jar or {}) do
+        local value_type = type(v)
+        if type(k) == "string"
+            and not reserved[k:lower()]
+            and (value_type == "string" or value_type == "number")
+            and tostring(v) ~= "" then
+            out[k] = tostring(v)
+        end
+    end
+
+    for _, line in ipairs(split_set_cookie(raw)) do
+        local first = line:match("^([^;]+)") or ""
+        local k, v = first:match("^%s*([^=]+)=(.*)$")
+        if k then
+            k, v = Util.trim(k), Util.trim(v)
+            if k ~= "" and not reserved[k:lower()] then
+                local lower = line:lower()
+                local deletion = v == ""
+                    or lower:find("max%-age%s*=%s*0") ~= nil
+                    or lower:find("expires%s*=%s*thu,%s*01%s+jan%s+1970") ~= nil
+                if deletion then out[k] = nil else out[k] = v end
+            end
+        end
+    end
+    return out
+end
+
 function Cookies.sanitize(jar)
     local cleaned, changed = {}, false
     for k, v in pairs(jar or {}) do

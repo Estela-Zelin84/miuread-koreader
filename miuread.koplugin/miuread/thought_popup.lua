@@ -456,6 +456,13 @@ end
 
 local M = {}
 
+function M.prewarm_font(font_name)
+    font_name=tostring(font_name or ""):match("^%s*(.-)%s*$")
+    if font_name=="" then return false end
+    local ok,css=pcall(Popup._book_font_css,{font_name=font_name})
+    return ok and css~=nil
+end
+
 function M.show(opts)
     opts = opts or {}
     return UIManager:show(Popup:new{

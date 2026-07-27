@@ -103,7 +103,8 @@ function Api:call(name, params, request_options)
     end
 
     local ok, data = pcall(request_once)
-    if not ok and Http.is_auth_error(data) and self.reader then
+    local annotation_endpoint=tostring(name)=="/book/underlines" or tostring(name)=="/book/readreviews"
+    if not ok and not annotation_endpoint and Http.is_auth_error(data) and self.reader then
         local recovered, recover_error = self.reader:_recover_login_session()
         logger.warn("[MiuRead][API] authentication recovery",
             "api=", tostring(name), "ok=", tostring(recovered),
@@ -120,6 +121,21 @@ function Api:shelf(options)
         retries=options.retries==nil and 1 or options.retries,
         timeout=options.timeout or {10,18},
     })
+end
+function Api:notebooks(count, last_sort)
+    local params={count=tonumber(count) or 100}
+    if tonumber(last_sort or 0) and tonumber(last_sort or 0)~=0 then
+        params.lastSort=tonumber(last_sort)
+    end
+    return self:call("/user/notebooks", params, {retries=1, timeout={10,18}})
+end
+function Api:bookmark_list(id)
+    return self:call("/book/bookmarklist", {bookId=tostring(id or "")}, {retries=1, timeout={10,18}})
+end
+function Api:review_list_mine(id, synckey, count)
+    return self:call("/review/list/mine", {
+        bookid=tostring(id or ""), count=tonumber(count) or 100, synckey=tonumber(synckey) or 0,
+    }, {retries=1, timeout={10,18}})
 end
 function Api:search(q, offset, count)
     return self:call("/store/search", {keyword=tostring(q or ""), scope=10, maxIdx=offset or 0, count=count or 30}, {retries=1, timeout={10, 18}})
@@ -148,7 +164,7 @@ function Api:web_progress(id)
     return data
 end
 
-function Api:_chapter_call(name, id, chapter_uid, extra)
+function Api:_chapter_call(name, id, chapter_uid, extra, request_options)
     local last
     local candidates = unique_candidates(chapter_uid)
     if #candidates == 0 then error(name .. ": invalid chapterUid") end
@@ -156,7 +172,7 @@ function Api:_chapter_call(name, id, chapter_uid, extra)
         local payload = U.copy(extra or {})
         payload.bookId = tostring(id)
         payload.chapterUid = uid
-        local ok, value = pcall(self.call, self, name, payload)
+        local ok, value = pcall(self.call, self, name, payload, request_options)
         if ok then return value end
         last = value
         if not tostring(value):lower():find("params error%(node%)") then error(value) end
@@ -164,8 +180,17 @@ function Api:_chapter_call(name, id, chapter_uid, extra)
     error(last or (name .. ": params error(node)"))
 end
 
+local ANNOTATION_REQUEST_OPTIONS={
+    retries=0,
+    rate_limit_retries=0,
+    rate_limit_fail_fast=true,
+    rate_limit_cooldown=300,
+    rate_limit_scope="annotations",
+    timeout={10,18},
+}
+
 function Api:underlines(id, chapter_uid)
-    return self:_chapter_call("/book/underlines", id, chapter_uid)
+    return self:_chapter_call("/book/underlines", id, chapter_uid, nil, ANNOTATION_REQUEST_OPTIONS)
 end
 
 function Api:review_batches(ranges, batch_size)
@@ -183,7 +208,8 @@ function Api:review_batches(ranges, batch_size)
 end
 
 function Api:readreviews(id, chapter_uid, batch)
-    return self:_chapter_call("/book/readreviews", id, chapter_uid, {reviews=sanitize(batch or {})})
+    return self:_chapter_call("/book/readreviews", id, chapter_uid,
+        {reviews=sanitize(batch or {})}, ANNOTATION_REQUEST_OPTIONS)
 end
 
 Api._scalar = scalar

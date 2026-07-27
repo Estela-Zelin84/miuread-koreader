@@ -5,9 +5,21 @@ local UIManager=require("ui/uimanager")
 local Async={}; Async.__index=Async
 function Async:new(store, options)
     options = options or {}
-    return setmetatable({store=store,job=nil,poll=nil,poll_interval=tonumber(options.poll_interval) or .25},self)
+    return setmetatable({
+        store=store,job=nil,poll=nil,
+        poll_interval=tonumber(options.poll_interval) or .25,
+        allow_android=options.allow_android==true,
+    },self)
 end
-function Async:available() return type(FFIUtil.runInSubProcess)=="function" and type(FFIUtil.isSubProcessDone)=="function" and not (type(FFIUtil.isAndroid)=="function" and FFIUtil.isAndroid()) end
+function Async:is_android()
+    return type(FFIUtil.isAndroid)=="function" and FFIUtil.isAndroid()==true
+end
+function Async:available()
+    local android=self:is_android()
+    return type(FFIUtil.runInSubProcess)=="function"
+        and type(FFIUtil.isSubProcessDone)=="function"
+        and (self.allow_android or not android)
+end
 function Async:busy() return self.job~=nil end
 function Async:_schedule()
     if self.poll then return end; local task; task=function() if self.poll~=task then return end; self.poll=nil; self:_check() end; self.poll=task; UIManager:scheduleIn(self.poll_interval,task)
@@ -20,7 +32,12 @@ function Async:_check()
     if j.callback then j.callback(result) end
 end
 function Async:cancel(reason)
-    if not self.job then return end; self.job.callback=nil; pcall(FFIUtil.terminateSubProcess,self.job.pid); os.remove(self.job.path); self.job=nil
+    if self.poll then UIManager:unschedule(self.poll); self.poll=nil end
+    if not self.job then return end
+    self.job.callback=nil
+    pcall(FFIUtil.terminateSubProcess,self.job.pid)
+    os.remove(self.job.path); os.remove(self.job.path..".tmp")
+    self.job=nil
 end
 function Async:run(label,fn,callback,timeout)
     if self.job then return false,"worker busy" end
