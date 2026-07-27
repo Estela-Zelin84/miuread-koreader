@@ -26,6 +26,13 @@ local function is_weread_url(url)
     return host == "weread.qq.com" or host:sub(-#".weread.qq.com") == ".weread.qq.com"
 end
 
+local function is_weread_api_url(url)
+    url = tostring(url or "")
+    if not is_weread_url(url) then return false end
+    return url:find("/web/", 1, true) ~= nil
+        or url:find("/api/", 1, true) ~= nil
+end
+
 local function absolute(base, loc)
     loc = tostring(loc or "")
     if loc:match("^https?://") then return loc end
@@ -51,8 +58,83 @@ local function pause(seconds)
     end
 end
 
+local function clock_now()
+    if ok_socket and socket and type(socket.gettime) == "function" then
+        return socket.gettime()
+    end
+    return os.time()
+end
+
+local function body_rate_limit(text)
+    text = tostring(text or "")
+    if text == "" or #text > 32768 or not text:match("^%s*[%[{]") then return nil end
+    local lower = text:lower()
+    local code = lower:match('"errcode"%s*:%s*([%-]?%d+)')
+        or lower:match('"err_code"%s*:%s*([%-]?%d+)')
+        or lower:match('"code"%s*:%s*([%-]?%d+)')
+    local numeric = tonumber(code)
+    if numeric == -10102 or numeric == -2014
+        or lower:find("hit api rate limit", 1, true)
+        or lower:find("too many requests", 1, true)
+        or lower:find("rate limit", 1, true)
+        or text:find("请求频率超限", 1, true)
+        or text:find("请求频率受限", 1, true) then
+        return tostring(code or "rate_limit")
+    end
+    return nil
+end
+
+local RATE_LIMIT_DELAYS = {15, 30, 60, 90}
+
 function Http:new(store)
-    return setmetatable({store = store, user_agent = Protocol.USER_AGENT}, self)
+    return setmetatable({
+        store = store,
+        user_agent = Protocol.USER_AGENT,
+        last_weread_request_at = 0,
+        rate_limit_until = 0,
+        min_weread_interval = 0.35,
+    }, self)
+end
+
+function Http:_cancelled()
+    if type(self.cancelled) ~= "function" then return false end
+    local ok, value = pcall(self.cancelled)
+    return ok and value == true
+end
+
+function Http:_report_rate_limit(remaining, attempt, maximum, code)
+    if type(self.on_rate_limit) ~= "function" then return end
+    local ok, err = pcall(self.on_rate_limit, remaining, attempt, maximum, code)
+    if not ok then logger.warn("[MiuRead][HTTP] rate-limit callback failed", tostring(err)) end
+end
+
+function Http:_wait_rate_limit(seconds, attempt, maximum, code)
+    seconds = math.max(1, math.floor(tonumber(seconds) or 1))
+    local deadline = clock_now() + seconds
+    self.rate_limit_until = math.max(tonumber(self.rate_limit_until) or 0, deadline)
+    local last_report
+    while true do
+        if self:_cancelled() then error("download cancelled") end
+        local remaining = math.max(0, math.ceil(deadline - clock_now()))
+        if remaining <= 0 then break end
+        if last_report == nil or remaining <= 3 or remaining <= last_report - 10 then
+            self:_report_rate_limit(remaining, attempt, maximum, code)
+            last_report = remaining
+        end
+        pause(math.min(1, remaining))
+    end
+end
+
+function Http:_pace(url, opt)
+    if not is_weread_api_url(url) or opt.pacing == false then return end
+    if self:_cancelled() then error("download cancelled") end
+    local now = clock_now()
+    local wait = math.max(0, (tonumber(self.rate_limit_until) or 0) - now)
+    local interval = tonumber(opt.min_interval) or tonumber(self.min_weread_interval) or 0
+    wait = math.max(wait, interval - (now - (tonumber(self.last_weread_request_at) or 0)))
+    if wait > 0 then pause(wait) end
+    if self:_cancelled() then error("download cancelled") end
+    self.last_weread_request_at = clock_now()
 end
 
 function Http:_jar()
@@ -133,6 +215,7 @@ function Http:_request_once(opt)
             socketutil:reset_timeout()
             return nil, nil, nil, current, "HTTP transport unavailable"
         end
+        self:_pace(current, opt)
         local called, ok, code, resp_headers, status = pcall(transport.request, {
             url = current,
             method = method,
@@ -182,22 +265,51 @@ function Http:request(opt)
     local retries = tonumber(opt.retries)
     if retries == nil then retries = 2 end
     retries = math.max(0, math.min(5, retries))
+    local rate_retries = tonumber(opt.rate_limit_retries)
+    if rate_retries == nil then
+        rate_retries = is_weread_api_url(opt.url) and tonumber(self.rate_limit_retries) or 0
+    end
+    rate_retries = math.max(0, math.min(#RATE_LIMIT_DELAYS, rate_retries))
+    local rate_attempt = 0
     local last_text, last_code, last_headers, last_url, last_error
 
-    for attempt = 1, retries + 1 do
-        local text, code, headers, url, err = self:_request_once(opt)
-        last_text, last_code, last_headers, last_url, last_error = text, code, headers, url, err
-        if code and not transient_status(code) then return text, code, headers, url end
-        if code and transient_status(code) and attempt > retries then return text, code, headers, url end
-        if not code and attempt > retries then
-            error("network request failed: " .. tostring(err or "unknown"))
+    while true do
+        local limited_code
+        for attempt = 1, retries + 1 do
+            local text, code, headers, url, err = self:_request_once(opt)
+            last_text, last_code, last_headers, last_url, last_error = text, code, headers, url, err
+            limited_code = (tonumber(code) == 429 or tonumber(code) == 499)
+                and tostring(code) or body_rate_limit(text)
+            if limited_code then break end
+            if code and not transient_status(code) then return text, code, headers, url end
+            if code and transient_status(code) and attempt > retries then return text, code, headers, url end
+            if not code and attempt > retries then
+                error("network request failed: " .. tostring(err or "unknown"))
+            end
+            logger.warn("[MiuRead][HTTP] retry", "attempt=", tostring(attempt), "url=", tostring(url or opt.url),
+                "status=", tostring(code or err or "network"))
+            pause(math.min(2.5, 0.35 * (2 ^ (attempt - 1))))
         end
-        logger.warn("[MiuRead][HTTP] retry", "attempt=", tostring(attempt), "url=", tostring(url or opt.url),
-            "status=", tostring(code or err or "network"))
-        pause(math.min(2.5, 0.35 * (2 ^ (attempt - 1))))
+
+        if not limited_code then
+            if last_code then return last_text, last_code, last_headers, last_url end
+            error("network request failed: " .. tostring(last_error or "unknown"))
+        end
+
+        if rate_attempt >= rate_retries then
+            error("请求频率仍受限 [MiuReadRateLimit] error_code=" .. tostring(limited_code)
+                .. "：自动等待后仍未恢复，已完成进度会保留，请稍后继续。")
+        end
+
+        rate_attempt = rate_attempt + 1
+        local retry_after = tonumber(hget(last_headers, "retry-after"))
+        local wait = RATE_LIMIT_DELAYS[rate_attempt] or RATE_LIMIT_DELAYS[#RATE_LIMIT_DELAYS]
+        if retry_after then wait = math.max(wait, math.min(180, retry_after)) end
+        logger.warn("[MiuRead][HTTP] rate limited; cooling down",
+            "attempt=", tostring(rate_attempt), "wait=", tostring(wait),
+            "code=", tostring(limited_code), "url=", tostring(last_url or opt.url))
+        self:_wait_rate_limit(wait, rate_attempt, rate_retries, limited_code)
     end
-    if last_code then return last_text, last_code, last_headers, last_url end
-    error("network request failed: " .. tostring(last_error or "unknown"))
 end
 
 local AUTH_ERROR_MARKER = "[MiuReadAuth]"
@@ -214,7 +326,7 @@ local function service_error(data, url)
     local code = data.errCode or data.errcode or data.code
     local message = tostring(data.errMsg or data.errmsg or data.message or data.msg or code or "")
     local lower = message:lower()
-    if tonumber(code) == -2014 or message:find("请求频率超限", 1, true)
+    if tonumber(code) == -10102 or tonumber(code) == -2014 or message:find("请求频率超限", 1, true)
         or lower:find("rate limit", 1, true) or lower:find("too many requests", 1, true) then
         return "请求频率受限 " .. RATE_LIMIT_MARKER .. " error_code=" .. tostring(code or "rate_limit")
             .. (message ~= "" and (": " .. message) or "")
@@ -268,6 +380,7 @@ local function is_rate_limit_error(value)
     return text:find(RATE_LIMIT_MARKER, 1, true) ~= nil
         or lower:find("http 429", 1, true) ~= nil
         or lower:find("http 499", 1, true) ~= nil
+        or lower:find("error_code=-10102", 1, true) ~= nil
         or lower:find("error_code=-2014", 1, true) ~= nil
         or lower:find("rate limit", 1, true) ~= nil
         or lower:find("too many requests", 1, true) ~= nil

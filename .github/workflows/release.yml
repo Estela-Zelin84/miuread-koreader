@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v2.0.0-beta.6.1"
+        description: "Release tag, for example v2.0.0-beta.6.3"
         required: true
         type: string
 
@@ -22,10 +22,10 @@ jobs:
       RELEASE_TAG: ${{ inputs.tag }}
 
     steps:
-      - name: Check out latest main
+      - name: Check out release source
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ contains(inputs.tag, '-') && 'beta' || 'main' }}
           fetch-depth: 0
 
       - name: Validate source and version
@@ -58,8 +58,18 @@ jobs:
             exit 1
           fi
 
+          if [[ "$VERSION" == *-* ]]; then
+            SOURCE_BRANCH="beta"
+            MANIFEST_NAME="update-beta.json"
+          else
+            SOURCE_BRANCH="main"
+            MANIFEST_NAME="update.json"
+          fi
+
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "PACKAGE_NAME=miuread-v${VERSION}-full.zip" >> "$GITHUB_ENV"
+          echo "SOURCE_BRANCH=$SOURCE_BRANCH" >> "$GITHUB_ENV"
+          echo "MANIFEST_NAME=$MANIFEST_NAME" >> "$GITHUB_ENV"
 
       - name: Build full package and update manifest
         shell: bash
@@ -141,7 +151,7 @@ jobs:
               "sha256": hashlib.sha256(payload).hexdigest(),
               "notes": "完整安装包；本次修改详见 GitHub Release 说明。",
           }
-          Path("dist/update.json").write_text(
+          Path("dist", os.environ["MANIFEST_NAME"]).write_text(
               json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
               encoding="utf-8",
           )
@@ -227,13 +237,13 @@ jobs:
           else
             if [ -f "$NOTES_FILE" ]; then
               gh release create "$RELEASE_TAG" "$FILE" \
-                --target main \
+                --target "$SOURCE_BRANCH" \
                 --title "觅阅 · 微信读书助手 $VERSION" \
                 --notes-file "$NOTES_FILE" \
                 "${EXTRA_ARGS[@]}"
             else
               gh release create "$RELEASE_TAG" "$FILE" \
-                --target main \
+                --target "$SOURCE_BRANCH" \
                 --title "觅阅 · 微信读书助手 $VERSION" \
                 --notes "全量更新包。" \
                 "${EXTRA_ARGS[@]}"
@@ -257,7 +267,7 @@ jobs:
           set -euo pipefail
 
           URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$PACKAGE_NAME"
-          EXPECTED="$(python3 -c 'import json; print(json.load(open("dist/update.json"))["sha256"])')"
+          EXPECTED="$(python3 -c 'import json, os; print(json.load(open("dist/" + os.environ["MANIFEST_NAME"]))["sha256"])')"
           success=0
           for attempt in $(seq 1 12); do
             rm -f dist/public-download.zip
@@ -273,30 +283,30 @@ jobs:
             sleep 5
           done
           if [ "$success" != "1" ]; then
-            echo "::error::Release 下载地址尚不可用或校验失败；不会更新 update.json。"
+            echo "::error::Release 下载地址尚不可用或校验失败；不会更新版本清单。"
             exit 1
           fi
 
-      - name: Publish repository update.json
+      - name: Publish update manifest
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          CONTENT="$(base64 -w 0 dist/update.json)"
-          API_PATH="repos/$GITHUB_REPOSITORY/contents/update.json"
-          CURRENT_SHA="$(gh api "$API_PATH?ref=main" --jq '.sha' 2>/dev/null || true)"
+          CONTENT="$(base64 -w 0 "dist/$MANIFEST_NAME")"
+          API_PATH="repos/$GITHUB_REPOSITORY/contents/$MANIFEST_NAME"
+          CURRENT_SHA="$(gh api "$API_PATH?ref=$SOURCE_BRANCH" --jq '.sha' 2>/dev/null || true)"
 
           if [ -n "$CURRENT_SHA" ]; then
             gh api --method PUT "$API_PATH" \
-              -f message="Update manifest to $RELEASE_TAG" \
+              -f message="Update $MANIFEST_NAME to $RELEASE_TAG" \
               -f content="$CONTENT" \
-              -f branch="main" \
+              -f branch="$SOURCE_BRANCH" \
               -f sha="$CURRENT_SHA" >/dev/null
           else
             gh api --method PUT "$API_PATH" \
-              -f message="Add manifest for $RELEASE_TAG" \
+              -f message="Add $MANIFEST_NAME for $RELEASE_TAG" \
               -f content="$CONTENT" \
-              -f branch="main" >/dev/null
+              -f branch="$SOURCE_BRANCH" >/dev/null
           fi

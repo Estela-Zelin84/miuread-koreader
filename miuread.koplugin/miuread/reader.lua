@@ -827,6 +827,7 @@ function Reader:chapter(book, chapter, format, opt)
 
         logger.warn("[MiuRead][Reader] chapter retry", "chapter=", tostring(uid),
             "attempt=", tostring(attempt), "error=", tostring(a))
+        if Http.is_rate_limit_error(a) then break end
         if is_auth_error(a) and not renewed then
             renewed = true
             local renew_ok, renew_error = self:_recover_login_session()

@@ -6,6 +6,7 @@ local InternalLinks = require("miuread.internal_links")
 local Thoughts = require("miuread.thoughts")
 local Epub = require("miuread.epub")
 local Json = require("miuread.json")
+local Http = require("miuread.http")
 local U = require("miuread.util")
 local logger = require("logger")
 local ok_socket, socket = pcall(require, "socket")
@@ -1032,6 +1033,7 @@ function Downloader:book(input, opt, progress)
             local ok, downloaded, downloaded_style, downloaded_assets, state = pcall(
                 self.reader.chapter, self.reader, book, chapter, format, {images=opt.images})
             if not ok then
+                if Http.is_rate_limit_error(downloaded) then error(downloaded) end
                 if not opt.chapter_uid and type(self.reader.is_access_denied_error)=="function"
                     and self.reader.is_access_denied_error(downloaded) then
                     return mark_restricted(chapter, downloaded)

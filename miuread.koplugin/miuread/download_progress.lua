@@ -166,6 +166,7 @@ function DownloadProgress:set_state(state)
         footnotes = "处理脚注",
         images = "处理图片",
         package = "验证并生成 EPUB",
+        rate_limit = "等待请求恢复",
         done = "下载完成",
         error = "下载失败",
         cancelled = "下载已取消",
