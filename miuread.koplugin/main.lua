@@ -166,8 +166,15 @@ function Plugin:online(label,fn) if not self:is_online() then self:info(_("Netwo
 function Plugin:list(title,items,empty) if not items or #items==0 then self:info(empty or _("No items")); return end; UIManager:show(Menu:new{title=title,item_table=items,is_borderless=true,title_bar_fm_style=true}) end
 function Plugin:logged_in() local a=self.store:auth(); return a.api_key~="" and next(a.cookies or {})~=nil end
 function Plugin:require_login() if not self:logged_in() then self:info(_("Not logged in")); return false end return true end
+function Plugin:_account_status_label()
+    if not self:logged_in() then return "未登录" end
+    local auth=self.store:auth()
+    local name=U.trim(tostring((auth.account or {}).name or ""))
+    return name~="" and ("已登录 · "..name) or "已登录"
+end
 function Plugin:home_menu()
     local out={
+        {text=self:_account_status_label(),enabled=false},
         {text="我的书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)},
         {text="搜索书籍",callback=self:safe("search",function() self:search_dialog() end)},
         {text="下载管理",callback=self:safe("downloads",function() self:show_downloads() end)},
@@ -175,7 +182,7 @@ function Plugin:home_menu()
         {text="设置",sub_item_table_func=function() return self:settings_menu() end},
     }
     if self:_has_download_status() then
-        table.insert(out,1,{text=self:_download_status_label(),callback=function() self:show_download_status() end})
+        table.insert(out,2,{text=self:_download_status_label(),callback=function() self:show_download_status() end})
     end
     return out
 end
@@ -2855,7 +2862,7 @@ end
 function Plugin:settings_menu()
     return {
         {text="显示书架封面",checked_func=function() return self.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("shelf_covers") end},
-        {text="想法字体大小",sub_item_table_func=function() return self:thought_font_menu() end},
+        {text="评论字体",sub_item_table_func=function() return self:thought_font_settings_menu() end},
         {text="下载公众号文章图片",checked_func=function() return self.store:preferences().mp_images==true end,keep_menu_open=true,callback=function() self:_toggle_preference("mp_images") end},
         {text="公众号缓存",sub_item_table_func=function() return self:mp_global_cache_menu() end},
         {text="下载关键进度提示",checked_func=function() return self.store:preferences().download_notice_enabled~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_notice_enabled") end},
@@ -2868,13 +2875,75 @@ function Plugin:settings_menu()
     }
 end
 
+function Plugin:thought_font_settings_menu()
+    local prefs=self.store:preferences().thoughts or {}
+    return {
+        {text="评论字体跟随正文",checked_func=function()
+            return (self.store:preferences().thoughts or {}).follow_body_font==true
+        end,keep_menu_open=true,callback=function()
+            local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+            p.thoughts.follow_body_font=p.thoughts.follow_body_font~=true
+            self.store:save_preferences(p)
+            self:toast(p.thoughts.follow_body_font and "评论字体将跟随正文" or "评论字体已改为固定字体")
+        end},
+        {text="自动跟随时，旧机型打开评论可能会卡顿",enabled=false},
+        {text="固定字体",post_text=self:_thought_font_face_label(prefs),sub_item_table_func=function() return self:thought_font_face_menu() end},
+        {text="字体大小",sub_item_table_func=function() return self:thought_font_menu() end},
+    }
+end
+function Plugin:_thought_font_face_label(prefs)
+    prefs=prefs or (self.store:preferences().thoughts or {})
+    local name=U.trim(tostring(prefs.font_face or ""))
+    return name~="" and name or "KOReader 默认"
+end
+function Plugin:thought_font_face_menu()
+    local rows={
+        {text="KOReader 默认字体（最快）",radio=true,menu_item_id="__default__",checked_func=function()
+            return U.trim(tostring((self.store:preferences().thoughts or {}).font_face or ""))==""
+        end,callback=function()
+            local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+            p.thoughts.font_face=""; p.thoughts.follow_body_font=false
+            self.store:save_preferences(p); self:toast("评论字体已设为 KOReader 默认字体")
+        end},
+    }
+    local ok,faces=pcall(function()
+        local cre=require("document/credocument"):engineInit()
+        return cre and cre.getFontFaces and cre.getFontFaces() or {}
+    end)
+    if not ok or type(faces)~="table" then
+        rows[#rows+1]={text="无法读取设备字体列表",enabled=false}
+        return rows
+    end
+    local unique,list={},{}
+    for _,face in ipairs(faces) do
+        face=U.trim(tostring(face or ""))
+        if face~="" and not unique[face] then unique[face]=true; list[#list+1]=face end
+    end
+    table.sort(list,function(a,b) return a:lower()<b:lower() end)
+    for _,face in ipairs(list) do
+        local selected=face
+        rows[#rows+1]={text=selected,radio=true,menu_item_id=selected,checked_func=function()
+            return tostring((self.store:preferences().thoughts or {}).font_face or "")==selected
+        end,callback=function()
+            local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+            p.thoughts.font_face=selected; p.thoughts.follow_body_font=false
+            self.store:save_preferences(p); self:toast("评论字体已设为："..selected)
+        end}
+    end
+    rows.max_per_page=7
+    rows.open_on_menu_item_id_func=function()
+        local face=U.trim(tostring((self.store:preferences().thoughts or {}).font_face or ""))
+        return face~="" and face or "__default__"
+    end
+    return rows
+end
 function Plugin:thought_font_menu()
     local choices={{"standard","较小（默认）"},{"large","适中"},{"xlarge","接近正文"}}
     local rows={}
     for _,choice in ipairs(choices) do
         local key,label=choice[1],choice[2]
         rows[#rows+1]={text=label,radio=true,checked_func=function() return (self.store:preferences().thoughts or {}).font==key end,callback=function()
-            local p=self.store:preferences(); p.thoughts=p.thoughts or {}; p.thoughts.font=key; self.store:save_preferences(p); self:toast("想法字体已设为："..label)
+            local p=self.store:preferences(); p.thoughts=p.thoughts or {}; p.thoughts.font=key; self.store:save_preferences(p); self:toast("评论字体大小已设为："..label)
         end}
     end
     return rows
@@ -3023,7 +3092,11 @@ local function usable_font_name(value)
     if value=="" then return nil end
     return value
 end
-function Plugin:_thought_font_name()
+function Plugin:_thought_font_name(prefs)
+    prefs=prefs or (self.store:preferences().thoughts or {})
+    if prefs.follow_body_font~=true then
+        return usable_font_name(prefs.font_face)
+    end
     local name=usable_font_name(self.ui and self.ui.font and self.ui.font.font_face)
     if name then return name end
 
@@ -3059,7 +3132,7 @@ function Plugin:_show_thought_href(href)
             source_html=source_html,
             html=html,
             font_size=self:_thought_font_size(prefs.font),
-            font_name=self:_thought_font_name(),
+            font_name=self:_thought_font_name(prefs),
             width_ratio=tonumber(prefs.width_ratio) or 0.91,
             height_ratio=tonumber(prefs.height_ratio) or 0.60,
             css=Thoughts.popup_css(),

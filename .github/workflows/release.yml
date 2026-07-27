@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v2.0.0-beta.6.3"
+        description: "Release tag, for example v2.0.0-beta.6.4"
         required: true
         type: string
 
@@ -45,6 +45,7 @@ jobs:
           grep -Fq "version = \"$VERSION\"" miuread.koplugin/_meta.lua
           grep -Fq "VERSION = \"$VERSION\"" miuread.koplugin/miuread/config.lua
           grep -Fq '觅阅 · 微信读书助手' miuread.koplugin/_meta.lua
+          test -f "CHANGELOG-$VERSION.txt"
 
           if find miuread.koplugin -type f \( \
               -iname '*.md' -o \
@@ -136,9 +137,14 @@ jobs:
               f"https://github.com/{repo}/releases/download/"
               f"v{version}/{package_name}"
           )
+          notes_path = Path(f"CHANGELOG-{version}.txt")
+          notes = notes_path.read_text(encoding="utf-8").strip()
+          if not notes:
+              notes = "全量更新包。"
           manifest = {
               "version": version,
               "name": f"觅阅 · 微信读书助手 {version}",
+              "channel": "beta" if "-" in version else "stable",
               "package_type": "full",
               "package_url": official,
               "package_urls": [
@@ -149,7 +155,7 @@ jobs:
               ],
               "size": len(payload),
               "sha256": hashlib.sha256(payload).hexdigest(),
-              "notes": "完整安装包；本次修改详见 GitHub Release 说明。",
+              "notes": notes,
           }
           Path("dist", os.environ["MANIFEST_NAME"]).write_text(
               json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -234,6 +240,11 @@ jobs:
                 --jq '.assets[].name'
             )
             gh release upload "$RELEASE_TAG" "$FILE"
+            if [ -f "$NOTES_FILE" ]; then
+              gh release edit "$RELEASE_TAG" \
+                --title "觅阅 · 微信读书助手 $VERSION" \
+                --notes-file "$NOTES_FILE"
+            fi
           else
             if [ -f "$NOTES_FILE" ]; then
               gh release create "$RELEASE_TAG" "$FILE" \

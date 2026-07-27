@@ -90,6 +90,7 @@ function Auth:_finish(data)
 
     local user,user_headers=self.http:get_json(BASE.."/api/userInfo?userVid="..Protocol.escape(vid),{auth=false,headers=merge_auth_headers(session,vid,key)})
     session=Cookies.session_absorb(session,header_value(user_headers,"set-cookie"))
+    local account_name=tostring(user.name or user.nickName or user.nickname or user.userName or "")
     local skill,skill_headers=self.http:get_json(BASE.."/api/skills/apikeyGet?only_show=1",{auth=false,headers=merge_auth_headers(session,vid,key)})
     session=Cookies.session_absorb(session,header_value(skill_headers,"set-cookie"))
     local api_key=skill_api_key(skill)
@@ -129,7 +130,7 @@ function Auth:_finish(data)
     self.store:save_auth({
         api_key=api_key,cookies=jar,wr_ticket=wr_ticket,wr_wrpa=wr_wrpa,
         ticket_updated_at=(wr_ticket~="" or wr_wrpa~="") and os.time() or 0,
-        account={name=tostring(user.name or ""),vid=vid,logged_at=os.time()},
+        account={name=account_name,vid=vid,logged_at=os.time()},
     })
     logger.info("[MiuRead][Auth] QR session finalized",
         "session_cookies=",tostring(cookie_count(session)),
@@ -138,7 +139,7 @@ function Auth:_finish(data)
         "renewal_succ=",tostring(renewal_succ),
         "ticket=",tostring(wr_ticket~=""),
         "wrpa=",tostring(wr_wrpa~=""))
-    return user.name or vid
+    return account_name~="" and account_name or vid
 end
 
 function Auth:_show_retry(message)

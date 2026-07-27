@@ -9,7 +9,7 @@ local defaults={
  schema=Config.SCHEMA,
  auth={api_key="",cookies={},wr_ticket="",wr_wrpa="",ticket_updated_at=0,
      account={name="",vid="",logged_at=0}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
@@ -651,6 +651,14 @@ function Store:migrate()
             -- beta.6.1 removes beta.6.0's persistent external-EPUB negative cache.
             -- A temporary identification failure must not hide an existing book.
             self.db:saveSetting("external_epub_cache",{})
+        end
+        if schema<51 then
+            -- beta.6.4 gives comments their own fixed font by default. Following
+            -- the current book font remains optional because resolving and
+            -- embedding a changing book font can delay older devices.
+            p.thoughts=p.thoughts or {}
+            if p.thoughts.follow_body_font==nil then p.thoughts.follow_body_font=false end
+            if p.thoughts.font_face==nil then p.thoughts.font_face="" end
         end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)
