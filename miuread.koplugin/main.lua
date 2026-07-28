@@ -2122,8 +2122,7 @@ function Plugin:_download_status_label()
         end
         if state.stage=="restart" then return "后台下载 · 正在从断点恢复" end
         if state.waiting_network==true then return "后台下载 · 等待网络" end
-        local title=tostring(state.title or "未命名")
-        if #title>16 then title=title:sub(1,16).."…" end
+        local title=U.utf8_truncate(state.title or "未命名",9)
         return "后台下载：《"..title.."》 "..tostring(self:_download_percent(state)).."%"
     end
     if state.status=="pending_install" then return "后台下载 · 等待更新" end

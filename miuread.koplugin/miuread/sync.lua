@@ -14,7 +14,7 @@ local Sync = {}
 Sync.__index = Sync
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 6
+local READ_REPORT_SERVICE_VERSION = 8
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
 
@@ -321,7 +321,8 @@ function Sync:new(reader, api, store, host, async)
         verified_remote_percent=nil, verification_ttl=4 * 60 * 60,
         daemon=nil, daemon_poll=nil, daemon_status_stamp=nil,
         daemon_context=nil, daemon_last_persist=0, daemon_generation=0,
-        daemon_restart_count=0,
+        daemon_restart_count=0, auth_recovery_busy=false, auth_recovery_at=0,
+        daemon_auth_retry_at=0,
         control_write_task=nil, session_started_at=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
         time_enabled=(store:preferences().sync or {}).time_enabled==true,
@@ -651,6 +652,39 @@ function Sync:mark_verified(book_id, reason, local_percent, remote_percent)
     return true
 end
 
+function Sync:_save_local_snapshot(book_id,position)
+    if type(position)~="table" or tostring(book_id or "")=="" then return end
+    local snapshot=U.copy(position)
+    snapshot.captured_at=os.time()
+    self.store:save_session(book_id,{local_position_snapshot=snapshot})
+end
+
+function Sync:_recover_auth_once(channel,error,on_done)
+    local now=os.time()
+    if self.auth_recovery_busy or now-(tonumber(self.auth_recovery_at) or 0)<60 then
+        if on_done then on_done(false,"登录恢复正在进行或刚刚尝试过") end
+        return false
+    end
+    self.auth_recovery_busy=true
+    self.auth_recovery_at=now
+    UIManager:scheduleIn(.1,function()
+        local called,renewed,detail=pcall(self.reader._recover_login_session,self.reader)
+        self.auth_recovery_busy=false
+        local success=called and renewed==true
+        if success then
+            if self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,channel) end
+            logger.info("[MiuRead][Sync] parent login recovery succeeded","channel=",tostring(channel))
+        else
+            local reason=called and detail or renewed
+            logger.warn("[MiuRead][Sync] parent login recovery failed","channel=",tostring(channel),
+                "error=",U.first_line(reason or error,180))
+            if self.host.on_auth_required then pcall(self.host.on_auth_required,self.host,channel,reason or error) end
+        end
+        if on_done then on_done(success,detail) end
+    end)
+    return true
+end
+
 function Sync:_prepare_context(record, ratio, session, force)
     local book_id = record.book.book_id
     local saved = type(session.report_context) == "table" and session.report_context or session
@@ -688,6 +722,7 @@ function Sync:upload(elapsed, callback, options)
     local session = self.store:session(book_id) or {}
     local auth = self.store:auth()
     local ratio = self:local_ratio() or 0
+    local auth_channel=options.progress_only and "progress" or "read_report"
     local chapters = (record.record and record.record.chapter_map) or record.book.catalog or {}
     -- Keep the old worker's own field names and cached context isolated from
     -- MiuRead's newer protocol model. On first use it refreshes the reader page,
@@ -698,14 +733,7 @@ function Sync:upload(elapsed, callback, options)
     legacy_book.title = record.book.title
     self:_decorate_legacy_context(legacy_book, record)
     local position_snapshot=self:local_position(ratio)
-    if position_snapshot then
-        legacy_book.chapter_uid=position_snapshot.chapter_uid or legacy_book.chapter_uid
-        legacy_book.chapter_idx=position_snapshot.chapter_index or legacy_book.chapter_idx
-        legacy_book.chapter_offset=position_snapshot.offset or legacy_book.chapter_offset
-        legacy_book.progress=position_snapshot.progress or legacy_book.progress
-        legacy_book.summary=position_snapshot.summary or record.book.title
-        legacy_book.saved_position_at=os.time()
-    end
+    self:_save_local_snapshot(book_id,position_snapshot)
 
     self.busy, self.state, self.last_attempt = true, options.progress_only and "progress_uploading" or "uploading", os.time()
     self.last_stage = options.progress_only and "主动提交阅读进度" or "调用兼容阅读时间上传链路"
@@ -727,12 +755,24 @@ function Sync:upload(elapsed, callback, options)
         self.state = self.progress_hold and "verification_required" or "waiting"
         self.store:reload()
         if not result.ok or type(result.value) ~= "table" then
-            self.consecutive_failures = self.consecutive_failures + 1
             self.last_error = result.error or "阅读时间工作器无结果"
             self.last_stage = "工作器失败"
             logger.warn("[MiuRead][ReadReport] worker failed", tostring(self.last_error))
+            if Http.is_auth_error(self.last_error) and options.auth_retried~=true then
+                local retry_options=U.copy(options); retry_options.auth_retried=true
+                self:_recover_auth_once(auth_channel,self.last_error,function(recovered)
+                    if recovered then self:upload(elapsed,callback,retry_options)
+                    else
+                        self.consecutive_failures=self.consecutive_failures+1
+                        self:_notify_failure()
+                        if callback then callback(false,self.last_error) end
+                    end
+                end)
+                return
+            end
+            self.consecutive_failures = self.consecutive_failures + 1
             if Http.is_auth_error(self.last_error) and self.host.on_auth_required then
-                pcall(self.host.on_auth_required,self.host,"read_report",self.last_error)
+                pcall(self.host.on_auth_required,self.host,auth_channel,self.last_error)
             end
             self:_notify_failure()
             if callback then callback(false, self.last_error) end
@@ -772,11 +812,24 @@ function Sync:upload(elapsed, callback, options)
         })
 
         if not value.accepted then
+            local rejected_auth=tostring(value.error_kind or "")=="authentication" or Http.is_auth_error(value.error)
+            local target_label=options.progress_only and "阅读进度" or "阅读时长"
+            self.last_error = "微信读书未确认接收"..target_label.."（" .. tostring(value.error or "unknown") .. "）"
+            if rejected_auth and options.auth_retried~=true then
+                local retry_options=U.copy(options); retry_options.auth_retried=true
+                self:_recover_auth_once(auth_channel,value.error or self.last_error,function(recovered)
+                    if recovered then self:upload(elapsed,callback,retry_options)
+                    else
+                        self.consecutive_failures=self.consecutive_failures+1
+                        self:_notify_failure()
+                        if callback then callback(false,self.last_error,position,value) end
+                    end
+                end)
+                return
+            end
             self.consecutive_failures = self.consecutive_failures + 1
-            self.last_error = "微信读书未确认接收阅读时长（" .. tostring(value.error or "unknown") .. "）"
-            if (tostring(value.error_kind or "")=="authentication" or Http.is_auth_error(value.error))
-                and self.host.on_auth_required then
-                pcall(self.host.on_auth_required,self.host,"read_report",value.error or self.last_error)
+            if rejected_auth and self.host.on_auth_required then
+                pcall(self.host.on_auth_required,self.host,auth_channel,value.error or self.last_error)
             end
             self.store:save_session(book_id, {
                 last_error=self.last_error,
@@ -959,7 +1012,7 @@ function Sync:_retire_legacy_daemon()
     -- current version. This prevents an OTA reload from leaving an older
     -- process uploading stale book or position data.
     local base = self.store.temp_dir .. "/readtime-service"
-    for _, suffix in ipairs({"", "-v1", "-v2", "-v3", "-v4", "-v5"}) do
+    for _, suffix in ipairs({"", "-v1", "-v2", "-v3", "-v4", "-v5", "-v6", "-v7"}) do
         U.atomic_write(base .. suffix .. ".stop", "1", true)
     end
 end
@@ -1269,8 +1322,19 @@ function Sync:_import_daemon_status(force)
         self.last_error = tostring(status.error)
         self.last_stage=error_kind=="authentication" and "登录验证失败，阅读时间已保留并等待自动重试"
             or (error_kind=="context" and "阅读上下文暂时无效，等待自动刷新" or "后台上传失败，等待自动重试")
-        if error_kind=="authentication" and self.consecutive_failures>=2 and self.host.on_auth_required then
-            pcall(self.host.on_auth_required,self.host,"read_report",self.last_error)
+        if error_kind=="authentication" then
+            local retry_now=os.time()
+            if retry_now-(tonumber(self.daemon_auth_retry_at) or 0)>=60 then
+                self.daemon_auth_retry_at=retry_now
+                self:_recover_auth_once("read_report",self.last_error,function(recovered)
+                    if recovered and not self.suspended and self.store:preferences().sync.time_enabled then
+                        self:_stop_daemon("auth_recovered",true)
+                        UIManager:scheduleIn(1,function() self:start("auth_recovered") end)
+                    end
+                end)
+            elseif self.consecutive_failures>=2 and self.host.on_auth_required then
+                pcall(self.host.on_auth_required,self.host,"read_report",self.last_error)
+            end
         end
         if final_flush then
             logger.warn("[MiuRead][ReadReport] final upload failed",
@@ -1368,14 +1432,7 @@ function Sync:_start_daemon(reason)
     legacy_book.title = record.book.title
     self:_decorate_legacy_context(legacy_book, record)
     local position_snapshot=self:local_position()
-    if position_snapshot then
-        legacy_book.chapter_uid=position_snapshot.chapter_uid or legacy_book.chapter_uid
-        legacy_book.chapter_idx=position_snapshot.chapter_index or legacy_book.chapter_idx
-        legacy_book.chapter_offset=position_snapshot.offset or legacy_book.chapter_offset
-        legacy_book.progress=position_snapshot.progress or legacy_book.progress
-        legacy_book.summary=position_snapshot.summary or record.book.title
-        legacy_book.saved_position_at=os.time()
-    end
+    self:_save_local_snapshot(book_id,position_snapshot)
 
     local existing_control = read_json_file(daemon.paths.control) or {}
     local existing_status = read_json_file(daemon.paths.status) or {}

@@ -19,6 +19,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
+local U = require("miuread.util")
 
 local Screen = Device.screen
 local DIVIDER_COLOR = Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
@@ -50,7 +51,7 @@ local function supported_image(path)
 end
 
 local function placeholder(cover_w,cover_h,title)
-    local mark=tostring(title or "书"):gsub("^%s+",""):sub(1,1)
+    local mark=U.utf8_sub(tostring(title or "书"):gsub("^%s+",""),1,1)
     if mark=="" then mark="书" end
     return FrameContainer:new{
         width=cover_w,

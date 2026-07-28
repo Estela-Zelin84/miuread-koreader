@@ -3,6 +3,7 @@ local Client = require("miuread.legacy.client")
 local Content = require("miuread.legacy.content")
 local WeRead = require("miuread.legacy.weread")
 local Http = require("miuread.http")
+local U = require("miuread.util")
 
 local Worker = {}
 
@@ -136,7 +137,7 @@ local function result_summary(result)
     end
     if err_message ~= nil then
         parts[#parts + 1] = "error_message="
-            .. tostring(err_message):gsub("[%c]+", " "):sub(1, 160)
+            .. U.first_line(tostring(err_message):gsub("[%c]+", " "), 160)
     end
     return table.concat(parts, ", ")
 end
@@ -331,7 +332,7 @@ end
 local function build_payload(book_id, elapsed_seconds, book, progress_ratio)
     local position, position_error = estimate_position(book, progress_ratio)
     if not position then return nil, position_error end
-    return WeRead.make_read_payload{
+    local payload=WeRead.make_read_payload{
         book_id = book_id,
         chapter_uid = position.chapter_uid,
         chapter_idx = position.chapter_idx,
@@ -343,28 +344,41 @@ local function build_payload(book_id, elapsed_seconds, book, progress_ratio)
         psvts = book.psvts,
         pclts = book.pclts,
         token = book.token,
-    }, position
+    }
+    local public={
+        ci=tonumber(payload.ci), co=tonumber(payload.co), pr=tonumber(payload.pr), rt=tonumber(payload.rt),
+        has_app_id=tostring(payload.appId or "")~="", has_ps=tostring(payload.ps or "")~="",
+        has_pc=tostring(payload.pc or "")~="", has_signature=tostring(payload.s or "")~="",
+        token_source=tostring(book.token or "")~="" and "reader_context" or "default",
+        pc_source=tostring(book.pclts or "")~="" and "reader_context" or "generated",
+        payload_fields_complete=tostring(payload.appId or "")~="" and tostring(payload.ps or "")~=""
+            and tostring(payload.pc or "")~="" and tostring(payload.s or "")~="",
+        position_source=position.source,
+    }
+    return payload, position, public
 end
 
 local function attempt_report(client, book_id, elapsed_seconds, book, progress_ratio)
-    local payload, position_or_error = build_payload(book_id, elapsed_seconds, book, progress_ratio)
+    local payload, position_or_error, payload_public = build_payload(book_id, elapsed_seconds, book, progress_ratio)
     if not payload then
-        return false, nil, tostring(position_or_error or "reading position unavailable"), "position"
+        return false, nil, tostring(position_or_error or "reading position unavailable"), "position", nil,
+            {payload_fields_complete=false}
     end
     local referer = book.reader_url or WeRead.reader_url(book_id)
-    local ok, result = pcall(function()
+    local ok, result, code, headers = pcall(function()
         return client:report_read(payload, referer)
     end)
+    local meta={code=tonumber(code),has_headers=type(headers)=="table"}
     if not ok then
         local message=tostring(result)
         local kind=Http.is_auth_error(message) and "authentication"
             or ((Http.is_network_error and Http.is_network_error(message)) and "transport" or "server")
-        return false, nil, message, kind
+        return false, nil, message, kind, position_or_error, payload_public, meta
     end
     if read_report_accepted(result) then
-        return true, result, nil, nil, position_or_error
+        return true, result, nil, nil, position_or_error, payload_public, meta
     end
-    return false, result, result_summary(result), "server"
+    return false, result, result_summary(result), "server", position_or_error, payload_public, meta
 end
 
 local BOOK_PATCH_KEYS = {
@@ -458,15 +472,18 @@ function Worker.run(job)
     book = context_or_error
     context_changed = initial_context_changed == true
 
-    local accepted, result, first_error, first_kind, first_position = attempt_report(
+    local accepted, result, first_error, first_kind, first_position, first_public, first_meta = attempt_report(
         client, book_id, elapsed_seconds, book, progress_ratio
     )
+    local latest_public,latest_meta=first_public,first_meta
     if accepted then
         return finish(settings, book, {
             ok = true,
             result = confirmation(result),
             path = "initial",
             position = first_position,
+            payload_public = latest_public,
+            meta = latest_meta,
         }, context_changed)
     end
     if first_kind == "transport" then
@@ -474,26 +491,34 @@ function Worker.run(job)
             ok = false,
             error = first_error,
             error_kind = "transport",
+            payload_public = latest_public,
+            meta = latest_meta,
         }, context_changed)
     end
 
     local first_failure = first_error
+    local retry_kind
     local refresh_ok, refreshed_or_error, refreshed_changed = pcall(function()
         return refresh_context(client, book_id, book, true)
     end)
     if refresh_ok then
         book = refreshed_or_error
         context_changed = context_changed or refreshed_changed == true
-        local retry_accepted, retry_result, retry_error, _, retry_position = attempt_report(
+        local retry_accepted, retry_result, retry_error, kind, retry_position, retry_public, retry_meta = attempt_report(
             client, book_id, elapsed_seconds, book, progress_ratio
         )
+        retry_kind=kind
+        latest_public=retry_public or latest_public
+        latest_meta=retry_meta or latest_meta
         if retry_accepted then
             return finish(settings, book, {
                 ok = true,
                 result = confirmation(retry_result),
                 path = "context_refresh",
                 position = retry_position,
-        }, context_changed)
+                payload_public = latest_public,
+                meta = latest_meta,
+            }, context_changed)
         end
         first_failure = "initial=" .. tostring(first_failure)
             .. "; refreshed=" .. tostring(retry_error)
@@ -506,7 +531,10 @@ function Worker.run(job)
         return finish(settings, book, {
             ok = false,
             error = first_failure,
-            error_kind = "server",
+            error_kind = (first_kind == "authentication" or retry_kind == "authentication")
+                and "authentication" or "server",
+            payload_public = latest_public,
+            meta = latest_meta,
         }, context_changed)
     end
 
@@ -520,6 +548,8 @@ function Worker.run(job)
             error = first_failure .. "; renewal=" .. renewal_error,
             error_kind = "authentication",
             renewal_attempted = true,
+            payload_public = latest_public,
+            meta = latest_meta,
         }, context_changed)
     end
 
@@ -532,14 +562,18 @@ function Worker.run(job)
             error = first_failure .. "; final_context=" .. tostring(final_book_or_error),
             error_kind = "context",
             renewal_attempted = true,
+            payload_public = latest_public,
+            meta = latest_meta,
         }, context_changed)
     end
     book = final_book_or_error
     context_changed = context_changed or final_context_changed == true
 
-    local final_accepted, final_result, final_error, final_kind, final_position = attempt_report(
+    local final_accepted, final_result, final_error, final_kind, final_position, final_public, final_meta = attempt_report(
         client, book_id, elapsed_seconds, book, progress_ratio
     )
+    latest_public=final_public or latest_public
+    latest_meta=final_meta or latest_meta
     if final_accepted then
         return finish(settings, book, {
             ok = true,
@@ -547,6 +581,8 @@ function Worker.run(job)
             path = "cookie_renewal",
             renewal_attempted = true,
             position = final_position,
+            payload_public = latest_public,
+            meta = latest_meta,
         }, context_changed)
     end
 
@@ -555,7 +591,9 @@ function Worker.run(job)
         error = first_failure .. "; final=" .. tostring(final_error),
         error_kind = final_kind or "server",
         renewal_attempted = true,
-        }, context_changed)
+        payload_public = latest_public,
+        meta = latest_meta,
+    }, context_changed)
 end
 
 return Worker

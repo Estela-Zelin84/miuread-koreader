@@ -122,6 +122,7 @@ local function public_result(result)
         response_summary = result.response_summary,
         attempts = result.attempts,
         payload_public = result.payload_public,
+        meta = result.meta,
     }
 end
 
@@ -166,7 +167,7 @@ function Service.run(job)
             api_key = auth.api_key or "",
             wr_ticket = auth.wr_ticket or "",
             wr_wrpa = auth.wr_wrpa or "",
-            allow_renewal = true,
+            allow_renewal = false,
         }
         local attempted_at = os.time()
         local ok, result = pcall(Adapter.run, report_job)

@@ -210,7 +210,7 @@ function Auth:_begin(refresh_count)
         if gen~=self.generation or not self.active then return end
         local ok,uid=pcall(self._uid,self)
         if not ok then
-            logger.warn("[MiuRead][Auth] QR creation failed", tostring(uid):gsub("[%c]+"," "):sub(1,180))
+            logger.warn("[MiuRead][Auth] QR creation failed", Util.first_line(tostring(uid):gsub("[%c]+"," "),180))
             self:_show_retry("二维码获取失败："..Util.first_line(uid,120))
             return
         end
@@ -264,7 +264,7 @@ function Auth:_schedule(uid,gen,otp)
             end
             self.poll_failures=(self.poll_failures or 0)+1
             if self.poll_failures==1 or self.poll_failures%5==0 then
-                logger.warn("[MiuRead][Auth] login poll failed", tostring(data):gsub("[%c]+"," "):sub(1,180))
+                logger.warn("[MiuRead][Auth] login poll failed", Util.first_line(tostring(data):gsub("[%c]+"," "),180))
             end
             self:_schedule(uid,gen,otp); return
         end

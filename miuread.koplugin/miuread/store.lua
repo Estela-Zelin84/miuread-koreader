@@ -780,6 +780,24 @@ function Store:migrate()
             local auth=invalidate_upload_health_table(self.db:readSetting("auth",{}) or {})
             self.db:saveSetting("auth",auth)
         end
+        if schema<59 then
+            -- 2.3.3 keeps all account, local-book, checkpoint, annotation and
+            -- pending reading-time data, but discards protocol contexts that
+            -- may combine a local snapshot with a different reader-page state.
+            local sessions=self.db:readSetting("sessions",{}) or {}
+            local cleaned,changed=invalidate_report_contexts_table(sessions)
+            for _,session in pairs(cleaned) do
+                if type(session)=="table" then
+                    if session.progress_sync_state=="mapping_pending"
+                        or session.progress_sync_state=="uploading" then
+                        session.progress_sync_state=nil; changed=changed+1
+                    end
+                    session.pending_report_seconds=math.max(0,math.floor(tonumber(session.pending_report_seconds) or 0))
+                end
+            end
+            if changed>0 then self.db:saveSetting("sessions",cleaned) end
+            self.db:saveSetting("auth",invalidate_upload_health_table(self.db:readSetting("auth",{}) or {}))
+        end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)
     end

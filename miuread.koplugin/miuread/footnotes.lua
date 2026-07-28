@@ -18,6 +18,7 @@ local ok_ffiutil, ffiutil = pcall(require, "ffi/util")
 local ok_logger, logger = pcall(require, "logger")
 if not ok_logger then logger = nil end
 local ok_util, util = pcall(require, "util")
+local MiuUtil = require("miuread.util")
 
 local LOG_MODULE = "[MiuRead][Footnotes]"
 local Footnotes = {}
@@ -383,8 +384,7 @@ end
 local function ref_display(inner)
     local display = strip_tags(inner)
     if display == "" then return "*" end
-    if #display > 24 then return display:sub(1, 24) end
-    return display
+    return MiuUtil.utf8_truncate(display, 24, "")
 end
 
 local function looks_like_footnote_ref(attrs, href, inner)
