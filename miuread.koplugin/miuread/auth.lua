@@ -117,7 +117,8 @@ function Auth:_finish(data)
     local wr_ticket,wr_wrpa="",""
     if renewal_ok then
         session=Cookies.session_absorb(session,header_value(renewal_headers,"set-cookie"))
-        renewal_succ=type(renewal)=="table" and (renewal.succ==true or tostring(renewal.succ)=="1")
+        renewal_succ=type(renewal)=="table"
+            and renewal.succ~=false and tostring(renewal.succ or "")~="0"
         wr_ticket=tostring(header_value(renewal_headers,"x-wr-ticket") or "")
         wr_wrpa=tostring(header_value(renewal_headers,"x-wrpa-0") or "")
     else
@@ -136,7 +137,7 @@ function Auth:_finish(data)
         ticket_updated_at=(wr_ticket~="" or wr_wrpa~="") and now or 0,
         account={name=account_name,vid=vid,logged_at=now},
         health={
-            state=web_ready and "ok" or "unknown",last_checked_at=now,last_ok_at=now,last_error_at=0,
+            state=web_ready and "ok" or "unknown",last_checked_at=now,last_ok_at=web_ready and now or 0,last_error_at=0,
             last_error_code="",last_error_message="",last_error_channel="",notice_pending=false,
             channels={
                 shelf=Util.copy(ok_channel),progress=Util.copy(ok_channel),
@@ -209,7 +210,7 @@ function Auth:_begin(refresh_count)
         if gen~=self.generation or not self.active then return end
         local ok,uid=pcall(self._uid,self)
         if not ok then
-            logger.warn("[MiuRead][Auth] QR creation failed", tostring(uid):gsub("[%c]+"," "):sub(1,180))
+            logger.warn("[MiuRead][Auth] QR creation failed", Util.first_line(tostring(uid):gsub("[%c]+"," "),180))
             self:_show_retry("二维码获取失败："..Util.first_line(uid,120))
             return
         end
@@ -263,7 +264,7 @@ function Auth:_schedule(uid,gen,otp)
             end
             self.poll_failures=(self.poll_failures or 0)+1
             if self.poll_failures==1 or self.poll_failures%5==0 then
-                logger.warn("[MiuRead][Auth] login poll failed", tostring(data):gsub("[%c]+"," "):sub(1,180))
+                logger.warn("[MiuRead][Auth] login poll failed", Util.first_line(tostring(data):gsub("[%c]+"," "),180))
             end
             self:_schedule(uid,gen,otp); return
         end

@@ -9,7 +9,98 @@ function U.merge(a,b)
     local o=U.copy(a or {}); for k,v in pairs(b or {}) do if type(v)=="table" and type(o[k])=="table" then o[k]=U.merge(o[k],v) else o[k]=U.copy(v) end end; return o
 end
 function U.trim(s) return (tostring(s or ""):gsub("^%s+",""):gsub("%s+$","")) end
-function U.first_line(s,n) local v=tostring(s or ""):match("^[^\r\n]*") or ""; n=n or 240; return #v>n and v:sub(1,n).."…" or v end
+local function utf8_sequence_length(first)
+    if not first then return 0 end
+    if first < 0x80 then return 1 end
+    if first >= 0xC2 and first <= 0xDF then return 2 end
+    if first >= 0xE0 and first <= 0xEF then return 3 end
+    if first >= 0xF0 and first <= 0xF4 then return 4 end
+    return 0
+end
+local function utf8_char_end(value,index)
+    local first=value:byte(index)
+    local length=utf8_sequence_length(first)
+    if length==0 then return index,false end
+    if length==1 then return index,true end
+    if index+length-1>#value then return index,false end
+    local second=value:byte(index+1)
+    if not second or second<0x80 or second>0xBF then return index,false end
+    if length>=3 then
+        if first==0xE0 and second<0xA0 then return index,false end
+        if first==0xED and second>0x9F then return index,false end
+        local third=value:byte(index+2)
+        if not third or third<0x80 or third>0xBF then return index,false end
+    end
+    if length==4 then
+        if first==0xF0 and second<0x90 then return index,false end
+        if first==0xF4 and second>0x8F then return index,false end
+        local fourth=value:byte(index+3)
+        if not fourth or fourth<0x80 or fourth>0xBF then return index,false end
+    end
+    return index+length-1,true
+end
+function U.is_valid_utf8(value)
+    value=tostring(value or "")
+    local index=1
+    while index<=#value do
+        local ending,valid=utf8_char_end(value,index)
+        if not valid then return false,index end
+        index=ending+1
+    end
+    return true
+end
+function U.utf8_len(value)
+    value=tostring(value or "")
+    local index,count=1,0
+    while index<=#value do
+        local ending=utf8_char_end(value,index)
+        index=ending+1
+        count=count+1
+    end
+    return count
+end
+function U.utf8_sub(value,first,last)
+    value=tostring(value or "")
+    first=math.floor(tonumber(first) or 1)
+    last=last==nil and math.huge or math.floor(tonumber(last) or 0)
+    if first<1 then first=1 end
+    if last<first or value=="" then return "" end
+    local index,count,start_byte,end_byte=1,0,nil,nil
+    while index<=#value do
+        count=count+1
+        local ending=utf8_char_end(value,index)
+        if count==first then start_byte=index end
+        if count<=last then end_byte=ending end
+        if count>=last then break end
+        index=ending+1
+    end
+    if not start_byte then return "" end
+    return value:sub(start_byte,end_byte or #value)
+end
+function U.utf8_truncate(value,max_chars,ellipsis)
+    value=tostring(value or "")
+    max_chars=math.max(0,math.floor(tonumber(max_chars) or 0))
+    ellipsis=ellipsis==nil and "…" or tostring(ellipsis)
+    if max_chars==0 then return value=="" and "" or ellipsis end
+    local index,count,last_end=1,0,0
+    while index<=#value and count<max_chars do
+        local ending=utf8_char_end(value,index)
+        count=count+1
+        last_end=ending
+        index=ending+1
+    end
+    if index>#value then return value end
+    return value:sub(1,last_end)..ellipsis
+end
+function U.contains_replacement_char(value)
+    return tostring(value or ""):find("\239\191\189",1,true)~=nil
+end
+function U.replacement_char_count(value)
+    local text=tostring(value or "")
+    local _,count=text:gsub("\239\191\189","")
+    return count
+end
+function U.first_line(s,n) local v=tostring(s or ""):match("^[^\r\n]*") or ""; return U.utf8_truncate(v,n or 240) end
 function U.safe_name(s,f) local v=U.trim(tostring(s or ""):gsub("[%z%c/\\:%*%?\"<>|]","_")):gsub("%s+"," "); return v~="" and v or (f or "item") end
 function U.id_name(s) local v=tostring(s or ""):gsub("[^%w%._%-]","_"); return v~="" and v or "unknown" end
 function U.xml(s) return (tostring(s or ""):gsub("&","&amp;"):gsub("<","&lt;"):gsub(">","&gt;"):gsub('"',"&quot;"):gsub("'","&apos;")) end

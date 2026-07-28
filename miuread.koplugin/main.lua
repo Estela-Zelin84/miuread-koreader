@@ -109,12 +109,20 @@ function Plugin:init()
         self.store:save_cover_guard({active=false,started_at=0,stage="",version=Config.VERSION})
     end
 
+    local startup_download_state=self.store:download_state()
+    if startup_download_state.status=="completed" then
+        self.store:clear_download_state()
+    end
     local recovered=self:_recover_download_state()
     if not recovered then UIManager:scheduleIn(1.0,function() self:_start_next_queued_download() end) end
     Actions.register()
     self.ui.menu:registerToMainMenu(self)
     local state=self.updater:startup()
-    if state=="updated" then UIManager:scheduleIn(1,function() self:toast(_("Update installed"),3) end) end
+    if state=="updated" then
+        UIManager:scheduleIn(1,function() self:status_toast("更新完成","当前运行版本 "..tostring(self.version),4) end)
+    elseif state=="mismatch" then
+        UIManager:scheduleIn(1,function() self:info("更新文件已经替换，但当前运行版本与目标版本不一致。\n\n请完整退出并重新启动 KOReader。\n当前运行："..tostring(self.version)) end)
+    end
     UIManager:scheduleIn(.8,function() if not self:_current_document_path() then self:_install_pending_downloads(false) end end)
     UIManager:scheduleIn(1.2,function() self:_show_auth_notice() end)
     UIManager:scheduleIn(5.0,function() self:maybe_auto_check_update(false) end)
@@ -213,8 +221,9 @@ function Plugin:require_login()
 end
 
 local AUTH_CHANNEL_LABELS={
-    shelf="书架访问",progress="云端进度读取",download="后台下载",read_report="阅读时间上传",
+    shelf="书架访问",progress="云端进度读取",download="书籍下载",read_report="阅读时间上传",
 }
+local AUTH_CHANNEL_ORDER={"shelf","progress","download","read_report"}
 local function auth_error_code(value)
     if Http.auth_error_code then
         local ok,code=pcall(Http.auth_error_code,value)
@@ -222,6 +231,10 @@ local function auth_error_code(value)
     end
     local text=tostring(value or "")
     return text:match("error_code=([%-]?%d+)") or text:match('"errcode"%s*:%s*([%-]?%d+)') or ""
+end
+local function auth_row(value)
+    return U.merge({state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0,last_ok_at=0},
+        type(value)=="table" and value or {})
 end
 function Plugin:_auth_health()
     if self.store.auth_health then return self.store:auth_health() end
@@ -235,20 +248,28 @@ function Plugin:_save_auth_health(health)
     self.store:save_auth(auth)
     return health
 end
+function Plugin:_recompute_auth_health(health)
+    health.channels=health.channels or {}
+    if not self:logged_in() then health.state="logged_out"; return health end
+    local partial,unknown=false,false
+    for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
+        local state=tostring(auth_row(health.channels[channel]).state)
+        if state=="expired" or state=="error" then partial=true
+        elseif state~="ok" then unknown=true end
+    end
+    health.state=partial and "partial" or (unknown and "unknown" or "ok")
+    return health
+end
 function Plugin:_mark_auth_channel_ok(channel)
     if not self:logged_in() then return end
     local now=os.time()
     local health=self:_auth_health()
     health.channels=health.channels or {}
-    health.channels[channel]={state="ok",checked_at=now,error="",code=""}
+    health.channels[channel]={state="ok",checked_at=now,error="",code="",failures=0,retry_at=0,last_ok_at=now}
     health.last_checked_at=now
     health.last_ok_at=now
-    local all_ok=true
-    for _,key in ipairs({"shelf","progress","download","read_report"}) do
-        if tostring((health.channels[key] or {}).state or "unknown")~="ok" then all_ok=false; break end
-    end
-    if all_ok then
-        health.state="ok"
+    self:_recompute_auth_health(health)
+    if health.state=="ok" then
         health.last_error_at=0
         health.last_error_code=""
         health.last_error_message=""
@@ -257,34 +278,50 @@ function Plugin:_mark_auth_channel_ok(channel)
     end
     self:_save_auth_health(health)
 end
-function Plugin:_mark_auth_channel_error(channel,err)
+function Plugin:_mark_auth_channel_error(channel,err,retry_at)
     if not self:logged_in() then return end
     local now=os.time()
     local health=self:_auth_health()
     health.channels=health.channels or {}
-    health.channels[channel]={state="error",checked_at=now,error=U.first_line(err,180),code=""}
+    local previous=auth_row(health.channels[channel])
+    health.channels[channel]={state="error",checked_at=now,error=U.first_line(err,180),code="",
+        failures=(tonumber(previous.failures) or 0)+1,retry_at=tonumber(retry_at) or 0,last_ok_at=previous.last_ok_at or 0}
     health.last_checked_at=now
+    health.last_error_at=now
+    health.last_error_message=U.first_line(err,220)
+    health.last_error_channel=channel
+    self:_recompute_auth_health(health)
     self:_save_auth_health(health)
 end
 function Plugin:_mark_auth_problem(channel,err,notify)
-    local text=tostring(err or "登录状态已失效")
+    local text=tostring(err or "登录状态暂时不可用")
     if not Http.is_auth_error(text) then return false end
     local now=os.time()
     local health=self:_auth_health()
     health.channels=health.channels or {}
+    local previous=auth_row(health.channels[channel])
+    local threshold=math.max(1,tonumber(Config.AUTH_NOTICE_FAILURE_THRESHOLD) or 2)
+    local failures=(tonumber(previous.failures) or 0)+1
+    local confirmed=text:find("自动续期失败",1,true)~=nil
+        or text:find("renewal=",1,true)~=nil
+        or text:find("refreshed=",1,true)~=nil
+    if confirmed then failures=math.max(failures,threshold) end
+    local expired=failures>=threshold
     local code=auth_error_code(text)
-    health.channels[channel]={state="expired",checked_at=now,error=U.first_line(text,180),code=code}
-    health.state="degraded"
+    health.channels[channel]={state=expired and "expired" or "error",checked_at=now,
+        error=U.first_line(text,180),code=code,failures=failures,retry_at=0,last_ok_at=previous.last_ok_at or 0}
     health.last_checked_at=now
     health.last_error_at=now
     health.last_error_code=code
     health.last_error_message=U.first_line(text,220)
     health.last_error_channel=channel
-    health.notice_pending=true
+    if notify~=false and expired then health.notice_pending=true end
+    self:_recompute_auth_health(health)
     self:_save_auth_health(health)
-    logger.warn("[MiuRead][Auth] feature session invalid",
-        "channel=",tostring(channel),"code=",tostring(code),"error=",U.first_line(text,160))
-    if notify~=false then UIManager:scheduleIn(.05,function() self:_show_auth_notice() end) end
+    logger.warn("[MiuRead][Auth] feature request authentication failed",
+        "channel=",tostring(channel),"code=",tostring(code),"failures=",tostring(failures),
+        "confirmed=",tostring(confirmed),"error=",U.first_line(text,160))
+    if health.notice_pending then UIManager:scheduleIn(.05,function() self:_show_auth_notice() end) end
     return true
 end
 function Plugin:_clear_auth_notice_pending()
@@ -297,18 +334,22 @@ end
 function Plugin:_show_auth_notice()
     if self._auth_notice_dialog or not self:logged_in() then return end
     local health=self:_auth_health()
-    if health.state~="degraded" or health.notice_pending~=true then return end
-    local channel=AUTH_CHANNEL_LABELS[tostring(health.last_error_channel or "")] or "在线功能"
+    if health.notice_pending~=true then return end
+    local channel_key=tostring(health.last_error_channel or "")
+    local channel=AUTH_CHANNEL_LABELS[channel_key] or "在线功能"
     local dialog
     local function close()
         if self._auth_notice_dialog==dialog then self._auth_notice_dialog=nil end
         UIManager:close(dialog)
     end
     dialog=ButtonDialog:new{
-        title="微信读书登录已失效\n\n"..channel.."已暂停。已下载章节、下载断点和本地阅读记录均已保留。请重新扫码登录，登录成功后会自动继续可恢复的任务。",
+        title=channel.."暂时无法验证登录\n\n只有此功能受到影响，其他功能会继续运行。插件会保留下载断点和待上传阅读时间，并在后续真实请求中自动重试。多次失败后可重新扫码。",
         title_align="center",
         buttons={
-            {{text="立即扫码",callback=function()
+            {{text="查看账号状态",callback=function()
+                self:_clear_auth_notice_pending(); close(); self:show_account_status()
+            end}},
+            {{text="重新扫码",callback=function()
                 self:_clear_auth_notice_pending(); close(); self.auth_flow:start()
             end}},
             {{text="稍后处理",callback=function()
@@ -320,38 +361,44 @@ function Plugin:_show_auth_notice()
     UIManager:show(dialog)
 end
 function Plugin:_account_status_label()
-    if not self:logged_in() then return "未登录" end
+    if not self:logged_in() then return "未登录 · 点击扫码" end
     local auth=self.store:auth()
     local health=self:_auth_health()
+    self:_recompute_auth_health(health)
     local name=U.trim(tostring((auth.account or {}).name or ""))
-    if health.state=="degraded" then
-        return name~="" and ("登录异常 · "..name) or "登录异常 · 点击处理"
+    if health.state=="partial" then
+        return name~="" and ("部分功能异常 · "..name) or "部分功能异常 · 点击查看"
     end
     if health.state~="ok" then
-        return name~="" and ("待验证 · "..name) or "已登录 · 待验证"
+        return name~="" and ("已登录 · "..name) or "已登录 · 功能待验证"
     end
     return name~="" and ("已登录 · "..name) or "已登录"
 end
 local function account_channel_text(row)
-    row=type(row)=="table" and row or {}
+    row=auth_row(row)
     local state=tostring(row.state or "unknown")
     if state=="ok" then return "正常" end
-    if state=="expired" then return "登录已失效" end
-    if state=="error" then return "暂时失败" end
-    return "尚未检查"
+    if state=="expired" then return "多次验证失败，可重新扫码" end
+    if state=="error" then
+        local retry_at=tonumber(row.retry_at or 0) or 0
+        return retry_at>os.time() and "暂时失败，等待自动重试" or "暂时失败"
+    end
+    return "将在实际使用时验证"
 end
 function Plugin:_account_details_text()
     local auth=self.store:auth()
     local health=self:_auth_health()
+    self:_recompute_auth_health(health)
     local name=U.trim(tostring((auth.account or {}).name or ""))
     local lines={"账号状态","","账号："..(name~="" and name or "—")}
     if not self:logged_in() then
-        lines[#lines+1]="状态：尚未登录"
+        lines[#lines+1]="基础登录：尚未登录"
         return table.concat(lines,"\n")
     end
-    lines[#lines+1]="状态："..(health.state=="ok" and "正常" or (health.state=="degraded" and "部分登录凭据已失效" or "等待实际验证"))
+    lines[#lines+1]="基础登录：正常"
+    lines[#lines+1]="在线功能："..(health.state=="ok" and "全部正常" or (health.state=="partial" and "部分暂时异常" or "等待实际使用验证"))
     lines[#lines+1]=""
-    for _,channel in ipairs({"shelf","progress","download","read_report"}) do
+    for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
         lines[#lines+1]=AUTH_CHANNEL_LABELS[channel].."："..account_channel_text((health.channels or {})[channel])
     end
     lines[#lines+1]=""
@@ -361,14 +408,17 @@ function Plugin:_account_details_text()
         local code=tostring(health.last_error_code or "")
         lines[#lines+1]="最近异常："..channel..(code~="" and ("（"..code.."）") or "")
     end
+    local sync_status=self.sync and self.sync:status() or {}
+    local pending=math.max(0,math.floor(tonumber(sync_status.pending_report_elapsed or 0) or 0))
+    if pending>0 then lines[#lines+1]="待上传阅读时间："..tostring(pending).." 秒" end
     lines[#lines+1]=""
-    lines[#lines+1]="本地书籍、下载断点和待上传阅读记录不会因登录失效而删除。"
+    lines[#lines+1]="续期只用于失败后的恢复，不再作为下载或上传的前置条件。"
     return table.concat(lines,"\n")
 end
 function Plugin:_set_all_auth_ok()
     if not self:logged_in() then return end
     local now=os.time()
-    local okrow={state="ok",checked_at=now,error="",code=""}
+    local okrow={state="ok",checked_at=now,error="",code="",failures=0,retry_at=0,last_ok_at=now}
     local health=self:_auth_health()
     health.state="ok"
     health.last_checked_at=now
@@ -386,30 +436,15 @@ end
 function Plugin:check_account_status()
     if not self:logged_in() then self.auth_flow:start(); return end
     self:online("account-status-check",function()
-        self:status_toast("账号状态","正在检查微信读书登录……",3)
-        local web_ok,web_result=pcall(self.reader.check_login_session,self.reader)
-        if web_ok then
-            self:_mark_auth_channel_ok("download")
-            self:_mark_auth_channel_ok("read_report")
-        elseif Http.is_auth_error(web_result) then
-            self:_mark_auth_problem("download",web_result,false)
-            self:_mark_auth_problem("read_report",web_result,false)
-        else
-            self:_mark_auth_channel_error("download",web_result)
-            self:_mark_auth_channel_error("read_report",web_result)
-        end
+        self:status_toast("账号状态","正在检查基础账号和书架访问",3)
         local shelf_ok,shelf_result=pcall(self.api.shelf,self.api,{retries=0,timeout={7,12}})
         if shelf_ok then
             self:_mark_auth_channel_ok("shelf")
-            self:_mark_auth_channel_ok("progress")
         elseif Http.is_auth_error(shelf_result) then
             self:_mark_auth_problem("shelf",shelf_result,false)
-            self:_mark_auth_problem("progress",shelf_result,false)
         else
             self:_mark_auth_channel_error("shelf",shelf_result)
-            self:_mark_auth_channel_error("progress",shelf_result)
         end
-        if web_ok and shelf_ok then self:_set_all_auth_ok() end
         self:show_account_status()
     end)
 end
@@ -451,7 +486,7 @@ function Plugin:on_auth_success(name)
     end
     local resumed=false
     local state=self.store:download_state()
-    if web_ready and state.status=="failed" and state.auth_required==true and type(state.book)=="table" then
+    if state.status=="failed" and state.auth_required==true and type(state.book)=="table" then
         state.status="interrupted"
         state.error="登录已恢复，正在继续下载。"
         state.auth_required=nil
@@ -467,35 +502,39 @@ function Plugin:on_auth_success(name)
     else
         UIManager:scheduleIn(.8,function() self:_start_next_queued_download() end)
     end
-    if web_ready and self.sync and self.sync.on_auth_restored then
+    if self.sync and self.sync.on_auth_restored then
         local ok,value=pcall(self.sync.on_auth_restored,self.sync)
         resumed=resumed or (ok and value==true)
     end
-    local title=web_ready and "账号状态已恢复" or "扫码登录完成"
+    local title="账号登录成功"
     local detail=tostring(name or "微信读书账号")
-        ..(resumed and " · 正在恢复后台任务" or (web_ready and "" or " · 正文会话等待检查"))
+        ..(resumed and " · 正在恢复后台任务" or (web_ready and "" or " · 在线功能将在实际使用时验证"))
     self:status_toast(title,detail,5)
 end
-function Plugin:_download_menu_post_text()
+function Plugin:_download_menu_text()
     if self:_has_download_status() then
-        return tostring(self:_download_status_label()):gsub("^后台下载%s*·%s*","")
+        return "下载管理 · "..tostring(self:_download_status_label()):gsub("^后台下载%s*[：·]?%s*","")
     end
     local queue=self.store:download_queue()
-    return #queue>0 and (tostring(#queue).." 项等待") or "空闲"
+    return #queue>0 and ("下载管理 · "..tostring(#queue).." 项等待") or "下载管理"
+end
+function Plugin:_sync_menu_text()
+    return "阅读同步 · "..tostring(self:progress_sync_label())
 end
 function Plugin:home_menu()
     self:maybe_auto_check_update(false)
-    local account={text="账号",post_text=self:_account_status_label(),callback=function() self:show_account_status() end}
+    local account={text=self:_account_status_label(),callback=function() self:show_account_status() end}
     local out={
         {text="我的书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)},
         {text="搜索书籍",callback=self:safe("search",function() self:search_dialog() end)},
-        {text="下载管理",post_text=self:_download_menu_post_text(),callback=self:safe("downloads",function() self:show_downloads() end)},
-        {text="阅读同步",post_text=self:progress_sync_label(),sub_item_table_func=function() return self:sync_menu() end},
+        {text=self:_download_menu_text(),callback=self:safe("downloads",function() self:show_downloads() end)},
+        {text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end},
         account,
         {text="设置与关于",sub_item_table_func=function() return self:settings_menu() end},
     }
     local health=self:_auth_health()
-    if self:logged_in() and health.state=="degraded" then
+    self:_recompute_auth_health(health)
+    if self:logged_in() and health.state=="partial" then
         table.remove(out,5); table.insert(out,1,account)
     end
     return out
@@ -505,12 +544,42 @@ function Plugin:current_book_menu()
     local r=self:_current_book_record()
     if not r or not r.book then return {{text="未识别当前觅阅书籍",enabled=false}} end
     local b={bookId=r.book.book_id,title=r.book.title,author=r.book.author,cover=r.book.cover}
-    return {
+    local items={
         {text="重新生成纯净版",callback=function() self:choose_download_mode(b,{annotations=false},false) end},
         {text="重新生成划线与想法版",callback=function() self:choose_download_mode(b,{annotations=true},false) end},
-        {text="章节下载",callback=function() self:chapters(b) end},
-        {text="管理本书文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end},
-        {text="书籍详情",callback=function() self:book_details(b) end},
+        {text="下载当前章",callback=function() self:download_current_chapters(1) end},
+        {text="下载当前章及后续 5 章",callback=function() self:download_current_chapters(6) end},
+        {text="下载当前章及后续 10 章",callback=function() self:download_current_chapters(11) end},
+        {text="选择章节范围",callback=function() self:chapters(b) end},
+    }
+    if self:_has_range_variant(b.bookId) then
+        items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(b) end}
+    end
+    items[#items+1]={text="管理本书文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end}
+    items[#items+1]={text="书籍详情",callback=function() self:book_details(b) end}
+    return items
+end
+
+function Plugin:current_mp_article_menu(mp_context)
+    local account={bookId=mp_context.bookId,title=mp_context.account_title or "公众号",author="公众号"}
+    local target
+    for _,article in ipairs(self.mp:cached_articles(mp_context.bookId) or {}) do
+        if tostring(article.reviewId or article.originalId or "")==tostring(mp_context.reviewId or "") then
+            target=article; break
+        end
+    end
+    if not target then return {{text="当前文章信息不可用",enabled=false}} end
+    local article=U.copy(target)
+    return {
+        {text="重新下载文章",callback=function() self:open_or_download_mp_article(account,article,true) end},
+        {text="删除本篇缓存",callback=function()
+            UIManager:show(ConfirmBox:new{text="删除《"..tostring(article.title or "文章").."》的本地缓存？",ok_callback=function()
+                local ok,err=self.mp:clear_article(account.bookId,article)
+                if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
+                self:status_toast("公众号","本篇缓存已删除",4)
+            end})
+        end},
+        {text="公众号缓存管理",sub_item_table_func=function() return self:mp_cache_menu(account,self.mp:cached_articles(account.bookId)) end},
     }
 end
 
@@ -523,17 +592,18 @@ function Plugin:reader_menu()
             {text="返回文章列表",callback=self:safe("mp-back",function() self:open_mp_account_by_id(mp_context.bookId,mp_context.account_title) end)},
             {text="上一篇",callback=self:safe("mp-prev",function() self:open_mp_neighbor(-1) end)},
             {text="下一篇",callback=self:safe("mp-next",function() self:open_mp_neighbor(1) end)},
-            {text="下载管理",post_text=self:_download_menu_post_text(),callback=function() self:show_downloads() end},
-            {text="账号",post_text=self:_account_status_label(),callback=function() self:show_account_status() end},
+            {text="当前文章",sub_item_table_func=function() return self:current_mp_article_menu(mp_context) end},
+            {text=self:_download_menu_text(),callback=function() self:show_downloads() end},
+            {text=self:_account_status_label(),callback=function() self:show_account_status() end},
             {text="设置与关于",sub_item_table_func=function() return self:settings_menu() end},
         }
     end
     return {
         {text="返回书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)},
         {text="当前书籍",sub_item_table_func=function() return self:current_book_menu() end},
-        {text="阅读同步",post_text=self:progress_sync_label(),sub_item_table_func=function() return self:sync_menu() end},
-        {text="下载管理",post_text=self:_download_menu_post_text(),callback=function() self:show_downloads() end},
-        {text="账号",post_text=self:_account_status_label(),callback=function() self:show_account_status() end},
+        {text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end},
+        {text=self:_download_menu_text(),callback=function() self:show_downloads() end},
+        {text=self:_account_status_label(),callback=function() self:show_account_status() end},
         {text="设置与关于",sub_item_table_func=function() return self:settings_menu() end},
     }
 end
@@ -820,12 +890,18 @@ function Plugin:_shelf_select(b)
     local id=tostring(b and (b.bookId or b.book_id) or "")
     if id=="" then return end
     if Protocol.is_mp_account(id) then self:mp_account(b); return end
-    local available={}
-    for _,kind in ipairs({"notes","clean","range_notes","range_clean","preview_notes","preview_clean"}) do
-        local r=self.store:variant(id,kind)
-        if r and r.file and U.file_exists(r.file) then available[#available+1]=r end
+    local record=self:_preferred_record(id)
+    if record and record.file and U.file_exists(record.file) then
+        self:open_file(record.file)
+    else
+        self:book_menu(b)
     end
-    if #available==1 then self:open_file(available[1].file) else self:book_menu(b) end
+end
+function Plugin:_shelf_hold(b)
+    local id=tostring(b and (b.bookId or b.book_id) or "")
+    if id=="" then return end
+    if Protocol.is_mp_account(id) then self:mp_account(b); return end
+    self:book_menu(b)
 end
 
 function Plugin:show_shelf_search_dialog(mp_mode,source_rows,section)
@@ -856,6 +932,7 @@ function Plugin:show_shelf_search_dialog(mp_mode,source_rows,section)
                     show_tabs=false,
                     show_covers=show_covers,
                     on_select=function(b) self:_shelf_select(b) end,
+                    on_hold=function(b) self:_shelf_hold(b) end,
                     on_page_changed=function(page,first,last,current)
                         if show_covers then self:_on_shelf_page(results,current,page,first,last) end
                     end,
@@ -1242,6 +1319,7 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
             show_covers=show_covers,
             on_search=function() self:show_shelf_search_dialog(mp_mode,all_rows,section) end,
             on_refresh=refresh,on_select=function(b) self:_shelf_select(b) end,
+            on_hold=function(b) self:_shelf_hold(b) end,
             on_page_changed=function(page,first,last,current)
                 if show_covers then self:_on_shelf_page(rows,current,page,first,last) end
             end,
@@ -1524,7 +1602,9 @@ function Plugin:show_mp_articles(book,articles,title_suffix)
     local items={
         {text="搜索文章",callback=function() self:mp_search_dialog(book,articles) end},
         {text="刷新文章列表",post_text="最近 100 篇",callback=function() self:_refresh_mp_articles(book,false) end},
-        {text="管理本号缓存",sub_item_table_func=function() return self:mp_cache_menu(book,articles) end},
+        {text="管理本号缓存",callback=function()
+            self:list("缓存管理 · "..tostring(book.title or "公众号"),self:mp_cache_menu(book,self.mp:cached_articles(book.bookId)),"暂无缓存")
+        end},
     }
     for _,row in ipairs(articles) do
         local article=U.copy(row)
@@ -1562,6 +1642,59 @@ function Plugin:mp_search_dialog(book,articles)
     UIManager:show(dialog); dialog:onShowKeyboard()
 end
 
+function Plugin:_close_mp_download_dialog()
+    local dialog=self._mp_download_dialog
+    self._mp_download_dialog=nil
+    if dialog then pcall(function() UIManager:close(dialog) end) end
+end
+
+function Plugin:_start_mp_article_download(book,article,force)
+    if self.mp_async:busy() then self:info("另一项公众号任务正在进行中。") return false end
+    local title=tostring(article.title or "文章")
+    local cancelled=false
+    local dialog
+    dialog=ButtonDialog:new{
+        title="正在下载公众号文章\n\n"..title.."\n\n文章通常较小，下载完成后会自动打开。",
+        title_align="left",
+        buttons={{{text="取消下载",callback=function()
+            cancelled=true
+            if self.mp_async and self.mp_async:busy() then self.mp_async:cancel("user_cancelled") end
+            self:_close_mp_download_dialog()
+            self:status_toast("公众号","已取消下载",3)
+        end}}},
+    }
+    self._mp_download_dialog=dialog
+    UIManager:show(dialog)
+
+    local book_copy,article_copy=U.copy(book),U.copy(article)
+    local prefs=self.store:preferences()
+    local started,err=self.mp_async:run("mp-article",function()
+        return self.mp:fetch_article(book_copy,article_copy,{images=prefs.mp_images==true,force=force==true})
+    end,function(result)
+        self:_close_mp_download_dialog()
+        if cancelled then return end
+        self.store:reload()
+        if result and result.ok and type(result.value)=="table" and result.value.file then
+            self:open_file(result.value.file)
+            return
+        end
+        local fallback=self.mp:article_record(book_copy.bookId,article_copy)
+        if fallback then
+            self:status_toast("公众号","下载未完整完成，已打开原缓存",4)
+            self:open_file(fallback.file)
+        else
+            logger.warn("[MiuRead][MP] article download failed",tostring(result and result.error))
+            self:info("文章下载失败：\n"..U.first_line(result and result.error or "未知错误",180))
+        end
+    end,120)
+    if not started then
+        self:_close_mp_download_dialog()
+        self:info("无法启动文章下载：\n"..tostring(err))
+        return false
+    end
+    return true
+end
+
 function Plugin:open_or_download_mp_article(book,article,force)
     local record=self.mp:article_record(book.bookId,article)
     if record and force~=true then self:open_file(record.file); return end
@@ -1570,26 +1703,15 @@ function Plugin:open_or_download_mp_article(book,article,force)
         if record then self:open_file(record.file) else self:info(_("Network unavailable")) end
         return
     end
-    if self.mp_async:busy() then self:info("另一项公众号任务正在进行中。") return end
-    self:status_toast("公众号",tostring(article.title or "文章").."正在下载",2)
-    local book_copy,article_copy=U.copy(book),U.copy(article)
-    local prefs=self.store:preferences()
-    local started,err=self.mp_async:run("mp-article",function()
-        return self.mp:fetch_article(book_copy,article_copy,{images=prefs.mp_images==true,force=force==true})
-    end,function(result)
-        self.store:reload()
-        if result and result.ok and type(result.value)=="table" and result.value.file then
-            self:open_file(result.value.file)
-        else
-            local fallback=self.mp:article_record(book_copy.bookId,article_copy)
-            if fallback then self:open_file(fallback.file)
-            else
-                logger.warn("[MiuRead][MP] article download failed",tostring(result and result.error))
-                self:info("文章下载失败，请稍后重试。")
-            end
-        end
-    end,120)
-    if not started then self:info("无法启动文章下载：\n"..tostring(err)) end
+    if force==true then
+        self:_start_mp_article_download(book,article,true)
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        text="《"..tostring(article.title or "文章").."》尚未缓存。\n\n是否下载并打开？公众号文章通常只需几秒。",
+        ok_text="下载并打开",
+        ok_callback=function() self:_start_mp_article_download(book,article,false) end,
+    })
 end
 
 function Plugin:mp_cache_menu(book,articles)
@@ -1609,8 +1731,10 @@ function Plugin:mp_cache_menu(book,articles)
     end
     items[#items+1]={text="清理本号文章缓存",callback=function()
         UIManager:show(ConfirmBox:new{text="清理《"..tostring(book.title or "公众号").."》的文章列表和单篇缓存？",ok_callback=function()
-            self.mp:clear_account(book.bookId)
-            self:toast("已清理")
+            local ok,err=self.mp:clear_account(book.bookId)
+            if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
+            self:status_toast("公众号","本号缓存已清理",4)
+            UIManager:scheduleIn(.15,function() self:show_mp_articles(book,articles,"缓存已清理") end)
         end})
     end}
     return items
@@ -1622,7 +1746,12 @@ function Plugin:mp_article_cache_menu(book,article)
         {text="重新下载文章",callback=function() self:open_or_download_mp_article(book,article,true) end},
         {text="删除单篇缓存",callback=function()
             UIManager:show(ConfirmBox:new{text="删除《"..tostring(article.title or "文章").."》的单篇缓存？",ok_callback=function()
-                self.mp:clear_article(book.bookId,article); self:toast("已清理")
+                local ok,err=self.mp:clear_article(book.bookId,article)
+                if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
+                self:status_toast("公众号","本篇缓存已删除",4)
+                UIManager:scheduleIn(.15,function()
+                    self:list("缓存管理 · "..tostring(book.title or "公众号"),self:mp_cache_menu(book,self.mp:cached_articles(book.bookId)),"暂无缓存")
+                end)
             end})
         end},
     }
@@ -1633,9 +1762,10 @@ function Plugin:mp_global_cache_menu()
     return {
         {text="清理全部公众号缓存",callback=function()
             UIManager:show(ConfirmBox:new{text="清理全部公众号列表和单篇文章缓存？",ok_callback=function()
-                U.remove_tree(self.store:mp_root())
-                U.mkdir(self.store:mp_root())
-                self:toast("已清理")
+                local ok,err=U.remove_tree(self.store:mp_root())
+                if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
+                if not U.mkdir(self.store:mp_root()) then self:info("缓存目录重建失败，请重启 KOReader。") return end
+                self:status_toast("公众号","全部缓存已清理",4)
             end})
         end},
     }
@@ -1671,6 +1801,9 @@ function Plugin:book_menu(b)
     end
     items[#items+1]={text="生成／更新书籍",callback=function() self:choose_download(b,nil,false) end}
     items[#items+1]={text="按章节下载",callback=function() self:chapters(b) end}
+    if self:_has_range_variant(b.bookId) then
+        items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(b) end}
+    end
     if self:_book_has_cache(b.bookId) or self.store:book_has_partial_cache(b.bookId) then
         items[#items+1]={text="管理本书文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end}
     end
@@ -1835,6 +1968,7 @@ function Plugin:_finish_download_runtime(runtime,result)
         end
         local auth_required=Http.is_auth_error(err)
         local rate_limited=Http.is_rate_limit_error(err)
+        local network_failed=Http.is_network_error and Http.is_network_error(err)
         local wait_seconds=tonumber(tostring(err):match("wait_seconds=(%d+)"))
         if auth_required then self:_mark_auth_problem("download",err,true) end
         self:_write_download_state("failed",{
@@ -1843,16 +1977,19 @@ function Plugin:_finish_download_runtime(runtime,result)
             current=runtime.last_state and runtime.last_state.current,total=runtime.last_state and runtime.last_state.total,
             percent=runtime.last_state and runtime.last_state.percent,seen=false,
             auth_required=auth_required or nil,
-            error_kind=auth_required and "authentication" or (rate_limited and "rate_limit" or nil),
+            error_kind=auth_required and "authentication" or (rate_limited and "rate_limit" or (network_failed and "network" or nil)),
             wait_seconds=rate_limited and wait_seconds or nil,
         },true)
         self:_update_open_shelf_download_status(b.bookId,
-            auth_required and "等待重新登录" or (rate_limited and "请求受限 · 稍后继续" or "生成未完成"))
+            auth_required and "等待重新登录" or (rate_limited and "请求受限 · 稍后继续"
+                or (network_failed and "等待网络 · 可继续" or "生成未完成")))
         local first
         if auth_required then
             first="微信读书登录已失效。下载断点已经保留，请重新扫码登录后继续。"
         elseif rate_limited then
             first="微信读书暂时限制了请求频率。插件已停止继续请求，正文和断点均已保留，请稍后继续下载。"
+        elseif network_failed then
+            first="网络连接暂时中断。已完成章节和下载断点均已保留，网络恢复后可继续下载。"
         else
             first=U.first_line(err)
         end
@@ -1860,15 +1997,17 @@ function Plugin:_finish_download_runtime(runtime,result)
             first="划线与想法暂时无法获取，可改为生成纯净版。已下载正文会保留。"
         end
         if was_background then
-            local toast_title=auth_required and "登录已失效" or (rate_limited and "请求受限" or "觅阅")
+            local toast_title=auth_required and "下载登录验证失败" or (rate_limited and "请求受限"
+                or (network_failed and "等待网络" or "觅阅"))
             local toast_text=auth_required and "后台下载已暂停，重新扫码后自动继续"
                 or (rate_limited and "已停止继续请求，下载断点已保留"
-                or (tostring(b.title or "未命名").."下载未完成，进度已保留"))
+                or (network_failed and "下载断点已保留，网络恢复后可继续"
+                or (tostring(b.title or "未命名").."下载未完成，进度已保留")))
             self:status_toast(toast_title,toast_text,5)
         else self:info(first) end
         -- A rate limit is account-wide. Starting the next queued book here would
         -- immediately hit the same limit and prolong the cooldown.
-        if not auth_required and not rate_limited then self:_start_next_queued_download() end
+        if not auth_required and not rate_limited and not network_failed then self:_start_next_queued_download() end
         return
     end
     self:_mark_auth_channel_ok("download")
@@ -1885,13 +2024,17 @@ function Plugin:_finish_download_runtime(runtime,result)
     local pending=rec.pending_install==true and rec.pending_file and U.file_exists(rec.pending_file)
     self:_update_open_shelf_download_status(b.bookId,pending and "等待关闭后更新"
         or (rec.annotation_pending==true and "正文已生成 · 批注待补" or "已生成"))
-    self:_write_download_state(pending and "pending_install" or "completed",{
-        title=b.title,book_id=b.bookId,book=U.copy(b),options=U.copy(opt),file=rec.file,
-        pending_file=rec.pending_file,pending_install=pending or nil,seen=false,percent=1,
-        current=rec.chapter_count,total=rec.expected_chapter_count,completed_at=os.time(),
-        annotation_pending=rec.annotation_pending==true or nil,
-        annotation_error_kind=rec.annotation_error_kind,
-    },true)
+    if pending then
+        self:_write_download_state("pending_install",{
+            title=b.title,book_id=b.bookId,book=U.copy(b),options=U.copy(opt),file=rec.file,
+            pending_file=rec.pending_file,pending_install=true,percent=1,
+            current=rec.chapter_count,total=rec.expected_chapter_count,completed_at=os.time(),
+            annotation_pending=rec.annotation_pending==true or nil,
+            annotation_error_kind=rec.annotation_error_kind,
+        },true)
+    else
+        self.store:clear_download_state()
+    end
     if done then done(rec,was_background); self:_start_next_queued_download(); return end
     if pending then
         local text=tostring(b.title or "未命名").."新版本已下载，关闭当前书籍后更新"
@@ -1967,7 +2110,7 @@ end
 function Plugin:_has_download_status()
     if self.download_task and self.download_task:busy() then return true end
     local state=self.store:download_state()
-    if state.status=="completed" then return state.seen~=true end
+    if state.status=="completed" then self.store:clear_download_state(); return false end
     return state.status=="failed" or state.status=="interrupted" or state.status=="pending_install"
 end
 function Plugin:_download_status_label()
@@ -1979,13 +2122,13 @@ function Plugin:_download_status_label()
         end
         if state.stage=="restart" then return "后台下载 · 正在从断点恢复" end
         if state.waiting_network==true then return "后台下载 · 等待网络" end
-        local title=tostring(state.title or "未命名")
-        if #title>16 then title=title:sub(1,16).."…" end
+        local title=U.utf8_truncate(state.title or "未命名",9)
         return "后台下载：《"..title.."》 "..tostring(self:_download_percent(state)).."%"
     end
     if state.status=="pending_install" then return "后台下载 · 等待更新" end
     if state.status=="completed" then return "后台下载 · 已完成" end
     if state.status=="failed" and state.auth_required==true then return "后台下载 · 等待重新登录" end
+    if state.status=="failed" and state.error_kind=="network" then return "后台下载 · 等待网络，可继续" end
     if state.status=="failed" then return "后台下载 · 未完成" end
     if state.status=="interrupted" then return "后台下载 · 可继续" end
     return "后台下载"
@@ -2128,7 +2271,7 @@ end
 function Plugin:_show_download_complete(rec,opt)
     local dialog
     dialog=ButtonDialog:new{title=self:_download_summary(rec,opt),title_align="center",buttons={
-        {{text="立即阅读",callback=function() UIManager:close(dialog); self.store:clear_download_state(); self:open_file(rec.file) end}},
+        {{text="立即阅读",callback=function() UIManager:close(dialog); self:open_file(rec.file) end}},
         {{text="关闭",callback=function() UIManager:close(dialog) end}},
     }}
     UIManager:show(dialog)
@@ -2137,13 +2280,18 @@ function Plugin:show_download_status()
     if self.download_task and self.download_task:busy() then self:_show_active_download_dialog(); return end
     local state=self.store:download_state()
     if not state.status or state.status=="" then self:info("当前没有后台下载记录。") return end
-    if state.status=="completed" then state.seen=true; self.store:save_download_state(state) end
+    if state.status=="completed" then
+        self.store:clear_download_state()
+        self:info("下载已经完成，记录已自动清除。\n\n可在下载管理的已完成列表中打开书籍。")
+        return
+    end
     local title=tostring(state.title or "未命名")
     local lines={}
     if state.status=="completed" then lines[#lines+1]="下载完成"
     elseif state.status=="pending_install" then lines[#lines+1]="新版本已下载完成"
     elseif state.status=="failed" and state.auth_required==true then lines[#lines+1]="等待重新登录"
     elseif state.status=="failed" and state.error_kind=="rate_limit" then lines[#lines+1]="请求频率受限，稍后可继续"
+    elseif state.status=="failed" and state.error_kind=="network" then lines[#lines+1]="网络中断，断点已保留"
     elseif state.status=="failed" then lines[#lines+1]="下载未完成"
     elseif state.status=="interrupted" then lines[#lines+1]="上次下载已中断"
     else lines[#lines+1]=tostring(state.status) end
@@ -2292,21 +2440,6 @@ end
 function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
     if not self:require_login() then return end
     if not self:is_online() then self:info(_("Network unavailable")); return end
-    local health=self:_auth_health()
-    local checked_at=tonumber(((health.channels or {}).download or {}).checked_at or 0) or 0
-    if health.state~="ok" or os.time()-checked_at>30*60 then
-        self:status_toast("后台下载","正在确认微信读书登录状态",3)
-        local login_ok,login_result=pcall(self.reader.check_login_session,self.reader)
-        if not login_ok then
-            self:_mark_auth_problem("download",login_result,true)
-            local state={status="failed",title=b and b.title,book_id=b and b.bookId,
-                book=U.copy(b or {}),options=U.copy(opt or {}),auth_required=true,
-                error_kind="authentication",error=tostring(login_result),seen=false,updated_at=os.time()}
-            self.store:save_download_state(state)
-            return false
-        end
-        self:_mark_auth_channel_ok("download")
-    end
     opt=U.copy(opt or {})
     if self.download_task and self.download_task:busy() then
         if from_queue then
@@ -2358,6 +2491,84 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
 end
 
 
+
+function Plugin:_range_variant(book_id,kind)
+    local record=self.store:variant(book_id,kind)
+    if record and record.file and U.file_exists(record.file) and record.partial_range==true then return record end
+end
+function Plugin:_has_range_variant(book_id)
+    return self:_range_variant(book_id,"range_notes")~=nil or self:_range_variant(book_id,"range_clean")~=nil
+end
+function Plugin:range_extend_menu(b)
+    local items={}
+    local clean=self:_range_variant(b.bookId,"range_clean")
+    local notes=self:_range_variant(b.bookId,"range_notes")
+    if clean then items[#items+1]={text="扩展章节版 · 纯净版",callback=function() self:show_range_extend_options(b,false,clean) end} end
+    if notes then items[#items+1]={text="扩展章节版 · 划线与想法版",callback=function() self:show_range_extend_options(b,true,notes) end} end
+    if #items==0 then return {{text="当前没有可扩展的章节版",enabled=false}} end
+    return items
+end
+function Plugin:show_range_extend_options(b,annotations,record)
+    self:online("range-extend",function()
+        local _,rows=self.downloader:catalog(b.bookId)
+        rows=rows or {}
+        local first=math.max(1,tonumber(record.range_start_index) or 1)
+        local last=math.min(#rows,tonumber(record.range_end_index) or first)
+        local items={}
+        for _,count in ipairs({5,10,20}) do
+            local target=math.min(#rows,last+count)
+            items[#items+1]={text="追加后续 "..tostring(math.max(0,target-last)).." 章",enabled=target>last,
+                callback=function()
+                    self:choose_download_mode(b,{annotations=annotations,range_start_index=first,range_end_index=target,
+                        range_start_title=rows[first] and rows[first].title,range_end_title=rows[target] and rows[target].title},false)
+                end}
+        end
+        items[#items+1]={text="扩展到指定章节",enabled=last<#rows,callback=function()
+            self:_chapter_list_menu(b,rows,"选择新的结束章节",function(target)
+                self:choose_download_mode(b,{annotations=annotations,range_start_index=first,range_end_index=target,
+                    range_start_title=rows[first] and rows[first].title,range_end_title=rows[target] and rows[target].title},false)
+            end,last+1)
+        end}
+        items[#items+1]={text="重新选择章节范围",callback=function() self:chapters(b) end}
+        self:list("扩展章节版 · 当前 "..tostring(last-first+1).." 章",items)
+    end)
+end
+function Plugin:_current_catalog_index(record,rows)
+    if not record or not record.record then return nil end
+    local local_map=record.record.chapter_map or {}
+    if #local_map==0 then return nil end
+    local ratio=self.sync:local_ratio() or 0
+    local position=self.sync:position(record,ratio,local_map)
+    local uid=tostring(position and position.chapter_uid or "")
+    if uid=="" then
+        local local_index=math.max(1,math.min(#local_map,math.floor(ratio*#local_map)+1))
+        local chapter=local_map[local_index] or {}
+        uid=tostring(chapter.uid or chapter.chapterUid or chapter.chapter_uid or "")
+    end
+    if uid~="" then
+        for index,chapter in ipairs(rows or {}) do
+            if tostring(chapter.chapterUid or chapter.uid or "")==uid then return index end
+        end
+    end
+    local local_index=math.max(1,math.min(#local_map,math.floor(ratio*#local_map)+1))
+    local hinted=tonumber(local_map[local_index] and local_map[local_index].index)
+    if hinted and rows and rows[hinted] then return hinted end
+    return nil
+end
+function Plugin:download_current_chapters(count)
+    local record=self:_current_book_record()
+    if not record or not record.book then self:info("当前不是觅阅生成的书籍。") return end
+    local b={bookId=record.book.book_id,title=record.book.title,author=record.book.author,cover=record.book.cover}
+    local wanted=math.max(1,tonumber(count) or 1)
+    self:online("current-chapter-download",function()
+        local _,rows=self.downloader:catalog(b.bookId)
+        rows=rows or {}
+        local first=self:_current_catalog_index(record,rows)
+        if not first or not rows[first] then self:info("暂时无法确定当前章节，请使用“选择章节范围”。") return end
+        local last=math.min(#rows,first+wanted-1)
+        self:_choose_range_version(b,rows,first,last,false)
+    end)
+end
 
 function Plugin:_chapter_state_text(book_id,chapter)
     local uid=tostring(chapter.chapterUid or chapter.uid or "")
@@ -2458,7 +2669,13 @@ function Plugin:chapter_menu(b,ch)
 end
 
 function Plugin:_open_file_direct(path)
-    if self.ui.document then self.ui:switchDocument(path) else self.ui:openFile(path) end
+    if self.ui and self.ui.document and type(self.ui.switchDocument)=="function" then
+        return self.ui:switchDocument(path)
+    end
+    local Event=require("ui/event")
+    local ReaderUI=require("apps/reader/readerui")
+    UIManager:broadcastEvent(Event:new("SetupShowReader"))
+    return ReaderUI:showReader(path)
 end
 function Plugin:open_file(path)
     if not path then self:info(_("No cached file")); return end
@@ -3252,7 +3469,7 @@ function Plugin:show_sync_status(_detail)
     if not s.time_enabled then time_text="已关闭"
     elseif not s.record or s.state=="stopped" then time_text="未运行"
     elseif s.state=="verification_required" or s.state=="fetching_remote" or s.state=="progress_sync" then time_text="等待位置确认"
-    elseif s.state=="paused" and self:_auth_health().state=="degraded" then time_text="登录已失效，等待重新扫码"
+    elseif s.state=="paused" then time_text="暂时失败，等待自动重试"
     elseif type(s.last_error)=="string" and (tonumber(s.consecutive_failures) or 0)>=2 then time_text="暂时失败，稍后重试"
     elseif s.state=="uploading" then time_text="正在同步"
     else time_text="运行中" end
@@ -3263,7 +3480,12 @@ function Plugin:show_sync_status(_detail)
 end
 
 function Plugin:on_auth_required(channel,err)
-    return self:_mark_auth_problem(channel,err,true)
+    local notify=tostring(channel or "")~="read_report"
+    local marked=self:_mark_auth_problem(channel,err,notify)
+    if marked and not notify then
+        self:status_toast("阅读时间上传","登录验证暂时失败，将自动重试；下载不受影响",5)
+    end
+    return marked
 end
 function Plugin:on_auth_channel_ok(channel)
     self:_mark_auth_channel_ok(channel)
@@ -3301,7 +3523,8 @@ function Plugin:on_read_report_interval_success(_status)
 end
 function Plugin:on_read_report_failure(err)
     if Http.is_auth_error(err) then
-        self:_mark_auth_problem("read_report",err,true)
+        self:_mark_auth_problem("read_report",err,false)
+        self:status_toast("阅读同步","登录验证暂时失败，阅读时间已保留并会自动重试",5)
         return
     end
     self:status_toast("阅读同步","连续同步失败，将稍后自动重试",5)
@@ -3541,10 +3764,11 @@ function Plugin:update_settings_menu()
         end,keep_menu_open=true,callback=function()
             local _,u=self:_update_preferences(); u.auto_check=u.auto_check==false; self:_save_update_preferences(u)
         end},
-        {text="检查频率",post_text=self:_update_interval_label(update.interval),sub_item_table_func=function() return self:update_frequency_menu() end},
-        {text="安装完成后",post_text=update.restart_mode=="auto" and "自动重启" or (update.restart_mode=="never" and "手动重启" or "询问"),sub_item_table_func=function() return self:update_restart_menu() end},
+        {text="检查频率 · "..self:_update_interval_label(update.interval),sub_item_table_func=function() return self:update_frequency_menu() end},
+        {text="安装完成后 · "..(update.restart_mode=="auto" and "自动重启" or (update.restart_mode=="never" and "稍后手动重启" or "询问是否重启")),sub_item_table_func=function() return self:update_restart_menu() end},
         {text="检查"..tostring(Config.UPDATE_CHANNEL_LABEL).."更新",callback=self:safe("update",function() self:check_update(false) end)},
-        {text="当前版本 · "..tostring(self.version),enabled=false},
+        {text="当前运行版本 · "..tostring(self.version),enabled=false},
+        {text="更新通道 · "..tostring(Config.UPDATE_CHANNEL_LABEL),enabled=false},
     }
 end
 function Plugin:_restart_koreader()
@@ -3583,7 +3807,7 @@ function Plugin:_after_update_installed(manifest)
         UIManager:scheduleIn(.8,function() self:_restart_koreader() end)
     else
         UIManager:show(ConfirmBox:new{
-            text="觅阅已更新至 "..version.."。\n\n需要重启 KOReader 才能使用新版本。",
+            text="更新文件已安装："..version.."。\n\n当前仍在运行 "..tostring(self.version).."，重启 KOReader 后才会切换到新版本。",
             ok_text="立即重启",cancel_text="稍后重启",ok_callback=function() self:_restart_koreader() end,
         })
     end

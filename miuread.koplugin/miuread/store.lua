@@ -12,15 +12,47 @@ local defaults={
      health={state="unknown",last_checked_at=0,last_ok_at=0,last_error_at=0,
          last_error_code="",last_error_message="",last_error_channel="",notice_pending=false,
          channels={
-             shelf={state="unknown",checked_at=0,error="",code=""},
-             progress={state="unknown",checked_at=0,error="",code=""},
-             download={state="unknown",checked_at=0,error="",code=""},
-             read_report={state="unknown",checked_at=0,error="",code=""},
+             shelf={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
+             progress={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
+             download={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
+             read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
  preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
+local function invalidate_report_contexts_table(sessions)
+    sessions=type(sessions)=="table" and sessions or {}
+    local changed=0
+    for _,session in pairs(sessions) do
+        if type(session)=="table" then
+            if session.legacy_report_context~=nil then session.legacy_report_context=nil; changed=changed+1 end
+            if session.report_context~=nil then session.report_context=nil; changed=changed+1 end
+            if session.last_error~=nil then session.last_error=nil; changed=changed+1 end
+            if tonumber(session.consecutive_failures or 0)~=0 then session.consecutive_failures=0; changed=changed+1 end
+            for _,key in ipairs({"last_response_summary","last_http_code","last_http_length","last_payload_public","last_path","last_stage"}) do
+                if session[key]~=nil then session[key]=nil; changed=changed+1 end
+            end
+        end
+    end
+    return sessions,changed
+end
+local function invalidate_upload_health_table(auth)
+    auth=U.merge(defaults.auth,auth or {})
+    auth.health.notice_pending=false
+    auth.health.last_error_channel=""
+    if tostring(auth.api_key or "")~="" and next(auth.cookies or {})~=nil then
+        auth.health.state="unknown"
+        for _,channel in ipairs({"progress","read_report"}) do
+            local row=auth.health.channels[channel] or {}
+            auth.health.channels[channel]={
+                state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0,
+                last_ok_at=tonumber(row.last_ok_at or 0) or 0,
+            }
+        end
+    end
+    return auth
+end
 local function public_documents_root(data_dir)
     local kindle_documents = "/mnt/us/documents"
     if lfs.attributes(kindle_documents,"mode")=="directory" then
@@ -700,6 +732,72 @@ function Store:migrate()
                 p.update.restart_mode="ask"
             end
         end
+        if schema<55 then
+            -- 2.3.1 keeps account and critical status text in the main label,
+            -- auto-clears obsolete completed download records, and enables
+            -- reusable checkpoints for an expanding chapter-range EPUB.
+        end
+        if schema<56 then
+            -- 2.3.2 removes renewal as a feature gate. Old `expired`/`degraded`
+            -- rows may have been created by a transient renewal or HTTP 403, so
+            -- logged-in accounts return to per-feature real-request validation.
+            local auth=self.db:readSetting("auth",{}) or {}
+            auth.health=U.merge(defaults.auth.health,auth.health or {})
+            local has_local=tostring(auth.api_key or "")~="" and next(auth.cookies or {})~=nil
+            auth.health.notice_pending=false
+            auth.health.last_error_channel=""
+            if has_local then
+                auth.health.state="unknown"
+                for _,channel in ipairs({"shelf","progress","download","read_report"}) do
+                    local previous_row=(auth.health.channels or {})[channel] or {}
+                    auth.health.channels[channel]={
+                        state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0,
+                        last_ok_at=tonumber(previous_row.last_ok_at or 0) or 0,
+                    }
+                end
+            else
+                auth.health.state="logged_out"
+            end
+            self.db:saveSetting("auth",U.merge(defaults.auth,auth))
+
+            local download_state=self.db:readSetting("download_state",{}) or {}
+            if download_state.status=="failed" and download_state.auth_required==true then
+                download_state.status="interrupted"
+                download_state.auth_required=nil
+                download_state.error_kind=nil
+                download_state.error="登录状态将在继续下载时通过真实请求重新验证；原下载断点已保留。"
+                download_state.updated_at=os.time()
+                self.db:saveSetting("download_state",download_state)
+            end
+        end
+        if schema<57 then
+            -- Clear reporting contexts introduced by the 2.3 series. They may
+            -- contain a stale chapter/context after QR login and cause both
+            -- progress and reading-time uploads to be rejected indefinitely.
+            local sessions=self.db:readSetting("sessions",{}) or {}
+            local cleaned,changed=invalidate_report_contexts_table(sessions)
+            if changed>0 then self.db:saveSetting("sessions",cleaned) end
+            local auth=invalidate_upload_health_table(self.db:readSetting("auth",{}) or {})
+            self.db:saveSetting("auth",auth)
+        end
+        if schema<59 then
+            -- 2.3.3 keeps all account, local-book, checkpoint, annotation and
+            -- pending reading-time data, but discards protocol contexts that
+            -- may combine a local snapshot with a different reader-page state.
+            local sessions=self.db:readSetting("sessions",{}) or {}
+            local cleaned,changed=invalidate_report_contexts_table(sessions)
+            for _,session in pairs(cleaned) do
+                if type(session)=="table" then
+                    if session.progress_sync_state=="mapping_pending"
+                        or session.progress_sync_state=="uploading" then
+                        session.progress_sync_state=nil; changed=changed+1
+                    end
+                    session.pending_report_seconds=math.max(0,math.floor(tonumber(session.pending_report_seconds) or 0))
+                end
+            end
+            if changed>0 then self.db:saveSetting("sessions",cleaned) end
+            self.db:saveSetting("auth",invalidate_upload_health_table(self.db:readSetting("auth",{}) or {}))
+        end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)
     end
@@ -1106,6 +1204,13 @@ function Store:mark_last_read(id,path,progress)
     if path then patch.last_read_path=path end
     if progress~=nil then patch.progress_local_percent=tonumber(progress) end
     self:save_session(id,patch)
+end
+function Store:invalidate_report_contexts(reason)
+    local sessions=self:get("sessions",{})
+    local cleaned,changed=invalidate_report_contexts_table(sessions)
+    if changed>0 then self:set("sessions",cleaned) end
+    self:save_auth(invalidate_upload_health_table(self:get("auth",{})))
+    return changed,reason
 end
 function Store:session(id) return self:get("sessions",{})[tostring(id)] end
 function Store:save_session(id,patch) local a=self:get("sessions",{}); local k=tostring(id); a[k]=U.merge(a[k] or {},patch or {}); self:set("sessions",a); return a[k] end

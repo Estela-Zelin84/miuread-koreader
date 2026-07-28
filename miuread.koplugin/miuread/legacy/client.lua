@@ -1,6 +1,7 @@
 local ltn12 = require("ltn12")
 local Cookie = require("miuread.legacy.cookie")
 local WeRead = require("miuread.legacy.weread")
+local U = require("miuread.util")
 
 local ok_https, https = pcall(require, "ssl.https")
 local ok_http, http = pcall(require, "socket.http")
@@ -76,7 +77,7 @@ local function http_error(client, code, text, headers)
                 table.insert(parts, "error_code=" .. tostring(err_code))
             end
             if err_message ~= nil then
-                local message = tostring(err_message):gsub("[%c]+", " "):sub(1, 200)
+                local message = U.first_line(tostring(err_message):gsub("[%c]+", " "), 200)
                 table.insert(parts, "error_message=" .. message)
             end
         end

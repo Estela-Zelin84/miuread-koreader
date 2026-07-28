@@ -76,6 +76,23 @@ local function file_bytes(path)
     return data
 end
 
+local function clean_notes(value)
+    local text=tostring(value or "")
+    if not U.is_valid_utf8(text) or U.contains_replacement_char(text) then return nil end
+    text=text:gsub("\r\n","\n"):gsub("\r","\n")
+    text=text:gsub("[•●▪◦]","-")
+    text=text:gsub("[%z\1-\8\11\12\14-\31]","")
+    return text
+end
+
+local function clean_manifest_text(m)
+    local notes=clean_notes(m and m.notes)
+    local name=clean_notes(m and m.name)
+    if m and m.notes~=nil and notes==nil then return nil,"更新说明包含损坏的 UTF-8 文本" end
+    if m and m.name~=nil and name==nil then return nil,"更新名称包含损坏的 UTF-8 文本" end
+    return {notes=notes or "",name=name}
+end
+
 local function validate_manifest(m)
     if type(m)~="table" or type(m.version)~="string" or m.version=="" then
         return nil,"更新清单缺少版本号"
@@ -99,6 +116,7 @@ function Updater:check()
     local urls=self:manifest_urls()
     if #urls==0 then return nil,"更新地址未配置" end
     local errors={}
+    local fallback
     for _,url in ipairs(urls) do
         local ok,m=pcall(function()
             return self.http:get_json(url,{auth=false,retries=1,redirects=8,timeout={15,45}})
@@ -106,17 +124,38 @@ function Updater:check()
         if ok then
             local valid,reason=validate_manifest(m)
             if valid then
-                logger.info("[MiuRead][Updater] manifest loaded",url,"version=",tostring(m.version))
-                if not U.semver_newer(m.version,self.version) then
-                    return {current=true,version=m.version,name=m.name,notes=m.notes}
+                local cleaned,text_error=clean_manifest_text(m)
+                if not cleaned then
+                    fallback=fallback or U.copy(m)
+                    fallback.notes="更新说明编码异常；可继续下载安装，安装包仍会执行完整性校验。"
+                    fallback.name=tostring(m.name or "")
+                    errors[#errors+1]=text_error
+                    logger.warn("[MiuRead][Updater] manifest text rejected",url,
+                        "replacement_chars=",tostring(U.replacement_char_count(m.notes or "")),
+                        "reason=",tostring(text_error))
+                else
+                    m.notes=cleaned.notes
+                    if cleaned.name~=nil then m.name=cleaned.name end
+                    logger.info("[MiuRead][Updater] manifest loaded",url,"version=",tostring(m.version),
+                        "notes_utf8_valid=true")
+                    if not U.semver_newer(m.version,self.version) then
+                        return {current=true,version=m.version,name=m.name,notes=m.notes}
+                    end
+                    return m
                 end
-                return m
+            else
+                errors[#errors+1]=reason
             end
-            errors[#errors+1]=reason
         else
             errors[#errors+1]=tostring(m)
             logger.warn("[MiuRead][Updater] manifest failed",url,tostring(m))
         end
+    end
+    if fallback then
+        if not U.semver_newer(fallback.version,self.version) then
+            return {current=true,version=fallback.version,name=fallback.name,notes=fallback.notes}
+        end
+        return fallback
     end
     return nil,errors[#errors] or "无法读取更新清单"
 end

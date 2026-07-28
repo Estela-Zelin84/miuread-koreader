@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "2.3.0",
-    SCHEMA = 54,
+    VERSION = "2.3.3",
+    SCHEMA = 59,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
@@ -22,7 +22,7 @@ local C = {
         "https://ghproxy.net/",
     },
 
-    AUTO_UPDATE_INTERVAL = 3 * 24 * 60 * 60,
+    AUTO_UPDATE_INTERVAL = 24 * 60 * 60,
     AUTO_UPDATE_RETRY_INTERVAL = 6 * 60 * 60,
 
     READ_INTERVAL = 30,
@@ -32,5 +32,13 @@ local C = {
     -- Coalesce page-turn control snapshots. Reading position stays in memory
     -- and is written at most once per window; suspend/close still flushes now.
     CONTROL_WRITE_DELAY = 30,
+
+    -- Online features are verified by their real request. Renewal is recovery,
+    -- never a prerequisite. Diagnostics never include account secrets.
+    AUTH_NOTICE_FAILURE_THRESHOLD = 2,
+    DOWNLOAD_AUTO_RESTARTS = 2,
+    DOWNLOAD_DIAGNOSTIC_KEEP = 3,
+    READ_REPORT_AUTH_RETRY_DELAYS = {120, 300, 900, 1800},
+    READ_REPORT_CONTEXT_RETRY_DELAYS = {60, 120, 300, 900},
 }
 return C

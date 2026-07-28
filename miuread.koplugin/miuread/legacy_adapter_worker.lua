@@ -135,7 +135,8 @@ function Adapter.run(job)
         response_summary = result.ok == true and "succ=1 (compatibility path)"
             or tostring(result.error or "compatibility path rejected"),
         attempts = { { stage = tostring(result.path or "compatibility") } },
-        payload_public = { compatibility_path = true },
+        payload_public = merge({ compatibility_path = true }, result.payload_public or {}),
+        meta = result.meta,
     }
 end
 

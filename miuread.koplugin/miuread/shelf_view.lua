@@ -19,6 +19,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
+local U = require("miuread.util")
 
 local Screen = Device.screen
 local DIVIDER_COLOR = Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
@@ -50,7 +51,7 @@ local function supported_image(path)
 end
 
 local function placeholder(cover_w,cover_h,title)
-    local mark=tostring(title or "书"):gsub("^%s+",""):sub(1,1)
+    local mark=U.utf8_sub(tostring(title or "书"):gsub("^%s+",""),1,1)
     if mark=="" then mark="书" end
     return FrameContainer:new{
         width=cover_w,
@@ -207,6 +208,13 @@ function ShelfItem:onTapSelect(arg, ges)
     return true
 end
 
+function ShelfItem:onHoldSelect(arg, ges)
+    if self.menu and self.menu.onMenuHold then
+        self.menu:onMenuHold(self.entry)
+    end
+    return true
+end
+
 function ShelfItem:onFocus()
     self._underline.color = Blitbuffer.COLOR_BLACK
     return true
@@ -219,6 +227,7 @@ end
 
 local ShelfMenu = Menu:extend{
     on_select_callback = nil,
+    on_hold_callback = nil,
     on_page_changed = nil,
     on_close_callback = nil,
     on_rendered_callback = nil,
@@ -254,6 +263,14 @@ function ShelfMenu:onMenuSelect(entry, pos)
         return true
     end
     return Menu.onMenuSelect(self,entry)
+end
+
+function ShelfMenu:onMenuHold(entry)
+    if entry and entry.book and self.on_hold_callback then
+        self.on_hold_callback(entry.book)
+        return true
+    end
+    return true
 end
 
 function ShelfMenu:updateItems(select_number, no_recalculate_dimen)
@@ -369,6 +386,7 @@ function ShelfView.show(opts)
         is_borderless=true,
         title_bar_fm_style=true,
         on_select_callback=opts.on_select,
+        on_hold_callback=opts.on_hold,
         on_page_changed=page_callback,
         on_close_callback=opts.on_close,
         on_rendered_callback=opts.on_rendered,
