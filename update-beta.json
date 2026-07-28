@@ -1,0 +1,16 @@
+{
+  "channel": "beta",
+  "version": "2.3.3-beta.3",
+  "name": "觅阅 · 微信读书助手 2.3.3-beta.3 内测版",
+  "package_type": "full",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.3.3-beta.3/miuread-v2.3.3-beta.3-full.zip",
+  "package_urls": [
+    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.3.3-beta.3/miuread-v2.3.3-beta.3-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.3.3-beta.3/miuread-v2.3.3-beta.3-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.3.3-beta.3/miuread-v2.3.3-beta.3-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v2.3.3-beta.3/miuread-v2.3.3-beta.3-full.zip"
+  ],
+  "size": 228148,
+  "sha256": "d8e780a34cd37f0bd94097762f40277f1acdac311b76a21262542cbdf71c3f74",
+  "notes": "2.3.3-beta.3 内测版\n\n本版以 2.3.3-beta.1 为基底，不采用 beta.2 的整体回退。\n\n修复与恢复：\n- 保留公众号文章打开、缓存管理、下载确认与前台加载页面等新版能力。\n- 保留书籍后台下载、断点续传、异常自动恢复、账号分通道状态与错误分类。\n- 修复后台下载标题、书架占位字、脚注标签和错误摘要按字节截断中文导致的“�”。\n- 更新清单改用 ASCII 安全 JSON；插件会跳过含损坏 UTF-8 的更新说明来源。\n- 阅读进度和阅读时间继续使用 1.1.46 已验证的底层请求格式，但不再把新版位置快照强行覆盖到旧协议上下文。\n- 本机位置快照继续保留用于界面、冲突判断和云端确认，不删除新版位置能力。\n- 登录续期统一回到主进程；子进程只返回明确认证错误，恢复成功后自动重试一次。\n- 阅读时间服务升级为 v8，停止复用旧服务；保留待上传时间、账号、书籍、断点、想法和划线。\n- 增加安全诊断：记录 ci/co/pr/rt 是否生成、HTTP 状态和字段完整性，不记录 Cookie、签名或令牌内容。\n\n重点验证：\n1. 本机位置领先云端时，“使用本机位置并上传”可以成功并被云端确认。\n2. 阅读约 30 秒后阅读时间能够上传，临时失败时秒数仍会保留。\n3. 长中文书名和更新说明不再出现“�”。\n4. 公众号缓存可删除，未缓存文章会先询问并显示加载页面。"
+}
