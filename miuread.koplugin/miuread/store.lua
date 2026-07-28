@@ -21,6 +21,38 @@ local defaults={
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
+local function invalidate_report_contexts_table(sessions)
+    sessions=type(sessions)=="table" and sessions or {}
+    local changed=0
+    for _,session in pairs(sessions) do
+        if type(session)=="table" then
+            if session.legacy_report_context~=nil then session.legacy_report_context=nil; changed=changed+1 end
+            if session.report_context~=nil then session.report_context=nil; changed=changed+1 end
+            if session.last_error~=nil then session.last_error=nil; changed=changed+1 end
+            if tonumber(session.consecutive_failures or 0)~=0 then session.consecutive_failures=0; changed=changed+1 end
+            for _,key in ipairs({"last_response_summary","last_http_code","last_http_length","last_payload_public","last_path","last_stage"}) do
+                if session[key]~=nil then session[key]=nil; changed=changed+1 end
+            end
+        end
+    end
+    return sessions,changed
+end
+local function invalidate_upload_health_table(auth)
+    auth=U.merge(defaults.auth,auth or {})
+    auth.health.notice_pending=false
+    auth.health.last_error_channel=""
+    if tostring(auth.api_key or "")~="" and next(auth.cookies or {})~=nil then
+        auth.health.state="unknown"
+        for _,channel in ipairs({"progress","read_report"}) do
+            local row=auth.health.channels[channel] or {}
+            auth.health.channels[channel]={
+                state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0,
+                last_ok_at=tonumber(row.last_ok_at or 0) or 0,
+            }
+        end
+    end
+    return auth
+end
 local function public_documents_root(data_dir)
     local kindle_documents = "/mnt/us/documents"
     if lfs.attributes(kindle_documents,"mode")=="directory" then
@@ -738,6 +770,16 @@ function Store:migrate()
                 self.db:saveSetting("download_state",download_state)
             end
         end
+        if schema<57 then
+            -- Clear reporting contexts introduced by the 2.3 series. They may
+            -- contain a stale chapter/context after QR login and cause both
+            -- progress and reading-time uploads to be rejected indefinitely.
+            local sessions=self.db:readSetting("sessions",{}) or {}
+            local cleaned,changed=invalidate_report_contexts_table(sessions)
+            if changed>0 then self.db:saveSetting("sessions",cleaned) end
+            local auth=invalidate_upload_health_table(self.db:readSetting("auth",{}) or {})
+            self.db:saveSetting("auth",auth)
+        end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)
     end
@@ -1144,6 +1186,13 @@ function Store:mark_last_read(id,path,progress)
     if path then patch.last_read_path=path end
     if progress~=nil then patch.progress_local_percent=tonumber(progress) end
     self:save_session(id,patch)
+end
+function Store:invalidate_report_contexts(reason)
+    local sessions=self:get("sessions",{})
+    local cleaned,changed=invalidate_report_contexts_table(sessions)
+    if changed>0 then self:set("sessions",cleaned) end
+    self:save_auth(invalidate_upload_health_table(self:get("auth",{})))
+    return changed,reason
 end
 function Store:session(id) return self:get("sessions",{})[tostring(id)] end
 function Store:save_session(id,patch) local a=self:get("sessions",{}); local k=tostring(id); a[k]=U.merge(a[k] or {},patch or {}); self:set("sessions",a); return a[k] end

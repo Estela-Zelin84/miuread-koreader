@@ -574,8 +574,9 @@ function Plugin:current_mp_article_menu(mp_context)
         {text="重新下载文章",callback=function() self:open_or_download_mp_article(account,article,true) end},
         {text="删除本篇缓存",callback=function()
             UIManager:show(ConfirmBox:new{text="删除《"..tostring(article.title or "文章").."》的本地缓存？",ok_callback=function()
-                self.mp:clear_article(account.bookId,article)
-                self:toast("本篇缓存已删除")
+                local ok,err=self.mp:clear_article(account.bookId,article)
+                if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
+                self:status_toast("公众号","本篇缓存已删除",4)
             end})
         end},
         {text="公众号缓存管理",sub_item_table_func=function() return self:mp_cache_menu(account,self.mp:cached_articles(account.bookId)) end},
@@ -1601,7 +1602,9 @@ function Plugin:show_mp_articles(book,articles,title_suffix)
     local items={
         {text="搜索文章",callback=function() self:mp_search_dialog(book,articles) end},
         {text="刷新文章列表",post_text="最近 100 篇",callback=function() self:_refresh_mp_articles(book,false) end},
-        {text="管理本号缓存",sub_item_table_func=function() return self:mp_cache_menu(book,articles) end},
+        {text="管理本号缓存",callback=function()
+            self:list("缓存管理 · "..tostring(book.title or "公众号"),self:mp_cache_menu(book,self.mp:cached_articles(book.bookId)),"暂无缓存")
+        end},
     }
     for _,row in ipairs(articles) do
         local article=U.copy(row)
@@ -1639,6 +1642,59 @@ function Plugin:mp_search_dialog(book,articles)
     UIManager:show(dialog); dialog:onShowKeyboard()
 end
 
+function Plugin:_close_mp_download_dialog()
+    local dialog=self._mp_download_dialog
+    self._mp_download_dialog=nil
+    if dialog then pcall(function() UIManager:close(dialog) end) end
+end
+
+function Plugin:_start_mp_article_download(book,article,force)
+    if self.mp_async:busy() then self:info("另一项公众号任务正在进行中。") return false end
+    local title=tostring(article.title or "文章")
+    local cancelled=false
+    local dialog
+    dialog=ButtonDialog:new{
+        title="正在下载公众号文章\n\n"..title.."\n\n文章通常较小，下载完成后会自动打开。",
+        title_align="left",
+        buttons={{{text="取消下载",callback=function()
+            cancelled=true
+            if self.mp_async and self.mp_async:busy() then self.mp_async:cancel("user_cancelled") end
+            self:_close_mp_download_dialog()
+            self:status_toast("公众号","已取消下载",3)
+        end}}},
+    }
+    self._mp_download_dialog=dialog
+    UIManager:show(dialog)
+
+    local book_copy,article_copy=U.copy(book),U.copy(article)
+    local prefs=self.store:preferences()
+    local started,err=self.mp_async:run("mp-article",function()
+        return self.mp:fetch_article(book_copy,article_copy,{images=prefs.mp_images==true,force=force==true})
+    end,function(result)
+        self:_close_mp_download_dialog()
+        if cancelled then return end
+        self.store:reload()
+        if result and result.ok and type(result.value)=="table" and result.value.file then
+            self:open_file(result.value.file)
+            return
+        end
+        local fallback=self.mp:article_record(book_copy.bookId,article_copy)
+        if fallback then
+            self:status_toast("公众号","下载未完整完成，已打开原缓存",4)
+            self:open_file(fallback.file)
+        else
+            logger.warn("[MiuRead][MP] article download failed",tostring(result and result.error))
+            self:info("文章下载失败：\n"..U.first_line(result and result.error or "未知错误",180))
+        end
+    end,120)
+    if not started then
+        self:_close_mp_download_dialog()
+        self:info("无法启动文章下载：\n"..tostring(err))
+        return false
+    end
+    return true
+end
+
 function Plugin:open_or_download_mp_article(book,article,force)
     local record=self.mp:article_record(book.bookId,article)
     if record and force~=true then self:open_file(record.file); return end
@@ -1647,26 +1703,15 @@ function Plugin:open_or_download_mp_article(book,article,force)
         if record then self:open_file(record.file) else self:info(_("Network unavailable")) end
         return
     end
-    if self.mp_async:busy() then self:info("另一项公众号任务正在进行中。") return end
-    self:status_toast("公众号",tostring(article.title or "文章").."正在下载",2)
-    local book_copy,article_copy=U.copy(book),U.copy(article)
-    local prefs=self.store:preferences()
-    local started,err=self.mp_async:run("mp-article",function()
-        return self.mp:fetch_article(book_copy,article_copy,{images=prefs.mp_images==true,force=force==true})
-    end,function(result)
-        self.store:reload()
-        if result and result.ok and type(result.value)=="table" and result.value.file then
-            self:open_file(result.value.file)
-        else
-            local fallback=self.mp:article_record(book_copy.bookId,article_copy)
-            if fallback then self:open_file(fallback.file)
-            else
-                logger.warn("[MiuRead][MP] article download failed",tostring(result and result.error))
-                self:info("文章下载失败，请稍后重试。")
-            end
-        end
-    end,120)
-    if not started then self:info("无法启动文章下载：\n"..tostring(err)) end
+    if force==true then
+        self:_start_mp_article_download(book,article,true)
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        text="《"..tostring(article.title or "文章").."》尚未缓存。\n\n是否下载并打开？公众号文章通常只需几秒。",
+        ok_text="下载并打开",
+        ok_callback=function() self:_start_mp_article_download(book,article,false) end,
+    })
 end
 
 function Plugin:mp_cache_menu(book,articles)
@@ -1686,8 +1731,10 @@ function Plugin:mp_cache_menu(book,articles)
     end
     items[#items+1]={text="清理本号文章缓存",callback=function()
         UIManager:show(ConfirmBox:new{text="清理《"..tostring(book.title or "公众号").."》的文章列表和单篇缓存？",ok_callback=function()
-            self.mp:clear_account(book.bookId)
-            self:toast("已清理")
+            local ok,err=self.mp:clear_account(book.bookId)
+            if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
+            self:status_toast("公众号","本号缓存已清理",4)
+            UIManager:scheduleIn(.15,function() self:show_mp_articles(book,articles,"缓存已清理") end)
         end})
     end}
     return items
@@ -1699,7 +1746,12 @@ function Plugin:mp_article_cache_menu(book,article)
         {text="重新下载文章",callback=function() self:open_or_download_mp_article(book,article,true) end},
         {text="删除单篇缓存",callback=function()
             UIManager:show(ConfirmBox:new{text="删除《"..tostring(article.title or "文章").."》的单篇缓存？",ok_callback=function()
-                self.mp:clear_article(book.bookId,article); self:toast("已清理")
+                local ok,err=self.mp:clear_article(book.bookId,article)
+                if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
+                self:status_toast("公众号","本篇缓存已删除",4)
+                UIManager:scheduleIn(.15,function()
+                    self:list("缓存管理 · "..tostring(book.title or "公众号"),self:mp_cache_menu(book,self.mp:cached_articles(book.bookId)),"暂无缓存")
+                end)
             end})
         end},
     }
@@ -1710,9 +1762,10 @@ function Plugin:mp_global_cache_menu()
     return {
         {text="清理全部公众号缓存",callback=function()
             UIManager:show(ConfirmBox:new{text="清理全部公众号列表和单篇文章缓存？",ok_callback=function()
-                U.remove_tree(self.store:mp_root())
-                U.mkdir(self.store:mp_root())
-                self:toast("已清理")
+                local ok,err=U.remove_tree(self.store:mp_root())
+                if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
+                if not U.mkdir(self.store:mp_root()) then self:info("缓存目录重建失败，请重启 KOReader。") return end
+                self:status_toast("公众号","全部缓存已清理",4)
             end})
         end},
     }
@@ -2617,7 +2670,13 @@ function Plugin:chapter_menu(b,ch)
 end
 
 function Plugin:_open_file_direct(path)
-    if self.ui.document then self.ui:switchDocument(path) else self.ui:openFile(path) end
+    if self.ui and self.ui.document and type(self.ui.switchDocument)=="function" then
+        return self.ui:switchDocument(path)
+    end
+    local Event=require("ui/event")
+    local ReaderUI=require("apps/reader/readerui")
+    UIManager:broadcastEvent(Event:new("SetupShowReader"))
+    return ReaderUI:showReader(path)
 end
 function Plugin:open_file(path)
     if not path then self:info(_("No cached file")); return end

@@ -14,7 +14,7 @@ local Sync = {}
 Sync.__index = Sync
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 5
+local READ_REPORT_SERVICE_VERSION = 6
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
 
@@ -959,7 +959,7 @@ function Sync:_retire_legacy_daemon()
     -- current version. This prevents an OTA reload from leaving an older
     -- process uploading stale book or position data.
     local base = self.store.temp_dir .. "/readtime-service"
-    for _, suffix in ipairs({"", "-v1", "-v2"}) do
+    for _, suffix in ipairs({"", "-v1", "-v2", "-v3", "-v4", "-v5"}) do
         U.atomic_write(base .. suffix .. ".stop", "1", true)
     end
 end
@@ -1717,11 +1717,20 @@ function Sync:on_auth_restored()
     self.last_error=nil
     self.consecutive_failures=0
     self.failure_notified=false
+    if self.daemon and self.daemon.active then
+        self:_stop_daemon("auth_restored",false,0)
+    end
+    self.async:cancel("auth_restored")
+    self.daemon_context=nil
+    if self.store and self.store.invalidate_report_contexts then
+        self.store:invalidate_report_contexts("auth_restored")
+    end
+    self.busy=false
     local record=self:record()
     if not record or self.suspended then return false end
     if self.store:preferences().sync.time_enabled~=true then return false end
     self.state="waiting"
-    self.last_stage="登录已恢复，正在补传阅读时间"
+    self.last_stage="登录已恢复，正在重建上传上下文"
     return self:start("auth_restored") == true
 end
 

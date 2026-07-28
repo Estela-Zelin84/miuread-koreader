@@ -206,10 +206,8 @@ local function refresh_context(client, book_id, book, force)
     local standalone_catalog_missing = book.source_is_standalone == true and book.catalog_complete ~= true
     local context_ready = book.psvts ~= nil and tostring(book.psvts) ~= ""
         and book.chapter_uid ~= nil
+        and type(book.chapters) == "table" and #book.chapters > 0
         and not standalone_catalog_missing
-        and ((type(book.chapters) == "table" and #book.chapters > 0)
-            or tonumber(book.chapter_word_count or 0) > 0
-            or book.catalog_complete == true)
 
     if not force and context_ready and context_age < CONTEXT_MAX_AGE_SECONDS then
         return book, false
@@ -246,17 +244,6 @@ local function refresh_context(client, book_id, book, force)
     end
 
     local selected = select_context_chapter(book)
-    if not selected and book.chapter_uid ~= nil and tostring(book.chapter_uid) ~= "" then
-        -- A login interruption may leave a valid saved reporting position while
-        -- the refreshed catalog temporarily contains only structural nodes.
-        -- Keep the last confirmed chapter instead of discarding pending time.
-        selected = {
-            chapterUid = book.chapter_uid,
-            chapterIdx = tonumber(book.chapter_idx) or 0,
-            wordCount = tonumber(book.chapter_word_count) or 0,
-            title = book.summary or book.title,
-        }
-    end
     if not selected then
         error("no readable chapter found for report context")
     end
