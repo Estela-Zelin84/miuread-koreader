@@ -49,28 +49,205 @@ local function plain(value)
     return tostring(value or ""):gsub("<[^>]+>", " "):gsub("&[%#%w]+;", " "):gsub("%s+", " ")
 end
 
-local function normalized_title(value)
-    return plain(value):lower():gsub("[%s%p%c]", "")
+-- Fold the full-width ASCII block (U+FF01-U+FF5E) onto plain ASCII so a title
+-- differing from the body only by punctuation width still compares equal.
+local function fold_fullwidth(value)
+    value = value:gsub("\239\188([\129-\191])", function(c) return string.char(c:byte() - 96) end)
+    value = value:gsub("\239\189([\128-\158])", function(c) return string.char(c:byte() - 32) end)
+    return value
 end
 
-local function prepare_chapter_body(html, title)
+-- Invisible spacing and CJK punctuation that Lua character classes cannot see,
+-- because %s and %p only ever match single-byte ASCII.
+local BLANK_PATTERNS = {
+    "\194\160",             -- U+00A0 no-break space
+    "\194\173",             -- U+00AD soft hyphen
+    "\227\128[\128-\191]",  -- U+3000-U+303F ideographic space, CJK punctuation
+    "\226\128[\128-\191]",  -- U+2000-U+203F spaces, dashes, quotes, ellipsis
+    "\226\129[\128-\175]",  -- U+2040-U+206F
+    "\239\187\191",         -- U+FEFF byte order mark
+}
+
+local function normalized_title(value)
+    local text = fold_fullwidth(plain(value)):lower()
+    for _, pattern in ipairs(BLANK_PATTERNS) do text = text:gsub(pattern, "") end
+    text = text:gsub("[%s%p%c]", "")
+    return text
+end
+
+local function trim_lead(value)
+    value = tostring(value or "")
+    while true do
+        local stripped = value:gsub("^[%s%c]+", "")
+        for _, blank in ipairs(BLANK_PATTERNS) do stripped = stripped:gsub("^" .. blank, "") end
+        if stripped == value then return value end
+        value = stripped
+    end
+end
+
+local CJK_DIGITS = {
+    ["〇"]=true, ["零"]=true, ["一"]=true, ["二"]=true, ["三"]=true, ["四"]=true,
+    ["五"]=true, ["六"]=true, ["七"]=true, ["八"]=true, ["九"]=true, ["十"]=true,
+    ["百"]=true, ["千"]=true, ["两"]=true,
+}
+local NUMBER_UNITS = {"章", "节", "節", "回", "卷", "篇", "部", "夜", "话", "話", "集", "幕", "折", "出"}
+local NUMBER_SEPARATORS = {["、"]=true, ["．"]=true, ["："]=true, ["，"]=true, ["。"]=true}
+
+local function has_number_unit(text)
+    for _, unit in ipairs(NUMBER_UNITS) do
+        if text:find(unit, 1, true) then return true end
+    end
+    return false
+end
+
+-- True when the title already carries numbering of its own. This deliberately
+-- errs towards "already numbered": a false positive only means nothing is
+-- changed, while a false negative could promote the wrong heading.
+local function title_is_numbered(title)
+    title = trim_lead(title)
+    if title == "" then return false end
+    if title:find("^%d") then return true end
+    if title:find("^[%(%[]%s*%d") then return true end
+    if title:find("^（%s*%d") or title:find("^【%s*%d") then return true end
+    local lowered = title:lower()
+    if lowered:find("^chapter") or lowered:find("^part%s") or lowered:find("^section%s") then return true end
+    if title:sub(1, 3) == "第" then
+        local following = title:sub(4, 6)
+        if CJK_DIGITS[following] then return true end
+        if title:sub(4, 4):find("%d") then return true end
+    end
+    if CJK_DIGITS[title:sub(1, 3)] then
+        local head = title:sub(1, 24)
+        if has_number_unit(head) then return true end
+        if NUMBER_SEPARATORS[title:sub(4, 6)] then return true end
+        if title:find("^...[%.%s]") then return true end
+    end
+    return false
+end
+
+local TITLE_SCAN_LIMIT = 2400
+local TITLE_SCAN_WINDOW = TITLE_SCAN_LIMIT + 2000
+local TITLE_SCAN_HEADINGS = 8
+local TITLE_SLACK_BYTES = 40
+
+local function attribute(attrs, name)
+    attrs = tostring(attrs or "")
+    return attrs:match(name .. '%s*=%s*"([^"]*)"')
+        or attrs:match(name .. "%s*=%s*'([^']*)'")
+        or ""
+end
+
+-- A heading may carry the catalog title as its text, as a title attribute, or
+-- as the caption of a title image. All three describe the same heading.
+local function heading_labels(head)
+    local out = {head.inner, attribute(head.attrs, "title")}
+    for image_attrs in head.inner:gmatch("<img([^>]*)>") do
+        out[#out + 1] = attribute(image_attrs, "alt")
+        out[#out + 1] = attribute(image_attrs, "title")
+    end
+    return out
+end
+
+local function collect_headings(window, limit)
+    local heads, position = {}, 1
+    while #heads < TITLE_SCAN_HEADINGS do
+        local first, last, tag, attrs, inner = window:find("<(h[1-6])([^>]*)>(.-)</%1%s*>", position)
+        if not first or first > limit then break end
+        heads[#heads + 1] = {first = first, last = last, tag = tag, attrs = attrs, inner = inner}
+        position = last + 1
+    end
+    return heads
+end
+
+-- prepare_chapter_body returns the wrapped body plus, when the downloaded
+-- content states a fuller version of the title than the catalog did, that
+-- fuller title. Nothing is ever invented: the returned title is text the
+-- service itself printed inside the chapter.
+--
+-- base_title is the catalog title before a numbered variant replaced it. When
+-- the body prints that bare title, the existing heading is upgraded in place,
+-- so restoring a number never produces a second visible title.
+local function prepare_chapter_body(html, title, base_title)
     local fragment = Codec.body(html)
     title = tostring(title or "")
-    if title == "" then return '<section class="miu-chapter" epub:type="chapter">' .. fragment .. "</section>" end
+    if title == "" then
+        return '<section class="miu-chapter" epub:type="chapter">' .. fragment .. "</section>", nil
+    end
+
     local wanted = normalized_title(title)
-    local prefix = fragment:sub(1, 1600)
-    local has_title = false
-    for tag, attrs, inner in prefix:gmatch("<(h[1-6])([^>]*)>(.-)</%1%s*>") do
-        if normalized_title(inner) == wanted then has_title = true; break end
+    local base_wanted = normalized_title(base_title or "")
+    if base_wanted == wanted then base_wanted = "" end
+    local slack = #trim_lead(title) + TITLE_SLACK_BYTES
+
+    local has_title, promoted = false, nil
+    if wanted ~= "" then
+        local window = fragment:sub(1, TITLE_SCAN_WINDOW)
+        local heads = collect_headings(window, TITLE_SCAN_LIMIT)
+
+        local function exact(value, target)
+            return target ~= "" and normalized_title(value) == target
+        end
+
+        -- The catalog says "锦朝" while the body heading says "第1章 锦朝".
+        -- Accepted only when the heading is itself numbered, contains the
+        -- catalog title, and is not materially longer than it.
+        local function numbered_variant(value)
+            local text = trim_lead(value)
+            if text == "" or #text > slack then return nil end
+            if not title_is_numbered(text) then return nil end
+            local folded = normalized_title(text)
+            if #folded <= #wanted or not folded:find(wanted, 1, true) then return nil end
+            return text
+        end
+
+        for index, head in ipairs(heads) do
+            for _, label in ipairs(heading_labels(head)) do
+                if exact(label, wanted) or exact(label, base_wanted) then
+                    has_title = true
+                    break
+                end
+                local variant = numbered_variant(label)
+                if variant then
+                    has_title = true
+                    promoted = promoted or variant
+                    break
+                end
+            end
+            if has_title then
+                if base_wanted ~= "" and exact(head.inner, base_wanted) and not exact(head.inner, wanted) then
+                    local replacement = "<" .. head.tag .. head.attrs .. ">" .. U.xml(title) .. "</" .. head.tag .. ">"
+                    fragment = fragment:sub(1, head.first - 1) .. replacement .. fragment:sub(head.last + 1)
+                end
+                break
+            end
+            -- Some books split one catalog title over neighbouring headings,
+            -- for example "第一夜" followed by "我们的不幸是谁的错？".
+            local joined = normalized_title(head.inner)
+            for next_index = index + 1, math.min(index + 2, #heads) do
+                local previous = heads[next_index - 1]
+                local gap = window:sub(previous.last + 1, heads[next_index].first - 1)
+                if normalized_title(gap) ~= "" then break end
+                joined = joined .. normalized_title(heads[next_index].inner)
+                if joined == wanted or (base_wanted ~= "" and joined == base_wanted) then
+                    has_title = true
+                    break
+                end
+            end
+            if has_title then break end
+        end
+
+        if not has_title then
+            local _, first_inner = window:match("^%s*<([pd][^>]*)>(.-)</[pd][^>]*>")
+            if first_inner and (exact(first_inner, wanted) or exact(first_inner, base_wanted)) then
+                has_title = true
+            end
+        end
     end
-    if not has_title then
-        local _, first_inner = prefix:match("^%s*<([pd][^>]*)>(.-)</[pd][^>]*>")
-        if first_inner and normalized_title(first_inner) == wanted then has_title = true end
-    end
+
     if not has_title then
         fragment = '<h1 class="miu-chapter-title">' .. U.xml(title) .. "</h1>\n" .. fragment
     end
-    return '<section class="miu-chapter" epub:type="chapter" data-miuread-section="1">' .. fragment .. "</section>"
+    return '<section class="miu-chapter" epub:type="chapter" data-miuread-section="1">' .. fragment .. "</section>", promoted
 end
 
 local function preview_information_chapter(book, mode, catalog_count, readable_count, restricted_count, failures)
@@ -164,7 +341,8 @@ local function option_key(opt)
         opt.annotations and "notes" or "clean",
         opt.images == false and "no-images" or "images",
         opt.chapter_uid and ("chapter-" .. U.id_name(opt.chapter_uid))
-            or ((opt.range_start_index and opt.range_end_index) and "range" or "book"),
+            or ((opt.range_start_index and opt.range_end_index)
+                and ("range-" .. tostring(opt.range_start_index) .. "-" .. tostring(opt.range_end_index)) or "book"),
     }, "-")
 end
 
