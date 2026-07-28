@@ -221,8 +221,9 @@ function Plugin:require_login()
 end
 
 local AUTH_CHANNEL_LABELS={
-    shelf="书架访问",progress="云端进度读取",download="后台下载",read_report="阅读时间上传",
+    shelf="书架访问",progress="云端进度读取",download="书籍下载",read_report="阅读时间上传",
 }
+local AUTH_CHANNEL_ORDER={"shelf","progress","download","read_report"}
 local function auth_error_code(value)
     if Http.auth_error_code then
         local ok,code=pcall(Http.auth_error_code,value)
@@ -230,6 +231,10 @@ local function auth_error_code(value)
     end
     local text=tostring(value or "")
     return text:match("error_code=([%-]?%d+)") or text:match('"errcode"%s*:%s*([%-]?%d+)') or ""
+end
+local function auth_row(value)
+    return U.merge({state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0,last_ok_at=0},
+        type(value)=="table" and value or {})
 end
 function Plugin:_auth_health()
     if self.store.auth_health then return self.store:auth_health() end
@@ -243,20 +248,28 @@ function Plugin:_save_auth_health(health)
     self.store:save_auth(auth)
     return health
 end
+function Plugin:_recompute_auth_health(health)
+    health.channels=health.channels or {}
+    if not self:logged_in() then health.state="logged_out"; return health end
+    local partial,unknown=false,false
+    for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
+        local state=tostring(auth_row(health.channels[channel]).state)
+        if state=="expired" or state=="error" then partial=true
+        elseif state~="ok" then unknown=true end
+    end
+    health.state=partial and "partial" or (unknown and "unknown" or "ok")
+    return health
+end
 function Plugin:_mark_auth_channel_ok(channel)
     if not self:logged_in() then return end
     local now=os.time()
     local health=self:_auth_health()
     health.channels=health.channels or {}
-    health.channels[channel]={state="ok",checked_at=now,error="",code=""}
+    health.channels[channel]={state="ok",checked_at=now,error="",code="",failures=0,retry_at=0,last_ok_at=now}
     health.last_checked_at=now
     health.last_ok_at=now
-    local all_ok=true
-    for _,key in ipairs({"shelf","progress","download","read_report"}) do
-        if tostring((health.channels[key] or {}).state or "unknown")~="ok" then all_ok=false; break end
-    end
-    if all_ok then
-        health.state="ok"
+    self:_recompute_auth_health(health)
+    if health.state=="ok" then
         health.last_error_at=0
         health.last_error_code=""
         health.last_error_message=""
@@ -265,34 +278,50 @@ function Plugin:_mark_auth_channel_ok(channel)
     end
     self:_save_auth_health(health)
 end
-function Plugin:_mark_auth_channel_error(channel,err)
+function Plugin:_mark_auth_channel_error(channel,err,retry_at)
     if not self:logged_in() then return end
     local now=os.time()
     local health=self:_auth_health()
     health.channels=health.channels or {}
-    health.channels[channel]={state="error",checked_at=now,error=U.first_line(err,180),code=""}
+    local previous=auth_row(health.channels[channel])
+    health.channels[channel]={state="error",checked_at=now,error=U.first_line(err,180),code="",
+        failures=(tonumber(previous.failures) or 0)+1,retry_at=tonumber(retry_at) or 0,last_ok_at=previous.last_ok_at or 0}
     health.last_checked_at=now
+    health.last_error_at=now
+    health.last_error_message=U.first_line(err,220)
+    health.last_error_channel=channel
+    self:_recompute_auth_health(health)
     self:_save_auth_health(health)
 end
 function Plugin:_mark_auth_problem(channel,err,notify)
-    local text=tostring(err or "登录状态已失效")
+    local text=tostring(err or "登录状态暂时不可用")
     if not Http.is_auth_error(text) then return false end
     local now=os.time()
     local health=self:_auth_health()
     health.channels=health.channels or {}
+    local previous=auth_row(health.channels[channel])
+    local threshold=math.max(1,tonumber(Config.AUTH_NOTICE_FAILURE_THRESHOLD) or 2)
+    local failures=(tonumber(previous.failures) or 0)+1
+    local confirmed=text:find("自动续期失败",1,true)~=nil
+        or text:find("renewal=",1,true)~=nil
+        or text:find("refreshed=",1,true)~=nil
+    if confirmed then failures=math.max(failures,threshold) end
+    local expired=failures>=threshold
     local code=auth_error_code(text)
-    health.channels[channel]={state="expired",checked_at=now,error=U.first_line(text,180),code=code}
-    health.state="degraded"
+    health.channels[channel]={state=expired and "expired" or "error",checked_at=now,
+        error=U.first_line(text,180),code=code,failures=failures,retry_at=0,last_ok_at=previous.last_ok_at or 0}
     health.last_checked_at=now
     health.last_error_at=now
     health.last_error_code=code
     health.last_error_message=U.first_line(text,220)
     health.last_error_channel=channel
-    health.notice_pending=true
+    if notify~=false and expired then health.notice_pending=true end
+    self:_recompute_auth_health(health)
     self:_save_auth_health(health)
-    logger.warn("[MiuRead][Auth] feature session invalid",
-        "channel=",tostring(channel),"code=",tostring(code),"error=",U.first_line(text,160))
-    if notify~=false then UIManager:scheduleIn(.05,function() self:_show_auth_notice() end) end
+    logger.warn("[MiuRead][Auth] feature request authentication failed",
+        "channel=",tostring(channel),"code=",tostring(code),"failures=",tostring(failures),
+        "confirmed=",tostring(confirmed),"error=",U.first_line(text,160))
+    if health.notice_pending then UIManager:scheduleIn(.05,function() self:_show_auth_notice() end) end
     return true
 end
 function Plugin:_clear_auth_notice_pending()
@@ -305,18 +334,22 @@ end
 function Plugin:_show_auth_notice()
     if self._auth_notice_dialog or not self:logged_in() then return end
     local health=self:_auth_health()
-    if health.state~="degraded" or health.notice_pending~=true then return end
-    local channel=AUTH_CHANNEL_LABELS[tostring(health.last_error_channel or "")] or "在线功能"
+    if health.notice_pending~=true then return end
+    local channel_key=tostring(health.last_error_channel or "")
+    local channel=AUTH_CHANNEL_LABELS[channel_key] or "在线功能"
     local dialog
     local function close()
         if self._auth_notice_dialog==dialog then self._auth_notice_dialog=nil end
         UIManager:close(dialog)
     end
     dialog=ButtonDialog:new{
-        title="微信读书登录已失效\n\n"..channel.."已暂停。已下载章节、下载断点和本地阅读记录均已保留。请重新扫码登录，登录成功后会自动继续可恢复的任务。",
+        title=channel.."暂时无法验证登录\n\n只有此功能受到影响，其他功能会继续运行。插件会保留下载断点和待上传阅读时间，并在后续真实请求中自动重试。多次失败后可重新扫码。",
         title_align="center",
         buttons={
-            {{text="立即扫码",callback=function()
+            {{text="查看账号状态",callback=function()
+                self:_clear_auth_notice_pending(); close(); self:show_account_status()
+            end}},
+            {{text="重新扫码",callback=function()
                 self:_clear_auth_notice_pending(); close(); self.auth_flow:start()
             end}},
             {{text="稍后处理",callback=function()
@@ -331,35 +364,41 @@ function Plugin:_account_status_label()
     if not self:logged_in() then return "未登录 · 点击扫码" end
     local auth=self.store:auth()
     local health=self:_auth_health()
+    self:_recompute_auth_health(health)
     local name=U.trim(tostring((auth.account or {}).name or ""))
-    if health.state=="degraded" then
-        return name~="" and ("登录异常 · "..name) or "登录异常 · 点击处理"
+    if health.state=="partial" then
+        return name~="" and ("部分功能异常 · "..name) or "部分功能异常 · 点击查看"
     end
     if health.state~="ok" then
-        return name~="" and ("待验证 · "..name) or "已登录 · 待验证"
+        return name~="" and ("已登录 · "..name) or "已登录 · 功能待验证"
     end
     return name~="" and ("已登录 · "..name) or "已登录"
 end
 local function account_channel_text(row)
-    row=type(row)=="table" and row or {}
+    row=auth_row(row)
     local state=tostring(row.state or "unknown")
     if state=="ok" then return "正常" end
-    if state=="expired" then return "登录已失效" end
-    if state=="error" then return "暂时失败" end
-    return "尚未检查"
+    if state=="expired" then return "多次验证失败，可重新扫码" end
+    if state=="error" then
+        local retry_at=tonumber(row.retry_at or 0) or 0
+        return retry_at>os.time() and "暂时失败，等待自动重试" or "暂时失败"
+    end
+    return "将在实际使用时验证"
 end
 function Plugin:_account_details_text()
     local auth=self.store:auth()
     local health=self:_auth_health()
+    self:_recompute_auth_health(health)
     local name=U.trim(tostring((auth.account or {}).name or ""))
     local lines={"账号状态","","账号："..(name~="" and name or "—")}
     if not self:logged_in() then
-        lines[#lines+1]="状态：尚未登录"
+        lines[#lines+1]="基础登录：尚未登录"
         return table.concat(lines,"\n")
     end
-    lines[#lines+1]="状态："..(health.state=="ok" and "正常" or (health.state=="degraded" and "部分登录凭据已失效" or "等待实际验证"))
+    lines[#lines+1]="基础登录：正常"
+    lines[#lines+1]="在线功能："..(health.state=="ok" and "全部正常" or (health.state=="partial" and "部分暂时异常" or "等待实际使用验证"))
     lines[#lines+1]=""
-    for _,channel in ipairs({"shelf","progress","download","read_report"}) do
+    for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
         lines[#lines+1]=AUTH_CHANNEL_LABELS[channel].."："..account_channel_text((health.channels or {})[channel])
     end
     lines[#lines+1]=""
@@ -369,14 +408,17 @@ function Plugin:_account_details_text()
         local code=tostring(health.last_error_code or "")
         lines[#lines+1]="最近异常："..channel..(code~="" and ("（"..code.."）") or "")
     end
+    local sync_status=self.sync and self.sync:status() or {}
+    local pending=math.max(0,math.floor(tonumber(sync_status.pending_report_elapsed or 0) or 0))
+    if pending>0 then lines[#lines+1]="待上传阅读时间："..tostring(pending).." 秒" end
     lines[#lines+1]=""
-    lines[#lines+1]="本地书籍、下载断点和待上传阅读记录不会因登录失效而删除。"
+    lines[#lines+1]="续期只用于失败后的恢复，不再作为下载或上传的前置条件。"
     return table.concat(lines,"\n")
 end
 function Plugin:_set_all_auth_ok()
     if not self:logged_in() then return end
     local now=os.time()
-    local okrow={state="ok",checked_at=now,error="",code=""}
+    local okrow={state="ok",checked_at=now,error="",code="",failures=0,retry_at=0,last_ok_at=now}
     local health=self:_auth_health()
     health.state="ok"
     health.last_checked_at=now
@@ -394,30 +436,15 @@ end
 function Plugin:check_account_status()
     if not self:logged_in() then self.auth_flow:start(); return end
     self:online("account-status-check",function()
-        self:status_toast("账号状态","正在检查微信读书登录……",3)
-        local web_ok,web_result=pcall(self.reader.check_login_session,self.reader)
-        if web_ok then
-            self:_mark_auth_channel_ok("download")
-            self:_mark_auth_channel_ok("read_report")
-        elseif Http.is_auth_error(web_result) then
-            self:_mark_auth_problem("download",web_result,false)
-            self:_mark_auth_problem("read_report",web_result,false)
-        else
-            self:_mark_auth_channel_error("download",web_result)
-            self:_mark_auth_channel_error("read_report",web_result)
-        end
+        self:status_toast("账号状态","正在检查基础账号和书架访问",3)
         local shelf_ok,shelf_result=pcall(self.api.shelf,self.api,{retries=0,timeout={7,12}})
         if shelf_ok then
             self:_mark_auth_channel_ok("shelf")
-            self:_mark_auth_channel_ok("progress")
         elseif Http.is_auth_error(shelf_result) then
             self:_mark_auth_problem("shelf",shelf_result,false)
-            self:_mark_auth_problem("progress",shelf_result,false)
         else
             self:_mark_auth_channel_error("shelf",shelf_result)
-            self:_mark_auth_channel_error("progress",shelf_result)
         end
-        if web_ok and shelf_ok then self:_set_all_auth_ok() end
         self:show_account_status()
     end)
 end
@@ -459,7 +486,7 @@ function Plugin:on_auth_success(name)
     end
     local resumed=false
     local state=self.store:download_state()
-    if web_ready and state.status=="failed" and state.auth_required==true and type(state.book)=="table" then
+    if state.status=="failed" and state.auth_required==true and type(state.book)=="table" then
         state.status="interrupted"
         state.error="登录已恢复，正在继续下载。"
         state.auth_required=nil
@@ -475,13 +502,13 @@ function Plugin:on_auth_success(name)
     else
         UIManager:scheduleIn(.8,function() self:_start_next_queued_download() end)
     end
-    if web_ready and self.sync and self.sync.on_auth_restored then
+    if self.sync and self.sync.on_auth_restored then
         local ok,value=pcall(self.sync.on_auth_restored,self.sync)
         resumed=resumed or (ok and value==true)
     end
-    local title=web_ready and "账号状态已恢复" or "扫码登录完成"
+    local title="账号登录成功"
     local detail=tostring(name or "微信读书账号")
-        ..(resumed and " · 正在恢复后台任务" or (web_ready and "" or " · 正文会话等待检查"))
+        ..(resumed and " · 正在恢复后台任务" or (web_ready and "" or " · 在线功能将在实际使用时验证"))
     self:status_toast(title,detail,5)
 end
 function Plugin:_download_menu_text()
@@ -506,7 +533,8 @@ function Plugin:home_menu()
         {text="设置与关于",sub_item_table_func=function() return self:settings_menu() end},
     }
     local health=self:_auth_health()
-    if self:logged_in() and health.state=="degraded" then
+    self:_recompute_auth_health(health)
+    if self:logged_in() and health.state=="partial" then
         table.remove(out,5); table.insert(out,1,account)
     end
     return out
@@ -1887,6 +1915,7 @@ function Plugin:_finish_download_runtime(runtime,result)
         end
         local auth_required=Http.is_auth_error(err)
         local rate_limited=Http.is_rate_limit_error(err)
+        local network_failed=Http.is_network_error and Http.is_network_error(err)
         local wait_seconds=tonumber(tostring(err):match("wait_seconds=(%d+)"))
         if auth_required then self:_mark_auth_problem("download",err,true) end
         self:_write_download_state("failed",{
@@ -1895,16 +1924,19 @@ function Plugin:_finish_download_runtime(runtime,result)
             current=runtime.last_state and runtime.last_state.current,total=runtime.last_state and runtime.last_state.total,
             percent=runtime.last_state and runtime.last_state.percent,seen=false,
             auth_required=auth_required or nil,
-            error_kind=auth_required and "authentication" or (rate_limited and "rate_limit" or nil),
+            error_kind=auth_required and "authentication" or (rate_limited and "rate_limit" or (network_failed and "network" or nil)),
             wait_seconds=rate_limited and wait_seconds or nil,
         },true)
         self:_update_open_shelf_download_status(b.bookId,
-            auth_required and "等待重新登录" or (rate_limited and "请求受限 · 稍后继续" or "生成未完成"))
+            auth_required and "等待重新登录" or (rate_limited and "请求受限 · 稍后继续"
+                or (network_failed and "等待网络 · 可继续" or "生成未完成")))
         local first
         if auth_required then
             first="微信读书登录已失效。下载断点已经保留，请重新扫码登录后继续。"
         elseif rate_limited then
             first="微信读书暂时限制了请求频率。插件已停止继续请求，正文和断点均已保留，请稍后继续下载。"
+        elseif network_failed then
+            first="网络连接暂时中断。已完成章节和下载断点均已保留，网络恢复后可继续下载。"
         else
             first=U.first_line(err)
         end
@@ -1912,15 +1944,17 @@ function Plugin:_finish_download_runtime(runtime,result)
             first="划线与想法暂时无法获取，可改为生成纯净版。已下载正文会保留。"
         end
         if was_background then
-            local toast_title=auth_required and "登录已失效" or (rate_limited and "请求受限" or "觅阅")
+            local toast_title=auth_required and "下载登录验证失败" or (rate_limited and "请求受限"
+                or (network_failed and "等待网络" or "觅阅"))
             local toast_text=auth_required and "后台下载已暂停，重新扫码后自动继续"
                 or (rate_limited and "已停止继续请求，下载断点已保留"
-                or (tostring(b.title or "未命名").."下载未完成，进度已保留"))
+                or (network_failed and "下载断点已保留，网络恢复后可继续"
+                or (tostring(b.title or "未命名").."下载未完成，进度已保留")))
             self:status_toast(toast_title,toast_text,5)
         else self:info(first) end
         -- A rate limit is account-wide. Starting the next queued book here would
         -- immediately hit the same limit and prolong the cooldown.
-        if not auth_required and not rate_limited then self:_start_next_queued_download() end
+        if not auth_required and not rate_limited and not network_failed then self:_start_next_queued_download() end
         return
     end
     self:_mark_auth_channel_ok("download")
@@ -2042,6 +2076,7 @@ function Plugin:_download_status_label()
     if state.status=="pending_install" then return "后台下载 · 等待更新" end
     if state.status=="completed" then return "后台下载 · 已完成" end
     if state.status=="failed" and state.auth_required==true then return "后台下载 · 等待重新登录" end
+    if state.status=="failed" and state.error_kind=="network" then return "后台下载 · 等待网络，可继续" end
     if state.status=="failed" then return "后台下载 · 未完成" end
     if state.status=="interrupted" then return "后台下载 · 可继续" end
     return "后台下载"
@@ -2204,6 +2239,7 @@ function Plugin:show_download_status()
     elseif state.status=="pending_install" then lines[#lines+1]="新版本已下载完成"
     elseif state.status=="failed" and state.auth_required==true then lines[#lines+1]="等待重新登录"
     elseif state.status=="failed" and state.error_kind=="rate_limit" then lines[#lines+1]="请求频率受限，稍后可继续"
+    elseif state.status=="failed" and state.error_kind=="network" then lines[#lines+1]="网络中断，断点已保留"
     elseif state.status=="failed" then lines[#lines+1]="下载未完成"
     elseif state.status=="interrupted" then lines[#lines+1]="上次下载已中断"
     else lines[#lines+1]=tostring(state.status) end
@@ -2352,21 +2388,6 @@ end
 function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
     if not self:require_login() then return end
     if not self:is_online() then self:info(_("Network unavailable")); return end
-    local health=self:_auth_health()
-    local checked_at=tonumber(((health.channels or {}).download or {}).checked_at or 0) or 0
-    if health.state~="ok" or os.time()-checked_at>30*60 then
-        self:status_toast("后台下载","正在确认微信读书登录状态",3)
-        local login_ok,login_result=pcall(self.reader.check_login_session,self.reader)
-        if not login_ok then
-            self:_mark_auth_problem("download",login_result,true)
-            local state={status="failed",title=b and b.title,book_id=b and b.bookId,
-                book=U.copy(b or {}),options=U.copy(opt or {}),auth_required=true,
-                error_kind="authentication",error=tostring(login_result),seen=false,updated_at=os.time()}
-            self.store:save_download_state(state)
-            return false
-        end
-        self:_mark_auth_channel_ok("download")
-    end
     opt=U.copy(opt or {})
     if self.download_task and self.download_task:busy() then
         if from_queue then
@@ -3390,7 +3411,7 @@ function Plugin:show_sync_status(_detail)
     if not s.time_enabled then time_text="已关闭"
     elseif not s.record or s.state=="stopped" then time_text="未运行"
     elseif s.state=="verification_required" or s.state=="fetching_remote" or s.state=="progress_sync" then time_text="等待位置确认"
-    elseif s.state=="paused" and self:_auth_health().state=="degraded" then time_text="登录已失效，等待重新扫码"
+    elseif s.state=="paused" then time_text="暂时失败，等待自动重试"
     elseif type(s.last_error)=="string" and (tonumber(s.consecutive_failures) or 0)>=2 then time_text="暂时失败，稍后重试"
     elseif s.state=="uploading" then time_text="正在同步"
     else time_text="运行中" end
@@ -3401,7 +3422,12 @@ function Plugin:show_sync_status(_detail)
 end
 
 function Plugin:on_auth_required(channel,err)
-    return self:_mark_auth_problem(channel,err,true)
+    local notify=tostring(channel or "")~="read_report"
+    local marked=self:_mark_auth_problem(channel,err,notify)
+    if marked and not notify then
+        self:status_toast("阅读时间上传","登录验证暂时失败，将自动重试；下载不受影响",5)
+    end
+    return marked
 end
 function Plugin:on_auth_channel_ok(channel)
     self:_mark_auth_channel_ok(channel)
@@ -3439,7 +3465,8 @@ function Plugin:on_read_report_interval_success(_status)
 end
 function Plugin:on_read_report_failure(err)
     if Http.is_auth_error(err) then
-        self:_mark_auth_problem("read_report",err,true)
+        self:_mark_auth_problem("read_report",err,false)
+        self:status_toast("阅读同步","登录验证暂时失败，阅读时间已保留并会自动重试",5)
         return
     end
     self:status_toast("阅读同步","连续同步失败，将稍后自动重试",5)

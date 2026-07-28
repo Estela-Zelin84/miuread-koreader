@@ -2,6 +2,7 @@ local Cookie = require("miuread.legacy.cookie")
 local Client = require("miuread.legacy.client")
 local Content = require("miuread.legacy.content")
 local WeRead = require("miuread.legacy.weread")
+local Http = require("miuread.http")
 
 local Worker = {}
 
@@ -368,7 +369,10 @@ local function attempt_report(client, book_id, elapsed_seconds, book, progress_r
         return client:report_read(payload, referer)
     end)
     if not ok then
-        return false, nil, tostring(result), "transport"
+        local message=tostring(result)
+        local kind=Http.is_auth_error(message) and "authentication"
+            or ((Http.is_network_error and Http.is_network_error(message)) and "transport" or "server")
+        return false, nil, message, kind
     end
     if read_report_accepted(result) then
         return true, result, nil, nil, position_or_error
@@ -455,10 +459,13 @@ function Worker.run(job)
         return refresh_context(client, book_id, book, false)
     end)
     if not context_ok then
+        local message=tostring(context_or_error)
+        local kind=Http.is_auth_error(message) and "authentication"
+            or ((Http.is_network_error and Http.is_network_error(message)) and "transport" or "context")
         return finish(settings, book, {
             ok = false,
-            error = tostring(context_or_error),
-            error_kind = "context",
+            error = message,
+            error_kind = kind,
         }, context_changed)
     end
     book = context_or_error

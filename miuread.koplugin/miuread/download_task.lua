@@ -4,6 +4,7 @@ local U = require("miuread.util")
 local UIManager = require("ui/uimanager")
 local Device = require("device")
 local logger = require("logger")
+local Config = require("miuread.config")
 local lfs = require("libs/libkoreader-lfs")
 
 local DownloadTask = {}
@@ -306,11 +307,12 @@ function DownloadTask:_finish(job, forced_error)
             "message="..tostring(state.message or ""),
             "started_at="..tostring(job.started_at or ""),
             "last_progress_at="..tostring(job.last_progress_at or ""),
+            "process_alive="..tostring(process_exists(job.pid)),
             "result_exists="..tostring(file_exists(job.result_path)),
             "recovery_exists="..tostring(job.recovery_path and file_exists(job.recovery_path) or false),
             "error="..tostring(type(result)=="table" and result.error or result or "unknown"),
         })
-        prune_diagnostics(self.store.temp_dir,5)
+        prune_diagnostics(self.store.temp_dir,tonumber(Config.DOWNLOAD_DIAGNOSTIC_KEEP) or 5)
         os.remove(job.progress_path)
     end
 
@@ -333,7 +335,8 @@ end
 function DownloadTask:_restart_interrupted(job)
     if not job or job.cancel_requested_at then return false end
     local count=tonumber(job.restart_count) or 0
-    if count>=2 or type(job.restart_book)~="table" or tostring(job.restart_book.bookId or "")=="" then
+    local maximum=math.max(0,tonumber(Config.DOWNLOAD_AUTO_RESTARTS) or 2)
+    if count>=maximum or type(job.restart_book)~="table" or tostring(job.restart_book.bookId or "")=="" then
         return false
     end
     local book=serializable_copy(job.restart_book)
@@ -341,7 +344,7 @@ function DownloadTask:_restart_interrupted(job)
     local on_progress,on_done=job.on_progress,job.on_done
     local state=U.copy(job.last_progress_state or {})
     state.stage="restart"
-    state.message="后台下载进程被系统中断，正在从断点自动恢复（"..tostring(count+1).."/2）"
+    state.message="后台下载进程被系统中断，正在从断点自动恢复（"..tostring(count+1).."/"..tostring(maximum).."）"
     state.updated_at=os.time()
     state.restart_count=count+1
     if on_progress then pcall(on_progress,state) end
@@ -474,6 +477,12 @@ function DownloadTask:_poll()
         -- and a recreated UI may no longer own waitpid(). Give both the last
         -- progress heartbeat and the process-state check enough time.
         if idle<60 or now-job.unknown_seen_at<120 then self:_schedule(); return end
+        if done_ok and done==true and self:_restart_interrupted(job) then return end
+        -- When /proc is unavailable and waitpid ownership was lost, wait longer
+        -- before deciding the worker vanished. This avoids duplicate workers on
+        -- Android while still recovering a truly dead task from its checkpoint.
+        if idle<180 or now-job.unknown_seen_at<180 then self:_schedule(); return end
+        if self:_restart_interrupted(job) then return end
         self:_finish(job)
         return
     end

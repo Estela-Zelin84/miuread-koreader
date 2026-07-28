@@ -426,7 +426,6 @@ local function is_auth_error(value)
         or tonumber(auth_error_code(text)) == -2012
         or tonumber(auth_error_code(text)) == -2041
         or lower:find("http 401", 1, true) ~= nil
-        or lower:find("http 403", 1, true) ~= nil
         or lower:find("login expired", 1, true) ~= nil
         or lower:find("login timeout", 1, true) ~= nil
         or lower:find("session expired", 1, true) ~= nil
@@ -434,6 +433,8 @@ local function is_auth_error(value)
         or lower:find("api key is not configured", 1, true) ~= nil
         or text:find("未登录", 1, true) ~= nil
         or text:find("登录过期", 1, true) ~= nil
+        or text:find("登录授权已过期", 1, true) ~= nil
+        or text:find("重新登录", 1, true) ~= nil
         or text:find("登录超时", 1, true) ~= nil
         or text:find("登录失效", 1, true) ~= nil
         or text:find("登录状态已失效", 1, true) ~= nil
@@ -441,6 +442,20 @@ end
 
 local function is_forbidden_error(value)
     return tostring(value or ""):lower():find("http 403",1,true)~=nil
+end
+
+local function is_network_error(value)
+    local text=tostring(value or "")
+    local lower=text:lower()
+    return lower:find("network request failed",1,true)~=nil
+        or lower:find("http nil",1,true)~=nil
+        or lower:find("status=nil",1,true)~=nil
+        or lower:find("connection",1,true)~=nil
+        or lower:find("broken pipe",1,true)~=nil
+        or lower:find("timed out",1,true)~=nil
+        or lower:find("timeout",1,true)~=nil
+        or text:find("网络不可用",1,true)~=nil
+        or text:find("网络请求失败",1,true)~=nil
 end
 
 local function is_rate_limit_error(value)
@@ -513,6 +528,7 @@ Http.auth_error_code = auth_error_code
 Http.auth_error_message = auth_error_message
 Http.is_auth_error = is_auth_error
 Http.is_forbidden_error = is_forbidden_error
+Http.is_network_error = is_network_error
 Http.is_rate_limit_error = is_rate_limit_error
 
 return Http

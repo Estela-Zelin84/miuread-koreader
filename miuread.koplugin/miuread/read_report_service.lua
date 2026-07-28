@@ -1,6 +1,7 @@
 local Json = require("miuread.json")
 local U = require("miuread.util")
 local Adapter = require("miuread.legacy_adapter_worker")
+local Config = require("miuread.config")
 
 local Service = {}
 
@@ -87,9 +88,19 @@ end
 local function retry_delay(kind,failures,interval)
     failures=math.min(10,math.max(1,tonumber(failures) or 1))
     interval=math.max(10,tonumber(interval) or 30)
+    local function configured(values,fallback)
+        values=type(values)=="table" and values or {}
+        return tonumber(values[math.min(failures,#values)] or values[#values]) or fallback
+    end
+    if kind=="authentication" then
+        return math.min(30*60,configured(Config.READ_REPORT_AUTH_RETRY_DELAYS,120))
+    end
+    if kind=="context" then
+        return math.min(30*60,configured(Config.READ_REPORT_CONTEXT_RETRY_DELAYS,60))
+    end
     if kind=="transport" then return math.min(30*60,math.max(interval,30)*(2^(failures-1))) end
     if kind=="server" then return math.min(30*60,math.max(120,interval*2)*(2^(failures-1))) end
-    return 0
+    return math.max(interval,60)
 end
 
 local function public_result(result)
@@ -138,7 +149,6 @@ function Service.run(job)
     local last_report_at = 0
     local last_flush_seq = 0
     local consecutive_failures = 0
-    local blocked_kind = nil
     local carry_elapsed = 0
 
     local function run_report(control, elapsed, final_flush, reason)
@@ -156,7 +166,7 @@ function Service.run(job)
             api_key = auth.api_key or "",
             wr_ticket = auth.wr_ticket or "",
             wr_wrpa = auth.wr_wrpa or "",
-            allow_renewal = false,
+            allow_renewal = true,
         }
         local attempted_at = os.time()
         local ok, result = pcall(Adapter.run, report_job)
@@ -179,23 +189,19 @@ function Service.run(job)
             local delay = 0
             if result.accepted then
                 consecutive_failures = 0
-                blocked_kind = nil
                 carry_elapsed = 0
             else
                 consecutive_failures = consecutive_failures + 1
                 carry_elapsed = elapsed
-                if kind=="authentication" or kind=="context" then
-                    blocked_kind=kind
-                else
-                    delay=retry_delay(kind,consecutive_failures,interval)
-                end
+                delay=retry_delay(kind,consecutive_failures,interval)
             end
             out.generation = generation
             out.seq = sequence
-            out.state = result.accepted and "waiting" or ((blocked_kind and "paused") or "error")
+            out.state = result.accepted and "waiting" or "error"
             out.error_kind = kind or result.error_kind
-            out.paused = blocked_kind ~= nil
+            out.paused = false
             out.retry_delay = delay
+            out.consecutive_failures = consecutive_failures
             out.attempted_at = attempted_at
             out.completed_at = completed_at
             out.elapsed_seconds = elapsed
@@ -204,7 +210,7 @@ function Service.run(job)
             out.pending_elapsed = result.accepted and 0 or carry_elapsed
             out.final_flush = final_flush == true
             out.flush_reason = reason
-            out.next_due = final_flush and 0 or (blocked_kind and 0 or (completed_at + (delay>0 and delay or interval)))
+            out.next_due = final_flush and 0 or (completed_at + (delay>0 and delay or interval))
             out.book_id = tostring(current_job.book_id or "")
             write_status(status_path, out)
             return out.next_due
@@ -223,6 +229,7 @@ function Service.run(job)
             error = tostring(result or "read report service failed"),
             error_kind = kind,
             retry_delay = delay,
+            consecutive_failures = consecutive_failures,
             attempted_at = attempted_at,
             completed_at = completed_at,
             elapsed_seconds = elapsed,
@@ -265,7 +272,6 @@ function Service.run(job)
                 last_flush_seq = 0
                 last_control_state = nil
                 consecutive_failures = 0
-                blocked_kind = nil
                 carry_elapsed = math.max(0,math.floor(tonumber(loaded.carry_elapsed) or 0))
                 U.atomic_write(context_path, Json.encode(book), true)
                 write_status(status_path, {
@@ -330,7 +336,7 @@ function Service.run(job)
                         book_id = tostring(current_job.book_id or ""),
                     })
                 end
-            elseif active and not blocked_kind then
+            elseif active then
                 local now = os.time()
                 local interval = math.max(10, tonumber(current_job.interval) or 30)
                 local idle_timeout = math.max(interval, tonumber(current_job.idle_timeout) or 600)

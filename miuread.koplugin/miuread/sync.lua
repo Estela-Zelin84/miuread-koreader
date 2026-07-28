@@ -1264,21 +1264,13 @@ function Sync:_import_daemon_status(force)
         if final_flush and stamp then self.store:mark_read_report_consumed(stamp) end
     elseif status.error then
         local error_kind=tostring(status.error_kind or "server")
-        local paused=(error_kind=="authentication" or error_kind=="context") and not final_flush
-        self.state = paused and "paused" or (daemon.active and "waiting" or "stopped")
-        self.consecutive_failures = self.consecutive_failures + 1
+        self.state = daemon.active and "waiting" or "stopped"
+        self.consecutive_failures = math.max(self.consecutive_failures + 1,tonumber(status.consecutive_failures) or 0)
         self.last_error = tostring(status.error)
-        if paused then
-            daemon.active=false
-            self.next_due=0
-            self.last_stage=error_kind=="authentication" and "登录失效，阅读时间同步已暂停"
-                or "当前章节上下文无效，阅读时间同步已暂停"
-            self:_write_daemon_control(false,true)
-            logger.warn("[MiuRead][ReadReport] service paused",
-                "kind=",error_kind,"book=",status_book_id,"error=",self.last_error)
-            if error_kind=="authentication" and self.host.on_auth_required then
-                pcall(self.host.on_auth_required,self.host,"read_report",self.last_error)
-            end
+        self.last_stage=error_kind=="authentication" and "登录验证失败，阅读时间已保留并等待自动重试"
+            or (error_kind=="context" and "阅读上下文暂时无效，等待自动刷新" or "后台上传失败，等待自动重试")
+        if error_kind=="authentication" and self.consecutive_failures>=2 and self.host.on_auth_required then
+            pcall(self.host.on_auth_required,self.host,"read_report",self.last_error)
         end
         if final_flush then
             logger.warn("[MiuRead][ReadReport] final upload failed",
@@ -1287,12 +1279,10 @@ function Sync:_import_daemon_status(force)
                 "error=", self.last_error)
             daemon.final_flush_pending = false
             if not daemon.active then daemon.book_id = nil end
-        elseif not paused then
+        else
             logger.warn("[MiuRead][ReadReport] service rejected",
                 "kind=",error_kind,"retry_delay=",tostring(status.retry_delay or 0),
-                "error=",self.last_error)
-            self:_notify_failure()
-        else
+                "failures=",tostring(self.consecutive_failures),"error=",self.last_error)
             self:_notify_failure()
         end
         if force or final_flush or self.consecutive_failures >= 2 then
@@ -1782,6 +1772,7 @@ function Sync:status()
         service_version=self.daemon and self.daemon.service_version or READ_REPORT_SERVICE_VERSION,
         final_flush_pending=self.daemon and self.daemon.final_flush_pending==true or false,
         last_elapsed=session and session.last_elapsed,
+        pending_report_elapsed=math.max(0,tonumber(self.pending_report_elapsed or (session and session.pending_report_seconds) or 0) or 0),
         last_report_reason=session and session.last_report_reason,
     }
 end
