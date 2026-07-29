@@ -6,9 +6,14 @@ local lfs = require("libs/libkoreader-lfs")
 local Thoughts = {}
 
 local CHAPTER_CACHE_LIMIT = 1
+local INDEX_CACHE_LIMIT = 2
 local POPUP_CACHE_LIMIT = 8
+local INDEX_VERSION = 1
+local INDEX_COMPLETE_MARKER = "thought-index-v1.complete"
 local chapter_cache = {}
 local chapter_cache_order = {}
+local index_cache = {}
+local index_cache_order = {}
 local popup_cache = {}
 local popup_cache_order = {}
 
@@ -26,10 +31,133 @@ local function cache_trim(cache, order, limit)
     end
 end
 
+local compact_group
+
 local function file_signature(path)
     local attr = lfs.attributes(path)
     if type(attr) ~= "table" then return nil end
     return tostring(attr.modification or 0) .. ":" .. tostring(attr.size or 0)
+end
+
+local function thought_index_paths(source_path)
+    local root, name = tostring(source_path or ""):match("^(.*)/thoughts/([^/]+)%.json$")
+    if not root or not name then return nil end
+    local dir = root .. "/thought-index"
+    U.mkdir(dir)
+    return dir .. "/" .. name .. ".json", dir .. "/" .. name .. ".data"
+end
+
+local function invalidate_index_path(source_path)
+    local index_path = thought_index_paths(source_path)
+    if not index_path then return end
+    index_cache[index_path] = nil
+    for i = #index_cache_order, 1, -1 do
+        if index_cache_order[i] == index_path then table.remove(index_cache_order, i) end
+    end
+end
+
+local function remove_index_files(source_path)
+    local index_path, data_path = thought_index_paths(source_path)
+    if not index_path then return end
+    invalidate_index_path(source_path)
+    os.remove(index_path)
+    os.remove(index_path .. ".tmp")
+    os.remove(data_path)
+    os.remove(data_path .. ".tmp")
+end
+
+local function build_index_from_rows(source_path, rows)
+    local index_path, data_path = thought_index_paths(source_path)
+    if not index_path then return nil, "想法缓存路径无效" end
+    local source_signature = file_signature(source_path)
+    if not source_signature then return nil, "想法缓存不存在" end
+
+    local chunks, entries, offset = {}, {}, 0
+    for _, group in ipairs(rows or {}) do
+        local item = compact_group(group)
+        local range = item and tostring(item.range or "") or ""
+        if item and range ~= "" and entries[range] == nil then
+            local encoded = Json.encode(item)
+            entries[range] = {offset=offset, length=#encoded}
+            chunks[#chunks + 1] = encoded
+            chunks[#chunks + 1] = "\n"
+            offset = offset + #encoded + 1
+        end
+    end
+
+    local data = table.concat(chunks)
+    local wrote_data, data_error = U.atomic_write(data_path, data, true)
+    if not wrote_data then return nil, "想法索引数据写入失败：" .. tostring(data_error) end
+    local index = {
+        version=INDEX_VERSION,
+        source_signature=source_signature,
+        generated_at=os.time(),
+        count=0,
+        entries=entries,
+    }
+    for _ in pairs(entries) do index.count = index.count + 1 end
+    local wrote_index, index_error = U.atomic_write(index_path, Json.encode(index), true)
+    if not wrote_index then
+        os.remove(data_path)
+        return nil, "想法索引写入失败：" .. tostring(index_error)
+    end
+    invalidate_index_path(source_path)
+    return index.count, index_path
+end
+
+local function load_compact_index(source_path)
+    local source_signature = file_signature(source_path)
+    if not source_signature then return nil, "想法缓存不存在" end
+    local index_path, data_path = thought_index_paths(source_path)
+    if not index_path or not file_signature(index_path) or not file_signature(data_path) then
+        return nil, "想法索引不存在"
+    end
+    local index_signature = file_signature(index_path)
+    local cached = index_cache[index_path]
+    if cached and cached.index_signature == index_signature
+        and cached.source_signature == source_signature then
+        cache_touch(index_cache_order, index_path)
+        return cached.index, nil, data_path, true
+    end
+    local raw = U.read_file(index_path, true)
+    if not raw then return nil, "想法索引不存在" end
+    local ok, index = pcall(Json.decode, raw)
+    if not ok or type(index) ~= "table" or tonumber(index.version) ~= INDEX_VERSION
+        or tostring(index.source_signature or "") ~= tostring(source_signature)
+        or type(index.entries) ~= "table" then
+        return nil, "想法索引已过期"
+    end
+    index_cache[index_path] = {
+        index=index,
+        index_signature=index_signature,
+        source_signature=source_signature,
+    }
+    cache_touch(index_cache_order, index_path)
+    cache_trim(index_cache, index_cache_order, INDEX_CACHE_LIMIT)
+    return index, nil, data_path, false
+end
+
+local function find_indexed(source_path, range)
+    local index, err, data_path, cache_hit = load_compact_index(source_path)
+    if not index then return nil, err end
+    local entry = index.entries[tostring(range or "")]
+    if type(entry) ~= "table" then return nil, "没有找到该划线对应的想法" end
+    local offset, length = tonumber(entry.offset), tonumber(entry.length)
+    if not offset or not length or offset < 0 or length <= 0 then return nil, "想法索引损坏" end
+    local file = io.open(data_path, "rb")
+    if not file then return nil, "想法索引数据不存在" end
+    local sought = file:seek("set", offset)
+    local raw = sought and file:read(length) or nil
+    file:close()
+    if not raw or #raw ~= length then return nil, "想法索引数据不完整" end
+    local ok, group = pcall(Json.decode, raw)
+    if not ok or type(group) ~= "table" then return nil, "想法索引数据损坏" end
+    return group, nil, {
+        path=source_path,
+        signature=file_signature(source_path),
+        cache_hit=cache_hit,
+        index_hit=true,
+    }
 end
 
 local function invalidate_path(path)
@@ -153,7 +281,7 @@ function Thoughts.cache_path(store, book_id, chapter_uid)
     return Thoughts.cache_dir(store, book_id) .. "/" .. U.id_name(chapter_uid) .. ".json"
 end
 
-local function compact_group(group)
+compact_group = function(group)
     if type(group) ~= "table" then return nil end
     local range = tostring(group.range or "")
     local texts = {}
@@ -183,11 +311,21 @@ function Thoughts.save(store, book_id, chapter_uid, groups)
     invalidate_path(path)
     if #rows == 0 then
         os.remove(path)
+        remove_index_files(path)
         return 0, path
     end
-    U.atomic_write(path, Json.encode(rows), true)
+    local wrote, write_error = U.atomic_write(path, Json.encode(rows), true)
+    if not wrote then return nil, tostring(write_error or "想法缓存写入失败") end
+    local indexed, index_error = build_index_from_rows(path, rows)
+    if not indexed then
+        if store and store.data_dir then os.remove(store.data_dir .. "/" .. INDEX_COMPLETE_MARKER) end
+        logger.warn("[MiuRead][Thoughts] compact index build failed",
+            "book=", tostring(book_id), "chapter=", tostring(chapter_uid),
+            "error=", tostring(index_error))
+    end
     logger.info("[MiuRead][Thoughts] cache saved", "book=", tostring(book_id),
-        "chapter=", tostring(chapter_uid), "groups=", tostring(#rows))
+        "chapter=", tostring(chapter_uid), "groups=", tostring(#rows),
+        "indexed=", tostring(indexed or 0))
     return #rows, path
 end
 
@@ -220,12 +358,17 @@ function Thoughts.load(store, book_id, chapter_uid)
 end
 
 function Thoughts.find(store, book_id, chapter_uid, range)
+    local source_path = Thoughts.cache_path(store, book_id, chapter_uid)
+    local indexed, index_error, index_token = find_indexed(source_path, range)
+    if indexed then return indexed, nil, index_token end
+    if store and store.data_dir then os.remove(store.data_dir .. "/" .. INDEX_COMPLETE_MARKER) end
+
     local _, err, cached, cache_hit = Thoughts.load(store, book_id, chapter_uid)
-    if not cached then return nil, err end
+    if not cached then return nil, err or index_error end
     local key = tostring(range or "")
     local group = cached.index[key]
     if group then
-        return group, nil, {path=cached.path, signature=cached.signature, cache_hit=cache_hit}
+        return group, nil, {path=cached.path, signature=cached.signature, cache_hit=cache_hit, index_hit=false}
     end
     return nil, "没有找到该划线对应的想法"
 end
@@ -456,9 +599,114 @@ function Thoughts.plain_text(group)
     return table.concat(lines, "\n"):gsub("\n+$", "")
 end
 
+
+function Thoughts.build_index(store, book_id, chapter_uid)
+    local source_path = Thoughts.cache_path(store, book_id, chapter_uid)
+    local raw = U.read_file(source_path, true)
+    if not raw then return nil, "想法缓存不存在" end
+    local ok, rows = pcall(Json.decode, raw)
+    if not ok or type(rows) ~= "table" then return nil, "想法缓存损坏" end
+    return build_index_from_rows(source_path, rows)
+end
+
+local function acquire_maintenance_lock(lock_path)
+    local attr = lfs.attributes(lock_path)
+    if attr and os.time() - (tonumber(attr.modification or 0) or 0) > 3600 then
+        U.remove_tree(lock_path)
+        attr = nil
+    end
+    if attr then return false end
+    return lfs.mkdir(lock_path) == true
+end
+
+function Thoughts.build_missing_indexes(data_dir, pause_path, limit)
+    data_dir=tostring(data_dir or "")
+    local root = data_dir .. "/books"
+    local complete_path = data_dir .. "/" .. INDEX_COMPLETE_MARKER
+    if lfs.attributes(complete_path, "mode") == "file" then
+        return {ok=true, complete=true, built=0, checked=0, failed=0, paused=false}
+    end
+    local lock_path = data_dir .. "/temp/thought-index-maintenance.lock"
+    if not acquire_maintenance_lock(lock_path) then return {ok=true, busy=true, built=0, checked=0} end
+    local result = {ok=true, built=0, checked=0, failed=0, paused=false}
+    local maximum = math.max(1, tonumber(limit) or 100000)
+    local function paused()
+        return tostring(pause_path or "") ~= "" and lfs.attributes(pause_path) ~= nil
+    end
+    local function visit_source(source_path)
+        if result.checked >= maximum or paused() then return false end
+        result.checked = result.checked + 1
+        local source_signature = file_signature(source_path)
+        local index = load_compact_index(source_path)
+        if index then return true end
+        local raw = U.read_file(source_path, true)
+        local after_read = file_signature(source_path)
+        if not raw or source_signature ~= after_read then
+            result.failed = result.failed + 1
+            return true
+        end
+        local ok, rows = pcall(Json.decode, raw)
+        if not ok or type(rows) ~= "table" then
+            result.failed = result.failed + 1
+            return true
+        end
+        local built = build_index_from_rows(source_path, rows)
+        if built then result.built = result.built + 1 else result.failed = result.failed + 1 end
+        return true
+    end
+    local ok, unexpected = xpcall(function()
+        if lfs.attributes(root, "mode") ~= "directory" then return end
+        local books = {}
+        for name in lfs.dir(root) do
+            if name ~= "." and name ~= ".." and lfs.attributes(root .. "/" .. name, "mode") == "directory" then
+                books[#books + 1] = name
+            end
+        end
+        table.sort(books)
+        for _, book_name in ipairs(books) do
+            if paused() or result.checked >= maximum then break end
+            local dir = root .. "/" .. book_name .. "/thoughts"
+            if lfs.attributes(dir, "mode") == "directory" then
+                local files = {}
+                for name in lfs.dir(dir) do
+                    if name:match("%.json$") then files[#files + 1] = name end
+                end
+                table.sort(files)
+                for _, name in ipairs(files) do
+                    if not visit_source(dir .. "/" .. name) then break end
+                end
+            end
+        end
+    end, debug.traceback)
+    result.paused = paused()
+    if not ok then result.ok=false; result.error=tostring(unexpected) end
+    if result.ok and not result.paused and result.failed==0 and result.checked<maximum then
+        U.atomic_write(complete_path, tostring(os.time()), true)
+        result.complete=true
+    end
+    U.remove_tree(lock_path)
+    return result
+end
+
+function Thoughts.comment_count(group)
+    local seen, count = {}, 0
+    for _, item in ipairs((group and group.texts) or {}) do
+        local content = clean(item.content)
+        if content ~= "" then
+            local author = clean(item.author)
+            local review_id = tostring(item.review_id or "")
+            local key = review_id ~= "" and ("id:" .. review_id) or (author .. "\0" .. content)
+            if not seen[key] then seen[key] = true; count = count + 1 end
+        end
+    end
+    return count
+end
+
 function Thoughts.clear_memory_cache()
     chapter_cache = {}
     chapter_cache_order = {}
+    index_cache = {}
+    index_cache_order = {}
     popup_cache = {}
     popup_cache_order = {}
 end

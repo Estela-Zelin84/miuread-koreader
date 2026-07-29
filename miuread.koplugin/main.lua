@@ -59,6 +59,13 @@ end
 function Plugin:init()
     math.randomseed(os.time()+math.floor(collectgarbage("count")))
     self.store=Store:new()
+    self._reader_context=self.ui and self.ui.document~=nil
+    self._thought_index_pause_path=self.store.temp_dir.."/thought-index.pause"
+    if self._reader_context then
+        U.atomic_write(self._thought_index_pause_path,"1",true)
+    else
+        os.remove(self._thought_index_pause_path)
+    end
     self.memory_mode=MemoryMode:new(self.store)
     logger.info("[MiuRead] initialized", "version=", tostring(Config.VERSION),
         "schema=", tostring(Config.SCHEMA), "root=", tostring(ROOT))
@@ -73,13 +80,17 @@ function Plugin:init()
     self.cache_cleanup_task=CacheCleanupTask:new(self.store)
     self.library=Library:new(self.api,self.http,self.store)
     self.access=Access:new(self.library,self.api,self.reader,self.store)
-    self.async=Async:new(self.store)
+    self.async=Async:new(self.store,{allow_android=true,disable_fallback=true})
     self.mp_async=Async:new(self.store,{poll_interval=.35,allow_android=true})
     self.search_async=Async:new(self.store,{poll_interval=.4,allow_android=true})
     self.shelf_async=Async:new(self.store,{poll_interval=.4,allow_android=true})
     self.cover_async=Async:new(self.store,{poll_interval=.30,allow_android=true})
+    self.identity_async=Async:new(self.store,{poll_interval=.20,allow_android=true,
+        disable_fallback=true})
+    self.thought_index_async=Async:new(self.store,{poll_interval=.75,allow_android=true,
+        disable_fallback=true})
     self.auth_flow=Auth:new(self.http,self.store,self)
-    self.sync=Sync:new(self.reader,self.api,self.store,self,self.async)
+    self.sync=Sync:new(self.reader,self.api,self.store,self,self.async,self.identity_async)
     self.updater=Updater:new(self.http,self.store,self.version,ROOT)
     self._suspended_at=nil
     self._cover_generation=0
@@ -100,37 +111,39 @@ function Plugin:init()
     self._download_state_last_write=0
     self._download_state_last_stage=nil
     self._auth_notice_dialog=nil
-    self._thought_prewarm_generation=0
     self._sync_success_notified=false
 
-    local guard=self.store:cover_guard()
-    local guard_age=os.time()-(tonumber(guard.started_at) or 0)
-    if guard.active==true and guard_age>=0 and guard_age<COVER_GUARD_WINDOW then
-        self._cover_safe_mode=true
-        logger.warn("[MiuRead][Cover] previous render did not finish; safe shelf mode enabled",
-            "stage=",tostring(guard.stage or ""),"age=",tostring(guard_age))
-    end
-    if guard.active==true then
-        self.store:save_cover_guard({active=false,started_at=0,stage="",version=Config.VERSION})
-    end
+    if not self._reader_context then
+        local guard=self.store:cover_guard()
+        local guard_age=os.time()-(tonumber(guard.started_at) or 0)
+        if guard.active==true and guard_age>=0 and guard_age<COVER_GUARD_WINDOW then
+            self._cover_safe_mode=true
+            logger.warn("[MiuRead][Cover] previous render did not finish; safe shelf mode enabled",
+                "stage=",tostring(guard.stage or ""),"age=",tostring(guard_age))
+        end
+        if guard.active==true then
+            self.store:save_cover_guard({active=false,started_at=0,stage="",version=Config.VERSION})
+        end
 
-    local startup_download_state=self.store:download_state()
-    if startup_download_state.status=="completed" then
-        self.store:clear_download_state()
+        local startup_download_state=self.store:download_state()
+        if startup_download_state.status=="completed" then self.store:clear_download_state() end
+        local recovered=self:_recover_download_state()
+        if not recovered then UIManager:scheduleIn(1.0,function() self:_start_next_queued_download() end) end
     end
-    local recovered=self:_recover_download_state()
-    if not recovered then UIManager:scheduleIn(1.0,function() self:_start_next_queued_download() end) end
     Actions.register()
     self.ui.menu:registerToMainMenu(self)
-    local state=self.updater:startup()
-    if state=="updated" then
-        UIManager:scheduleIn(1,function() self:status_toast("更新完成","当前运行版本 "..tostring(self.version),4) end)
-    elseif state=="mismatch" then
-        UIManager:scheduleIn(1,function() self:info("更新文件已经替换，但当前运行版本与目标版本不一致。\n\n请完整退出并重新启动 KOReader。\n当前运行："..tostring(self.version)) end)
+    if not self._reader_context then
+        local state=self.updater:startup()
+        if state=="updated" then
+            UIManager:scheduleIn(1,function() self:status_toast("更新完成","当前运行版本 "..tostring(self.version),4) end)
+        elseif state=="mismatch" then
+            UIManager:scheduleIn(1,function() self:info("更新文件已经替换，但当前运行版本与目标版本不一致。\n\n请完整退出并重新启动 KOReader。\n当前运行："..tostring(self.version)) end)
+        end
+        UIManager:scheduleIn(.8,function() if not self:_current_document_path() then self:_install_pending_downloads(false) end end)
+        UIManager:scheduleIn(1.2,function() self:_show_auth_notice() end)
+        UIManager:scheduleIn(8.0,function() self:_start_thought_index_maintenance() end)
+        UIManager:scheduleIn(5.0,function() self:maybe_auto_check_update(false) end)
     end
-    UIManager:scheduleIn(.8,function() if not self:_current_document_path() then self:_install_pending_downloads(false) end end)
-    UIManager:scheduleIn(1.2,function() self:_show_auth_notice() end)
-    UIManager:scheduleIn(5.0,function() self:maybe_auto_check_update(false) end)
 end
 
 function Plugin:addToMainMenu(items) items.miuread={text=Config.NAME,sorting_hint="tools",sub_item_table_func=function() return self.ui.document and self:reader_menu() or self:home_menu() end} end
@@ -226,9 +239,10 @@ function Plugin:require_login()
 end
 
 local AUTH_CHANNEL_LABELS={
-    shelf="书架访问",progress="云端进度读取",download="书籍下载",read_report="阅读时间上传",
+    shelf="书架访问",progress="云端进度读取",download="正文下载",
+    annotations="划线与想法访问",read_report="阅读时间上传",
 }
-local AUTH_CHANNEL_ORDER={"shelf","progress","download","read_report"}
+local AUTH_CHANNEL_ORDER={"shelf","progress","download","annotations","read_report"}
 local function auth_error_code(value)
     if Http.auth_error_code then
         local ok,code=pcall(Http.auth_error_code,value)
@@ -298,6 +312,33 @@ function Plugin:_mark_auth_channel_error(channel,err,retry_at)
     self:_recompute_auth_health(health)
     self:_save_auth_health(health)
 end
+function Plugin:_mark_auth_access_denied(channel,err,notify)
+    if not self:logged_in() then return false end
+    local now=os.time()
+    local health=self:_auth_health()
+    health.channels=health.channels or {}
+    local previous=auth_row(health.channels[channel])
+    local failures=(tonumber(previous.failures) or 0)+1
+    local threshold=math.max(1,tonumber(Config.AUTH_NOTICE_FAILURE_THRESHOLD) or 2)
+    local confirmed=failures>=threshold
+    local message=U.first_line(err or "HTTP 403",220)
+    health.channels[channel]={state=confirmed and "expired" or "error",checked_at=now,
+        error=U.first_line(message,180),code="403",failures=failures,retry_at=0,
+        last_ok_at=previous.last_ok_at or 0}
+    health.last_checked_at=now
+    health.last_error_at=now
+    health.last_error_code="403"
+    health.last_error_message=message
+    health.last_error_channel=channel
+    if notify~=false and confirmed then health.notice_pending=true end
+    self:_recompute_auth_health(health)
+    self:_save_auth_health(health)
+    logger.warn("[MiuRead][Auth] feature access denied",
+        "channel=",tostring(channel),"failures=",tostring(failures),"confirmed=",tostring(confirmed),
+        "error=",U.first_line(message,160))
+    if health.notice_pending then UIManager:scheduleIn(.05,function() self:_show_auth_notice() end) end
+    return true
+end
 function Plugin:_mark_auth_problem(channel,err,notify)
     local text=tostring(err or "登录状态暂时不可用")
     if not Http.is_auth_error(text) then return false end
@@ -342,13 +383,17 @@ function Plugin:_show_auth_notice()
     if health.notice_pending~=true then return end
     local channel_key=tostring(health.last_error_channel or "")
     local channel=AUTH_CHANNEL_LABELS[channel_key] or "在线功能"
+    local annotation_forbidden=channel_key=="annotations" and tostring(health.last_error_code or "")=="403"
+    local notice_text=annotation_forbidden
+        and "正文下载仍可使用，但划线与想法接口连续拒绝访问。插件已保留正文、已有批注和下载断点。请重新扫码后再次生成书籍。"
+        or "只有此功能受到影响，其他功能会继续运行。插件会保留下载断点和待上传阅读时间，并在后续真实请求中自动重试。多次失败后可重新扫码。"
     local dialog
     local function close()
         if self._auth_notice_dialog==dialog then self._auth_notice_dialog=nil end
         UIManager:close(dialog)
     end
     dialog=ButtonDialog:new{
-        title=channel.."暂时无法验证登录\n\n只有此功能受到影响，其他功能会继续运行。插件会保留下载断点和待上传阅读时间，并在后续真实请求中自动重试。多次失败后可重新扫码。",
+        title=channel.."暂时异常\n\n"..notice_text,
         title_align="center",
         buttons={
             {{text="查看账号状态",callback=function()
@@ -434,7 +479,8 @@ function Plugin:_set_all_auth_ok()
     health.last_error_channel=""
     health.notice_pending=false
     health.channels={
-        shelf=U.copy(okrow),progress=U.copy(okrow),download=U.copy(okrow),read_report=U.copy(okrow),
+        shelf=U.copy(okrow),progress=U.copy(okrow),download=U.copy(okrow),
+        annotations=U.copy(okrow),read_report=U.copy(okrow),
     }
     self:_save_auth_health(health)
 end
@@ -842,8 +888,8 @@ function Plugin:_prepare_shelf_rows(rows)
             elseif download_state.status=="pending_install" then
                 b.download_status=DownloadResult.shelf_status(download_state,true)
             elseif download_state.status=="failed" or download_state.status=="interrupted" then b.download_status="生成未完成"
-            elseif download_state.status=="annotation_pending" then b.download_status="已生成 · 划线或想法待补全"
-            elseif download_state.status=="completed" and download_state.annotation_fallback==true then b.download_status="已生成 · 少量内容已保留在章节末尾"
+            elseif download_state.status=="annotation_pending" then b.download_status="生成未完成"
+            elseif download_state.status=="completed" and download_state.annotation_fallback==true then b.download_status="已生成"
             elseif download_state.status=="completed" and download_state.seen~=true then b.download_status="刚刚生成完成" end
         end
         b.status_text=self:_shelf_status_text(b)
@@ -1985,7 +2031,7 @@ function Plugin:_finish_download_runtime(runtime,result)
         },true)
         self:_update_open_shelf_download_status(b.bookId,
             auth_required and "等待重新登录" or (rate_limited and "请求受限 · 稍后继续"
-                or (network_failed and "等待网络 · 可继续" or (content_pending and "等待补全" or "生成未完成"))))
+                or (network_failed and "等待网络 · 可继续" or "生成未完成")))
         local first
         if auth_required then
             first="微信读书登录已失效。下载断点已经保留，请重新扫码登录后继续。"
@@ -1994,7 +2040,7 @@ function Plugin:_finish_download_runtime(runtime,result)
         elseif network_failed then
             first="网络连接暂时中断。已完成章节和下载断点均已保留，网络恢复后可继续下载。"
         elseif content_pending then
-            first="下载内容暂时未完整，原文件和下载进度已保留，请稍后重试。"
+            first="生成未完成，原文件和下载进度已保留。请稍后使用“生成／更新书籍”重试。"
         else
             first=U.first_line(err)
         end
@@ -2004,7 +2050,7 @@ function Plugin:_finish_download_runtime(runtime,result)
             local toast_text=auth_required and "后台下载已暂停，重新扫码后自动继续"
                 or (rate_limited and "已停止继续请求，下载断点已保留"
                 or (network_failed and "下载断点已保留，网络恢复后可继续"
-                or (content_pending and "下载暂未完成，原文件和进度已保留"
+                or (content_pending and "生成未完成，原文件和进度已保留"
                 or (tostring(b.title or "未命名").."下载未完成，进度已保留"))))
             self:status_toast(toast_title,toast_text,5)
         else self:info(first) end
@@ -2015,6 +2061,26 @@ function Plugin:_finish_download_runtime(runtime,result)
     end
     self:_mark_auth_channel_ok("download")
     local rec=self:_merge_download_result(result,b,opt)
+    if opt.annotations==true then
+        if DownloadResult.annotation_pending(rec) then
+            local kind=tostring(rec.annotation_error_kind or ((rec.annotation_summary or {}).error_kind) or "incomplete")
+            local errors=type(rec.annotation_summary)=="table" and rec.annotation_summary.errors or nil
+            local detail="划线与想法未完整获取"
+            if type(errors)=="table" and #errors>0 then
+                local first=errors[1]
+                detail=type(first)=="table" and tostring(first.error or detail) or tostring(first or detail)
+            end
+            if kind=="forbidden" then
+                self:_mark_auth_access_denied("annotations",detail,true)
+            elseif kind=="authentication" then
+                self:_mark_auth_problem("annotations",detail,true)
+            else
+                self:_mark_auth_channel_error("annotations",detail)
+            end
+        else
+            self:_mark_auth_channel_ok("annotations")
+        end
+    end
     if rec.pending_install and tostring(self:_current_document_path() or "")~=tostring(rec.file or "") then
         self:_install_pending_downloads(false)
         self.store:reload()
@@ -2132,9 +2198,9 @@ function Plugin:_download_status_label()
         return "后台下载：《"..title.."》 "..tostring(self:_download_percent(state)).."%"
     end
     if state.status=="pending_install" then
-        return state.annotation_pending==true and "后台下载 · 等待更新，划线或想法待补全" or "后台下载 · 等待更新"
+        return "后台下载 · 等待更新"
     end
-    if state.status=="annotation_pending" then return "后台下载 · 划线或想法待补全" end
+    if state.status=="annotation_pending" then return "后台下载 · 生成未完成" end
     if state.status=="completed" then return "后台下载 · 已完成" end
     if state.status=="failed" and state.auth_required==true then return "后台下载 · 等待重新登录" end
     if state.status=="failed" and state.error_kind=="network" then return "后台下载 · 等待网络，可继续" end
@@ -2282,12 +2348,6 @@ function Plugin:_show_download_complete(rec,opt,book)
     local buttons={
         {{text="立即阅读",callback=function() UIManager:close(dialog); self:open_file(rec.file) end}},
     }
-    if DownloadResult.annotation_pending(rec) and type(book)=="table" then
-        buttons[#buttons+1]={{text="重新尝试补全",callback=function()
-            UIManager:close(dialog)
-            self:download(book,opt or {},false,nil,true)
-        end}}
-    end
     buttons[#buttons+1]={{text="关闭",callback=function() UIManager:close(dialog) end}}
     dialog=ButtonDialog:new{title=self:_download_summary(rec,opt),title_align="center",buttons=buttons}
     UIManager:show(dialog)
@@ -2298,20 +2358,16 @@ function Plugin:show_download_status()
     if not state.status or state.status=="" then self:info("当前没有后台下载记录。") return end
     if state.status=="completed" then
         self.store:clear_download_state()
-        if state.annotation_fallback==true then
-            self:info("下载已经完成，少量无法准确定位的内容已保留在对应章节末尾。\n\n可在下载管理中打开书籍。")
-        else
-            self:info("下载已经完成，记录已自动清除。\n\n可在下载管理的已完成列表中打开书籍。")
-        end
+        self:info("下载已经完成，记录已自动清除。\n\n可在下载管理的已完成列表中打开书籍。")
         return
     end
     local title=tostring(state.title or "未命名")
     local lines={}
     if state.status=="completed" then lines[#lines+1]="下载完成"
-    elseif state.status=="annotation_pending" then lines[#lines+1]="正文已生成，部分划线或想法待补全"
+    elseif state.status=="annotation_pending" then lines[#lines+1]="生成未完成，请稍后重新生成"
     elseif state.status=="pending_install" then
-        if state.annotation_pending==true then lines[#lines+1]="新版本已下载，部分划线或想法待补全"
-        elseif state.annotation_fallback==true then lines[#lines+1]="新版本已下载，少量内容已保留在章节末尾"
+        if state.annotation_pending==true then lines[#lines+1]="新版本已下载完成"
+        elseif state.annotation_fallback==true then lines[#lines+1]="新版本已下载完成"
         else lines[#lines+1]="新版本已下载完成" end
     elseif state.status=="failed" and state.auth_required==true then lines[#lines+1]="等待重新登录"
     elseif state.status=="failed" and state.error_kind=="rate_limit" then lines[#lines+1]="请求频率受限，稍后可继续"
@@ -2333,9 +2389,9 @@ function Plugin:show_download_status()
         end}}
     end
     if state.status=="annotation_pending" and type(state.book)=="table" then
-        buttons[#buttons+1]={{text="继续补全",callback=function()
+        buttons[#buttons+1]={{text="重新生成",callback=function()
             UIManager:close(dialog)
-            self:download(state.book,state.options or {},false,nil,true)
+            self:choose_download(state.book,nil,false)
         end}}
     elseif state.status=="failed" and state.auth_required==true then
         buttons[#buttons+1]={{text="重新扫码登录",callback=function() UIManager:close(dialog); self.auth_flow:start() end}}
@@ -2443,8 +2499,8 @@ function Plugin:_install_pending_downloads(notify)
         self:_refresh_local_files()
         if notify then
             local text
-            if any_pending then text=installed>1 and "多个新版本已安装，部分划线或想法待补全" or "新版本已安装，部分划线或想法待补全"
-            elseif any_fallback then text=installed>1 and "多个新版本已安装，少量内容已保留在章节末尾" or "新版本已安装，少量内容已保留在章节末尾"
+            if any_pending then text=installed>1 and "多个新版本已安装" or "新版本已安装"
+            elseif any_fallback then text=installed>1 and "多个新版本已安装" or "新版本已安装"
             else text=installed>1 and "多个新版本已安装" or "新版本已安装" end
             self:status_toast("觅阅",text,4)
         end
@@ -2733,11 +2789,6 @@ function Plugin:chapter_menu(b,ch)
             items[#items+1]={text="阅读"..label,callback=function() self:open_file(record.file) end}
         end
     end
-    if notes and notes.annotation_pending==true then
-        items[#items+1]={text="继续补全划线与想法",callback=function()
-            self:_retry_annotation_record(b.bookId,"notes",notes,uid)
-        end}
-    end
     items[#items+1]={text=(clean or notes) and "更新本章" or "下载本章",callback=function() self:choose_download(b,nil,true,uid) end}
     if clean or notes then items[#items+1]={text="删除本章文件",callback=function() self:_confirm_delete_chapter_cache(b.bookId,uid,ch.title or uid) end} end
     self:list(ch.title or uid,items)
@@ -3021,13 +3072,6 @@ function Plugin:_annotation_retry_options(kind,record,chapter_uid)
     return opt
 end
 
-function Plugin:_retry_annotation_record(book_id,kind,record,chapter_uid)
-    local stored=self.store:book(book_id) or {}
-    local book={bookId=tostring(book_id),title=stored.title or record.title or "未命名",
-        author=stored.author or record.author,cover=stored.cover or record.cover}
-    self:download(book,self:_annotation_retry_options(kind,record,chapter_uid),false,nil,true)
-end
-
 function Plugin:_download_book_labels(b)
     local labels={}
     for _,kind in ipairs({"clean","notes","range_clean","range_notes","preview_clean","preview_notes"}) do
@@ -3036,17 +3080,16 @@ function Plugin:_download_book_labels(b)
             labels[#labels+1]=DownloadResult.variant_label(self:_variant_label(kind),r)
         end
     end
-    local chapter_count,chapter_pending=0,false
+    local chapter_count=0
     for _,row in pairs(b.chapters or {}) do
         for _,r in pairs(row or {}) do
             if r.file and U.file_exists(r.file) then
                 chapter_count=chapter_count+1
-                if r.annotation_pending==true then chapter_pending=true end
             end
         end
     end
     if chapter_count>0 then
-        labels[#labels+1]="单章 "..tostring(chapter_count)..(chapter_pending and " · 待补全" or "")
+        labels[#labels+1]="单章 "..tostring(chapter_count)
     end
     if self.store:book_has_partial_cache(b.book_id) then labels[#labels+1]="未完成缓存" end
     return labels,chapter_count
@@ -3189,11 +3232,6 @@ function Plugin:downloaded_book_menu(book_ref)
         for _,variant in ipairs(variants) do
             local kind_key=variant.kind; local file=variant.file; local label=variant.label; local record=variant.record
             items[#items+1]={text="阅读"..label,post_text="EPUB",callback=function() self:open_file(file) end}
-            if record.annotation_pending==true and tostring(kind_key):find("notes",1,true) then
-                items[#items+1]={text="继续补全划线与想法",post_text=self:_variant_label(kind_key),callback=function()
-                    self:_retry_annotation_record(book_id,kind_key,record,nil)
-                end}
-            end
             items[#items+1]={text="删除"..label,post_text="仅删除该版本",callback=function() self:_confirm_delete_variant(book_id,kind_key,b.title) end}
         end
     end
@@ -3776,7 +3814,7 @@ end
 function Plugin:display_settings_menu()
     return {
         {text="显示书架封面",checked_func=function() return self.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("shelf_covers") end},
-        {text="评论字体",sub_item_table_func=function() return self:thought_font_settings_menu() end},
+        {text="评论显示",post_text="原生轻量窗口",enabled=false},
     }
 end
 function Plugin:_memory_mode_label()
@@ -4221,6 +4259,38 @@ local function extract_thought_href(value,seen,depth)
     for _,key in ipairs({"href","url","target","link","uri","dest","destination"}) do local found=extract_thought_href(value[key],seen,depth+1); if found then return found end end
     for _,child in pairs(value) do local found=extract_thought_href(child,seen,depth+1); if found then return found end end
 end
+function Plugin:_start_thought_index_maintenance()
+    if not self.thought_index_async or not self.ui or self.ui.document then return false end
+    if self.download_task and self.download_task:busy() then
+        UIManager:scheduleIn(10,function() self:_start_thought_index_maintenance() end)
+        return false
+    end
+    if self.thought_index_async:busy() or not self.thought_index_async:available() then return false end
+    local data_dir=self.store.data_dir
+    local pause_path=self._thought_index_pause_path
+    os.remove(pause_path)
+    local started,err=self.thought_index_async:run("thought-index-maintenance",function()
+        local ok,ffi=pcall(require,"ffi")
+        if ok and ffi then
+            pcall(ffi.cdef,"int setpriority(int which, int who, int prio);")
+            pcall(function() ffi.C.setpriority(0,0,15) end)
+        end
+        return Thoughts.build_missing_indexes(data_dir,pause_path,100000)
+    end,function(result)
+        if not result or result.ok~=true or type(result.value)~="table" then
+            logger.warn("[MiuRead][Thoughts] background index maintenance failed",
+                tostring(result and result.error or "unknown"))
+            return
+        end
+        local value=result.value
+        logger.info("[MiuRead][Thoughts] background index maintenance",
+            "checked=",tostring(value.checked or 0),"built=",tostring(value.built or 0),
+            "failed=",tostring(value.failed or 0),"paused=",tostring(value.paused==true))
+    end,900)
+    if not started then logger.dbg("[MiuRead][Thoughts] index maintenance deferred",tostring(err)) end
+    return started==true
+end
+
 function Plugin:_teardown_thought_tap()
     if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then pcall(function() self.ui:unRegisterTouchZones({{id="miuread_thought_popup",overrides={"tap_link"}}}) end) end
     self._thought_tap_setup=nil
@@ -4285,34 +4355,19 @@ function Plugin:_show_thought_href(href)
     local ok,unexpected=xpcall(function()
         local group,err,token=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
         if not group then self:info(tostring(err or "没有想法内容")); return end
-        local prefs=self.store:preferences().thoughts or {}
-        local source_html,html,metrics,html_cache_hit=Thoughts.popup_parts_cached(
-            self.store,info.book_id,info.chapter_uid,info.range,group,token
-        )
-        if html=="" then self:info("没有想法内容"); return end
-        local shown,mode,show_error=ThoughtPopup.show{
-            source_html=source_html,
-            html=html,
-            fallback_text=Thoughts.plain_text(group),
-            fallback_title="想法（简化显示）",
-            font_size=self:_thought_font_size(prefs.font),
-            font_name=self:_thought_font_name(prefs),
-            width_ratio=tonumber(prefs.width_ratio) or 0.91,
-            height_ratio=tonumber(prefs.height_ratio) or 0.60,
-            css=Thoughts.popup_css(),
-            metrics=metrics,
+        local text=Thoughts.plain_text(group)
+        if text=="" then self:info("没有想法内容"); return end
+        local shown,mode,show_error=ThoughtPopup.show_plain{
+            fallback_text=text,
+            fallback_title="想法",
         }
         if not shown then error(show_error or "想法窗口无法显示") end
-        if mode=="plain" and self._thought_plain_notice_shown~=true then
-            self._thought_plain_notice_shown=true
-            self:status_toast("想法","KOReader 字体组件不完整，已使用简化方式显示。",4)
-        end
         logger.info("[MiuRead][ThoughtPopup] opened",
-            "mode=",tostring(mode or "rich"),
+            "mode=",tostring(mode or "native"),
             "book=",tostring(info.book_id),"chapter=",tostring(info.chapter_uid),
-            "comments=",tostring(metrics and metrics.comment_count or 0),
-            "chapter_cache=",token and token.cache_hit and "hit" or "miss",
-            "html_cache=",html_cache_hit and "hit" or "miss",
+            "comments=",tostring(Thoughts.comment_count(group)),
+            "source=",token and token.index_hit and "compact_index" or "chapter_cache",
+            "cache=",token and token.cache_hit and "hit" or "miss",
             "elapsed_ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
     end,debug.traceback)
     self._thought_popup_busy=false
@@ -4335,36 +4390,21 @@ function Plugin:_setup_thought_tap()
     self._thought_tap_setup=true
 end
 
-function Plugin:_schedule_thought_prewarm(book_id)
-    self._thought_prewarm_generation=(tonumber(self._thought_prewarm_generation) or 0)+1
-    local generation=self._thought_prewarm_generation
-    UIManager:scheduleIn(1.8,function()
-        if generation~=self._thought_prewarm_generation or not self.ui or not self.ui.document then return end
-        local active=self.sync and self.sync.current
-        if not active or tostring(active.book.book_id or "")~=tostring(book_id or "") then return end
-        local prefs=self.store:preferences().thoughts or {}
-        if ThoughtPopup.prewarm_font then pcall(ThoughtPopup.prewarm_font,self:_thought_font_name(prefs)) end
-        local position=self.sync:local_position()
-        local chapter_uid=position and position.chapter_uid
-        if chapter_uid~=nil and tostring(chapter_uid)~="" then
-            local ok,rows=pcall(Thoughts.load,self.store,book_id,chapter_uid)
-            logger.dbg("[MiuRead][ThoughtPopup] prewarm",
-                "book=",tostring(book_id),"chapter=",tostring(chapter_uid),
-                "cache=",tostring(ok and type(rows)=="table"))
-        end
-    end)
-end
-
 function Plugin:on_sync_record_ready(current)
+    self:_teardown_thought_tap()
     if current and current.book then
         local book_id,path=tostring(current.book.book_id),current.path
+        local record=current.record or {}
+        local variant=tostring(current.variant or record.variant or "")
+        if record.annotation_requested==true or variant:find("notes",1,true) then
+            self:_setup_thought_tap()
+        end
         UIManager:scheduleIn(1.0,function()
             local active=self.sync and self.sync.current
             if self.ui and self.ui.document and active and tostring(active.book.book_id)==book_id then
                 self.store:mark_last_read(book_id,path)
             end
         end)
-        self:_schedule_thought_prewarm(book_id)
     end
     if self.store:preferences().sync.progress_enabled~=false then
         self:_wait_for_network("reader-ready-progress",function(ready)
@@ -4382,7 +4422,8 @@ function Plugin:on_sync_record_missing()
 end
 function Plugin:onReaderReady()
     logger.info("[MiuRead][Sync] reader ready")
-    self:_teardown_thought_tap(); self:_setup_thought_tap()
+    if self._thought_index_pause_path then U.atomic_write(self._thought_index_pause_path,"1",true) end
+    self:_teardown_thought_tap()
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
     self._progress_remote_retries={}
@@ -4418,7 +4459,7 @@ function Plugin:onResume()
 end
 function Plugin:onCloseDocument()
     self:_cancel_network_waits()
-    self._thought_prewarm_generation=(tonumber(self._thought_prewarm_generation) or 0)+1
+    if self._thought_index_pause_path then os.remove(self._thought_index_pause_path) end
     self:_teardown_thought_tap(); self._progress_prompted_book_id=nil; self._progress_check_running=false; self.sync:on_close()
     UIManager:scheduleIn(.2,function() self:_install_pending_downloads(true) end)
 end

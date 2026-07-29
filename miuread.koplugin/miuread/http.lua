@@ -329,7 +329,7 @@ function Http:request(opt)
         local code=shared_state and shared_state.code or "rate_limit"
         if opt.rate_limit_fail_fast==true then
             error("请求频率暂时受限 [MiuReadRateLimit] error_code="..tostring(code)
-                .." wait_seconds="..tostring(shared_remaining).."：已暂停附加内容请求，请稍后补全。")
+                .." wait_seconds="..tostring(shared_remaining).."：已暂停附加内容请求，请稍后重试。")
         end
         logger.warn("[MiuRead][HTTP] respecting shared rate-limit cooldown",
             "wait=",tostring(shared_remaining),"code=",tostring(code),"url=",Util.redact_url(opt.url or ""))
@@ -369,7 +369,7 @@ function Http:request(opt)
             local remaining=self:_set_shared_rate_limit(cooldown,limited_code,last_url or opt.url,rate_limit_scope)
             error("请求频率仍受限 [MiuReadRateLimit] error_code=" .. tostring(limited_code)
                 .. " wait_seconds="..tostring(remaining)
-                .. "：已停止继续请求，正文和下载断点会保留，请稍后补全。")
+                .. "：已停止继续请求，正文和下载断点会保留，请稍后重试。")
         end
 
         rate_attempt = rate_attempt + 1

@@ -9,6 +9,9 @@ function Async:new(store, options)
         store=store,job=nil,poll=nil,
         poll_interval=tonumber(options.poll_interval) or .25,
         allow_android=options.allow_android==true,
+        defer_fallback=options.defer_fallback==true,
+        disable_fallback=options.disable_fallback==true,
+        fallback_delay=tonumber(options.fallback_delay) or .1,
     },self)
 end
 function Async:is_android()
@@ -34,14 +37,36 @@ end
 function Async:cancel(reason)
     if self.poll then UIManager:unschedule(self.poll); self.poll=nil end
     if not self.job then return end
-    self.job.callback=nil
-    pcall(FFIUtil.terminateSubProcess,self.job.pid)
-    os.remove(self.job.path); os.remove(self.job.path..".tmp")
+    local job=self.job
+    job.callback=nil
+    if job.fallback_task then UIManager:unschedule(job.fallback_task) end
+    if job.pid then pcall(FFIUtil.terminateSubProcess,job.pid) end
+    if job.path then os.remove(job.path); os.remove(job.path..".tmp") end
     self.job=nil
 end
 function Async:run(label,fn,callback,timeout)
     if self.job then return false,"worker busy" end
-    if not self:available() then local ok,x=pcall(fn); callback(ok and {ok=true,value=x} or {ok=false,error=tostring(x)}); return true end
+    if not self:available() then
+        if self.disable_fallback then return false,"worker unavailable" end
+        if not self.defer_fallback then
+            local ok,x=pcall(fn)
+            callback(ok and {ok=true,value=x} or {ok=false,error=tostring(x)})
+            return true
+        end
+        local job={label=label,callback=callback,started=os.time(),fallback=true}
+        local task
+        task=function()
+            if self.job~=job then return end
+            job.fallback_task=nil
+            local ok,x=pcall(fn)
+            self.job=nil
+            if job.callback then job.callback(ok and {ok=true,value=x} or {ok=false,error=tostring(x)}) end
+        end
+        job.fallback_task=task
+        self.job=job
+        UIManager:scheduleIn(self.fallback_delay,task)
+        return true
+    end
     local path=self.store.temp_dir.."/worker-"..tostring(os.time()).."-"..tostring(math.random(10000,99999))..".json"; local child=function() local ok,x=pcall(fn); local res=ok and {ok=true,value=x} or {ok=false,error=tostring(x)}; local encoded=Json.encode(res); U.atomic_write(path,encoded,true) end
     local ok,pid,err=pcall(FFIUtil.runInSubProcess,child,false,false); if not ok or not pid then return false,tostring(err or pid) end; self.job={pid=pid,path=path,label=label,callback=callback,started=os.time(),timeout=timeout or 45}; self:_schedule(); return true
 end

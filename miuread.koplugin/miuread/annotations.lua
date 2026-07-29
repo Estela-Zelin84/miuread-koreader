@@ -233,7 +233,7 @@ function Annotations:fetch_chapter(book_id, uid, progress)
                 "book=",result.book_id,"chapter=",result.chapter_uid,"batch=",index,"/",#batches)
             local stop=false
             for item_index,item in ipairs(batch) do
-                progress("thoughts",index,#batches,"逐条补全 "..tostring(item_index).."/"..tostring(#batch))
+                progress("thoughts",index,#batches,"获取想法 "..tostring(item_index).."/"..tostring(#batch))
                 local single_ok,single_response,single_network,single_kind=call_with_retry(
                     "thought range "..tostring(index).."."..tostring(item_index),function()
                         return self.api:readreviews(book_id,uid,{item})
@@ -640,42 +640,10 @@ local function render_text_token(token, marks, data)
     return table.concat(out)
 end
 
-local function append_before_body(html, section)
-    html, section = tostring(html or ""), tostring(section or "")
-    if section == "" then return html end
-    local body_end = html:lower():find("</body>", 1, true)
-    if body_end then return html:sub(1, body_end - 1) .. section .. html:sub(body_end) end
-    return html .. section
-end
-
-local function unresolved_section(data, unresolved)
-    if type(unresolved) ~= "table" or #unresolved == 0 then return "" end
-    local rows = {
-        '<section class="miu-unlocated" data-miuread-unlocated="1">',
-        '<h2>未定位内容</h2>',
-        '<p class="miu-unlocated-note">以下划线未能准确定位到正文，已保留在章节末尾。</p>',
-    }
-    for _, item in ipairs(unresolved) do
-        local text = U.trim(tostring(item.quote or ""))
-        if text == "" then text = "一条未能定位的划线" end
-        local key = tostring(item.key or "")
-        rows[#rows + 1] = '<div class="miu-unlocated-item">'
-        if item.thought and key ~= "" then
-            local href = Thoughts.href(data.book_id, data.chapter_uid, key)
-            rows[#rows + 1] = '<a class="miu-thought-link" href="' .. U.xml(href) .. '"><span class="miu-thought-mark ' .. Thoughts.mark_class(key) .. '" data-miu-range="' .. U.xml(key) .. '">' .. U.xml(text) .. '</span></a>'
-        else
-            rows[#rows + 1] = '<span class="miu-inline-mark">' .. U.xml(text) .. '</span>'
-        end
-        rows[#rows + 1] = '</div>'
-    end
-    rows[#rows + 1] = '</section>'
-    return table.concat(rows, "\n")
-end
-
 local function inject(html, data)
     local tokens, visible_count = tokenize(html)
     local index = build_text_index(tokens)
-    local marks, stats, unresolved = intervals(data, visible_count, index)
+    local marks, stats = intervals(data, visible_count, index)
     local rendered = tostring(html or "")
     if #marks > 0 then
         local out = {}
@@ -685,7 +653,10 @@ local function inject(html, data)
         end
         rendered = table.concat(out)
     end
-    return append_before_body(rendered, unresolved_section(data, unresolved)), stats
+    -- Unlocated marks remain in the annotation cache and diagnostic counters.
+    -- They are deliberately omitted from the EPUB instead of being appended to
+    -- the chapter, so generated books contain only content placed in context.
+    return rendered, stats
 end
 
 function Annotations:apply(html, data)

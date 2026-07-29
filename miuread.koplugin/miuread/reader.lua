@@ -583,7 +583,7 @@ function Reader:_recover_login_session()
 
     self._renewing_session = false
     if ok then
-        logger.info("[MiuRead][Reader] login session renewed and verified",
+        logger.info("[MiuRead][Reader] login renewal completed; web credentials present",
             "skills=", tostring(result.skills_verified == true),
             "vid_unchanged=", tostring(before_vid == "" or before_vid == tostring(result.vid or "")))
         return true, result

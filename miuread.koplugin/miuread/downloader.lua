@@ -24,7 +24,7 @@ Downloader.__index = Downloader
 local CACHE_SCHEMA = 9
 local FOOTNOTE_TRANSFORM_VERSION = 2
 local TITLE_TRANSFORM_VERSION = 2
-local ANNOTATION_TRANSFORM_VERSION = 3
+local ANNOTATION_TRANSFORM_VERSION = 4
 
 local BASE_CSS = [[
 body { line-height: 1.75; margin: 5%; }
@@ -727,10 +727,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     ensure_not_cancelled()
     local previous_chapters=type(opt.previous_chapter_map)=="table" and opt.previous_chapter_map
         or (type(existing_record)=="table" and existing_record.chapter_map or nil)
-    if opt.annotations==true and opt.annotation_pending==true and type(existing_record)=="table"
-        and existing_record.complete~=false and existing_record.annotation_pending~=true
-        and U.file_exists(existing_record.file or "") then
-        error("下载内容暂时未完整 [MiuReadAnnotationPending]：原文件和下载断点已保留。")
+    if opt.annotations==true and opt.annotation_pending==true then
+        error("划线与想法暂时未完整 [MiuReadAnnotationPending]：原文件和下载断点已保留。")
     end
 
     local estimate=1024*1024
@@ -928,7 +926,7 @@ function Downloader:book(input, opt, progress)
     local function record_annotation_error(chapter,annotation)
         local uid=chapter_uid(chapter)
         local message=table.concat(annotation and annotation.errors or {},"; ")
-        if message=="" then message="批注数据待补全" end
+        if message=="" then message="批注数据尚未完整" end
         annotation_error_map[uid]={uid=uid,title=chapter and chapter.title,error=message,
             error_kind=annotation and annotation.error_kind or "incomplete"}
         annotation_error_kind=annotation_error_kind or (annotation and annotation.error_kind) or "incomplete"
@@ -960,18 +958,30 @@ function Downloader:book(input, opt, progress)
             and self.reader and type(self.reader._recover_login_session)=="function" then
             annotation_recovery_attempted=true
             local recovered,recover_error=self.reader:_recover_login_session()
-            logger.warn("[MiuRead][Download] annotation authentication recovery",
-                "ok=",tostring(recovered),"book=",tostring(book.bookId),
+            logger.info("[MiuRead][Download] annotation login renewal attempted",
+                "renewed=",tostring(recovered),"book=",tostring(book.bookId),
                 "error=",recovered and "" or tostring(recover_error))
             if recovered then
                 local retry_ok,retry_annotation=pcall(self.annotations.fetch_chapter,self.annotations,
                     book.bookId,chapter.chapterUid or chapter.uid,function(stage,current_index,total)
                         if report_progress then report_progress(stage,current_index,total) end
                     end)
-                if retry_ok and type(retry_annotation)=="table" then current=retry_annotation
+                if retry_ok and type(retry_annotation)=="table" then
+                    current=retry_annotation
+                    if current.complete==true or (current.auth_required~=true and current.forbidden~=true) then
+                        logger.info("[MiuRead][Download] annotation access restored after renewal",
+                            "book=",tostring(book.bookId),"chapter=",uid)
+                    else
+                        logger.warn("[MiuRead][Download] annotation access still unavailable after renewal",
+                            "book=",tostring(book.bookId),"chapter=",uid,
+                            "kind=",tostring(current.error_kind or "incomplete"))
+                    end
                 else
                     current.errors=current.errors or {}
                     current.errors[#current.errors+1]=tostring(retry_annotation)
+                    logger.warn("[MiuRead][Download] annotation endpoint retry failed after renewal",
+                        "book=",tostring(book.bookId),"chapter=",uid,
+                        "error=",tostring(retry_annotation))
                 end
             else
                 current.errors=current.errors or {}
@@ -1119,7 +1129,7 @@ function Downloader:book(input, opt, progress)
 
         if retry_round and retry_round > 0 then
             progress("resume", index, expected, chapter.title, {
-                message="正在补全失败项目（第 " .. tostring(retry_round) .. " 轮）",
+                message="正在重试失败项目（第 " .. tostring(retry_round) .. " 轮）",
             })
         end
 
@@ -1183,7 +1193,7 @@ function Downloader:book(input, opt, progress)
         if entry and entry.content_done then
             body, style, new_assets = cache_load_base(cache, entry)
             if body then
-                progress("resume", index, expected, chapter.title, {message="正文已完成，继续补全附加内容"})
+                progress("resume", index, expected, chapter.title, {message="正文已完成，正在获取附加内容"})
             else
                 logger.warn("[MiuRead][Download] content checkpoint invalid", "chapter=", uid, "error=", tostring(style))
                 cache_reset_entry(cache, uid)
