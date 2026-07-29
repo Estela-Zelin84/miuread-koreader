@@ -427,13 +427,13 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
         })
         if not ok or not data or #data == 0 then
             remote_failed[url] = true
-            logger.warn("[MiuRead][Reader] remote image failed", "url=", tostring(url), "error=", ok and "empty" or tostring(data))
+            logger.warn("[MiuRead][Reader] remote image failed", "url=", Util.redact_url(url), "error=", ok and "empty" or tostring(data))
             return nil
         end
         local ext, mime = Codec.media(data, url)
         if not tostring(mime):match("^image/") then
             remote_failed[url] = true
-            logger.warn("[MiuRead][Reader] remote asset is not an image", "url=", tostring(url), "mime=", tostring(mime))
+            logger.warn("[MiuRead][Reader] remote asset is not an image", "url=", Util.redact_url(url), "mime=", tostring(mime))
             return nil
         end
         remote_index = remote_index + 1
@@ -734,7 +734,7 @@ function Reader:_epub_once(book, chapter, opt, state)
                 for key, href in pairs(tar_map) do source_map[key] = href end
             else
                 logger.warn("[MiuRead][Reader] chapter image archive failed", "chapter=", tostring(uid),
-                    "url=", tostring(tar_url), "error=", ok_tar and "empty" or tostring(blob))
+                    "url=", Util.redact_url(tar_url), "error=", ok_tar and "empty" or tostring(blob))
             end
         end
     end

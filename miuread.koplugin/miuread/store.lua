@@ -17,7 +17,7 @@ local defaults={
              download={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",memory_mode={enabled=false,previous_known=false,previous_ratio=false},thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
@@ -797,6 +797,25 @@ function Store:migrate()
             end
             if changed>0 then self.db:saveSetting("sessions",cleaned) end
             self.db:saveSetting("auth",invalidate_upload_health_table(self.db:readSetting("auth",{}) or {}))
+        end
+        if schema<60 then
+            -- 2.3.4 restores one simple success-notice switch and removes
+            -- accumulated reading-time catch-up. Old pending seconds are
+            -- intentionally discarded so an upgrade can never submit a long
+            -- reading-time batch.
+            p.sync=p.sync or {}
+            p.sync.success_notice_enabled=true
+            p.sync.time_notice_enabled=nil
+            p.sync.progress_notice_mode=nil
+            local sessions=self.db:readSetting("sessions",{}) or {}
+            local changed=false
+            for _,session in pairs(sessions) do
+                if type(session)=="table" then
+                    if tonumber(session.pending_report_seconds or 0)~=0 then changed=true end
+                    session.pending_report_seconds=0
+                end
+            end
+            if changed then self.db:saveSetting("sessions",sessions) end
         end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)

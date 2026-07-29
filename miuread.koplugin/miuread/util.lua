@@ -105,8 +105,77 @@ function U.safe_name(s,f) local v=U.trim(tostring(s or ""):gsub("[%z%c/\\:%*%?\"
 function U.id_name(s) local v=tostring(s or ""):gsub("[^%w%._%-]","_"); return v~="" and v or "unknown" end
 function U.xml(s) return (tostring(s or ""):gsub("&","&amp;"):gsub("<","&lt;"):gsub(">","&gt;"):gsub('"',"&quot;"):gsub("'","&apos;")) end
 function U.url_decode(s) return (tostring(s or ""):gsub("+"," "):gsub("%%(%x%x)",function(h) return string.char(tonumber(h,16)) end)) end
-function U.file_exists(p) local f=io.open(p,"rb"); if not f then return false end f:close(); return true end
-function U.read_file(p,b) local f,e=io.open(p,b and "rb" or "r"); if not f then return nil,e end local d=f:read("*a"); f:close(); return d end
+local function raw_file_exists(p)
+    local f=io.open(p,"rb")
+    if not f then return false end
+    f:close()
+    return true
+end
+local function recover_previous_file(p)
+    p=tostring(p or "")
+    if p=="" or raw_file_exists(p) then return raw_file_exists(p) end
+    local dir,name=p:match("^(.*)/([^/]+)$")
+    if not dir or dir=="" then dir="."; name=p end
+    if lfs.attributes(dir,"mode")~="directory" then return false end
+    local best,best_time=nil,-1
+    local escaped=name:gsub("([^%w])","%%%1")
+    local listed,iter,state=pcall(lfs.dir,dir)
+    if not listed or type(iter)~="function" then return false end
+    for item in iter,state do
+        if item==name..".previous" or item:match("^"..escaped.."%.previous%-%d+%-%d+$") then
+            local candidate=dir.."/"..item
+            local modified=tonumber(lfs.attributes(candidate,"modification") or 0) or 0
+            if raw_file_exists(candidate) and modified>=best_time then best,best_time=candidate,modified end
+        end
+    end
+    if not best then return false end
+    local restored=os.rename(best,p)
+    if not restored then
+        local input=io.open(best,"rb")
+        local output=input and io.open(p,"wb") or nil
+        local copied=input~=nil and output~=nil
+        if input and output then
+            while copied do
+                local chunk=input:read(256*1024)
+                if not chunk then break end
+                if not output:write(chunk) then copied=false end
+            end
+            if copied and output:flush()==nil then copied=false end
+            output:close(); input:close()
+            local source_size=raw_file_exists(best) and lfs.attributes(best,"size") or nil
+            local target_size=raw_file_exists(p) and lfs.attributes(p,"size") or nil
+            restored=copied and source_size~=nil and target_size==source_size
+            if restored then os.remove(best) else os.remove(p) end
+        else
+            if input then input:close() end
+            if output then output:close() end
+            os.remove(p)
+        end
+    end
+    return restored==true or raw_file_exists(p)
+end
+local function cleanup_previous_files(p)
+    local dir,name=tostring(p or ""):match("^(.*)/([^/]+)$")
+    if not dir or dir=="" then dir="."; name=tostring(p or "") end
+    if lfs.attributes(dir,"mode")~="directory" then return end
+    local listed,iter,state=pcall(lfs.dir,dir)
+    if not listed or type(iter)~="function" then return end
+    local escaped=name:gsub("([^%w])","%%%1")
+    for item in iter,state do
+        if item==name..".previous" or item:match("^"..escaped.."%.previous%-%d+%-%d+$") then
+            os.remove(dir.."/"..item)
+        end
+    end
+end
+function U.file_exists(p) return raw_file_exists(p) or recover_previous_file(p) end
+function U.read_file(p,b)
+    if not raw_file_exists(p) then recover_previous_file(p) end
+    local f,e=io.open(p,b and "rb" or "r")
+    if not f then return nil,e end
+    local d=f:read("*a")
+    f:close()
+    return d
+end
 function U.file_size(p) local f=io.open(p,"rb"); if not f then return nil end local n=f:seek("end"); f:close(); return n end
 function U.mkdir(p)
     if not p or p=="" then return false end
@@ -116,9 +185,35 @@ function U.mkdir(p)
 end
 function U.atomic_write(p,d,b)
     local parent=p:match("^(.*)/[^/]+$"); if parent then U.mkdir(parent) end
-    local t=p..".tmp-"..tostring(os.time()).."-"..tostring(math.random(1000,9999)); local f,e=io.open(t,b and "wb" or "w"); if not f then return nil,e end
-    local ok,er=f:write(d or ""); f:flush(); f:close(); if not ok then os.remove(t); return nil,er end
-    os.remove(p); local r,re=os.rename(t,p); if not r then os.remove(t); return nil,re end; return true
+    local payload=d or ""
+    local t=p..".tmp-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
+    local f,e=io.open(t,b and "wb" or "w"); if not f then return nil,e end
+    local ok,er=f:write(payload)
+    local flushed,flush_error=f:flush()
+    f:close()
+    if not ok or flushed==nil then os.remove(t); return nil,er or flush_error end
+    if U.file_size(t)~=#payload then os.remove(t); return nil,"temporary file size mismatch" end
+
+    -- POSIX rename replaces the old file atomically. Some platforms refuse to
+    -- replace an existing target, so keep a recoverable previous generation for
+    -- that fallback instead of deleting the last valid file first.
+    local r,re=os.rename(t,p)
+    if r then cleanup_previous_files(p); return true end
+    local previous=p..".previous-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
+    local had_previous=U.file_exists(p)
+    if had_previous then
+        local backed_up,backup_error=os.rename(p,previous)
+        if not backed_up then os.remove(t); return nil,backup_error or re end
+    end
+    r,re=os.rename(t,p)
+    if not r then
+        if had_previous then os.rename(previous,p) end
+        os.remove(t)
+        return nil,re
+    end
+    if had_previous then os.remove(previous) end
+    cleanup_previous_files(p)
+    return true
 end
 function U.remove_tree(p)
     p=tostring(p or "")
@@ -178,38 +273,59 @@ function U.move_file_safe(source,target,validator)
     source=tostring(source or "")
     target=tostring(target or "")
     if source=="" or target=="" then return nil,"invalid path" end
-    local moved,move_error=os.rename(source,target)
-    if moved then return true,"rename" end
-    local stage=target..".miuread-copying-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
-    os.remove(stage)
-    local copied,copy_error=U.copy_file_stream(source,stage)
-    if not copied then return nil,"rename failed: "..tostring(move_error).."; copy failed: "..tostring(copy_error) end
+    if not U.file_exists(source) then return nil,"source missing" end
     if validator then
-        local called,valid,validation_error=pcall(validator,stage)
+        local called,valid,validation_error=pcall(validator,source)
         if not called or valid~=true then
-            os.remove(stage)
-            return nil,"copied file validation failed: "..tostring(called and validation_error or valid)
+            return nil,"source validation failed: "..tostring(called and validation_error or valid)
         end
     end
+
     local target_exists=U.file_exists(target)
     local old_backup=target..".miuread-old-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
     if target_exists then
-        os.remove(old_backup)
         local backed_up,backup_error=os.rename(target,old_backup)
-        if not backed_up then
+        if not backed_up then return nil,"existing target backup failed: "..tostring(backup_error) end
+    end
+
+    local moved,move_error=os.rename(source,target)
+    local mode="rename"
+    if not moved then
+        local stage=target..".miuread-copying-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
+        os.remove(stage)
+        local copied,copy_error=U.copy_file_stream(source,stage)
+        if not copied then
+            if target_exists then os.rename(old_backup,target) end
+            return nil,"rename failed: "..tostring(move_error).."; copy failed: "..tostring(copy_error)
+        end
+        if validator then
+            local called,valid,validation_error=pcall(validator,stage)
+            if not called or valid~=true then
+                os.remove(stage)
+                if target_exists then os.rename(old_backup,target) end
+                return nil,"copied file validation failed: "..tostring(called and validation_error or valid)
+            end
+        end
+        moved,move_error=os.rename(stage,target)
+        if not moved then
             os.remove(stage)
-            return nil,"existing target backup failed: "..tostring(backup_error)
+            if target_exists then os.rename(old_backup,target) end
+            return nil,"copied file install failed: "..tostring(move_error)
+        end
+        os.remove(source)
+        mode="copy"
+    end
+
+    if validator then
+        local called,valid,validation_error=pcall(validator,target)
+        if not called or valid~=true then
+            os.remove(target)
+            if target_exists then os.rename(old_backup,target) end
+            return nil,"installed file validation failed: "..tostring(called and validation_error or valid)
         end
     end
-    local installed,install_error=os.rename(stage,target)
-    if not installed then
-        if target_exists then os.rename(old_backup,target) end
-        os.remove(stage)
-        return nil,"copied file install failed: "..tostring(install_error)
-    end
     if target_exists then os.remove(old_backup) end
-    os.remove(source)
-    return true,"copy"
+    return true,mode
 end
 function U.copy_file(a,b) local d,e=U.read_file(a,true); if not d then return nil,e end return U.atomic_write(b,d,true) end
 function U.copy_tree(a,b)
@@ -224,6 +340,29 @@ function U.clamp(v,a,b) v=tonumber(v) or a; if v<a then return a elseif v>b then
 function U.percent(n,d) d=tonumber(d) or 0; if d<=0 then return 0 end return math.floor(U.clamp((tonumber(n) or 0)*100/d,0,100)+.5) end
 function U.now_text(t) t=tonumber(t) or 0; return t>0 and os.date("%Y-%m-%d %H:%M:%S",t) or "—" end
 function U.shell_quote(s) return "'"..tostring(s):gsub("'","'\\''").."'" end
+
+function U.redact_url(value)
+    local text=tostring(value or "")
+    local sensitive={uid=true,otp=true,token=true,ticket=true,session=true,skey=true,
+        wr_skey=true,wr_ticket=true,wr_wrpa=true,access_token=true,refresh_token=true}
+    text=text:gsub("([?&])([^=&#%s]+)=([^&#%s]*)",function(prefix,name,content)
+        if sensitive[tostring(name):lower()] then return prefix..name.."=***" end
+        return prefix..name.."="..content
+    end)
+    return text
+end
+function U.free_space(path)
+    path=tostring(path or ".")
+    local pipe=io.popen("df -Pk "..U.shell_quote(path).." 2>/dev/null","r")
+    if not pipe then return nil end
+    local raw=pipe:read("*a") or ""
+    pipe:close()
+    local last
+    for line in raw:gmatch("[^\r\n]+") do last=line end
+    if not last then return nil end
+    local available=last:match("%s(%d+)%s+%d+%%?%s+[^%s]+%s*$")
+    return available and tonumber(available)*1024 or nil
+end
 local function semver_parse(value)
     local major, minor, patch, pre = tostring(value or ""):match("^v?(%d+)%.(%d+)%.(%d+)(.*)$")
     if not major then return nil end

@@ -24,7 +24,10 @@ local Annotations=require("miuread.annotations")
 local Downloader=require("miuread.downloader")
 local DownloadProgress=require("miuread.download_progress")
 local DownloadTask=require("miuread.download_task")
+local DownloadResult=require("miuread.download_result")
+local EpubInstaller=require("miuread.epub_installer")
 local CacheCleanupTask=require("miuread.cache_cleanup_task")
+local MemoryMode=require("miuread.memory_mode")
 local Library=require("miuread.library")
 local ShelfView=require("miuread.shelf_view")
 local Async=require("miuread.async")
@@ -56,6 +59,7 @@ end
 function Plugin:init()
     math.randomseed(os.time()+math.floor(collectgarbage("count")))
     self.store=Store:new()
+    self.memory_mode=MemoryMode:new(self.store)
     logger.info("[MiuRead] initialized", "version=", tostring(Config.VERSION),
         "schema=", tostring(Config.SCHEMA), "root=", tostring(ROOT))
     sanitize_saved_auth(self.store)
@@ -97,6 +101,7 @@ function Plugin:init()
     self._download_state_last_stage=nil
     self._auth_notice_dialog=nil
     self._thought_prewarm_generation=0
+    self._sync_success_notified=false
 
     local guard=self.store:cover_guard()
     local guard_age=os.time()-(tonumber(guard.started_at) or 0)
@@ -824,11 +829,21 @@ function Plugin:_prepare_shelf_rows(rows)
             cover_index_changed=true
             if self._cover_index_pending then self._cover_index_pending[tostring(b.bookId)]=nil end
         end
-        b.download_status=nil
+        if b.annotation_pending==true or b.annotation_fallback==true then
+            b.download_status=DownloadResult.shelf_status({
+                annotation_pending=b.annotation_pending==true,
+                annotation_fallback=b.annotation_fallback==true,
+            },false)
+        else
+            b.download_status=nil
+        end
         if tostring(download_state.book_id or "")~="" and tostring(download_state.book_id)==tostring(b.bookId or "") then
             if download_state.status=="active" then b.download_status="生成中 "..tostring(self:_download_percent(download_state)).."%"
-            elseif download_state.status=="pending_install" then b.download_status="等待关闭后更新"
+            elseif download_state.status=="pending_install" then
+                b.download_status=DownloadResult.shelf_status(download_state,true)
             elseif download_state.status=="failed" or download_state.status=="interrupted" then b.download_status="生成未完成"
+            elseif download_state.status=="annotation_pending" then b.download_status="已生成 · 划线或想法待补全"
+            elseif download_state.status=="completed" and download_state.annotation_fallback==true then b.download_status="已生成 · 少量内容已保留在章节末尾"
             elseif download_state.status=="completed" and download_state.seen~=true then b.download_status="刚刚生成完成" end
         end
         b.status_text=self:_shelf_status_text(b)
@@ -1864,29 +1879,15 @@ function Plugin:_download_summary(rec,opt)
     local preview_mode=tostring(rec and rec.preview_mode or "complete")
     local heading=preview and (preview_mode=="info" and "试读信息版生成完成"
         or (preview_mode=="partial" and "部分试读版生成完成" or "试读版生成完成")) or "下载完成"
-    local lines={
-        heading,
-        "保存位置："..tostring(rec.file or ""),
-        "打开一次后会出现在 KOReader 最近阅读中",
-    }
+    local lines={heading}
+    local annotation_note=DownloadResult.summary_note(rec)
+    if annotation_note then lines[#lines+1]=annotation_note end
+    lines[#lines+1]="保存位置："..tostring(rec.file or "")
+    lines[#lines+1]="打开一次后会出现在 KOReader 最近阅读中"
     if rec and rec.partial_range==true then
-        lines[#lines+1]="章节范围："..tostring(rec.range_start_title or rec.range_start_index or "起始章节")
-            .." 至 "..tostring(rec.range_end_title or rec.range_end_index or "结束章节")
         lines[#lines+1]="章节版不会上传整书阅读进度，避免局部比例覆盖云端位置。"
     end
-    if preview then
-        lines[#lines+1]="成功取得正文："..tostring(rec.readable_chapter_count or 0).." / "..tostring(rec.catalog_chapter_count or rec.expected_chapter_count or 0)
-        if preview_mode=="info" then lines[#lines+1]="本文件只包含书籍信息和权限说明，不含试读正文。"
-        elseif preview_mode=="partial" then lines[#lines+1]="未成功取得的试读章节未写入文件，可稍后重新生成。" end
-    end
-    if rec and rec.annotation_pending==true then
-        lines[#lines+1]="划线与想法暂时无法完整获取，已生成正文完整的纯净版。"
-        lines[#lines+1]="正文断点已保留；下次重新生成划线与想法版时不会重新下载正文。"
-    elseif opt and opt.annotations then
-        local a=rec.annotation_summary or {}
-        lines[#lines+1]="划线："..tostring(a.underlines or 0)
-        lines[#lines+1]="含想法的划线："..tostring(a.thoughts or 0)
-    end
+    if preview and preview_mode=="info" then lines[#lines+1]="本文件只包含书籍信息和权限说明。" end
     return table.concat(lines,"\n")
 end
 
@@ -1969,6 +1970,7 @@ function Plugin:_finish_download_runtime(runtime,result)
         local auth_required=Http.is_auth_error(err)
         local rate_limited=Http.is_rate_limit_error(err)
         local network_failed=Http.is_network_error and Http.is_network_error(err)
+        local content_pending=tostring(err):find("[MiuReadAnnotationPending]",1,true)~=nil
         local wait_seconds=tonumber(tostring(err):match("wait_seconds=(%d+)"))
         if auth_required then self:_mark_auth_problem("download",err,true) end
         self:_write_download_state("failed",{
@@ -1977,12 +1979,13 @@ function Plugin:_finish_download_runtime(runtime,result)
             current=runtime.last_state and runtime.last_state.current,total=runtime.last_state and runtime.last_state.total,
             percent=runtime.last_state and runtime.last_state.percent,seen=false,
             auth_required=auth_required or nil,
-            error_kind=auth_required and "authentication" or (rate_limited and "rate_limit" or (network_failed and "network" or nil)),
+            error_kind=auth_required and "authentication" or (rate_limited and "rate_limit"
+                or (network_failed and "network" or (content_pending and "content_pending" or nil))),
             wait_seconds=rate_limited and wait_seconds or nil,
         },true)
         self:_update_open_shelf_download_status(b.bookId,
             auth_required and "等待重新登录" or (rate_limited and "请求受限 · 稍后继续"
-                or (network_failed and "等待网络 · 可继续" or "生成未完成")))
+                or (network_failed and "等待网络 · 可继续" or (content_pending and "等待补全" or "生成未完成"))))
         local first
         if auth_required then
             first="微信读书登录已失效。下载断点已经保留，请重新扫码登录后继续。"
@@ -1990,11 +1993,10 @@ function Plugin:_finish_download_runtime(runtime,result)
             first="微信读书暂时限制了请求频率。插件已停止继续请求，正文和断点均已保留，请稍后继续下载。"
         elseif network_failed then
             first="网络连接暂时中断。已完成章节和下载断点均已保留，网络恢复后可继续下载。"
+        elseif content_pending then
+            first="下载内容暂时未完整，原文件和下载进度已保留，请稍后重试。"
         else
             first=U.first_line(err)
-        end
-        if tostring(err):find("ANNOTATION_FORBIDDEN",1,true) then
-            first="划线与想法暂时无法获取，可改为生成纯净版。已下载正文会保留。"
         end
         if was_background then
             local toast_title=auth_required and "下载登录验证失败" or (rate_limited and "请求受限"
@@ -2002,7 +2004,8 @@ function Plugin:_finish_download_runtime(runtime,result)
             local toast_text=auth_required and "后台下载已暂停，重新扫码后自动继续"
                 or (rate_limited and "已停止继续请求，下载断点已保留"
                 or (network_failed and "下载断点已保留，网络恢复后可继续"
-                or (tostring(b.title or "未命名").."下载未完成，进度已保留")))
+                or (content_pending and "下载暂未完成，原文件和进度已保留"
+                or (tostring(b.title or "未命名").."下载未完成，进度已保留"))))
             self:status_toast(toast_title,toast_text,5)
         else self:info(first) end
         -- A rate limit is account-wide. Starting the next queued book here would
@@ -2022,14 +2025,16 @@ function Plugin:_finish_download_runtime(runtime,result)
     end
     self:_refresh_local_files()
     local pending=rec.pending_install==true and rec.pending_file and U.file_exists(rec.pending_file)
-    self:_update_open_shelf_download_status(b.bookId,pending and "等待关闭后更新"
-        or (rec.annotation_pending==true and "正文已生成 · 批注待补" or "已生成"))
-    if pending then
-        self:_write_download_state("pending_install",{
+    local annotation_pending=DownloadResult.annotation_pending(rec)
+    local annotation_fallback=DownloadResult.annotation_fallback(rec)
+    self:_update_open_shelf_download_status(b.bookId,DownloadResult.shelf_status(rec,pending))
+    if pending or annotation_pending then
+        self:_write_download_state(DownloadResult.state(rec,pending),{
             title=b.title,book_id=b.bookId,book=U.copy(b),options=U.copy(opt),file=rec.file,
-            pending_file=rec.pending_file,pending_install=true,percent=1,
+            pending_file=pending and rec.pending_file or nil,pending_install=pending or nil,percent=1,
             current=rec.chapter_count,total=rec.expected_chapter_count,completed_at=os.time(),
-            annotation_pending=rec.annotation_pending==true or nil,
+            annotation_pending=annotation_pending or nil,
+            annotation_fallback=annotation_fallback or nil,
             annotation_error_kind=rec.annotation_error_kind,
         },true)
     else
@@ -2037,17 +2042,17 @@ function Plugin:_finish_download_runtime(runtime,result)
     end
     if done then done(rec,was_background); self:_start_next_queued_download(); return end
     if pending then
-        local text=tostring(b.title or "未命名").."新版本已下载，关闭当前书籍后更新"
+        local text=DownloadResult.notice(b.title,rec,true)
         if was_background then self:status_toast("觅阅",text,5) else self:info(text) end
     elseif was_background then
-        if self.store:preferences().download_complete_notice~=false then
-            self:status_toast("觅阅",tostring(b.title or "未命名")..
-                (rec.annotation_pending==true and "正文下载完成，批注待补全" or "下载完成"),5)
+        if self.store:preferences().download_complete_notice~=false or annotation_pending or annotation_fallback then
+            self:status_toast("觅阅",DownloadResult.notice(b.title,rec,false),5)
         end
     elseif open_after and rec.file then
-        self.store:clear_download_state(); self:open_file(rec.file)
+        if not annotation_pending then self.store:clear_download_state() end
+        self:open_file(rec.file)
     else
-        self:_show_download_complete(rec,opt)
+        self:_show_download_complete(rec,opt,b)
     end
     self:_start_next_queued_download()
 end
@@ -2112,6 +2117,7 @@ function Plugin:_has_download_status()
     local state=self.store:download_state()
     if state.status=="completed" then self.store:clear_download_state(); return false end
     return state.status=="failed" or state.status=="interrupted" or state.status=="pending_install"
+        or state.status=="annotation_pending"
 end
 function Plugin:_download_status_label()
     local state=self:_download_state()
@@ -2125,7 +2131,10 @@ function Plugin:_download_status_label()
         local title=U.utf8_truncate(state.title or "未命名",9)
         return "后台下载：《"..title.."》 "..tostring(self:_download_percent(state)).."%"
     end
-    if state.status=="pending_install" then return "后台下载 · 等待更新" end
+    if state.status=="pending_install" then
+        return state.annotation_pending==true and "后台下载 · 等待更新，划线或想法待补全" or "后台下载 · 等待更新"
+    end
+    if state.status=="annotation_pending" then return "后台下载 · 划线或想法待补全" end
     if state.status=="completed" then return "后台下载 · 已完成" end
     if state.status=="failed" and state.auth_required==true then return "后台下载 · 等待重新登录" end
     if state.status=="failed" and state.error_kind=="network" then return "后台下载 · 等待网络，可继续" end
@@ -2268,12 +2277,19 @@ function Plugin:_merge_download_result(result,book,opt)
     end
     return rec
 end
-function Plugin:_show_download_complete(rec,opt)
+function Plugin:_show_download_complete(rec,opt,book)
     local dialog
-    dialog=ButtonDialog:new{title=self:_download_summary(rec,opt),title_align="center",buttons={
+    local buttons={
         {{text="立即阅读",callback=function() UIManager:close(dialog); self:open_file(rec.file) end}},
-        {{text="关闭",callback=function() UIManager:close(dialog) end}},
-    }}
+    }
+    if DownloadResult.annotation_pending(rec) and type(book)=="table" then
+        buttons[#buttons+1]={{text="重新尝试补全",callback=function()
+            UIManager:close(dialog)
+            self:download(book,opt or {},false,nil,true)
+        end}}
+    end
+    buttons[#buttons+1]={{text="关闭",callback=function() UIManager:close(dialog) end}}
+    dialog=ButtonDialog:new{title=self:_download_summary(rec,opt),title_align="center",buttons=buttons}
     UIManager:show(dialog)
 end
 function Plugin:show_download_status()
@@ -2282,13 +2298,21 @@ function Plugin:show_download_status()
     if not state.status or state.status=="" then self:info("当前没有后台下载记录。") return end
     if state.status=="completed" then
         self.store:clear_download_state()
-        self:info("下载已经完成，记录已自动清除。\n\n可在下载管理的已完成列表中打开书籍。")
+        if state.annotation_fallback==true then
+            self:info("下载已经完成，少量无法准确定位的内容已保留在对应章节末尾。\n\n可在下载管理中打开书籍。")
+        else
+            self:info("下载已经完成，记录已自动清除。\n\n可在下载管理的已完成列表中打开书籍。")
+        end
         return
     end
     local title=tostring(state.title or "未命名")
     local lines={}
     if state.status=="completed" then lines[#lines+1]="下载完成"
-    elseif state.status=="pending_install" then lines[#lines+1]="新版本已下载完成"
+    elseif state.status=="annotation_pending" then lines[#lines+1]="正文已生成，部分划线或想法待补全"
+    elseif state.status=="pending_install" then
+        if state.annotation_pending==true then lines[#lines+1]="新版本已下载，部分划线或想法待补全"
+        elseif state.annotation_fallback==true then lines[#lines+1]="新版本已下载，少量内容已保留在章节末尾"
+        else lines[#lines+1]="新版本已下载完成" end
     elseif state.status=="failed" and state.auth_required==true then lines[#lines+1]="等待重新登录"
     elseif state.status=="failed" and state.error_kind=="rate_limit" then lines[#lines+1]="请求频率受限，稍后可继续"
     elseif state.status=="failed" and state.error_kind=="network" then lines[#lines+1]="网络中断，断点已保留"
@@ -2298,14 +2322,21 @@ function Plugin:show_download_status()
     lines[#lines+1]="《"..title.."》"
     if state.current and state.total and tonumber(state.total)>0 then lines[#lines+1]="章节 "..tostring(state.current).." / "..tostring(state.total) end
     if state.error and state.error~="" then lines[#lines+1]="\n"..U.first_line(state.error) end
-    if state.annotation_pending==true then
-        lines[#lines+1]="\n正文已完整生成；划线与想法将在下次重新生成时补全。"
-    end
     if state.status=="pending_install" then lines[#lines+1]="\n关闭当前书籍后会自动安装新版本。" end
     local buttons={}
     local dialog
-    if state.status=="completed" and state.file and U.file_exists(state.file) then
-        buttons[#buttons+1]={{text="立即阅读",callback=function() UIManager:close(dialog); self.store:clear_download_state(); self:open_file(state.file) end}}
+    if (state.status=="completed" or state.status=="annotation_pending") and state.file and U.file_exists(state.file) then
+        buttons[#buttons+1]={{text="立即阅读",callback=function()
+            UIManager:close(dialog)
+            if state.status~="annotation_pending" then self.store:clear_download_state() end
+            self:open_file(state.file)
+        end}}
+    end
+    if state.status=="annotation_pending" and type(state.book)=="table" then
+        buttons[#buttons+1]={{text="继续补全",callback=function()
+            UIManager:close(dialog)
+            self:download(state.book,state.options or {},false,nil,true)
+        end}}
     elseif state.status=="failed" and state.auth_required==true then
         buttons[#buttons+1]={{text="重新扫码登录",callback=function() UIManager:close(dialog); self.auth_flow:start() end}}
     elseif (state.status=="failed" or state.status=="interrupted") and type(state.book)=="table" then
@@ -2320,32 +2351,28 @@ function Plugin:_install_pending_record(book_id,kind,chapter_uid,record)
     local pending=tostring(record and record.pending_file or "")
     local target=tostring(record and record.file or "")
     if pending=="" or target=="" or not U.file_exists(pending) then return false,"等待安装文件不存在" end
-    local backup=target..".miuread-backup"
-    os.remove(backup)
-    local had_previous=U.file_exists(target)
-    if had_previous then
-        local ok,err=os.rename(target,backup)
-        if not ok then return false,"无法保护原 EPUB："..tostring(err) end
-    end
-    local ok,err=os.rename(pending,target)
-    if not ok then
-        if had_previous then os.rename(backup,target) end
-        return false,"无法安装新 EPUB："..tostring(err)
-    end
-    if had_previous then os.remove(backup) end
+    local validation={book_id=book_id,variant=record.variant or kind,chapters=record.chapter_map,
+        previous_chapters=record.previous_chapter_map}
+    local ok,mode_or_error=EpubInstaller.install(pending,target,validation)
+    if not ok then return false,"无法安装新 EPUB："..tostring(mode_or_error) end
     local updated=U.copy(record)
-    updated.pending_file=nil; updated.pending_install=nil; updated.installed_at=os.time()
+    updated.pending_file=nil
+    updated.pending_install=nil
+    updated.previous_chapter_map=nil
+    updated.installed_at=os.time()
+    updated.file_size=U.file_size(target)
     if chapter_uid then self.store:save_chapter_variant(book_id,chapter_uid,kind,updated)
     else self.store:save_variant(book_id,kind,updated) end
     self.store:remove_pending_install(book_id,kind,chapter_uid)
     return true,updated
 end
+
 function Plugin:_install_pending_downloads(notify)
     local current=tostring(self:_current_document_path() or "")
     self.store:reload()
     local pending=self.store:prune_pending_installs()
     if #pending==0 then return false end
-    local installed,last_record=0,nil
+    local installed_records={}
     for _,item in ipairs(pending) do
         local book_id=tostring(item.book_id or "")
         local kind=tostring(item.kind or "")
@@ -2362,24 +2389,64 @@ function Plugin:_install_pending_downloads(notify)
             self.store:remove_pending_install(book_id,kind,chapter_uid)
         elseif tostring(record.file or "")~=current then
             local ok,value=self:_install_pending_record(book_id,kind,chapter_uid,record)
-            if ok then installed=installed+1; last_record=value
-            else logger.warn("[MiuRead][Download] pending install failed",tostring(value)) end
+            if ok then
+                value.book_id=value.book_id or book_id
+                value._kind=kind
+                value._chapter_uid=chapter_uid
+                installed_records[#installed_records+1]=value
+            else
+                logger.warn("[MiuRead][Download] pending install failed",tostring(value))
+            end
         end
     end
+    local installed=#installed_records
     if installed>0 then
         local remaining=self.store:prune_pending_installs()
         local state=self.store:download_state()
+        local aggregate=DownloadResult.aggregate(installed_records)
+        local any_pending=aggregate.annotation_pending==true
+        local any_fallback=aggregate.annotation_fallback==true
+        local pending_record,last_record=nil,installed_records[#installed_records]
+        for _,record in ipairs(installed_records) do
+            if record.annotation_pending==true and not pending_record then pending_record=record end
+        end
         if #remaining==0 then
-            state.status="completed"; state.pending_install=nil; state.pending_file=nil; state.seen=false
+            state.status=any_pending and "annotation_pending" or "completed"
+            state.annotation_pending=any_pending or nil
+            state.annotation_fallback=any_fallback or nil
+            state.annotation_error_kind=pending_record and pending_record.annotation_error_kind or nil
+            state.pending_install=nil
+            state.pending_file=nil
+            state.seen=false
+            if installed==1 then
+                local record=installed_records[1]
+                state.file=record.file
+                state.book_id=record.book_id
+                local stored=self.store:book(record.book_id)
+                state.title=stored and stored.title or record.title
+                state.book=stored and {bookId=record.book_id,title=stored.title,author=stored.author,cover=stored.cover} or nil
+                state.options=self:_annotation_retry_options(record._kind,record,record._chapter_uid)
+            else
+                state.file=pending_record and pending_record.file or (last_record and last_record.file)
+                state.book=nil
+                state.options=nil
+                state.title="多个新版本"
+            end
         else
-            state.status="pending_install"; state.pending_install=true
+            state.status="pending_install"
+            state.pending_install=true
+            state.annotation_pending=any_pending or state.annotation_pending
+            state.annotation_fallback=any_fallback or state.annotation_fallback
         end
         state.updated_at=os.time()
-        if last_record then state.file=last_record.file end
         self.store:save_download_state(state)
         self:_refresh_local_files()
         if notify then
-            self:status_toast("觅阅",installed>1 and (tostring(installed).." 个新版本已安装") or "新版本已安装",4)
+            local text
+            if any_pending then text=installed>1 and "多个新版本已安装，部分划线或想法待补全" or "新版本已安装，部分划线或想法待补全"
+            elseif any_fallback then text=installed>1 and "多个新版本已安装，少量内容已保留在章节末尾" or "新版本已安装，少量内容已保留在章节末尾"
+            else text=installed>1 and "多个新版本已安装" or "新版本已安装" end
+            self:status_toast("觅阅",text,4)
         end
         return true
     end
@@ -2661,7 +2728,15 @@ function Plugin:chapter_menu(b,ch)
     local items={}
     for _,entry in ipairs({{record=clean,label="纯净版"},{record=notes,label="划线与想法版"}}) do
         local record=entry.record
-        if record then items[#items+1]={text="阅读"..entry.label,callback=function() self:open_file(record.file) end} end
+        if record then
+            local label=DownloadResult.variant_label(entry.label,record)
+            items[#items+1]={text="阅读"..label,callback=function() self:open_file(record.file) end}
+        end
+    end
+    if notes and notes.annotation_pending==true then
+        items[#items+1]={text="继续补全划线与想法",callback=function()
+            self:_retry_annotation_record(b.bookId,"notes",notes,uid)
+        end}
     end
     items[#items+1]={text=(clean or notes) and "更新本章" or "下载本章",callback=function() self:choose_download(b,nil,true,uid) end}
     if clean or notes then items[#items+1]={text="删除本章文件",callback=function() self:_confirm_delete_chapter_cache(b.bookId,uid,ch.title or uid) end} end
@@ -2932,18 +3007,51 @@ function Plugin:_confirm_delete_book_downloads(book_id,title)
         end,
     })
 end
+function Plugin:_annotation_retry_options(kind,record,chapter_uid)
+    record=type(record)=="table" and record or {}
+    local opt={annotations=true}
+    if chapter_uid then
+        opt.chapter_uid=tostring(chapter_uid)
+    elseif tostring(kind or ""):sub(1,6)=="range_" or record.partial_range==true then
+        opt.range_start_index=tonumber(record.range_start_index)
+        opt.range_end_index=tonumber(record.range_end_index)
+        opt.range_start_title=record.range_start_title
+        opt.range_end_title=record.range_end_title
+    end
+    return opt
+end
+
+function Plugin:_retry_annotation_record(book_id,kind,record,chapter_uid)
+    local stored=self.store:book(book_id) or {}
+    local book={bookId=tostring(book_id),title=stored.title or record.title or "未命名",
+        author=stored.author or record.author,cover=stored.cover or record.cover}
+    self:download(book,self:_annotation_retry_options(kind,record,chapter_uid),false,nil,true)
+end
+
 function Plugin:_download_book_labels(b)
     local labels={}
     for _,kind in ipairs({"clean","notes","range_clean","range_notes","preview_clean","preview_notes"}) do
         local r=b.variants and b.variants[kind]
-        if r and r.file and U.file_exists(r.file) then labels[#labels+1]=self:_variant_label(kind) end
+        if r and r.file and U.file_exists(r.file) then
+            labels[#labels+1]=DownloadResult.variant_label(self:_variant_label(kind),r)
+        end
     end
-    local chapter_count=0
-    for _,row in pairs(b.chapters or {}) do for _,r in pairs(row or {}) do if r.file and U.file_exists(r.file) then chapter_count=chapter_count+1 end end end
-    if chapter_count>0 then labels[#labels+1]="单章 "..tostring(chapter_count) end
+    local chapter_count,chapter_pending=0,false
+    for _,row in pairs(b.chapters or {}) do
+        for _,r in pairs(row or {}) do
+            if r.file and U.file_exists(r.file) then
+                chapter_count=chapter_count+1
+                if r.annotation_pending==true then chapter_pending=true end
+            end
+        end
+    end
+    if chapter_count>0 then
+        labels[#labels+1]="单章 "..tostring(chapter_count)..(chapter_pending and " · 待补全" or "")
+    end
     if self.store:book_has_partial_cache(b.book_id) then labels[#labels+1]="未完成缓存" end
     return labels,chapter_count
 end
+
 function Plugin:show_storage_usage()
     if self.cache_cleanup_task and self.cache_cleanup_task:busy() then self:info("缓存任务正在运行，请稍候。") return end
     local categories=self:_storage_categories()
@@ -3041,7 +3149,7 @@ function Plugin:downloaded_chapters_menu(book_id)
         for _,kind in ipairs({"clean","notes","range_clean","range_notes","preview_clean","preview_notes"}) do
             local r=row and row[kind]
             if r and r.file and U.file_exists(r.file) then
-                labels[#labels+1]=self:_variant_label(kind)
+                labels[#labels+1]=DownloadResult.variant_label(self:_variant_label(kind),r)
                 title=title or r.title
             end
         end
@@ -3071,13 +3179,21 @@ function Plugin:downloaded_book_menu(book_ref)
     local variants={}
     for _,kind in ipairs({"clean","notes","range_clean","range_notes","preview_clean","preview_notes"}) do
         local r=b.variants and b.variants[kind]
-        if r and r.file and U.file_exists(r.file) then variants[#variants+1]={kind=kind,file=r.file,label=self:_variant_label(kind)} end
+        if r and r.file and U.file_exists(r.file) then
+            local label=DownloadResult.variant_label(self:_variant_label(kind),r)
+            variants[#variants+1]={kind=kind,file=r.file,label=label,record=r}
+        end
     end
     if #variants>0 then
         items[#items+1]={text="可阅读版本",enabled=false}
         for _,variant in ipairs(variants) do
-            local kind_key=variant.kind; local file=variant.file; local label=variant.label
+            local kind_key=variant.kind; local file=variant.file; local label=variant.label; local record=variant.record
             items[#items+1]={text="阅读"..label,post_text="EPUB",callback=function() self:open_file(file) end}
+            if record.annotation_pending==true and tostring(kind_key):find("notes",1,true) then
+                items[#items+1]={text="继续补全划线与想法",post_text=self:_variant_label(kind_key),callback=function()
+                    self:_retry_annotation_record(book_id,kind_key,record,nil)
+                end}
+            end
             items[#items+1]={text="删除"..label,post_text="仅删除该版本",callback=function() self:_confirm_delete_variant(book_id,kind_key,b.title) end}
         end
     end
@@ -3112,14 +3228,86 @@ function Plugin:progress_sync_label()
     return labels[state] or "已开启"
 end
 
-function Plugin:sync_menu()
+function Plugin:_sync_success_notice_enabled()
+    return (self.store:preferences().sync or {}).success_notice_enabled~=false
+end
+function Plugin:toggle_sync_success_notice()
+    local p=self.store:preferences(); p.sync=p.sync or {}
+    p.sync.success_notice_enabled=not (p.sync.success_notice_enabled~=false)
+    self.store:save_preferences(p)
+    self:status_toast("同步成功提醒",p.sync.success_notice_enabled and "已开启" or "已关闭",3)
+end
+function Plugin:_show_auto_sync_success(text)
+    if self._sync_success_notified==true or not self:_sync_success_notice_enabled() then return end
+    self._sync_success_notified=true
+    self:status_toast("同步完成",text or "已成功上传",3)
+end
+function Plugin:sync_diagnostics_menu()
     return {
-        {text="阅读时间同步",checked_func=function() return self.store:preferences().sync.time_enabled==true end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
-        {text="阅读进度同步",checked_func=function() return self.store:preferences().sync.progress_enabled~=false end,keep_menu_open=true,callback=function() self:toggle_progress_sync() end},
-        {text="立即同步进度",callback=function() self:manual_sync() end},
-        {text="同步状态",callback=function() self:show_sync_status(false) end},
+        {text="检查当前书籍识别",callback=function()
+            local r=self.sync:record()
+            if not r or not r.book then self:info("当前文件未被识别为觅阅书籍。") return end
+            self:info("当前书籍已识别\n\n书名："..tostring(r.book.title or "未命名")
+                .."\n书籍 ID："..tostring(r.book.book_id or "")
+                .."\n文件："..tostring(r.path or ""))
+        end},
+        {text="检查登录状态",callback=function() self:show_account_status() end},
+        {text="测试云端进度读取",callback=function() self:manual_sync() end},
+        {text="测试当前进度上传",callback=function() self:upload_local_progress(true) end},
+        {text="测试上传 30 秒阅读时间",callback=function()
+            if not self.sync:record() then self:info("请先打开一本觅阅下载的书籍。") return end
+            self:status_toast("阅读时间测试","正在上传 30 秒……",3)
+            self.sync:test_upload(function(ok,result)
+                if ok then self:status_toast("阅读时间测试","30 秒已成功上传",4)
+                else self:info("阅读时间测试失败\n\n"..tostring(result or "未知错误")) end
+            end)
+        end},
+        {text="查看详细错误",callback=function() self:show_sync_status(true) end},
+        {text="重置当前书籍同步状态",callback=function()
+            local r=self.sync:record()
+            if not r or not r.book then self:info("请先打开一本觅阅下载的书籍。") return end
+            local id=tostring(r.book.book_id)
+            UIManager:show(ConfirmBox:new{text="重置当前书籍的临时同步状态？\n\n不会删除书籍、本机阅读位置、划线、想法或账号。",ok_callback=function()
+                self.sync:stop("manual_reset",0)
+                local sessions=self.store:get("sessions",{})
+                local session=sessions[id] or {}
+                for _,key in ipairs({
+                    "legacy_report_context","report_context","last_error","last_response_summary",
+                    "last_http_code","last_http_length","last_payload_public","last_path","last_stage",
+                    "progress_sync_state","progress_sync_message","progress_upload_state","progress_upload_error",
+                    "consecutive_failures"
+                }) do session[key]=nil end
+                session.pending_report_seconds=0
+                sessions[id]=session
+                self.store:set("sessions",sessions)
+                self.sync:clear_verified("manual_reset")
+                self.sync.last_error=nil
+                self.sync.consecutive_failures=0
+                self._sync_success_notified=false
+                self:status_toast("阅读同步","临时状态已重置",3)
+                UIManager:scheduleIn(.5,function()
+                    if not self.ui or not self.ui.document then return end
+                    local prefs=self.store:preferences().sync or {}
+                    if prefs.progress_enabled~=false then self:ensure_read_report_progress("manual_reset",true)
+                    elseif prefs.time_enabled==true then self.sync:start("manual_reset") end
+                end)
+            end})
+        end},
     }
 end
+
+function Plugin:sync_menu()
+    return {
+        {text="同步状态",callback=function() self:show_sync_status(false) end},
+        {text="上传当前进度",callback=function() self:upload_local_progress(true) end},
+        {text="读取云端进度",callback=function() self:manual_sync() end},
+        {text="自动同步阅读进度",checked_func=function() return self.store:preferences().sync.progress_enabled~=false end,keep_menu_open=true,callback=function() self:toggle_progress_sync() end},
+        {text="自动同步阅读时间",checked_func=function() return self.store:preferences().sync.time_enabled==true end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
+        {text="同步成功提醒",checked_func=function() return self:_sync_success_notice_enabled() end,keep_menu_open=true,callback=function() self:toggle_sync_success_notice() end},
+        {text="同步诊断",sub_item_table_func=function() return self:sync_diagnostics_menu() end},
+    }
+end
+
 function Plugin:toggle_time_sync()
     local p=self.store:preferences(); p.sync.time_enabled=not p.sync.time_enabled; self.store:save_preferences(p)
     if p.sync.time_enabled then
@@ -3145,7 +3333,11 @@ end
 
 
 function Plugin:_show_progress_success(_text)
-    -- Automatic success notifications stay silent to avoid unnecessary e-ink refreshes.
+    local prefs=self.store:preferences().sync or {}
+    -- When reading-time sync is active, its first accepted report contains the
+    -- current position too, so one combined notice is enough.
+    if prefs.time_enabled==true then return end
+    self:_show_auto_sync_success("阅读进度已上传")
 end
 function Plugin:toggle_progress_sync()
     local p=self.store:preferences(); p.sync.progress_enabled=not (p.sync.progress_enabled~=false); p.sync.pull_on_open=p.sync.progress_enabled; self.store:save_preferences(p)
@@ -3460,7 +3652,7 @@ function Plugin:_relative_time(ts)
     if delta<86400 then return tostring(math.floor(delta/3600)).."小时前" end
     return U.now_text(ts)
 end
-function Plugin:show_sync_status(_detail)
+function Plugin:show_sync_status(detail)
     local s=self.sync:status()
     local remote=s.remote and math.floor((s.remote.percent or 0)+.5) or nil
     local local_text=s.local_percent~=nil and (tostring(s.local_percent).."%")
@@ -3469,13 +3661,25 @@ function Plugin:show_sync_status(_detail)
     if not s.time_enabled then time_text="已关闭"
     elseif not s.record or s.state=="stopped" then time_text="未运行"
     elseif s.state=="verification_required" or s.state=="fetching_remote" or s.state=="progress_sync" then time_text="等待位置确认"
-    elseif s.state=="paused" then time_text="暂时失败，等待自动重试"
+    elseif s.state=="paused" then time_text="暂时失败，稍后重新计时"
     elseif type(s.last_error)=="string" and (tonumber(s.consecutive_failures) or 0)>=2 then time_text="暂时失败，稍后重试"
     elseif s.state=="uploading" then time_text="正在同步"
     else time_text="运行中" end
     local lines={"阅读同步","","阅读时间："..time_text,"阅读进度："..self:progress_sync_label(),"当前位置："..local_text}
     if remote then lines[#lines+1]="云端位置："..remote.."%" end
     lines[#lines+1]="上次同步："..self:_relative_time(s.last_upload)
+    if detail then
+        lines[#lines+1]=""
+        lines[#lines+1]="详细信息"
+        lines[#lines+1]="单次阅读时间上限：30 秒"
+        lines[#lines+1]="后台服务版本："..tostring(s.service_version or "—")
+        if s.last_elapsed then lines[#lines+1]="上次提交时长："..tostring(s.last_elapsed).." 秒" end
+        if s.last_stage then lines[#lines+1]="当前阶段："..U.first_line(s.last_stage,160) end
+        if s.last_error then lines[#lines+1]="最近错误："..U.first_line(s.last_error,200) end
+        if s.last_response_summary then lines[#lines+1]="响应摘要："..U.first_line(s.last_response_summary,200) end
+        if s.last_http_code then lines[#lines+1]="HTTP："..tostring(s.last_http_code) end
+        if s.last_path then lines[#lines+1]="上传路径："..tostring(s.last_path) end
+    end
     self:info(table.concat(lines,"\n"))
 end
 
@@ -3483,7 +3687,7 @@ function Plugin:on_auth_required(channel,err)
     local notify=tostring(channel or "")~="read_report"
     local marked=self:_mark_auth_problem(channel,err,notify)
     if marked and not notify then
-        self:status_toast("阅读时间上传","登录验证暂时失败，将自动重试；下载不受影响",5)
+        self:status_toast("阅读时间上传","登录验证暂时失败，本次时间不补传；下载不受影响",5)
     end
     return marked
 end
@@ -3518,16 +3722,23 @@ function Plugin:on_read_report_success(path)
         end
     end
 end
-function Plugin:on_read_report_interval_success(_status)
-    -- Periodic success remains silent.
+function Plugin:on_read_report_interval_success(status)
+    if status and (status.recovery_probe==true or tonumber(status.elapsed_seconds or 0)<=0) then return end
+    local prefs=self.store:preferences().sync or {}
+    if prefs.time_enabled~=true then return end
+    if prefs.progress_enabled~=false then
+        self:_show_auto_sync_success("阅读进度和阅读时间已上传")
+    else
+        self:_show_auto_sync_success("阅读时间已上传")
+    end
 end
 function Plugin:on_read_report_failure(err)
     if Http.is_auth_error(err) then
         self:_mark_auth_problem("read_report",err,false)
-        self:status_toast("阅读同步","登录验证暂时失败，阅读时间已保留并会自动重试",5)
+        self:status_toast("阅读同步","登录验证暂时失败，本次时间不补传；稍后重新计时",5)
         return
     end
-    self:status_toast("阅读同步","连续同步失败，将稍后自动重试",5)
+    self:status_toast("阅读同步","连续同步失败，本次时间不补传；稍后重试",5)
 end
 function Plugin:_current_book_record()
     self.store:reload()
@@ -3568,13 +3779,86 @@ function Plugin:display_settings_menu()
         {text="评论字体",sub_item_table_func=function() return self:thought_font_settings_menu() end},
     }
 end
+function Plugin:_memory_mode_label()
+    local status=self.memory_mode:status()
+    if not status.available then return status.enabled and "配置异常" or "不可用" end
+    if status.enabled then return status.matches and "已开启" or "配置异常" end
+    if status.residual then return "外部或残留设置" end
+    return "关闭"
+end
+
+function Plugin:_set_memory_mode(enabled)
+    local ok,result_or_error=self.memory_mode:set_enabled(enabled)
+    if not ok then
+        self:info("无法修改低内存模式：\n"..tostring(result_or_error))
+        return
+    end
+    local result=result_or_error or {}
+    if enabled then
+        self:info("低内存模式已开启。\n\n完整退出并重新启动 KOReader 后生效。PDF、漫画和快速跳页可能稍慢。")
+    elseif result.external_change then
+        self:info("低内存模式已关闭。\n\n检测到缓存设置已被其他配置修改，因此没有覆盖当前值。完整重启 KOReader 后生效。")
+    else
+        self:info("低内存模式已关闭，原有缓存设置已恢复。\n\n完整退出并重新启动 KOReader 后生效。")
+    end
+end
+
+
+function Plugin:restore_memory_mode()
+    local status=self.memory_mode:status()
+    if not status.enabled and not status.residual then
+        self:info("当前没有检测到低内存设置，无需恢复。")
+        return
+    end
+    local text
+    if status.enabled then
+        text="恢复开启低内存模式前的缓存设置？\n\n恢复后需要完整重启 KOReader。卸载觅阅前建议先执行恢复。"
+    else
+        text="检测到外部或旧版本遗留的低内存设置。是否恢复缓存策略？\n\n无法确认它是否由觅阅写入；恢复后需要完整重启 KOReader。"
+    end
+    UIManager:show(ConfirmBox:new{
+        text=text,ok_text="恢复",ok_callback=function()
+            if status.enabled then self:_set_memory_mode(false); return end
+            local ok,result_or_error=self.memory_mode:restore_detected()
+            if not ok then self:info("无法恢复缓存设置：\n"..tostring(result_or_error)); return end
+            local result=result_or_error or {}
+            self:info(result.used_default and "低内存设置已清除，将恢复 KOReader 默认缓存策略。\n\n完整重启 KOReader 后生效。"
+                or "低内存设置已恢复。\n\n完整重启 KOReader 后生效。")
+        end,
+    })
+end
+
+function Plugin:toggle_memory_mode()
+    local status=self.memory_mode:status()
+    local state=(self.store:preferences().memory_mode or {}).enabled==true
+    if state then
+        self:_set_memory_mode(false)
+        return
+    end
+    if status.residual then
+        self:info("检测到外部或旧版本遗留的低内存设置。请先使用“恢复缓存设置”，再由觅阅重新开启。")
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        text="低内存模式适合下载大书时容易闪退或卡死的设备。\n\n开启后会减少 KOReader 页面缓存，PDF、漫画和快速跳页可能稍慢。需要完整重启 KOReader 后生效。",
+        ok_text="开启",
+        ok_callback=function() self:_set_memory_mode(true) end,
+    })
+end
+
 function Plugin:download_settings_menu()
-    return {
+    local memory_status=self.memory_mode:status()
+    local items={
         {text="下载关键进度提示",checked_func=function() return self.store:preferences().download_notice_enabled~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_notice_enabled") end},
         {text="下载完成提醒",checked_func=function() return self.store:preferences().download_complete_notice~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_complete_notice") end},
-        {text="下载目录",post_text=self:_download_dir_label(),callback=function() self:directory_dialog() end},
-        {text="存储与清理",callback=function() self:show_downloads() end},
+        {text="低内存模式",post_text=self:_memory_mode_label(),checked_func=function() return (self.store:preferences().memory_mode or {}).enabled==true end,callback=function() self:toggle_memory_mode() end},
     }
+    if memory_status.enabled or memory_status.residual then
+        items[#items+1]={text="恢复缓存设置",callback=function() self:restore_memory_mode() end}
+    end
+    items[#items+1]={text="下载目录",post_text=self:_download_dir_label(),callback=function() self:directory_dialog() end}
+    items[#items+1]={text="存储与清理",callback=function() self:show_downloads() end}
+    return items
 end
 function Plugin:mp_settings_menu()
     return {
@@ -3879,9 +4163,17 @@ function Plugin:check_update(automatic)
     end)
 end
 function Plugin:show_about()
+    local memory_note=""
+    local memory_status=self.memory_mode:status()
+    if memory_status.enabled then
+        memory_note="\n\n低内存模式当前已开启。卸载觅阅前，请在“下载选项”中恢复缓存设置。"
+    elseif memory_status.residual then
+        memory_note="\n\n检测到外部或遗留的低内存设置，可在“下载选项”中检查并恢复。"
+    end
     self:info(Config.NAME.." "..self.version
         .."\n\n微信读书内容下载、书架管理与阅读同步。"
         .."\n\n已下载书籍作为本地 EPUB 直接打开，不进行联网权限验证或锁定。"
+        ..memory_note
         .."\n\n".._("Unofficial client"))
 end
 function Plugin:onShowMiuRead() self:show_shelf(false,false,"account") end
@@ -3998,9 +4290,11 @@ function Plugin:_show_thought_href(href)
             self.store,info.book_id,info.chapter_uid,info.range,group,token
         )
         if html=="" then self:info("没有想法内容"); return end
-        ThoughtPopup.show{
+        local shown,mode,show_error=ThoughtPopup.show{
             source_html=source_html,
             html=html,
+            fallback_text=Thoughts.plain_text(group),
+            fallback_title="想法（简化显示）",
             font_size=self:_thought_font_size(prefs.font),
             font_name=self:_thought_font_name(prefs),
             width_ratio=tonumber(prefs.width_ratio) or 0.91,
@@ -4008,7 +4302,13 @@ function Plugin:_show_thought_href(href)
             css=Thoughts.popup_css(),
             metrics=metrics,
         }
+        if not shown then error(show_error or "想法窗口无法显示") end
+        if mode=="plain" and self._thought_plain_notice_shown~=true then
+            self._thought_plain_notice_shown=true
+            self:status_toast("想法","KOReader 字体组件不完整，已使用简化方式显示。",4)
+        end
         logger.info("[MiuRead][ThoughtPopup] opened",
+            "mode=",tostring(mode or "rich"),
             "book=",tostring(info.book_id),"chapter=",tostring(info.chapter_uid),
             "comments=",tostring(metrics and metrics.comment_count or 0),
             "chapter_cache=",token and token.cache_hit and "hit" or "miss",
@@ -4018,7 +4318,7 @@ function Plugin:_show_thought_href(href)
     self._thought_popup_busy=false
     if not ok then
         logger.err("[MiuRead][ThoughtPopup] open failed",tostring(unexpected))
-        self:info("想法弹窗打开失败：\n"..U.first_line(unexpected,220))
+        self:info("想法内容暂时无法显示，请重启 KOReader 后重试。")
     end
     return true
 end
@@ -4086,7 +4386,7 @@ function Plugin:onReaderReady()
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
     self._progress_remote_retries={}
-    self._progress_success_notified=false
+    self._sync_success_notified=false
     self._last_progress_submit_notice=nil
     self.sync:on_reader_ready()
 end

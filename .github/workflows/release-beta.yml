@@ -53,6 +53,20 @@ jobs:
           PY
           cat release.env >> "$GITHUB_ENV"
 
+      - name: Run Lua checks and regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y lua5.1
+          find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
+          lua5.1 tests/test_chapter_title.lua "$PWD"
+          lua5.1 tests/test_memory_mode.lua "$PWD"
+          lua5.1 tests/test_download_result.lua "$PWD"
+          lua5.1 tests/test_annotation_fallback.lua "$PWD"
+          lua5.1 tests/test_thought_plain.lua "$PWD"
+          lua5.1 tests/test_thought_popup_fallback.lua "$PWD"
+
       - name: Build beta full package and manifest
         shell: bash
         run: |

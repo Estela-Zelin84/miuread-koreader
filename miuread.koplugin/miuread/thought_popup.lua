@@ -9,6 +9,7 @@ local OverlapGroup = require("ui/widget/overlapgroup")
 local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
 local Size = require("ui/size")
 local UIManager = require("ui/uimanager")
+local logger = require("logger")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Screen = Device.screen
@@ -455,8 +456,54 @@ function Popup:onTapPage(_, ges)
 end
 
 local M = {}
+local rich_disabled_reason = nil
+
+local function rich_component_error(value)
+    local text = tostring(value or ""):lower()
+    return text:find("cannot open", 1, true) ~= nil and text:find("font", 1, true) ~= nil
+        or text:find("cannot access page tree", 1, true) ~= nil
+        or text:find("mupdf", 1, true) ~= nil and text:find("font", 1, true) ~= nil
+end
+
+local function fallback_text(opts)
+    local text = tostring(opts and opts.fallback_text or "")
+    if text == "" then text = "没有想法内容" end
+    return text
+end
+
+function M.show_plain(opts, reason)
+    opts = opts or {}
+    local title = tostring(opts.fallback_title or "想法（简化显示）")
+    local text = fallback_text(opts)
+    local ok_viewer, TextViewer = pcall(require, "ui/widget/textviewer")
+    if ok_viewer and TextViewer and type(TextViewer.new) == "function" then
+        local ok, viewer_or_error = xpcall(function()
+            return TextViewer:new{title=title, text=text}
+        end, debug.traceback)
+        if ok then
+            local shown, show_error = pcall(UIManager.show, UIManager, viewer_or_error)
+            if shown then return true, "plain", reason end
+            reason = tostring(reason or "") .. "\n" .. tostring(show_error)
+        else
+            reason = tostring(reason or "") .. "\n" .. tostring(viewer_or_error)
+        end
+    end
+
+    local ok_info, InfoMessage = pcall(require, "ui/widget/infomessage")
+    if ok_info and InfoMessage and type(InfoMessage.new) == "function" then
+        local compact = text
+        if #compact > 2400 then compact = compact:sub(1, 2400) .. "\n\n内容较长，请修复 KOReader 字体组件后查看完整富文本。" end
+        local shown, show_error = pcall(function()
+            UIManager:show(InfoMessage:new{text=title .. "\n\n" .. compact})
+        end)
+        if shown then return true, "plain", reason end
+        reason = tostring(reason or "") .. "\n" .. tostring(show_error)
+    end
+    return nil, "plain", reason or "无法创建简化想法窗口"
+end
 
 function M.prewarm_font(font_name)
+    if rich_disabled_reason then return false end
     font_name=tostring(font_name or ""):match("^%s*(.-)%s*$")
     if font_name=="" then return false end
     local ok,css=pcall(Popup._book_font_css,{font_name=font_name})
@@ -465,17 +512,38 @@ end
 
 function M.show(opts)
     opts = opts or {}
-    return UIManager:show(Popup:new{
-        html = opts.html,
-        source_html = opts.source_html,
-        font_size = opts.font_size,
-        font_name = opts.font_name,
-        width_ratio = opts.width_ratio,
-        height_ratio = opts.height_ratio,
-        css = opts.css or "",
-        metrics = opts.metrics,
-        on_close_callback = opts.on_close,
-    })
+    if rich_disabled_reason then
+        return M.show_plain(opts, rich_disabled_reason)
+    end
+
+    local ok, popup_or_error = xpcall(function()
+        return Popup:new{
+            html = opts.html,
+            source_html = opts.source_html,
+            font_size = opts.font_size,
+            font_name = opts.font_name,
+            width_ratio = opts.width_ratio,
+            height_ratio = opts.height_ratio,
+            css = opts.css or "",
+            metrics = opts.metrics,
+            on_close_callback = opts.on_close,
+        }
+    end, debug.traceback)
+    if ok then
+        local shown, show_error = pcall(UIManager.show, UIManager, popup_or_error)
+        if shown then return true, "rich" end
+        popup_or_error = show_error
+    end
+
+    local reason = tostring(popup_or_error or "想法窗口创建失败")
+    if rich_component_error(reason) then rich_disabled_reason = reason end
+    logger.warn("[MiuRead][ThoughtPopup] rich popup unavailable; using plain fallback",
+        "persistent=", tostring(rich_disabled_reason ~= nil), "error=", reason)
+    return M.show_plain(opts, reason)
+end
+
+function M.rich_disabled_reason()
+    return rich_disabled_reason
 end
 
 return M

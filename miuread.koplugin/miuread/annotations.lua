@@ -1,6 +1,7 @@
 local logger = require("logger")
 local Thoughts = require("miuread.thoughts")
 local Http = require("miuread.http")
+local U = require("miuread.util")
 local ok_socket, socket = pcall(require, "socket")
 
 local Annotations = {}
@@ -27,6 +28,7 @@ local function call_with_retry(label, fn)
         local ok, value = pcall(fn)
         if ok and type(value) == "table" then return true, value, false end
         last = ok and (label .. " returned invalid data") or tostring(value)
+        if Http.is_auth_error(last) then return false,last,false,"authentication" end
         if Http.is_rate_limit_error(last) then return false,last,false,"rate_limit" end
         if Http.is_forbidden_error(last) then return false,last,false,"forbidden" end
         local network_down=is_network_failure(last)
@@ -153,135 +155,146 @@ end
 function Annotations:new(api) return setmetatable({api = api}, self) end
 
 function Annotations:fetch_chapter(book_id, uid, progress)
-    local result = {book_id=str(book_id),chapter_uid=str(uid),underlines={},review_map={},review_groups={},underline_count=0,thought_count=0,thought_entry_count=0,errors={},underline_request_ok=false}
-    progress = progress or function() end
-    local ok, data, network_down, error_kind = call_with_retry("underlines", function() return self.api:underlines(book_id, uid) end)
+    local result={book_id=str(book_id),chapter_uid=str(uid),underlines={},review_map={},review_groups={},
+        underline_count=0,thought_count=0,thought_entry_count=0,errors={},underline_request_ok=false,
+        underlines_partial=false,completed_ranges={},pending_ranges={},review_complete=false,complete=false}
+    progress=progress or function() end
+    local ok,data,network_down,error_kind=call_with_retry("underlines",function()
+        return self.api:underlines(book_id,uid)
+    end)
     if not ok then
-        local err = str(data)
-        result.errors[#result.errors + 1] = err
-        result.forbidden = error_kind=="forbidden"
-        result.rate_limited = error_kind=="rate_limit"
-        result.error_kind = error_kind or (network_down and "network") or "server"
-        logger.warn("[MiuRead][Annotations] underlines failed", "book=", result.book_id, "chapter=", result.chapter_uid, "error=", err)
+        local err=str(data)
+        result.errors[#result.errors+1]=err
+        result.auth_required=error_kind=="authentication"
+        result.forbidden=error_kind=="forbidden"
+        result.rate_limited=error_kind=="rate_limit"
+        result.error_kind=error_kind or (network_down and "network") or "server"
+        logger.warn("[MiuRead][Annotations] underlines failed","book=",result.book_id,
+            "chapter=",result.chapter_uid,"kind=",tostring(result.error_kind),"error=",err)
         return result
     end
-    result.underline_request_ok = true
+
+    result.underline_request_ok=true
     local invalid_underlines
-    result.underlines, invalid_underlines = table_entries(array_from(data, {"underlines", "updated", "bookmarks"}))
-    result.underline_count = #result.underlines
-    if invalid_underlines > 0 then
+    result.underlines,invalid_underlines=table_entries(array_from(data,{"underlines","updated","bookmarks"}))
+    result.underline_count=#result.underlines
+    if invalid_underlines>0 then
+        result.underlines_partial=true
+        result.error_kind=result.error_kind or "data"
+        result.errors[#result.errors+1]="underline response contained invalid entries"
         logger.warn("[MiuRead][Annotations] ignored invalid underline entries",
-            "book=", result.book_id, "chapter=", result.chapter_uid,
-            "count=", tostring(invalid_underlines))
+            "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid_underlines))
     end
-    local ranges, seen = {}, {}
-    for _, row in ipairs(result.underlines) do
-        local key = range_key(row)
-        if key ~= "" and not seen[key] then seen[key] = true; ranges[#ranges + 1] = key end
+
+    local ranges,seen={},{ }
+    for _,row in ipairs(result.underlines) do
+        local key=range_key(row)
+        if key~="" and not seen[key] then seen[key]=true; ranges[#ranges+1]=key end
     end
-    progress("underlines", result.underline_count, result.underline_count, "")
-    if #ranges == 0 then return result end
-    local groups = {}
-    local batches = self.api:review_batches(ranges, 5)
-    for index, batch in ipairs(batches) do
-        progress("thoughts", index, #batches, "")
-        local good, response, network_down, thought_error_kind = call_with_retry("thoughts batch " .. tostring(index), function()
-            return self.api:readreviews(book_id, uid, batch)
-        end)
-        if good then
-            local rows, invalid = table_entries(array_from(response, {"reviews", "updated"}))
-            for _, item in ipairs(rows) do groups[#groups + 1] = item end
-            if invalid > 0 then
-                logger.warn("[MiuRead][Annotations] ignored invalid review groups",
-                    "book=", result.book_id, "chapter=", result.chapter_uid,
-                    "batch=", tostring(index), "count=", tostring(invalid))
-            end
-        else
-            if thought_error_kind=="forbidden" or thought_error_kind=="rate_limit" then
-                result.forbidden=thought_error_kind=="forbidden"
-                result.rate_limited=thought_error_kind=="rate_limit"
-                result.error_kind=thought_error_kind
-                result.errors[#result.errors+1]=str(response)
-                logger.warn("[MiuRead][Annotations] thoughts blocked",
-                    "book=",result.book_id,"chapter=",result.chapter_uid,
-                    "kind=",tostring(thought_error_kind))
-                return result
-            end
-            if network_down then
-                local err="batch "..tostring(index)..": "..str(response)
-                result.errors[#result.errors+1]=err
-                result.error_kind=result.error_kind or "network"
-                logger.warn("[MiuRead][Annotations] network unavailable; individual thought fallback skipped",
-                    "book=",result.book_id,"chapter=",result.chapter_uid,
-                    "batch=",tostring(index),"/",tostring(#batches),"error=",str(response))
-                break
-            end
-            -- A grouped request can fail even when each individual range is valid.
-            -- Fall back to one range at a time only for an explicit parameter/range
-            -- problem. Authentication, rate limits, server failures and unknown
-            -- errors must never explode into dozens of extra requests.
-            if not is_data_specific_failure(response) then
-                local err="batch "..tostring(index)..": "..str(response)
-                result.errors[#result.errors+1]=err
-                result.error_kind=result.error_kind or "server"
-                logger.warn("[MiuRead][Annotations] thought fallback suppressed",
-                    "book=",result.book_id,"chapter=",result.chapter_uid,
-                    "batch=",tostring(index),"/",tostring(#batches),
-                    "error=",str(response))
-                break
-            end
-            local batch_errors = {}
-            logger.warn("[MiuRead][Annotations] thoughts batch failed; trying individual ranges",
-                "book=", result.book_id, "chapter=", result.chapter_uid,
-                "batch=", index, "/", #batches, "error=", str(response))
-            for item_index, item in ipairs(batch) do
-                progress("thoughts", index, #batches, "逐条补全 " .. tostring(item_index) .. "/" .. tostring(#batch))
-                local single_ok, single_response, single_network, single_kind = call_with_retry(
-                    "thought range " .. tostring(index) .. "." .. tostring(item_index),
-                    function() return self.api:readreviews(book_id, uid, {item}) end)
-                if single_ok then
-                    local rows, invalid = table_entries(array_from(single_response, {"reviews", "updated"}))
-                    for _, row in ipairs(rows) do groups[#groups + 1] = row end
-                    if invalid > 0 then
-                        logger.warn("[MiuRead][Annotations] ignored invalid review groups",
-                            "book=", result.book_id, "chapter=", result.chapter_uid,
-                            "batch=", tostring(index), "item=", tostring(item_index),
-                            "count=", tostring(invalid))
-                    end
-                else
-                    if single_kind=="forbidden" or single_kind=="rate_limit" or single_network then
-                        result.forbidden=single_kind=="forbidden"
-                        result.rate_limited=single_kind=="rate_limit"
-                        result.error_kind=single_kind or (single_network and "network") or "server"
-                        result.errors[#result.errors+1]=str(single_response)
-                        logger.warn("[MiuRead][Annotations] individual fallback aborted",
-                            "book=",result.book_id,"chapter=",result.chapter_uid,
-                            "kind=",tostring(result.error_kind))
-                        return result
-                    end
-                    batch_errors[#batch_errors + 1] = str(item.range) .. ": " .. str(single_response)
-                end
-            end
-            if #batch_errors > 0 then
-                local err = table.concat(batch_errors, "; ")
-                result.errors[#result.errors + 1] = "batch " .. index .. ": " .. err
-                logger.warn("[MiuRead][Annotations] thoughts individual fallback incomplete",
-                    "book=", result.book_id, "chapter=", result.chapter_uid,
-                    "batch=", index, "/", #batches, "error=", err)
-            end
+    progress("underlines",result.underline_count,result.underline_count,"")
+    if #ranges==0 then
+        result.review_complete=true
+        result.complete=result.underline_request_ok and result.underlines_partial~=true
+        return result
+    end
+
+    local groups={}
+    local batches=self.api:review_batches(ranges,5)
+    local completed,pending={},{}
+    local function mark_batch(batch,target)
+        for _,item in ipairs(batch or {}) do
+            local key=range_key(item)
+            if key~="" then target[key]=true end
         end
     end
-    local invalid_reviews
-    result.review_map, result.review_groups, result.thought_count,
-        result.thought_entry_count, invalid_reviews = normalize_reviews({reviews=groups})
-    if invalid_reviews > 0 then
-        logger.warn("[MiuRead][Annotations] ignored invalid review entries",
-            "book=", result.book_id, "chapter=", result.chapter_uid,
-            "count=", tostring(invalid_reviews))
+    local function mark_remaining(first)
+        for index=first,#batches do mark_batch(batches[index],pending) end
     end
-    logger.info("[MiuRead][Annotations] chapter fetched", "book=", result.book_id, "chapter=", result.chapter_uid,
-        "underlines=", result.underline_count, "thought_groups=", result.thought_count,
-        "thought_entries=", result.thought_entry_count, "errors=", #result.errors)
+
+    for index,batch in ipairs(batches) do
+        progress("thoughts",index,#batches,"")
+        local good,response,batch_network,batch_kind=call_with_retry("thoughts batch "..tostring(index),function()
+            return self.api:readreviews(book_id,uid,batch)
+        end)
+        if good then
+            local rows,invalid=table_entries(array_from(response,{"reviews","updated"}))
+            for _,item in ipairs(rows) do groups[#groups+1]=item end
+            if invalid>0 then
+                mark_batch(batch,pending)
+                result.error_kind=result.error_kind or "data"
+                result.errors[#result.errors+1]="batch "..tostring(index).." contained invalid review groups"
+                logger.warn("[MiuRead][Annotations] ignored invalid review groups","book=",result.book_id,
+                    "chapter=",result.chapter_uid,"batch=",tostring(index),"count=",tostring(invalid))
+            else
+                mark_batch(batch,completed)
+            end
+        elseif is_data_specific_failure(response) then
+            logger.warn("[MiuRead][Annotations] thoughts batch failed; trying individual ranges",
+                "book=",result.book_id,"chapter=",result.chapter_uid,"batch=",index,"/",#batches)
+            local stop=false
+            for item_index,item in ipairs(batch) do
+                progress("thoughts",index,#batches,"逐条补全 "..tostring(item_index).."/"..tostring(#batch))
+                local single_ok,single_response,single_network,single_kind=call_with_retry(
+                    "thought range "..tostring(index).."."..tostring(item_index),function()
+                        return self.api:readreviews(book_id,uid,{item})
+                    end)
+                local key=range_key(item)
+                if single_ok then
+                    local rows,invalid=table_entries(array_from(single_response,{"reviews","updated"}))
+                    for _,row in ipairs(rows) do groups[#groups+1]=row end
+                    if invalid>0 then
+                        if key~="" then pending[key]=true end
+                        result.error_kind=result.error_kind or "data"
+                        result.errors[#result.errors+1]="review range contained invalid entries"
+                        logger.warn("[MiuRead][Annotations] ignored invalid review groups",
+                            "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid))
+                    elseif key~="" then
+                        completed[key]=true
+                    end
+                else
+                    if key~="" then pending[key]=true end
+                    result.errors[#result.errors+1]=str(single_response)
+                    result.error_kind=single_kind or (single_network and "network") or "server"
+                    result.auth_required=single_kind=="authentication"
+                    result.forbidden=single_kind=="forbidden"
+                    result.rate_limited=single_kind=="rate_limit"
+                    if result.auth_required or result.forbidden or result.rate_limited or single_network then
+                        for rest=item_index+1,#batch do mark_batch({batch[rest]},pending) end
+                        mark_remaining(index+1)
+                        stop=true
+                        break
+                    end
+                end
+            end
+            if stop then break end
+        else
+            mark_remaining(index)
+            result.errors[#result.errors+1]="batch "..tostring(index)..": "..str(response)
+            result.error_kind=batch_kind or (batch_network and "network") or "server"
+            result.auth_required=batch_kind=="authentication"
+            result.forbidden=batch_kind=="forbidden"
+            result.rate_limited=batch_kind=="rate_limit"
+            logger.warn("[MiuRead][Annotations] thoughts batch deferred","book=",result.book_id,
+                "chapter=",result.chapter_uid,"batch=",tostring(index),"/",tostring(#batches),
+                "kind=",tostring(result.error_kind))
+            break
+        end
+    end
+
+    local invalid_reviews
+    result.review_map,result.review_groups,result.thought_count,result.thought_entry_count,invalid_reviews=
+        normalize_reviews({reviews=groups})
+    for key in pairs(completed) do result.completed_ranges[#result.completed_ranges+1]=key end
+    for key in pairs(pending) do result.pending_ranges[#result.pending_ranges+1]=key end
+    table.sort(result.completed_ranges)
+    table.sort(result.pending_ranges)
+    result.review_complete=#result.pending_ranges==0
+    result.complete=result.underline_request_ok and result.underlines_partial~=true and result.review_complete
+    if invalid_reviews>0 then logger.warn("[MiuRead][Annotations] ignored invalid review entries",
+        "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid_reviews)) end
+    logger.info("[MiuRead][Annotations] chapter fetched","book=",result.book_id,"chapter=",result.chapter_uid,
+        "underlines=",result.underline_count,"thought_groups=",result.thought_count,
+        "thought_entries=",result.thought_entry_count,"pending_ranges=",#result.pending_ranges)
     return result
 end
 
@@ -528,8 +541,26 @@ local function numeric_interval(a, b, visible_count, index)
 end
 
 local function intervals(data, visible_count, index)
-    local out = {}
-    local stats = {quote_aligned=0, numeric=0, dropped=0}
+    local out, unresolved, unresolved_seen = {}, {}, {}
+    local stats = {quote_aligned=0, numeric=0, dropped=0, fallback=0}
+
+    local function unresolved_item(row, reason)
+        row = type(row) == "table" and row or {}
+        local key = range_key(row)
+        local dedupe = key ~= "" and ("range:" .. key) or ("row:" .. tostring(row))
+        if unresolved_seen[dedupe] then return end
+        unresolved_seen[dedupe] = true
+        local quotes = quote_candidates(row, data)
+        unresolved[#unresolved + 1] = {
+            key=key,
+            quote=quotes[1] or "",
+            thought=key ~= "" and #(data.review_map[key] or {}) > 0,
+            reason=reason,
+        }
+        stats.dropped = stats.dropped + 1
+        stats.fallback = stats.fallback + 1
+    end
+
     for _, row in ipairs(data.underlines or {}) do
         local raw_a, raw_b = parse_range(range_key(row))
         if raw_a then
@@ -546,22 +577,28 @@ local function intervals(data, visible_count, index)
             end
             if a and b and b > a then
                 out[#out + 1] = {
-                    a=a, b=b, key=range_key(row),
+                    a=a, b=b, key=range_key(row), row=row,
                     thought=#(data.review_map[range_key(row)] or {}) > 0,
                 }
             else
-                stats.dropped = stats.dropped + 1
+                unresolved_item(row, "position")
             end
         else
-            stats.dropped = stats.dropped + 1
+            unresolved_item(row, "range")
         end
     end
     table.sort(out, function(x,y) if x.a==y.a then return x.b<y.b end return x.a<y.a end)
     local clean, cursor = {}, -1
     for _, it in ipairs(out) do
-        if it.a >= cursor then clean[#clean + 1] = it; cursor = it.b end
+        if it.a >= cursor then
+            it.row = nil
+            clean[#clean + 1] = it
+            cursor = it.b
+        else
+            unresolved_item(it.row, "overlap")
+        end
     end
-    return clean, stats
+    return clean, stats, unresolved
 end
 
 local function render_text_token(token, marks, data)
@@ -603,17 +640,52 @@ local function render_text_token(token, marks, data)
     return table.concat(out)
 end
 
+local function append_before_body(html, section)
+    html, section = tostring(html or ""), tostring(section or "")
+    if section == "" then return html end
+    local body_end = html:lower():find("</body>", 1, true)
+    if body_end then return html:sub(1, body_end - 1) .. section .. html:sub(body_end) end
+    return html .. section
+end
+
+local function unresolved_section(data, unresolved)
+    if type(unresolved) ~= "table" or #unresolved == 0 then return "" end
+    local rows = {
+        '<section class="miu-unlocated" data-miuread-unlocated="1">',
+        '<h2>未定位内容</h2>',
+        '<p class="miu-unlocated-note">以下划线未能准确定位到正文，已保留在章节末尾。</p>',
+    }
+    for _, item in ipairs(unresolved) do
+        local text = U.trim(tostring(item.quote or ""))
+        if text == "" then text = "一条未能定位的划线" end
+        local key = tostring(item.key or "")
+        rows[#rows + 1] = '<div class="miu-unlocated-item">'
+        if item.thought and key ~= "" then
+            local href = Thoughts.href(data.book_id, data.chapter_uid, key)
+            rows[#rows + 1] = '<a class="miu-thought-link" href="' .. U.xml(href) .. '"><span class="miu-thought-mark ' .. Thoughts.mark_class(key) .. '" data-miu-range="' .. U.xml(key) .. '">' .. U.xml(text) .. '</span></a>'
+        else
+            rows[#rows + 1] = '<span class="miu-inline-mark">' .. U.xml(text) .. '</span>'
+        end
+        rows[#rows + 1] = '</div>'
+    end
+    rows[#rows + 1] = '</section>'
+    return table.concat(rows, "\n")
+end
+
 local function inject(html, data)
     local tokens, visible_count = tokenize(html)
     local index = build_text_index(tokens)
-    local marks, stats = intervals(data, visible_count, index)
-    if #marks == 0 then return html, stats end
-    local out = {}
-    for _, token in ipairs(tokens) do
-        if token.kind == "text" then out[#out + 1] = render_text_token(token, marks, data)
-        else out[#out + 1] = token.raw end
+    local marks, stats, unresolved = intervals(data, visible_count, index)
+    local rendered = tostring(html or "")
+    if #marks > 0 then
+        local out = {}
+        for _, token in ipairs(tokens) do
+            if token.kind == "text" then out[#out + 1] = render_text_token(token, marks, data)
+            else out[#out + 1] = token.raw end
+        end
+        rendered = table.concat(out)
     end
-    return table.concat(out), stats
+    return append_before_body(rendered, unresolved_section(data, unresolved)), stats
 end
 
 function Annotations:apply(html, data)
@@ -623,13 +695,175 @@ function Annotations:apply(html, data)
         "book=", tostring(data.book_id or ""), "chapter=", tostring(data.chapter_uid or ""),
         "quote=", tostring(alignment and alignment.quote_aligned or 0),
         "numeric=", tostring(alignment and alignment.numeric or 0),
-        "dropped=", tostring(alignment and alignment.dropped or 0))
+        "dropped=", tostring(alignment and alignment.dropped or 0),
+        "fallback=", tostring(alignment and alignment.fallback or 0))
     return rendered, CSS, {
         underlines=data.underline_count, thoughts=data.thought_count,
         thought_entries=data.thought_entry_count or 0, errors=#(data.errors or {}),
         quote_aligned=alignment and alignment.quote_aligned or 0,
         dropped=alignment and alignment.dropped or 0,
+        fallback=alignment and alignment.fallback or 0,
     }
+end
+
+local CACHE_UNDERLINE_FIELDS={"range","markRange","bookmarkRange","markText","bookmarkText","rangeText","abstract","text","content"}
+local CACHE_REVIEW_FIELDS={"content","abstract","created","author","likes","review_id"}
+
+local function safe_scalar_copy(source,fields)
+    local out={}
+    source=type(source)=="table" and source or {}
+    for _,key in ipairs(fields) do
+        local value=rawget(source,key)
+        if type(value)=="string" or type(value)=="number" or type(value)=="boolean" then out[key]=value end
+    end
+    return out
+end
+
+local function cached_groups(groups)
+    local out={}
+    for _,group in ipairs(groups or {}) do
+        local key=tostring(group.range or "")
+        if key~="" then
+            local texts={}
+            for _,review in ipairs(group.texts or {}) do
+                local item=safe_scalar_copy(review,CACHE_REVIEW_FIELDS)
+                if tostring(item.content or "")~="" then texts[#texts+1]=item end
+            end
+            out[#out+1]={range=key,texts=texts}
+        end
+    end
+    table.sort(out,function(a,b) return tostring(a.range)<tostring(b.range) end)
+    return out
+end
+
+function Annotations:to_cache(data)
+    data=type(data)=="table" and data or {}
+    local underlines={}
+    for _,row in ipairs(data.underlines or {}) do underlines[#underlines+1]=safe_scalar_copy(row,CACHE_UNDERLINE_FIELDS) end
+    return {
+        schema=1,book_id=str(data.book_id),chapter_uid=str(data.chapter_uid),underlines=underlines,
+        review_groups=cached_groups(data.review_groups),completed_ranges=data.completed_ranges or {},
+        pending_ranges=data.pending_ranges or {},underline_request_ok=data.underline_request_ok==true,
+        underlines_partial=data.underlines_partial==true,review_complete=data.review_complete==true,
+        complete=data.complete==true,error_kind=data.error_kind,
+    }
+end
+
+function Annotations:from_cache(value)
+    value=type(value)=="table" and value or {}
+    local groups=cached_groups(value.review_groups)
+    local map,group_count,entry_count={},0,0
+    for _,group in ipairs(groups) do
+        map[group.range]=group.texts
+        if #group.texts>0 then group_count=group_count+1; entry_count=entry_count+#group.texts end
+    end
+    local underlines={}
+    for _,row in ipairs(value.underlines or {}) do underlines[#underlines+1]=safe_scalar_copy(row,CACHE_UNDERLINE_FIELDS) end
+    return {book_id=str(value.book_id),chapter_uid=str(value.chapter_uid),underlines=underlines,
+        review_map=map,review_groups=groups,underline_count=#underlines,thought_count=group_count,
+        thought_entry_count=entry_count,errors={},completed_ranges=value.completed_ranges or {},
+        pending_ranges=value.pending_ranges or {},underline_request_ok=value.underline_request_ok==true,
+        underlines_partial=value.underlines_partial==true,review_complete=value.review_complete==true,
+        complete=value.complete==true,error_kind=value.error_kind,
+        cached=true}
+end
+
+local function merge_review_lists(old_rows,new_rows)
+    local out,positions={},{}
+    local function add(rows,replace)
+        for _,item in ipairs(rows or {}) do
+            local key=tostring(item.review_id or "")
+            if key=="" then key=tostring(item.content or "").."\0"..tostring(item.author or "") end
+            if key~="" then
+                local index=positions[key]
+                if index and replace then out[index]=item
+                elseif not index then positions[key]=#out+1; out[#out+1]=item end
+            end
+        end
+    end
+    add(old_rows,false)
+    add(new_rows,true)
+    table.sort(out,function(a,b)
+        local ac,bc=tonumber(a.created or 0) or 0,tonumber(b.created or 0) or 0
+        if ac==bc then return tostring(a.review_id or a.content or "")<tostring(b.review_id or b.content or "") end
+        return ac<bc
+    end)
+    return out
+end
+
+local function merge_underlines(old_rows,new_rows)
+    local out,positions={},{}
+    local function add(rows,replace)
+        for _,row in ipairs(rows or {}) do
+            local key=range_key(row)
+            if key~="" then
+                local index=positions[key]
+                if index and replace then out[index]=row
+                elseif not index then positions[key]=#out+1; out[#out+1]=row end
+            end
+        end
+    end
+    add(old_rows,false)
+    add(new_rows,true)
+    return out
+end
+
+function Annotations:merge(previous,current)
+    previous=type(previous)=="table" and previous or nil
+    current=type(current)=="table" and current or {}
+    if current.underline_request_ok~=true then
+        if previous then
+            previous.errors=current.errors or {}
+            previous.error_kind=current.error_kind
+            previous.auth_required=current.auth_required
+            previous.forbidden=current.forbidden
+            previous.rate_limited=current.rate_limited
+            previous.complete=false
+            previous.review_complete=false
+            return previous
+        end
+        current.complete=false
+        current.review_complete=false
+        return current
+    end
+
+    if current.underlines_partial==true and previous then
+        current.underlines=merge_underlines(previous.underlines,current.underlines)
+    end
+
+    local completed,pending={},{}
+    for _,key in ipairs(current.completed_ranges or {}) do completed[tostring(key)]=true end
+    for _,key in ipairs(current.pending_ranges or {}) do pending[tostring(key)]=true end
+    local old_map=previous and previous.review_map or {}
+    local new_map=current.review_map or {}
+    local active,groups={},{}
+    for _,row in ipairs(current.underlines or {}) do
+        local key=range_key(row)
+        if key~="" then active[key]=true end
+    end
+    for key in pairs(active) do
+        local texts
+        if completed[key] then texts=new_map[key] or {}
+        elseif pending[key] then texts=merge_review_lists(old_map[key],new_map[key])
+        else texts=merge_review_lists(old_map[key],new_map[key]) end
+        groups[#groups+1]={range=key,texts=texts}
+    end
+    table.sort(groups,function(a,b) return tostring(a.range)<tostring(b.range) end)
+    current.review_groups=cached_groups(groups)
+    current.review_map={}
+    current.thought_count=0
+    current.thought_entry_count=0
+    for _,group in ipairs(current.review_groups) do
+        current.review_map[group.range]=group.texts
+        if #group.texts>0 then
+            current.thought_count=current.thought_count+1
+            current.thought_entry_count=current.thought_entry_count+#group.texts
+        end
+    end
+    current.underline_count=#(current.underlines or {})
+    current.review_complete=#(current.pending_ranges or {})==0
+    current.complete=current.underline_request_ok and current.underlines_partial~=true and current.review_complete
+    return current
 end
 
 return Annotations

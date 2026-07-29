@@ -14,7 +14,7 @@ local Sync = {}
 Sync.__index = Sync
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 8
+local READ_REPORT_SERVICE_VERSION = 9
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
 
@@ -1232,14 +1232,11 @@ function Sync:_import_daemon_status(force)
     if status.context_changed or force then self:_load_daemon_context() end
     self.next_due = tonumber(status.next_due) or self.next_due or 0
     if status_book_id~="" then
-        if status.accepted==true and status.carry_consumed==true then
-            self.pending_report_elapsed=0
-            self.pending_report_status_at=tonumber(status.completed_at) or os.time()
+        self.pending_report_elapsed=0
+        self.pending_report_status_at=tonumber(status.completed_at) or os.time()
+        local saved=self.store:session(status_book_id) or {}
+        if tonumber(saved.pending_report_seconds or 0)~=0 then
             self.store:save_session(status_book_id,{pending_report_seconds=0})
-        elseif tonumber(status.pending_elapsed or 0)>0 then
-            self.pending_report_elapsed=math.max(0,math.floor(tonumber(status.pending_elapsed) or 0))
-            self.pending_report_status_at=tonumber(status.completed_at) or os.time()
-            self.store:save_session(status_book_id,{pending_report_seconds=self.pending_report_elapsed})
         end
     end
     if status.state == "service_waiting" or status.state == "inactive" then
@@ -1262,7 +1259,7 @@ function Sync:_import_daemon_status(force)
     self.last_path = status.path or self.last_path
     self.last_response_summary = status.response_summary or status.error or self.last_response_summary
     if final_flush then
-        self.last_stage = status.accepted and "关闭前阅读时间补传成功" or "关闭前阅读时间补传失败"
+        self.last_stage = status.accepted and "关闭前阅读时间上传成功" or "关闭前阅读时间上传失败"
     else
         self.last_stage = status.accepted and "兼容上传链路已确认" or "后台上传失败"
     end
@@ -1320,8 +1317,8 @@ function Sync:_import_daemon_status(force)
         self.state = daemon.active and "waiting" or "stopped"
         self.consecutive_failures = math.max(self.consecutive_failures + 1,tonumber(status.consecutive_failures) or 0)
         self.last_error = tostring(status.error)
-        self.last_stage=error_kind=="authentication" and "登录验证失败，阅读时间已保留并等待自动重试"
-            or (error_kind=="context" and "阅读上下文暂时无效，等待自动刷新" or "后台上传失败，等待自动重试")
+        self.last_stage=error_kind=="authentication" and "登录验证失败，本次时间不补传，将稍后重新计时"
+            or (error_kind=="context" and "阅读上下文暂时无效，等待自动刷新" or "后台上传失败，本次时间不补传，将稍后重试")
         if error_kind=="authentication" then
             local retry_now=os.time()
             if retry_now-(tonumber(self.daemon_auth_retry_at) or 0)>=60 then
@@ -1406,8 +1403,12 @@ function Sync:_start_daemon(reason)
     local interval = math.max(10, tonumber(prefs.interval) or 30)
     local session = self.store:session(book_id) or {}
     local auth = self.store:auth()
-    self.pending_report_elapsed=math.max(0,math.floor(tonumber(session.pending_report_seconds) or 0))
+    self.pending_report_elapsed=0
     self.pending_report_status_at=os.time()
+    if tonumber(session.pending_report_seconds or 0)~=0 then
+        self.store:save_session(book_id,{pending_report_seconds=0})
+        session.pending_report_seconds=0
+    end
     local existing_job=read_json_file(daemon.paths.job) or {}
     local existing_account=type(existing_job.auth)=="table" and existing_job.auth.account or {}
     local current_account=type(auth.account)=="table" and auth.account or {}
@@ -1456,7 +1457,7 @@ function Sync:_start_daemon(reason)
         book_title = record.book.title,
         book_path = record.path,
         book = legacy_book,
-        carry_elapsed = math.max(0,math.floor(tonumber(session.pending_report_seconds) or 0)),
+        carry_elapsed = 0,
         auth = {
             cookies = auth.cookies or {},
             api_key = auth.api_key or "",
@@ -1522,8 +1523,8 @@ function Sync:_final_elapsed()
     local uploaded = tonumber(self.last_upload or 0) or 0
     local base = math.max(started, uploaded)
     local elapsed = math.max(0, now - base)
-    local maximum = tonumber(self.store:preferences().sync.idle_timeout) or 600
-    elapsed = math.min(elapsed, math.max(FINAL_REPORT_MIN_SECONDS, maximum))
+    local maximum = math.max(FINAL_REPORT_MIN_SECONDS, tonumber(Config.READ_INTERVAL) or 30)
+    elapsed = math.min(elapsed, maximum)
     if elapsed < FINAL_REPORT_MIN_SECONDS then return nil end
     return elapsed
 end
@@ -1701,15 +1702,6 @@ function Sync:on_suspend()
     if r then
         local position = self:local_position()
         local now=os.time()
-        local session=self.store:session(r.book.book_id) or {}
-        local stored_pending=math.max(0,math.floor(tonumber(session.pending_report_seconds) or 0))
-        local service_pending=math.max(0,math.floor(tonumber(self.pending_report_elapsed) or 0))
-        if service_pending>0 then
-            local since_status=math.max(0,now-(tonumber(self.pending_report_status_at) or now))
-            pending_elapsed=math.max(stored_pending,service_pending+since_status)
-        else
-            pending_elapsed=stored_pending+pending_elapsed
-        end
         self.store:save_session(r.book.book_id, {
             pending={
                 percent=position and position.progress or nil,
@@ -1719,12 +1711,12 @@ function Sync:on_suspend()
             },
             last_read_at=now,last_read_path=r.path,
             progress_local_percent=position and position.progress or nil,
-            pending_report_seconds=pending_elapsed,
+            pending_report_seconds=0,
         })
     end
-    -- Never perform a network flush while KOReader is tearing down input and
-    -- device services. The elapsed time is carried into the next normal report.
-    self:stop("suspend", 0)
+    -- The background worker may submit only the current 10-30 second tail.
+    -- Failed time is discarded and is never carried into the next session.
+    self:stop("suspend", pending_elapsed)
 end
 
 function Sync:on_resume(_slept)
@@ -1838,7 +1830,7 @@ function Sync:status()
         service_version=self.daemon and self.daemon.service_version or READ_REPORT_SERVICE_VERSION,
         final_flush_pending=self.daemon and self.daemon.final_flush_pending==true or false,
         last_elapsed=session and session.last_elapsed,
-        pending_report_elapsed=math.max(0,tonumber(self.pending_report_elapsed or (session and session.pending_report_seconds) or 0) or 0),
+        pending_report_elapsed=0,
         last_report_reason=session and session.last_report_reason,
     }
 end

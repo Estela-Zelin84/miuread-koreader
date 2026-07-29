@@ -29,6 +29,24 @@ M.CSS = [[
     padding: 0;
     color: transparent;
 }
+.miu-unlocated {
+    margin: 1.8em 0 0 0;
+    padding: .8em 0 0 0;
+    border-top: 1px solid #999;
+}
+.miu-unlocated h2 {
+    font-size: 1.05em;
+    margin: 0 0 .5em 0;
+}
+.miu-unlocated-note {
+    font-size: .85em;
+    color: #555;
+    margin: 0 0 .8em 0;
+}
+.miu-unlocated-item {
+    margin: .65em 0;
+    line-height: 1.5;
+}
 /* MIUREAD_ANNOTATION_STYLE_V2_END */
 ]]
 
@@ -51,6 +69,9 @@ local TARGET_SELECTORS = {
     ".miu-thought-link",
     ".miu-thought-star",
     ".miu-has-thought",
+    ".miu-unlocated",
+    ".miu-unlocated-note",
+    ".miu-unlocated-item",
 }
 
 local function strip_marked_block(css, begin_marker, end_marker)

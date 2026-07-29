@@ -420,6 +420,42 @@ function Thoughts.popup_parts_cached(store, book_id, chapter_uid, range, group, 
     return source_html, html, metrics, false
 end
 
+
+function Thoughts.plain_text(group)
+    if type(group) ~= "table" then return "没有想法内容" end
+    local lines = {}
+    local abstract = Thoughts.group_abstract(group)
+    if abstract ~= "" then
+        lines[#lines + 1] = "正文"
+        lines[#lines + 1] = abstract
+        lines[#lines + 1] = ""
+    end
+
+    local seen = {}
+    local count = 0
+    for _, item in ipairs(group.texts or {}) do
+        local content = clean(item.content)
+        if content ~= "" then
+            local author = clean(item.author)
+            if author == "" then author = "微信读书用户" end
+            local review_id = tostring(item.review_id or "")
+            local key = review_id ~= "" and ("id:" .. review_id) or (author .. "\0" .. content)
+            if not seen[key] then
+                seen[key] = true
+                count = count + 1
+                local likes = tonumber(item.likes or 0) or 0
+                local heading = author
+                if likes > 0 then heading = heading .. " · 赞 " .. tostring(likes) end
+                lines[#lines + 1] = heading
+                lines[#lines + 1] = content
+                lines[#lines + 1] = ""
+            end
+        end
+    end
+    if count == 0 then lines[#lines + 1] = "没有想法内容" end
+    return table.concat(lines, "\n"):gsub("\n+$", "")
+end
+
 function Thoughts.clear_memory_cache()
     chapter_cache = {}
     chapter_cache_order = {}

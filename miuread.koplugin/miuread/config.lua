@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "2.3.3-beta.3",
-    SCHEMA = 59,
+    VERSION = "2.3.4-beta.5",
+    SCHEMA = 60,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
@@ -33,12 +33,14 @@ local C = {
     -- and is written at most once per window; suspend/close still flushes now.
     CONTROL_WRITE_DELAY = 30,
 
+    LOW_MEMORY_SETTING = "DGLOBAL_CACHE_FREE_PROPORTION",
+    LOW_MEMORY_RATIO = 0.15,
+
     -- Online features are verified by their real request. Renewal is recovery,
-    -- never a prerequisite. The beta keeps more local diagnostics, but no
-    -- account secrets are written to diagnostic text files.
+    -- never a prerequisite. Diagnostics never include account secrets.
     AUTH_NOTICE_FAILURE_THRESHOLD = 2,
     DOWNLOAD_AUTO_RESTARTS = 2,
-    DOWNLOAD_DIAGNOSTIC_KEEP = 8,
+    DOWNLOAD_DIAGNOSTIC_KEEP = 3,
     READ_REPORT_AUTH_RETRY_DELAYS = {120, 300, 900, 1800},
     READ_REPORT_CONTEXT_RETRY_DELAYS = {60, 120, 300, 900},
 }
