@@ -30,6 +30,8 @@ local CacheCleanupTask=require("miuread.cache_cleanup_task")
 local MemoryMode=require("miuread.memory_mode")
 local Library=require("miuread.library")
 local ShelfView=require("miuread.shelf_view")
+local HomeView=require("miuread.home_view")
+local LocalLibrary=require("miuread.local_library")
 local Async=require("miuread.async")
 local Sync=require("miuread.sync")
 local Updater=require("miuread.updater")
@@ -43,6 +45,8 @@ local unpack_args=unpack or table.unpack
 local SHELF_CACHE_TTL=15*60
 local SHELF_DIRECT_CACHE_TTL=6*60*60
 local COVER_GUARD_WINDOW=6*60*60
+local HOME_LOCAL_CACHE_TTL=15*60
+local HOME_SESSION_SUPPRESSED=false
 local source=debug.getinfo(1,"S").source:gsub("^@",""); local ROOT=source:match("^(.*)/main%.lua$") or "."
 local Plugin=WidgetContainer:extend{name="miuread",is_doc_only=false,version=Config.VERSION}
 local function normalize(v) local b=v.bookInfo or v.book or v; return {bookId=tostring(b.bookId or v.bookId or ""),title=b.title or v.title or "未命名",author=b.author or v.author or "",cover=b.cover or v.cover,category=b.category or v.category,progress=tonumber(v.progress or b.progress or 0) or 0,updateTime=tonumber(v.updateTime or b.updateTime or 0) or 0} end
@@ -89,6 +93,7 @@ function Plugin:init()
         disable_fallback=true})
     self.thought_index_async=Async:new(self.store,{poll_interval=.75,allow_android=true,
         disable_fallback=true})
+    self.home_async=Async:new(self.store,{poll_interval=.45,allow_android=true,disable_fallback=true})
     self.auth_flow=Auth:new(self.http,self.store,self)
     self.sync=Sync:new(self.reader,self.api,self.store,self,self.async,self.identity_async)
     self.updater=Updater:new(self.http,self.store,self.version,ROOT)
@@ -112,6 +117,9 @@ function Plugin:init()
     self._download_state_last_stage=nil
     self._auth_notice_dialog=nil
     self._sync_success_notified=false
+    self._home_view=nil
+    self._home_scan_generation=0
+    self._home_refreshing=false
 
     if not self._reader_context then
         local guard=self.store:cover_guard()
@@ -143,6 +151,14 @@ function Plugin:init()
         UIManager:scheduleIn(1.2,function() self:_show_auth_notice() end)
         UIManager:scheduleIn(8.0,function() self:_start_thought_index_maintenance() end)
         UIManager:scheduleIn(5.0,function() self:maybe_auto_check_update(false) end)
+        local home_prefs=(self.store:preferences().home_ui or {})
+        if home_prefs.enabled==true and not HOME_SESSION_SUPPRESSED then
+            UIManager:nextTick(function()
+                if not self.ui.document and not HOME_SESSION_SUPPRESSED and not HomeView.is_shown() then
+                    self:show_miuread_home(false)
+                end
+            end)
+        end
     end
 end
 
@@ -576,6 +592,7 @@ function Plugin:home_menu()
     self:maybe_auto_check_update(false)
     local account={text=self:_account_status_label(),callback=function() self:show_account_status() end}
     local out={
+        {text="觅阅首页（预览）",callback=self:safe("home-ui",function() self:show_miuread_home(false) end)},
         {text="我的书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)},
         {text="搜索书籍",callback=self:safe("search",function() self:search_dialog() end)},
         {text=self:_download_menu_text(),callback=self:safe("downloads",function() self:show_downloads() end)},
@@ -586,7 +603,10 @@ function Plugin:home_menu()
     local health=self:_auth_health()
     self:_recompute_auth_health(health)
     if self:logged_in() and health.state=="partial" then
-        table.remove(out,5); table.insert(out,1,account)
+        for index,row in ipairs(out) do
+            if row==account then table.remove(out,index); break end
+        end
+        table.insert(out,1,account)
     end
     return out
 end
@@ -650,7 +670,10 @@ function Plugin:reader_menu()
         }
     end
     return {
-        {text="返回书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)},
+        {text=(self.store:preferences().home_ui or {}).enabled==true and "返回觅阅首页" or "返回书架",callback=self:safe("shelf",function()
+            if (self.store:preferences().home_ui or {}).enabled==true then self:return_to_miuread_home()
+            else self:show_shelf(false,false,"account") end
+        end)},
         {text="当前书籍",sub_item_table_func=function() return self:current_book_menu() end},
         {text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end},
         {text=self:_download_menu_text(),callback=function() self:show_downloads() end},
@@ -1405,6 +1428,287 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
     end,force_remote,section)
 end
 
+
+function Plugin:_home_root()
+    local prefs=self.store:preferences().home_ui or {}
+    local root=U.trim(tostring(prefs.local_root or ""))
+    if root=="" and _G.G_reader_settings and type(_G.G_reader_settings.readSetting)=="function" then
+        local ok,value=pcall(_G.G_reader_settings.readSetting,_G.G_reader_settings,"home_dir")
+        if ok then root=U.trim(tostring(value or "")) end
+    end
+    if root=="" or root=="/" then
+        for _,candidate in ipairs({"/mnt/us/documents","/mnt/us/books",self.store.default_books_dir}) do
+            if candidate and lfs.attributes(candidate,"mode")=="directory" then root=candidate; break end
+        end
+    end
+    if root=="" then root=self.store.default_books_dir end
+    return root
+end
+
+function Plugin:_home_local_cache()
+    local value=self.store:get("home_local_index",{})
+    if type(value)~="table" then value={} end
+    value.books=type(value.books)=="table" and value.books or {}
+    return value
+end
+
+function Plugin:_home_local_rows()
+    local cache=self:_home_local_cache()
+    local rows={}
+    local known_paths={}
+    local function remember(path)
+        path=tostring(path or ""):gsub("\\","/"):gsub("/+","/")
+        if path~="" then known_paths[path]=true end
+    end
+    for _,book in pairs(self.store:library() or {}) do
+        for _,record in pairs(book.variants or {}) do
+            if type(record)=="table" then remember(record.file); remember(record.original_file) end
+        end
+        for _,chapter in pairs(book.chapters or {}) do
+            for _,record in pairs(chapter or {}) do
+                if type(record)=="table" then remember(record.file); remember(record.original_file) end
+            end
+        end
+    end
+    for _,row in ipairs(cache.books or {}) do
+        local path=tostring(row.file or "")
+        local key=path:gsub("\\","/"):gsub("/+","/")
+        if path~="" and U.file_exists(path) and not known_paths[key] then
+            local copy=U.copy(row)
+            copy.local_file=true
+            copy.source="local"
+            copy.status_text=tostring(copy.format or "本地书籍")
+            rows[#rows+1]=copy
+        end
+    end
+    table.sort(rows,function(a,b)
+        local am,bm=tonumber(a.modified_at) or 0,tonumber(b.modified_at) or 0
+        if am~=bm then return am>bm end
+        return tostring(a.title or ""):lower()<tostring(b.title or ""):lower()
+    end)
+    return rows,cache
+end
+
+function Plugin:_home_miuread_rows()
+    local remote_books,remote_mp=self.library:cached()
+    local rows=self:_shelf_rows("generated",false,remote_books or {},{},#(remote_books or {})>0)
+    rows=self.library:sort_filter(rows,{section="generated"})
+    table.sort(rows,function(a,b)
+        local ar,br=tonumber(a.lastReadTime) or 0,tonumber(b.lastReadTime) or 0
+        if ar~=br then return ar>br end
+        local ad,bd=tonumber(a.downloadedAt) or 0,tonumber(b.downloadedAt) or 0
+        if ad~=bd then return ad>bd end
+        return tostring(a.title or ""):lower()<tostring(b.title or ""):lower()
+    end)
+    self:_prepare_shelf_rows(rows)
+    for _,row in ipairs(rows) do
+        row.source="miuread"
+        row.status_text=self:_shelf_status_text(row)
+    end
+    return rows
+end
+
+function Plugin:_home_stop_background(reason)
+    self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
+    self._home_refreshing=false
+    if self.home_async then self.home_async:cancel(reason or "home hidden") end
+    if self.thought_index_async then self.thought_index_async:cancel(reason or "reader opening") end
+    if self._thought_index_pause_path then U.atomic_write(self._thought_index_pause_path,"1",true) end
+end
+
+function Plugin:_home_scan_local(force)
+    if self:_active_reader_ui() then return false end
+    local root=self:_home_root()
+    local cache=self:_home_local_cache()
+    local age=os.time()-(tonumber(cache.scanned_at) or 0)
+    if not force and tostring(cache.root or "")==root and age>=0 and age<HOME_LOCAL_CACHE_TTL then return false end
+    if not self.home_async or self.home_async:busy() then return false end
+    if not self.home_async:available() then
+        logger.warn("[MiuRead][Home] local scan unavailable","root=",root)
+        return false
+    end
+    self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
+    local generation=self._home_scan_generation
+    self._home_refreshing=true
+    local started,err=self.home_async:run("home-local-library",function()
+        return LocalLibrary.scan(root,{limit=900,max_depth=8})
+    end,function(result)
+        if generation~=self._home_scan_generation then return end
+        self._home_refreshing=false
+        if result and result.ok==true and type(result.value)=="table" then
+            self.store:set("home_local_index",result.value)
+            logger.info("[MiuRead][Home] local library refreshed",
+                "root=",tostring(root),"count=",tostring(#(result.value.books or {})),
+                "truncated=",tostring(result.value.truncated==true))
+            if HomeView.is_shown() then UIManager:scheduleIn(.05,function() self:show_miuread_home(false,true) end) end
+        else
+            logger.warn("[MiuRead][Home] local library refresh failed",tostring(result and result.error or "unknown"))
+        end
+    end,180)
+    if not started then
+        self._home_refreshing=false
+        logger.warn("[MiuRead][Home] local scan not started",tostring(err))
+        return false
+    end
+    if HomeView.is_shown() then
+        UIManager:scheduleIn(.05,function()
+            if generation==self._home_scan_generation and self._home_refreshing then
+                self:_show_miuread_home_now(false,true)
+            end
+        end)
+    end
+    return true
+end
+
+function Plugin:_home_open_miuread(book)
+    self:_home_stop_background("opening book")
+    local id=tostring(book and (book.bookId or book.book_id) or "")
+    local record=id~="" and self:_preferred_record(id) or nil
+    if record and record.file and U.file_exists(record.file) then
+        return self:_open_file_direct(record.file)
+    end
+    if id~="" then self:book_menu(book) else self:info("本地书籍记录不存在") end
+end
+
+function Plugin:_home_open_local(book)
+    local path=tostring(book and book.file or "")
+    if path=="" or not U.file_exists(path) then self:info("本地文件不存在"); return end
+    self:_home_stop_background("opening local book")
+    return self:_open_file_direct(path)
+end
+
+function Plugin:_home_local_book_menu(book)
+    local path=tostring(book and book.file or "")
+    local dir=path:match("^(.*)/[^/]+$") or self:_home_root()
+    self:list(tostring(book and book.title or "本地书籍"),{
+        {text="打开",callback=function() self:_home_open_local(book) end},
+        {text="在 KOReader 文件管理器中查看",callback=function()
+            HOME_SESSION_SUPPRESSED=true
+            HomeView.close(); self._home_view=nil
+            local FileManager=require("apps/filemanager/filemanager")
+            FileManager:showFiles(dir)
+        end},
+        {text="文件位置",post_text=path,enabled=false},
+    })
+end
+
+function Plugin:show_home_local_library(rows)
+    rows=rows or select(1,self:_home_local_rows())
+    if #rows==0 then self:info("没有发现普通本地书籍"); return end
+    local ok,view=pcall(ShelfView.show,{
+        title="本地书籍 · "..tostring(#rows).."本",books=rows,
+        show_actions=false,show_tabs=false,show_covers=true,
+        on_select=function(book) self:_home_open_local(book) end,
+        on_hold=function(book) self:_home_local_book_menu(book) end,
+    })
+    if ok and view then return end
+    logger.warn("[MiuRead][Home] local shelf unavailable",tostring(view))
+    local items={}
+    for _,book in ipairs(rows) do
+        local row=book
+        items[#items+1]={text=tostring(row.title or "未命名"),post_text=tostring(row.format or ""),callback=function() self:_home_open_local(row) end}
+    end
+    self:list("本地书籍",items)
+end
+
+function Plugin:home_preview_menu()
+    return {
+        {text="微信书架",callback=function() self:show_shelf(false,false,"account") end},
+        {text="公众号",callback=function() self:show_mp_shelf(false) end},
+        {text=self:_download_menu_text(),callback=function() self:show_downloads() end},
+        {text="刷新本地书库",callback=function() self:show_miuread_home(true) end},
+        {text=self:_account_status_label(),callback=function() self:show_account_status() end},
+        {text="设置与关于",sub_item_table_func=function() return self:settings_menu() end},
+        {text="暂时返回原生首页",callback=function()
+            HOME_SESSION_SUPPRESSED=true
+            self:_home_stop_background("native home")
+            HomeView.close(); self._home_view=nil
+        end},
+    }
+end
+
+function Plugin:_active_reader_ui()
+    local ok,ReaderUI=pcall(require,"apps/reader/readerui")
+    if not ok or not ReaderUI then return nil end
+    local instance=ReaderUI.instance
+    return instance and instance.document and instance or nil
+end
+
+function Plugin:_show_miuread_home_now(force_scan,from_refresh)
+    HOME_SESSION_SUPPRESSED=false
+    local miuread_rows=self:_home_miuread_rows()
+    local local_rows,cache=self:_home_local_rows()
+    local top_miu,top_local={},{}
+    for i=1,math.min(3,#miuread_rows) do top_miu[#top_miu+1]=miuread_rows[i] end
+    for i=1,math.min(3,#local_rows) do top_local[#top_local+1]=local_rows[i] end
+    local footer
+    if self._home_refreshing then footer="正在后台整理本地书库，阅读时会自动停止"
+    elseif tonumber(cache.scanned_at or 0)>0 then
+        footer="本地书库："..tostring(self:_home_root()).." · 长按书籍查看更多"
+    else footer="本地书库将在后台自动整理，不影响打开和阅读" end
+    local view,err=HomeView.show{
+        title="觅阅首页",
+        miuread_books=top_miu,miuread_count=#miuread_rows,
+        local_books=top_local,local_count=#local_rows,
+        footer_text=footer,
+        on_downloads=function() self:show_downloads() end,
+        on_menu=function() self:list("觅阅首页",self:home_preview_menu()) end,
+        on_native=function()
+            HOME_SESSION_SUPPRESSED=true
+            self:_home_stop_background("native home")
+            HomeView.close(); self._home_view=nil
+        end,
+        on_miuread_all=function() self:show_shelf(false,false,"generated") end,
+        on_local_all=function() self:show_home_local_library(local_rows) end,
+        on_empty_miuread=function() self:show_shelf(false,false,"account") end,
+        on_open_miuread=function(book) self:_home_open_miuread(book) end,
+        on_hold_miuread=function(book) self:_shelf_hold(book) end,
+        on_open_local=function(book) self:_home_open_local(book) end,
+        on_hold_local=function(book) self:_home_local_book_menu(book) end,
+        on_close=function(current) if self._home_view==current then self._home_view=nil end end,
+    }
+    if not view then self:info("觅阅首页暂时无法显示：\n"..tostring(err or "未知错误")); return false end
+    self._home_view=view
+    if self._thought_index_pause_path then os.remove(self._thought_index_pause_path) end
+    if not from_refresh then self:_home_scan_local(force_scan==true) end
+    if not force_scan then UIManager:scheduleIn(2.5,function()
+        if HomeView.is_shown() and not self._home_refreshing then self:_start_thought_index_maintenance() end
+    end) end
+    return true
+end
+
+function Plugin:show_miuread_home(force_scan,from_refresh)
+    if self:_active_reader_ui() then return self:return_to_miuread_home() end
+    return self:_show_miuread_home_now(force_scan,from_refresh)
+end
+
+function Plugin:_restore_home_after_reader_close(attempt)
+    attempt=tonumber(attempt) or 1
+    if HOME_SESSION_SUPPRESSED or (self.store:preferences().home_ui or {}).enabled~=true then return false end
+    if HomeView.is_shown() then return true end
+    if self:_active_reader_ui() then
+        if attempt<20 then
+            UIManager:scheduleIn(.15,function() self:_restore_home_after_reader_close(attempt+1) end)
+        end
+        return false
+    end
+    return self:_show_miuread_home_now(false,false)
+end
+
+function Plugin:return_to_miuread_home()
+    HOME_SESSION_SUPPRESSED=false
+    local readerui=self:_active_reader_ui()
+    if readerui then
+        local file=readerui.document and readerui.document.file
+        UIManager:nextTick(function()
+            readerui:onClose(false)
+            if type(readerui.showFileManager)=="function" then readerui:showFileManager(file) end
+            UIManager:scheduleIn(.15,function() self:_restore_home_after_reader_close(1) end)
+        end)
+        return true
+    end
+    return self:_show_miuread_home_now(false,false)
+end
 
 function Plugin:search_dialog()
     if not self:require_login() then return end
@@ -2795,6 +3099,7 @@ function Plugin:chapter_menu(b,ch)
 end
 
 function Plugin:_open_file_direct(path)
+    if HomeView.is_shown() then self:_home_stop_background("reader opening") end
     if self.ui and self.ui.document and type(self.ui.switchDocument)=="function" then
         return self.ui:switchDocument(path)
     end
@@ -3813,6 +4118,19 @@ end
 
 function Plugin:display_settings_menu()
     return {
+        {text="使用觅阅首页（预览）",checked_func=function() return (self.store:preferences().home_ui or {}).enabled==true end,callback=function()
+            local p=self.store:preferences(); p.home_ui=p.home_ui or {}
+            p.home_ui.enabled=p.home_ui.enabled~=true
+            self.store:save_preferences(p)
+            HOME_SESSION_SUPPRESSED=false
+            if p.home_ui.enabled then
+                self:toast("觅阅首页已启用")
+                if not (self.ui and self.ui.document) then UIManager:scheduleIn(.05,function() self:show_miuread_home(false) end) end
+            else
+                HomeView.close(); self._home_view=nil; self:toast("已恢复 KOReader 原生首页")
+            end
+        end},
+        {text="刷新本地书库",callback=function() self:show_miuread_home(true) end},
         {text="显示书架封面",checked_func=function() return self.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("shelf_covers") end},
         {text="评论显示",post_text="原生轻量窗口",enabled=false},
     }
@@ -4261,6 +4579,7 @@ local function extract_thought_href(value,seen,depth)
 end
 function Plugin:_start_thought_index_maintenance()
     if not self.thought_index_async or not self.ui or self.ui.document then return false end
+    if (self.store:preferences().home_ui or {}).enabled==true and not HomeView.is_shown() then return false end
     if self.download_task and self.download_task:busy() then
         UIManager:scheduleIn(10,function() self:_start_thought_index_maintenance() end)
         return false
@@ -4462,6 +4781,9 @@ function Plugin:onCloseDocument()
     if self._thought_index_pause_path then os.remove(self._thought_index_pause_path) end
     self:_teardown_thought_tap(); self._progress_prompted_book_id=nil; self._progress_check_running=false; self.sync:on_close()
     UIManager:scheduleIn(.2,function() self:_install_pending_downloads(true) end)
+    if (self.store:preferences().home_ui or {}).enabled==true and not HOME_SESSION_SUPPRESSED then
+        UIManager:scheduleIn(.25,function() pcall(function() self:_restore_home_after_reader_close(1) end) end)
+    end
 end
 function Plugin:onFlushSettings() self:_flush_cover_index(); self.store:flush() end
 return Plugin

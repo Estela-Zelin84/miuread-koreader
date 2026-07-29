@@ -1,14 +1,14 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "3.0.0-beta.4",
-    SCHEMA = 62,
+    VERSION = "3.1.0-beta.2",
+    SCHEMA = 63,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
     -- 更新清单固定保存在对应发布分支的仓库根目录；清单中的下载地址
     -- 指向 GitHub Release 全量包。安装另一通道的全量包可切换更新通道。
     UPDATE_CHANNEL = "beta",
-    UPDATE_CHANNEL_LABEL = "内测",
+    UPDATE_CHANNEL_LABEL = "内测通道",
     UPDATE_MANIFEST = "https://raw.githubusercontent.com/miumiupy98-art/miuread-koreader/beta/update-beta.json",
     UPDATE_MANIFESTS = {
         "https://raw.githubusercontent.com/miumiupy98-art/miuread-koreader/beta/update-beta.json",
