@@ -45,7 +45,7 @@ jobs:
           grep -Fq "version = \"$VERSION\"" miuread.koplugin/_meta.lua
           grep -Fq "VERSION = \"$VERSION\"" miuread.koplugin/miuread/config.lua
           grep -Fq '觅阅 · 微信读书助手' miuread.koplugin/_meta.lua
-          test -f "CHANGELOG-$VERSION.txt"
+          test -f "CHANGELOG.md"
 
           if find miuread.koplugin -type f \( \
               -iname '*.md' -o \
@@ -145,7 +145,7 @@ jobs:
               f"https://github.com/{repo}/releases/download/"
               f"v{version}/{package_name}"
           )
-          notes_path = Path(f"CHANGELOG-{version}.txt")
+          notes_path = Path("CHANGELOG.md")
           notes = notes_path.read_text(encoding="utf-8").strip()
           if not notes:
               notes = "全量更新包。"
@@ -232,7 +232,7 @@ jobs:
           set -euo pipefail
 
           FILE="dist/$PACKAGE_NAME"
-          NOTES_FILE="CHANGELOG-$VERSION.txt"
+          NOTES_FILE="CHANGELOG.md"
           EXTRA_ARGS=()
           case "$VERSION" in
             *-alpha*|*-beta*|*-rc*) EXTRA_ARGS+=(--prerelease) ;;
