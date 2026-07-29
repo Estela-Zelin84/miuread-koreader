@@ -137,7 +137,7 @@ function Http:_set_shared_rate_limit(seconds,code,url,scope)
     local payload={
         until_at=until_at,
         code=tostring(code or "rate_limit"),
-        source=tostring(url or ""),
+        source=Util.redact_url(url or ""),
         scope=tostring(scope or "global"),
         updated_at=os.time(),
     }
@@ -329,10 +329,10 @@ function Http:request(opt)
         local code=shared_state and shared_state.code or "rate_limit"
         if opt.rate_limit_fail_fast==true then
             error("请求频率暂时受限 [MiuReadRateLimit] error_code="..tostring(code)
-                .." wait_seconds="..tostring(shared_remaining).."：已暂停附加内容请求，请稍后补全。")
+                .." wait_seconds="..tostring(shared_remaining).."：已暂停附加内容请求，请稍后重试。")
         end
         logger.warn("[MiuRead][HTTP] respecting shared rate-limit cooldown",
-            "wait=",tostring(shared_remaining),"code=",tostring(code),"url=",tostring(opt.url or ""))
+            "wait=",tostring(shared_remaining),"code=",tostring(code),"url=",Util.redact_url(opt.url or ""))
         self:_wait_rate_limit(shared_remaining,0,math.max(1,rate_retries),code)
     end
     local rate_attempt = 0
@@ -351,7 +351,7 @@ function Http:request(opt)
             if not code and attempt > retries then
                 error("network request failed: " .. tostring(err or "unknown"))
             end
-            logger.warn("[MiuRead][HTTP] retry", "attempt=", tostring(attempt), "url=", tostring(url or opt.url),
+            logger.warn("[MiuRead][HTTP] retry", "attempt=", tostring(attempt), "url=", Util.redact_url(url or opt.url),
                 "status=", tostring(code or err or "network"))
             pause(math.min(2.5, 0.35 * (2 ^ (attempt - 1))))
         end
@@ -361,14 +361,15 @@ function Http:request(opt)
             error("network request failed: " .. tostring(last_error or "unknown"))
         end
 
-        local retry_after = tonumber(hget(last_headers, "retry-after"))
+        local retry_after_value = hget(last_headers, "retry-after")
+        local retry_after = retry_after_value and tonumber(retry_after_value) or nil
         if rate_attempt >= rate_retries then
             local cooldown=tonumber(opt.rate_limit_cooldown) or retry_after or SHARED_RATE_LIMIT_DEFAULT
             cooldown=math.max(30,math.min(1800,cooldown))
             local remaining=self:_set_shared_rate_limit(cooldown,limited_code,last_url or opt.url,rate_limit_scope)
             error("请求频率仍受限 [MiuReadRateLimit] error_code=" .. tostring(limited_code)
                 .. " wait_seconds="..tostring(remaining)
-                .. "：已停止继续请求，正文和下载断点会保留，请稍后补全。")
+                .. "：已停止继续请求，正文和下载断点会保留，请稍后重试。")
         end
 
         rate_attempt = rate_attempt + 1
@@ -376,7 +377,7 @@ function Http:request(opt)
         if retry_after then wait = math.max(wait, math.min(180, retry_after)) end
         logger.warn("[MiuRead][HTTP] rate limited; cooling down",
             "attempt=", tostring(rate_attempt), "wait=", tostring(wait),
-            "code=", tostring(limited_code), "url=", tostring(last_url or opt.url))
+            "code=", tostring(limited_code), "url=", Util.redact_url(last_url or opt.url))
         self:_wait_rate_limit(wait, rate_attempt, rate_retries, limited_code)
     end
 end
@@ -393,7 +394,7 @@ end
 
 local function service_error(data, url)
     local code = data.errCode or data.errcode or data.code
-    local message = tostring(data.errMsg or data.errmsg or data.message or data.msg or code or "")
+    local message = Util.redact_url(data.errMsg or data.errmsg or data.message or data.msg or code or "")
     local lower = message:lower()
     if tonumber(code) == -10102 or tonumber(code) == -2014 or message:find("请求频率超限", 1, true)
         or lower:find("rate limit", 1, true) or lower:find("too many requests", 1, true) then
@@ -477,7 +478,7 @@ function Http:json(opt)
     text = text or ""
     if not code or code < 200 or code >= 300 then
         local content_type = hget(headers, "content-type") or "unknown"
-        local preview = Util.first_line(text, 180)
+        local preview = Util.redact_url(Util.first_line(text, 180))
         local message = "HTTP " .. tostring(code or "nil")
             .. ", content_type=" .. tostring(content_type)
             .. ", body_bytes=" .. tostring(#text)
@@ -492,7 +493,7 @@ function Http:json(opt)
         error(message)
     end
     local ok, data = pcall(Json.decode, text)
-    if not ok then error("invalid JSON from " .. tostring(url) .. ": " .. Util.first_line(text, 180)) end
+    if not ok then error("invalid JSON from " .. Util.redact_url(url) .. ": " .. Util.first_line(text, 180)) end
     if type(data) == "table" then
         local ec = data.errCode or data.errcode
         if ec == nil and tonumber(data.code) and tonumber(data.code) < 0 then ec = data.code end
@@ -502,8 +503,8 @@ function Http:json(opt)
         code = code,
         length = #(text or ""),
         content_type = hget(headers, "content-type"),
-        url = url,
-        preview = Util.first_line(text, 180),
+        url = Util.redact_url(url),
+        preview = Util.redact_url(Util.first_line(text, 180)),
     }
     return data, headers, meta
 end

@@ -579,6 +579,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     local task_token = stamp .. "-" .. tostring(math.random(100000,999999))
     local clean_book = serializable_copy(book)
     local clean_options = serializable_copy(options or {})
+    clean_options.download_run_id=tostring(clean_options.download_run_id or task_token)
     local start_auth=self.store:auth()
     local start_account=type(start_auth.account)=="table" and start_auth.account or {}
     local auth_snapshot={
@@ -837,7 +838,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         task_token = task_token,
         restart_count = tonumber(restart_count) or 0,
         restart_book = serializable_copy(book),
-        restart_options = serializable_copy(options),
+        restart_options = serializable_copy(clean_options),
         started_at = os.time(),
     }
     self:_claim(pid)

@@ -150,12 +150,18 @@ function Service.run(job)
     local last_report_at = 0
     local last_flush_seq = 0
     local consecutive_failures = 0
-    local carry_elapsed = 0
+    local recovery_probe = false
 
     local function run_report(control, elapsed, final_flush, reason)
         local interval = math.max(10, tonumber(current_job.interval) or 30)
-        local carried = math.max(0, math.floor(tonumber(carry_elapsed) or 0))
-        elapsed = math.max(1, math.floor(tonumber(elapsed) or interval)) + carried
+        -- Keep each request within one normal reporting interval. After a
+        -- failure, the next accepted request is a zero-second recovery probe;
+        -- normal timing restarts from that successful probe.
+        if recovery_probe then
+            elapsed = 0
+        else
+            elapsed = math.max(1, math.min(interval, math.floor(tonumber(elapsed) or interval)))
+        end
         sequence = sequence + 1
         local report_job = {
             book_id = tostring(current_job.book_id or ""),
@@ -190,10 +196,10 @@ function Service.run(job)
             local delay = 0
             if result.accepted then
                 consecutive_failures = 0
-                carry_elapsed = 0
+                recovery_probe = false
             else
                 consecutive_failures = consecutive_failures + 1
-                carry_elapsed = elapsed
+                recovery_probe = true
                 delay=retry_delay(kind,consecutive_failures,interval)
             end
             out.generation = generation
@@ -206,9 +212,10 @@ function Service.run(job)
             out.attempted_at = attempted_at
             out.completed_at = completed_at
             out.elapsed_seconds = elapsed
-            out.carry_elapsed = carried
-            out.carry_consumed = result.accepted and carried > 0
-            out.pending_elapsed = result.accepted and 0 or carry_elapsed
+            out.carry_elapsed = 0
+            out.carry_consumed = false
+            out.pending_elapsed = 0
+            out.recovery_probe = elapsed == 0
             out.final_flush = final_flush == true
             out.flush_reason = reason
             out.next_due = final_flush and 0 or (completed_at + (delay>0 and delay or interval))
@@ -218,7 +225,7 @@ function Service.run(job)
         end
 
         consecutive_failures = consecutive_failures + 1
-        carry_elapsed = elapsed
+        recovery_probe = true
         local kind=classify_error(nil,result)
         local delay=retry_delay(kind,consecutive_failures,interval)
         local due = final_flush and 0 or (completed_at + delay)
@@ -234,9 +241,10 @@ function Service.run(job)
             attempted_at = attempted_at,
             completed_at = completed_at,
             elapsed_seconds = elapsed,
-            carry_elapsed = carried,
+            carry_elapsed = 0,
             carry_consumed = false,
-            pending_elapsed = carry_elapsed,
+            pending_elapsed = 0,
+            recovery_probe = elapsed == 0,
             final_flush = final_flush == true,
             flush_reason = reason,
             next_due = due,
@@ -273,7 +281,7 @@ function Service.run(job)
                 last_flush_seq = 0
                 last_control_state = nil
                 consecutive_failures = 0
-                carry_elapsed = math.max(0,math.floor(tonumber(loaded.carry_elapsed) or 0))
+                recovery_probe = false
                 U.atomic_write(context_path, Json.encode(book), true)
                 write_status(status_path, {
                     generation = generation,
@@ -282,7 +290,7 @@ function Service.run(job)
                     next_due = next_due,
                     book_id = tostring(loaded.book_id or ""),
                     first_delay = first_delay,
-                    carry_elapsed = carry_elapsed,
+                    carry_elapsed = 0,
                     service_version = tonumber(job.service_version) or 0,
                 })
             end

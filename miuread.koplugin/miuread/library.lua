@@ -236,6 +236,8 @@ local function record_state(row)
     local total_size=0
     local has_clean=false
     local has_notes=false
+    local annotation_pending=false
+    local annotation_fallback=false
     local content_type=nil
     local function scan(record,kind,is_final)
         if type(record)~="table" then return end
@@ -250,7 +252,11 @@ local function record_state(row)
                     total_size=total_size+(tonumber(U.file_size(file)) or 0)
                     content_type=record.content_type or content_type
                     if kind=="clean" or kind=="range_clean" or kind=="preview_clean" then has_clean=true end
-                    if kind=="notes" or kind=="range_notes" or kind=="preview_notes" then has_notes=true end
+                    if kind=="notes" or kind=="range_notes" or kind=="preview_notes" then
+                        has_notes=true
+                        if record.annotation_pending==true then annotation_pending=true end
+                        if record.annotation_fallback==true then annotation_fallback=true end
+                    end
                 else
                     partial_downloaded=true
                 end
@@ -271,6 +277,8 @@ local function record_state(row)
         file_size=total_size,
         has_clean=has_clean,
         has_notes=has_notes,
+        annotation_pending=annotation_pending,
+        annotation_fallback=annotation_fallback,
         content_type=content_type,
     }
 end
@@ -312,6 +320,8 @@ function Library:local_books(library_snapshot,sessions_snapshot)
                 fileSize=state.file_size,
                 hasClean=state.has_clean,
                 hasNotes=state.has_notes,
+                annotation_pending=state.annotation_pending,
+                annotation_fallback=state.annotation_fallback,
                 access=U.copy(row.access or {}),
                 content_type=state.content_type or row.content_type,
                 local_record=row,
@@ -349,6 +359,8 @@ local function merge_local_metadata(remote,local_book)
     remote.fileSize=tonumber(local_book.fileSize or 0) or 0
     remote.hasClean=local_book.hasClean==true
     remote.hasNotes=local_book.hasNotes==true
+    remote.annotation_pending=local_book.annotation_pending==true
+    remote.annotation_fallback=local_book.annotation_fallback==true
     remote.access=U.copy(local_book.access or {})
     remote.content_type=remote.content_type or local_book.content_type
     remote.local_record=local_book.local_record

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v2.3.0-beta.1"
+        description: "Release tag, for example v3.0.0"
         required: true
         type: string
 
@@ -71,6 +71,14 @@ jobs:
           echo "PACKAGE_NAME=miuread-v${VERSION}-full.zip" >> "$GITHUB_ENV"
           echo "SOURCE_BRANCH=$SOURCE_BRANCH" >> "$GITHUB_ENV"
           echo "MANIFEST_NAME=$MANIFEST_NAME" >> "$GITHUB_ENV"
+
+      - name: Run Lua syntax checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y lua5.1
+          find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
 
       - name: Build full package and update manifest
         shell: bash

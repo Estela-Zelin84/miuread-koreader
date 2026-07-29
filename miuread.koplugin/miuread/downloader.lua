@@ -7,6 +7,9 @@ local Thoughts = require("miuread.thoughts")
 local Epub = require("miuread.epub")
 local Json = require("miuread.json")
 local Http = require("miuread.http")
+local DownloadPlan = require("miuread.download_plan")
+local AnnotationCache = require("miuread.annotation_cache")
+local EpubInstaller = require("miuread.epub_installer")
 local U = require("miuread.util")
 local logger = require("logger")
 local ok_socket, socket = pcall(require, "socket")
@@ -20,6 +23,8 @@ Downloader.__index = Downloader
 
 local CACHE_SCHEMA = 9
 local FOOTNOTE_TRANSFORM_VERSION = 2
+local TITLE_TRANSFORM_VERSION = 2
+local ANNOTATION_TRANSFORM_VERSION = 4
 
 local BASE_CSS = [[
 body { line-height: 1.75; margin: 5%; }
@@ -52,18 +57,19 @@ end
 -- Fold the full-width ASCII block (U+FF01-U+FF5E) onto plain ASCII so a title
 -- differing from the body only by punctuation width still compares equal.
 local function fold_fullwidth(value)
+    value = tostring(value or "")
     value = value:gsub("\239\188([\129-\191])", function(c) return string.char(c:byte() - 96) end)
     value = value:gsub("\239\189([\128-\158])", function(c) return string.char(c:byte() - 32) end)
     return value
 end
 
--- Invisible spacing and CJK punctuation that Lua character classes cannot see,
--- because %s and %p only ever match single-byte ASCII.
+-- Lua's %s and %p only cover single-byte ASCII. Remove common invisible spacing
+-- and CJK punctuation explicitly so visually identical headings compare equal.
 local BLANK_PATTERNS = {
     "\194\160",             -- U+00A0 no-break space
     "\194\173",             -- U+00AD soft hyphen
-    "\227\128[\128-\191]",  -- U+3000-U+303F ideographic space, CJK punctuation
-    "\226\128[\128-\191]",  -- U+2000-U+203F spaces, dashes, quotes, ellipsis
+    "\227\128[\128-\191]",  -- U+3000-U+303F ideographic space and CJK punctuation
+    "\226\128[\128-\191]",  -- U+2000-U+203F spaces, dashes, quotes and ellipsis
     "\226\129[\128-\175]",  -- U+2040-U+206F
     "\239\187\191",         -- U+FEFF byte order mark
 }
@@ -71,15 +77,14 @@ local BLANK_PATTERNS = {
 local function normalized_title(value)
     local text = fold_fullwidth(plain(value)):lower()
     for _, pattern in ipairs(BLANK_PATTERNS) do text = text:gsub(pattern, "") end
-    text = text:gsub("[%s%p%c]", "")
-    return text
+    return text:gsub("[%s%p%c]", "")
 end
 
 local function trim_lead(value)
     value = tostring(value or "")
     while true do
         local stripped = value:gsub("^[%s%c]+", "")
-        for _, blank in ipairs(BLANK_PATTERNS) do stripped = stripped:gsub("^" .. blank, "") end
+        for _, pattern in ipairs(BLANK_PATTERNS) do stripped = stripped:gsub("^" .. pattern, "") end
         if stripped == value then return value end
         value = stripped
     end
@@ -100,21 +105,16 @@ local function has_number_unit(text)
     return false
 end
 
--- True when the title already carries numbering of its own. This deliberately
--- errs towards "already numbered": a false positive only means nothing is
--- changed, while a false negative could promote the wrong heading.
 local function title_is_numbered(title)
     title = trim_lead(title)
     if title == "" then return false end
-    if title:find("^%d") then return true end
-    if title:find("^[%(%[]%s*%d") then return true end
+    if title:find("^%d") or title:find("^[%(%[]%s*%d") then return true end
     if title:find("^（%s*%d") or title:find("^【%s*%d") then return true end
     local lowered = title:lower()
     if lowered:find("^chapter") or lowered:find("^part%s") or lowered:find("^section%s") then return true end
     if title:sub(1, 3) == "第" then
         local following = title:sub(4, 6)
-        if CJK_DIGITS[following] then return true end
-        if title:sub(4, 4):find("%d") then return true end
+        if CJK_DIGITS[following] or title:sub(4, 4):find("%d") then return true end
     end
     if CJK_DIGITS[title:sub(1, 3)] then
         local head = title:sub(1, 24)
@@ -137,11 +137,9 @@ local function attribute(attrs, name)
         or ""
 end
 
--- A heading may carry the catalog title as its text, as a title attribute, or
--- as the caption of a title image. All three describe the same heading.
 local function heading_labels(head)
     local out = {head.inner, attribute(head.attrs, "title")}
-    for image_attrs in head.inner:gmatch("<img([^>]*)>") do
+    for image_attrs in tostring(head.inner or ""):gmatch("<img([^>]*)>") do
         out[#out + 1] = attribute(image_attrs, "alt")
         out[#out + 1] = attribute(image_attrs, "title")
     end
@@ -149,105 +147,72 @@ local function heading_labels(head)
 end
 
 local function collect_headings(window, limit)
-    local heads, position = {}, 1
-    while #heads < TITLE_SCAN_HEADINGS do
+    local headings, position = {}, 1
+    while #headings < TITLE_SCAN_HEADINGS do
         local first, last, tag, attrs, inner = window:find("<(h[1-6])([^>]*)>(.-)</%1%s*>", position)
         if not first or first > limit then break end
-        heads[#heads + 1] = {first = first, last = last, tag = tag, attrs = attrs, inner = inner}
+        headings[#headings + 1] = {first=first, last=last, tag=tag, attrs=attrs, inner=inner}
         position = last + 1
     end
-    return heads
+    return headings
 end
 
--- prepare_chapter_body returns the wrapped body plus, when the downloaded
--- content states a fuller version of the title than the catalog did, that
--- fuller title. Nothing is ever invented: the returned title is text the
--- service itself printed inside the chapter.
---
--- base_title is the catalog title before a numbered variant replaced it. When
--- the body prints that bare title, the existing heading is upgraded in place,
--- so restoring a number never produces a second visible title.
-local function prepare_chapter_body(html, title, base_title)
+local function prepare_chapter_body(html, title)
     local fragment = Codec.body(html)
     title = tostring(title or "")
     if title == "" then
-        return '<section class="miu-chapter" epub:type="chapter">' .. fragment .. "</section>", nil
+        return '<section class="miu-chapter" epub:type="chapter">' .. fragment .. "</section>"
     end
 
     local wanted = normalized_title(title)
-    local base_wanted = normalized_title(base_title or "")
-    if base_wanted == wanted then base_wanted = "" end
-    local slack = #trim_lead(title) + TITLE_SLACK_BYTES
-
-    local has_title, promoted = false, nil
+    local has_title = false
     if wanted ~= "" then
         local window = fragment:sub(1, TITLE_SCAN_WINDOW)
-        local heads = collect_headings(window, TITLE_SCAN_LIMIT)
+        local headings = collect_headings(window, TITLE_SCAN_LIMIT)
+        local slack = #trim_lead(title) + TITLE_SLACK_BYTES
 
-        local function exact(value, target)
-            return target ~= "" and normalized_title(value) == target
+        local function exact(value)
+            return normalized_title(value) == wanted
         end
 
-        -- The catalog says "锦朝" while the body heading says "第1章 锦朝".
-        -- Accepted only when the heading is itself numbered, contains the
-        -- catalog title, and is not materially longer than it.
         local function numbered_variant(value)
-            local text = trim_lead(value)
-            if text == "" or #text > slack then return nil end
-            if not title_is_numbered(text) then return nil end
+            local text = trim_lead(plain(value))
+            if text == "" or #text > slack or not title_is_numbered(text) then return false end
             local folded = normalized_title(text)
-            if #folded <= #wanted or not folded:find(wanted, 1, true) then return nil end
-            return text
+            return #folded > #wanted and folded:find(wanted, 1, true) ~= nil
         end
 
-        for index, head in ipairs(heads) do
+        for index, head in ipairs(headings) do
             for _, label in ipairs(heading_labels(head)) do
-                if exact(label, wanted) or exact(label, base_wanted) then
-                    has_title = true
-                    break
-                end
-                local variant = numbered_variant(label)
-                if variant then
-                    has_title = true
-                    promoted = promoted or variant
-                    break
-                end
-            end
-            if has_title then
-                if base_wanted ~= "" and exact(head.inner, base_wanted) and not exact(head.inner, wanted) then
-                    local replacement = "<" .. head.tag .. head.attrs .. ">" .. U.xml(title) .. "</" .. head.tag .. ">"
-                    fragment = fragment:sub(1, head.first - 1) .. replacement .. fragment:sub(head.last + 1)
-                end
-                break
-            end
-            -- Some books split one catalog title over neighbouring headings,
-            -- for example "第一夜" followed by "我们的不幸是谁的错？".
-            local joined = normalized_title(head.inner)
-            for next_index = index + 1, math.min(index + 2, #heads) do
-                local previous = heads[next_index - 1]
-                local gap = window:sub(previous.last + 1, heads[next_index].first - 1)
-                if normalized_title(gap) ~= "" then break end
-                joined = joined .. normalized_title(heads[next_index].inner)
-                if joined == wanted or (base_wanted ~= "" and joined == base_wanted) then
+                if exact(label) or numbered_variant(label) then
                     has_title = true
                     break
                 end
             end
             if has_title then break end
+
+            -- Some books split one catalog title over neighbouring headings.
+            local joined = normalized_title(head.inner)
+            for next_index = index + 1, math.min(index + 2, #headings) do
+                local previous = headings[next_index - 1]
+                local gap = window:sub(previous.last + 1, headings[next_index].first - 1)
+                if normalized_title(gap) ~= "" then break end
+                joined = joined .. normalized_title(headings[next_index].inner)
+                if joined == wanted then has_title = true; break end
+            end
+            if has_title then break end
         end
 
         if not has_title then
-            local _, first_inner = window:match("^%s*<([pd][^>]*)>(.-)</[pd][^>]*>")
-            if first_inner and (exact(first_inner, wanted) or exact(first_inner, base_wanted)) then
-                has_title = true
-            end
+            local _, first_inner = window:match("^%s*<([pd])[^>]*>(.-)</%1%s*>")
+            if first_inner and exact(first_inner) then has_title = true end
         end
     end
 
     if not has_title then
         fragment = '<h1 class="miu-chapter-title">' .. U.xml(title) .. "</h1>\n" .. fragment
     end
-    return '<section class="miu-chapter" epub:type="chapter" data-miuread-section="1">' .. fragment .. "</section>", promoted
+    return '<section class="miu-chapter" epub:type="chapter" data-miuread-section="1">' .. fragment .. "</section>"
 end
 
 local function preview_information_chapter(book, mode, catalog_count, readable_count, restricted_count, failures)
@@ -341,8 +306,7 @@ local function option_key(opt)
         opt.annotations and "notes" or "clean",
         opt.images == false and "no-images" or "images",
         opt.chapter_uid and ("chapter-" .. U.id_name(opt.chapter_uid))
-            or ((opt.range_start_index and opt.range_end_index)
-                and ("range-" .. tostring(opt.range_start_index) .. "-" .. tostring(opt.range_end_index)) or "book"),
+            or ((opt.range_start_index and opt.range_end_index) and "range" or "book"),
     }, "-")
 end
 
@@ -538,6 +502,8 @@ local function cache_save_final(cache, chapter, body, annotation, style, footnot
     entry.thoughts = annotation and (annotation.thought_count or 0) or 0
     entry.thought_entries = annotation and (annotation.thought_entry_count or 0) or 0
     entry.footnote_transform_version = FOOTNOTE_TRANSFORM_VERSION
+    entry.title_transform_version = TITLE_TRANSFORM_VERSION
+    entry.annotation_transform_version = ANNOTATION_TRANSFORM_VERSION
     entry.footnote_candidates = footnote_stats and tonumber(footnote_stats.candidates or footnote_stats.refs or 0) or 0
     entry.footnote_refs = footnote_stats and tonumber(footnote_stats.refs or 0) or 0
     entry.footnotes_converted = footnote_stats and tonumber(footnote_stats.converted or 0) or 0
@@ -584,90 +550,6 @@ local function validate_cached_chapter(path)
     return valid,validation_error
 end
 
-local function le16(data, position)
-    local a, b = data:byte(position, position + 1)
-    if not a or not b then return nil end
-    return a + b * 256
-end
-
-local function le32(data, position)
-    local a, b, c, d = data:byte(position, position + 3)
-    if not a or not b or not c or not d then return nil end
-    return a + b * 256 + c * 65536 + d * 16777216
-end
-
-local function validate_epub(path, expected)
-    local file, open_error = io.open(path, "rb")
-    if not file then return nil, open_error or "EPUB 文件不存在" end
-    local size = file:seek("end") or 0
-    if size < 512 then file:close(); return nil, "EPUB 文件为空或过小" end
-
-    file:seek("set", 0)
-    local first = file:read(30)
-    if not first or first:sub(1, 4) ~= "PK\003\004" then
-        file:close(); return nil, "EPUB ZIP 头无效"
-    end
-    local first_name_length = le16(first, 27) or 0
-    local first_extra_length = le16(first, 29) or 0
-    local first_name = file:read(first_name_length)
-    if first_name ~= "mimetype" or first_extra_length ~= 0 then
-        file:close(); return nil, "EPUB mimetype 条目无效"
-    end
-
-    local tail_size = math.min(size, 65558)
-    file:seek("set", size - tail_size)
-    local tail = file:read(tail_size) or ""
-    local marker, search_at = nil, 1
-    while true do
-        local found = tail:find("PK\005\006", search_at, true)
-        if not found then break end
-        marker = found
-        search_at = found + 1
-    end
-    if not marker then file:close(); return nil, "EPUB ZIP 目录结束标记缺失" end
-
-    local entry_count = le16(tail, marker + 10)
-    local central_size = le32(tail, marker + 12)
-    local central_offset = le32(tail, marker + 16)
-    if not entry_count or not central_size or not central_offset
-        or central_offset + central_size > size then
-        file:close(); return nil, "EPUB ZIP 中央目录无效"
-    end
-
-    file:seek("set", central_offset)
-    local names = {}
-    for _ = 1, entry_count do
-        local header = file:read(46)
-        if not header or #header ~= 46 or header:sub(1, 4) ~= "PK\001\002" then
-            file:close(); return nil, "EPUB ZIP 中央目录条目损坏"
-        end
-        local name_length = le16(header, 29) or 0
-        local extra_length = le16(header, 31) or 0
-        local comment_length = le16(header, 33) or 0
-        local name = file:read(name_length)
-        if not name or #name ~= name_length then
-            file:close(); return nil, "EPUB ZIP 条目名称损坏"
-        end
-        names[name] = true
-        if extra_length + comment_length > 0 then
-            file:seek("cur", extra_length + comment_length)
-        end
-    end
-    file:close()
-
-    local required = {
-        "mimetype", "META-INF/container.xml", "OEBPS/package.opf",
-        "OEBPS/nav.xhtml", "OEBPS/toc.ncx", "OEBPS/style.css", "OEBPS/miuread.json",
-    }
-    for _, name in ipairs(required) do
-        if not names[name] then return nil, "EPUB 缺少必要文件：" .. name end
-    end
-    for index = 1, expected do
-        local name = string.format("OEBPS/text/chapter-%04d.xhtml", index)
-        if not names[name] then return nil, "EPUB 缺少章节文件：" .. tostring(index) end
-    end
-    return true
-end
 
 function Downloader:new(reader, api, annotations, store, http)
     return setmetatable({reader=reader, api=api, annotations=annotations, store=store, http=http}, self)
@@ -798,6 +680,13 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     local dir = self.store:epub_root()
     local standalone = opt.chapter_uid ~= nil
     local partial_range = not standalone and opt.range_start_index ~= nil and opt.range_end_index ~= nil
+    local access_scope=tostring(opt.access_scope or "full")
+    local storage_kind=partial_range and ("range_"..kind)
+        or ((access_scope=="preview" and not standalone) and ("preview_"..kind) or kind)
+    local existing_record
+    if standalone then existing_record=self.store:chapter_variant(book.bookId,opt.chapter_uid,storage_kind)
+    else existing_record=self.store:variant(book.bookId,storage_kind) end
+
     local chapter_name = standalone and (" - " .. U.safe_name(chapters[1] and chapters[1].title or "章节")) or ""
     local range_name = partial_range and "【章节版】" or ""
     local preview_name=""
@@ -806,8 +695,24 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         elseif preview_mode=="partial" then preview_name="【试读版·部分内容】"
         else preview_name="【试读版】" end
     end
-    local filename = U.safe_name(book.title, "book") .. preview_name .. range_name .. chapter_name .. " [" .. suffix .. "].epub"
-    local path = self.store:epub_path(filename)
+    local filename=U.safe_name(book.title,"book")..preview_name..range_name..chapter_name.." ["..suffix.."].epub"
+    local path=self.store:epub_path(filename)
+    if U.file_exists(path) then
+        local identity=type(self.store.epub_identity)=="function" and self.store:epub_identity(path) or nil
+        local same_identity=type(identity)=="table"
+            and tostring(identity.book_id or "")==tostring(book.bookId)
+            and (tostring(identity.variant or "")=="" or tostring(identity.variant)==storage_kind)
+            and (not standalone or tostring(identity.chapter_uid or "")==tostring(opt.chapter_uid))
+        if not same_identity and type(existing_record)=="table" and tostring(existing_record.file or "")==tostring(path) then
+            same_identity=true
+        end
+        if not same_identity then
+            local collision_id=standalone and (tostring(book.bookId).."-"..tostring(opt.chapter_uid)) or tostring(book.bookId)
+            local stem=filename:gsub("%.epub$","")
+            filename=stem.." ["..U.id_name(collision_id):sub(-12).."].epub"
+            path=self.store:epub_path(filename)
+        end
+    end
     local map = {}
     for index, chapter in ipairs(chapters) do
         map[#map + 1] = {
@@ -816,31 +721,49 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         }
     end
 
-    -- Build beside the formal file. Only a fully validated temporary EPUB may
-    -- replace the existing book, so a failed refresh never destroys a known
-    -- good copy.
-    local link_stats = repair_internal_links(chapters)
-    local temp_path = path .. ".miuread-new-" .. tostring(os.time()) .. "-" .. tostring(math.random(1000, 9999))
+    local function ensure_not_cancelled()
+        if opt.cancelled and opt.cancelled() then error("download cancelled") end
+    end
+    ensure_not_cancelled()
+    local previous_chapters=type(opt.previous_chapter_map)=="table" and opt.previous_chapter_map
+        or (type(existing_record)=="table" and existing_record.chapter_map or nil)
+    if opt.annotations==true and opt.annotation_pending==true then
+        error("划线与想法暂时未完整 [MiuReadAnnotationPending]：原文件和下载断点已保留。")
+    end
+
+    local estimate=1024*1024
+    for _,chapter in ipairs(chapters) do
+        estimate=estimate+(chapter.body_path and (U.file_size(chapter.body_path) or 0) or #tostring(chapter.body or ""))
+    end
+    for _,asset in ipairs(assets) do
+        estimate=estimate+(asset.data_path and (U.file_size(asset.data_path) or 0) or #tostring(asset.data or ""))
+    end
+    if cover then estimate=estimate+(cover.data_path and (U.file_size(cover.data_path) or 0) or #tostring(cover.data or "")) end
+    local free=U.free_space(dir)
+    local required=estimate+(U.file_size(path) or 0)+8*1024*1024
+    if free and free<required then
+        error("存储空间不足，未生成新的 EPUB。原文件和下载断点均已保留。")
+    end
+
+    local link_stats=repair_internal_links(chapters)
+    ensure_not_cancelled()
+    local stamp=tostring(opt.download_run_id or os.time()):gsub("[^%w%-]","-")
+    local temp_path=path:gsub("%.epub$","")..".miuread-new-"..stamp..".epub"
+    os.remove(temp_path)
     collectgarbage("collect")
     logger.info("[MiuRead][Download] low-memory EPUB package started",
-        "chapters=", tostring(#chapters), "assets=", tostring(#assets),
-        "memory_kb=", tostring(math.floor(collectgarbage("count"))))
+        "chapters=",tostring(#chapters),"assets=",tostring(#assets),
+        "memory_kb=",tostring(math.floor(collectgarbage("count"))))
     local now=os.time()
-    local access_scope=tostring(opt.access_scope or "full")
-    local storage_kind=partial_range and ("range_"..kind)
-        or ((access_scope=="preview" and not standalone) and ("preview_"..kind) or kind)
-    local built, build_error = pcall(Epub.build, temp_path, book, chapters, css, assets, cover, {
-        schema=7, book_id=book.bookId, title=book.title, author=book.author,
-        variant=storage_kind, base_variant=kind, standalone=standalone, chapter_uid=opt.chapter_uid,
+    local built,build_error=pcall(Epub.build,temp_path,book,chapters,css,assets,cover,{
+        schema=8,book_id=book.bookId,title=book.title,author=book.author,
+        variant=storage_kind,base_variant=kind,standalone=standalone,chapter_uid=opt.chapter_uid,
         partial_range=partial_range,range_start_index=tonumber(opt.range_start_index),
         range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
-        range_end_title=opt.range_end_title,
-        content_type="book",
-        sync_enabled=not partial_range,
-        read_report_enabled=not partial_range,
-        chapters=map, generated_at=now, complete=true,
-        access_scope=access_scope,
-        catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
+        range_end_title=opt.range_end_title,content_type="book",
+        sync_enabled=not partial_range,read_report_enabled=not partial_range,
+        chapters=map,generated_at=now,complete=true,task_id=opt.download_run_id,
+        access_scope=access_scope,catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
         readable_count=tonumber(opt.readable_chapter_count) or #chapters,
         restricted_count=tonumber(opt.restricted_chapter_count) or 0,
         preview_mode=access_scope=="preview" and preview_mode or nil,
@@ -848,55 +771,35 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
         annotation_requested=opt.annotation_requested==true or opt.annotations==true,
         annotation_pending=opt.annotation_pending==true or nil,
+        annotation_fallback=opt.annotation_fallback==true or nil,
         annotation_error_kind=opt.annotation_error_kind,
-        internal_links={links=link_stats.links or 0, rewritten=link_stats.rewritten or 0,
-            unresolved=link_stats.unresolved or 0, critical=link_stats.unresolved_critical or 0},
+        internal_links={links=link_stats.links or 0,rewritten=link_stats.rewritten or 0,
+            unresolved=link_stats.unresolved or 0,critical=link_stats.unresolved_critical or 0},
     })
     if not built then os.remove(temp_path); error(build_error) end
+    ensure_not_cancelled()
+    local validation_options={book_id=book.bookId,variant=storage_kind,chapters=map,previous_chapters=previous_chapters}
+    local valid,validation_error=EpubInstaller.validate(temp_path,validation_options)
+    if not valid then os.remove(temp_path); error("EPUB 完整性验证失败："..tostring(validation_error)) end
     logger.info("[MiuRead][Download] low-memory EPUB package completed",
-        "bytes=", tostring(U.file_size(temp_path) or 0),
-        "memory_kb=", tostring(math.floor(collectgarbage("count"))))
-    local valid, validation_error = validate_epub(temp_path, #chapters)
-    if not valid then
-        os.remove(temp_path)
-        error("EPUB 完整性验证失败：" .. tostring(validation_error))
-    end
+        "bytes=",tostring(U.file_size(temp_path) or 0),
+        "memory_kb=",tostring(math.floor(collectgarbage("count"))))
 
-    local active_path = tostring(opt.active_document_path or "")
-    local defer_install = active_path ~= "" and active_path == tostring(path) and U.file_exists(path)
+    local active_path=tostring(opt.active_document_path or "")
+    local defer_install=active_path~="" and active_path==tostring(path) and U.file_exists(path)
     local pending_path
+    ensure_not_cancelled()
     if defer_install then
-        pending_path = path .. ".miuread-pending"
-        os.remove(pending_path)
-        local staged, stage_mode_or_error = U.move_file_safe(temp_path, pending_path, function(candidate)
-            return validate_epub(candidate, #chapters)
-        end)
-        if not staged then
-            os.remove(temp_path)
-            error("无法暂存当前正在阅读书籍的新版本：" .. tostring(stage_mode_or_error))
-        end
-        logger.info("[MiuRead][Download] pending EPUB installed","mode=",tostring(stage_mode_or_error))
+        pending_path=path:gsub("%.epub$","")..".miuread-pending-"..stamp..".epub"
+        local staged,stage_mode_or_error=EpubInstaller.stage(temp_path,pending_path,validation_options)
+        if not staged then os.remove(temp_path); error("无法暂存当前正在阅读书籍的新版本："..tostring(stage_mode_or_error)) end
+        local old_pending=type(existing_record)=="table" and tostring(existing_record.pending_file or "") or ""
+        if old_pending~="" and old_pending~=pending_path and U.file_exists(old_pending) then os.remove(old_pending) end
+        logger.info("[MiuRead][Download] pending EPUB staged","mode=",tostring(stage_mode_or_error))
     else
-        local backup_path = path .. ".miuread-backup"
-        os.remove(backup_path)
-        local had_previous = U.file_exists(path)
-        if had_previous then
-            local backed_up, backup_error = os.rename(path, backup_path)
-            if not backed_up then
-                os.remove(temp_path)
-                error("无法保护原 EPUB：" .. tostring(backup_error))
-            end
-        end
-        local installed, install_mode_or_error = U.move_file_safe(temp_path, path, function(candidate)
-            return validate_epub(candidate, #chapters)
-        end)
-        if not installed then
-            if had_previous then os.rename(backup_path, path) end
-            os.remove(temp_path)
-            error("无法安装新 EPUB：" .. tostring(install_mode_or_error))
-        end
+        local installed,install_mode_or_error=EpubInstaller.install(temp_path,path,validation_options)
+        if not installed then os.remove(temp_path); error("无法安装新 EPUB："..tostring(install_mode_or_error)) end
         logger.info("[MiuRead][Download] EPUB installed","mode=",tostring(install_mode_or_error))
-        if had_previous then os.remove(backup_path) end
     end
 
     local record = {
@@ -916,13 +819,18 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         preview_mode=access_scope=="preview" and preview_mode or nil,
         access_scope=access_scope,
         guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
-        chapter_map=map, failures=U.copy(failures or {}), complete=true, file_size=U.file_size(path) or U.file_size(pending_path),
+        chapter_map=map,failures=U.copy(failures or {}),complete=true,
+        file_size=defer_install and U.file_size(pending_path) or U.file_size(path),
+        previous_chapter_map=defer_install and U.copy(previous_chapters or {}) or nil,
+        task_id=opt.download_run_id,
         pending_install=defer_install or nil,
         pending_file=pending_path,
         annotation_requested=opt.annotation_requested==true or opt.annotations==true,
         annotation_pending=opt.annotation_pending==true or nil,
+        annotation_fallback=opt.annotation_fallback==true or nil,
         annotation_error_kind=opt.annotation_error_kind,
         annotation_errors=U.copy(opt.annotation_errors or {}),
+        annotation_account_key=opt.annotations and annotation_account_key or nil,
     }
     if standalone then
         record.chapter_uid = tostring(opt.chapter_uid)
@@ -992,26 +900,12 @@ function Downloader:book(input, opt, progress)
         }
     end
     opt.full_catalog_map=full_catalog_map
-    local selected = {}
-    if opt.chapter_uid then
-        for _, chapter in ipairs(all) do
-            if tostring(chapter.chapterUid or chapter.uid) == tostring(opt.chapter_uid) then selected[1] = chapter; break end
-        end
-    elseif opt.range_start_index and opt.range_end_index then
-        local first=math.max(1,tonumber(opt.range_start_index) or 1)
-        local last=math.min(#all,tonumber(opt.range_end_index) or first)
-        if last<first then first,last=last,first end
-        for index,chapter in ipairs(all) do
-            if index>=first and index<=last then selected[#selected+1]=chapter end
-        end
-        opt.range_start_index=first
-        opt.range_end_index=last
-        opt.range_start_title=opt.range_start_title or (all[first] and all[first].title)
-        opt.range_end_title=opt.range_end_title or (all[last] and all[last].title)
-    else
-        for index, chapter in ipairs(all) do
-            if not opt.limit or index <= tonumber(opt.limit) then selected[#selected + 1] = chapter end
-        end
+    local requested_kind=opt.annotations==true and "notes" or "clean"
+    local existing_range=(opt.range_start_index and opt.range_end_index)
+        and self.store:variant(book.bookId,"range_"..requested_kind) or nil
+    local selected=DownloadPlan.select(all,opt,existing_range)
+    if type(opt.missing_previous_chapter_uids)=="table" and #opt.missing_previous_chapter_uids>0 then
+        error("微信读书目录已经变化，无法安全覆盖已有章节版。原文件已保留；请删除旧章节版后重新生成。")
     end
     if #selected == 0 then error("no readable chapter") end
     expected = #selected
@@ -1020,60 +914,101 @@ function Downloader:book(input, opt, progress)
     session = cache.manifest.session
     local failure_map, restricted_map = {}, {}
     local requested_annotations=opt.annotations==true
-    local annotation_blocked=false
-    local annotation_degraded=false
+    opt.download_run_id=tostring(opt.download_run_id or (os.time().."-"..math.random(100000,999999)))
+    local annotation_account_key=AnnotationCache.account_key(self.store)
+    local annotation_suspended=false
     local annotation_error_kind=nil
-    local annotation_errors={}
+    local annotation_error_map={}
     local annotation_recovery_attempted=false
     local function chapter_uid(chapter)
         return tostring(chapter and (chapter.chapterUid or chapter.uid) or "")
     end
-
-    local function fetch_annotation(chapter, report_progress)
+    local function record_annotation_error(chapter,annotation)
         local uid=chapter_uid(chapter)
-        if annotation_blocked then
-            return {book_id=tostring(book.bookId),chapter_uid=uid,underlines={},review_map={},review_groups={},
-                underline_count=0,thought_count=0,thought_entry_count=0,underline_request_ok=false,
-                disabled=true,error_kind=annotation_error_kind or "disabled",errors={}}
+        local message=table.concat(annotation and annotation.errors or {},"; ")
+        if message=="" then message="批注数据尚未完整" end
+        annotation_error_map[uid]={uid=uid,title=chapter and chapter.title,error=message,
+            error_kind=annotation and annotation.error_kind or "incomplete"}
+        annotation_error_kind=annotation_error_kind or (annotation and annotation.error_kind) or "incomplete"
+    end
+
+    local function fetch_annotation(chapter,report_progress)
+        local uid=chapter_uid(chapter)
+        local previous=AnnotationCache.load(cache.root,uid,annotation_account_key,self.annotations)
+        if annotation_suspended then
+            local cached=previous or self.annotations:from_cache({book_id=book.bookId,chapter_uid=uid})
+            cached.complete=false
+            cached.review_complete=false
+            cached.error_kind=annotation_error_kind or "deferred"
+            cached.errors=cached.errors or {}
+            return cached
         end
-        local ok,annotation=pcall(self.annotations.fetch_chapter,self.annotations,
-            book.bookId,chapter.chapterUid or chapter.uid,function(stage,current,total)
-                if report_progress then report_progress(stage,current,total) end
+
+        local ok,current=pcall(self.annotations.fetch_chapter,self.annotations,
+            book.bookId,chapter.chapterUid or chapter.uid,function(stage,current_index,total)
+                if report_progress then report_progress(stage,current_index,total) end
             end)
-        if not ok or type(annotation)~="table" then
-            annotation={
-                book_id=tostring(book.bookId),chapter_uid=uid,underlines={},review_map={},review_groups={},
-                underline_count=0,thought_count=0,thought_entry_count=0,
-                underline_request_ok=false,errors={tostring(annotation)},
-            }
+        if not ok or type(current)~="table" then
+            current={book_id=tostring(book.bookId),chapter_uid=uid,underlines={},review_map={},review_groups={},
+                underline_count=0,thought_count=0,thought_entry_count=0,underline_request_ok=false,
+                review_complete=false,complete=false,error_kind="server",errors={tostring(current)}}
         end
-        if annotation.forbidden==true and not annotation_recovery_attempted
+
+        if (current.auth_required==true or current.forbidden==true) and not annotation_recovery_attempted
             and self.reader and type(self.reader._recover_login_session)=="function" then
             annotation_recovery_attempted=true
             local recovered,recover_error=self.reader:_recover_login_session()
-            logger.warn("[MiuRead][Download] annotation authentication recovery",
-                "ok=",tostring(recovered),"book=",tostring(book.bookId),
+            logger.info("[MiuRead][Download] annotation login renewal attempted",
+                "renewed=",tostring(recovered),"book=",tostring(book.bookId),
                 "error=",recovered and "" or tostring(recover_error))
             if recovered then
                 local retry_ok,retry_annotation=pcall(self.annotations.fetch_chapter,self.annotations,
-                    book.bookId,chapter.chapterUid or chapter.uid,function(stage,current,total)
-                        if report_progress then report_progress(stage,current,total) end
+                    book.bookId,chapter.chapterUid or chapter.uid,function(stage,current_index,total)
+                        if report_progress then report_progress(stage,current_index,total) end
                     end)
-                if retry_ok and type(retry_annotation)=="table" then annotation=retry_annotation
+                if retry_ok and type(retry_annotation)=="table" then
+                    current=retry_annotation
+                    if current.complete==true or (current.auth_required~=true and current.forbidden~=true) then
+                        logger.info("[MiuRead][Download] annotation access restored after renewal",
+                            "book=",tostring(book.bookId),"chapter=",uid)
+                    else
+                        logger.warn("[MiuRead][Download] annotation access still unavailable after renewal",
+                            "book=",tostring(book.bookId),"chapter=",uid,
+                            "kind=",tostring(current.error_kind or "incomplete"))
+                    end
                 else
-                    annotation.errors=annotation.errors or {}
-                    annotation.errors[#annotation.errors+1]=tostring(retry_annotation)
+                    current.errors=current.errors or {}
+                    current.errors[#current.errors+1]=tostring(retry_annotation)
+                    logger.warn("[MiuRead][Download] annotation endpoint retry failed after renewal",
+                        "book=",tostring(book.bookId),"chapter=",uid,
+                        "error=",tostring(retry_annotation))
                 end
             else
-                annotation.errors=annotation.errors or {}
-                annotation.errors[#annotation.errors+1]="自动续期失败："..tostring(recover_error)
+                current.errors=current.errors or {}
+                current.errors[#current.errors+1]="自动续期失败："..tostring(recover_error)
             end
         end
-        if annotation.forbidden==true or annotation.rate_limited==true then annotation_blocked=true end
-        if annotation.underline_request_ok and #(annotation.errors or {})==0 then
-            Thoughts.save(self.store,book.bookId,chapter.chapterUid or chapter.uid,annotation.review_groups)
+
+        if current.auth_required==true then
+            error(table.concat(current.errors or {},"; ")~="" and table.concat(current.errors or {},"; ")
+                or "登录状态已失效 [MiuReadAuth]")
         end
-        return annotation
+        if current.rate_limited==true then
+            error(table.concat(current.errors or {},"; ")~="" and table.concat(current.errors or {},"; ")
+                or "请求频率暂时受限 [MiuReadRateLimit]")
+        end
+        if current.forbidden==true then
+            annotation_suspended=true
+            annotation_error_kind="forbidden"
+        end
+
+        local merged=self.annotations:merge(previous,current)
+        local saved,save_error=AnnotationCache.save(cache.root,uid,annotation_account_key,self.annotations,merged)
+        if not saved then error("无法保存批注断点："..tostring(save_error)) end
+        if type(merged.review_groups)=="table" then
+            Thoughts.save(self.store,book.bookId,chapter.chapterUid or chapter.uid,merged.review_groups)
+        end
+        return merged
     end
 
     local function mark_failure(chapter, message)
@@ -1194,7 +1129,7 @@ function Downloader:book(input, opt, progress)
 
         if retry_round and retry_round > 0 then
             progress("resume", index, expected, chapter.title, {
-                message="正在补全失败项目（第 " .. tostring(retry_round) .. " 轮）",
+                message="正在重试失败项目（第 " .. tostring(retry_round) .. " 轮）",
             })
         end
 
@@ -1211,7 +1146,35 @@ function Downloader:book(input, opt, progress)
                 "to=",tostring(FOOTNOTE_TRANSFORM_VERSION))
         end
 
-        if entry and entry.complete and not (requested_annotations and entry.annotation_pending==true) then
+        if entry and entry.complete
+            and tonumber(entry.title_transform_version or 0) ~= TITLE_TRANSFORM_VERSION then
+            -- Rebuild only the derived chapter wrapper. Existing body, image and
+            -- annotation checkpoints remain reusable.
+            entry.complete = false
+            entry.error = nil
+            cache_save(cache)
+            logger.info("[MiuRead][Download] rebuilding cached chapter for title transformer",
+                "chapter=",uid,"from=",tostring(entry.title_transform_version or 0),
+                "to=",tostring(TITLE_TRANSFORM_VERSION))
+        end
+
+        if entry and entry.complete and requested_annotations
+            and tonumber(entry.annotation_transform_version or 0) ~= ANNOTATION_TRANSFORM_VERSION then
+            -- Rebuild from the pristine chapter body so newly added annotation
+            -- fallbacks are applied without redownloading正文 or images.
+            entry.complete = false
+            entry.error = nil
+            cache_save(cache)
+            logger.info("[MiuRead][Download] rebuilding cached chapter for annotation transformer",
+                "chapter=",uid,"from=",tostring(entry.annotation_transform_version or 0),
+                "to=",tostring(ANNOTATION_TRANSFORM_VERSION))
+        end
+
+        local annotation_current=not requested_annotations or (
+            tostring(entry and entry.annotation_run_id or "")==tostring(opt.download_run_id)
+            and tostring(entry and entry.annotation_account_key or "")==tostring(annotation_account_key)
+            and entry.annotation_pending~=true)
+        if entry and entry.complete and annotation_current then
             local cached_path, cached_style = cache_load_final_source(cache, entry)
             if cached_path then
                 local valid,validation_error=validate_cached_chapter(cached_path)
@@ -1230,7 +1193,7 @@ function Downloader:book(input, opt, progress)
         if entry and entry.content_done then
             body, style, new_assets = cache_load_base(cache, entry)
             if body then
-                progress("resume", index, expected, chapter.title, {message="正文已完成，继续补全附加内容"})
+                progress("resume", index, expected, chapter.title, {message="正文已完成，正在获取附加内容"})
             else
                 logger.warn("[MiuRead][Download] content checkpoint invalid", "chapter=", uid, "error=", tostring(style))
                 cache_reset_entry(cache, uid)
@@ -1260,39 +1223,30 @@ function Downloader:book(input, opt, progress)
         end
 
         local annotation
-        if requested_annotations and not annotation_blocked then
-            progress("underlines", index, expected, chapter.title)
-            annotation = fetch_annotation(chapter,function(stage,current,total)
-                progress(stage,index,expected,chapter.title,{batch=current,batches=total})
+        if requested_annotations then
+            progress("underlines",index,expected,chapter.title)
+            annotation=fetch_annotation(chapter,function(stage,current_index,total)
+                progress(stage,index,expected,chapter.title,{batch=current_index,batches=total})
             end)
-            if annotation.forbidden==true or annotation.rate_limited==true
-                or not annotation.underline_request_ok or #(annotation.errors or {}) > 0 then
-                annotation_degraded=true
-                annotation_blocked=true
-                annotation_error_kind=annotation.error_kind or (annotation.forbidden and "forbidden")
-                    or (annotation.rate_limited and "rate_limit") or "incomplete"
-                local message=table.concat(annotation.errors or {}, "; ")
-                if message=="" then message="批注数据未完整获取" end
-                annotation_errors[#annotation_errors+1]={uid=uid,title=chapter.title,error=message}
-                entry.annotation_done=false
-                entry.annotation_pending=true
-                entry.annotation_error=message
-                cache_save(cache)
-                annotation=nil
-                logger.warn("[MiuRead][Download] annotations downgraded to clean EPUB",
+            local pending=annotation.complete~=true
+            entry.annotation_done=not pending
+            entry.annotation_pending=pending or nil
+            entry.annotation_error_kind=pending and (annotation.error_kind or "incomplete") or nil
+            entry.annotation_error=pending and table.concat(annotation.errors or {},"; ") or nil
+            entry.annotation_account_key=annotation_account_key
+            entry.annotation_run_id=opt.download_run_id
+            if pending then
+                record_annotation_error(chapter,annotation)
+                logger.warn("[MiuRead][Download] annotations preserved with pending items",
                     "book=",tostring(book.bookId),"chapter=",uid,
-                    "kind=",tostring(annotation_error_kind),"error=",U.first_line(message,160))
+                    "kind=",tostring(annotation.error_kind or "incomplete"))
             else
-                entry.annotation_done=true
-                entry.annotation_pending=nil
-                entry.annotation_error=nil
-                local extra_css
-                body, extra_css = self.annotations:apply(body, annotation)
-                style = tostring(style or "") .. "\n" .. tostring(extra_css or "")
+                annotation_error_map[uid]=nil
             end
-        elseif requested_annotations then
-            entry.annotation_done=false
-            entry.annotation_pending=true
+            local extra_css,apply_stats
+            body,extra_css,apply_stats=self.annotations:apply(body,annotation)
+            entry.annotation_fallback=tonumber(apply_stats and apply_stats.fallback or 0) or 0
+            style=tostring(style or "").."\n"..tostring(extra_css or "")
             cache_save(cache)
         end
 
@@ -1312,51 +1266,26 @@ function Downloader:book(input, opt, progress)
     -- again, and a later success removes the earlier failure state.
     for retry_round = 1, 2 do
         local pending = {}
-        for index, chapter in ipairs(selected) do
-            local uid = tostring(chapter.chapterUid or chapter.uid)
-            if failure_map[uid] then pending[#pending + 1] = {chapter=chapter, index=index} end
+        for index,chapter in ipairs(selected) do
+            local uid=tostring(chapter.chapterUid or chapter.uid)
+            local entry=cache.manifest.chapters[uid]
+            if failure_map[uid] or (requested_annotations and entry and entry.annotation_pending==true
+                and entry.annotation_error_kind~="forbidden") then
+                pending[#pending+1]={chapter=chapter,index=index}
+            end
         end
         if #pending == 0 then break end
         pause(retry_round == 1 and 1.5 or 3.0)
         for _, item in ipairs(pending) do process_one(item.chapter, item.index, retry_round) end
     end
 
-    if requested_annotations and annotation_degraded then
-        -- Some earlier chapters may already contain injected marks. Rebuild every
-        -- completed chapter from its pristine正文 checkpoint so the fallback is a
-        -- genuinely clean EPUB, while preserving any existing complete notes EPUB.
-        for index,chapter in ipairs(selected) do
-            local uid=tostring(chapter.chapterUid or chapter.uid)
-            if not restricted_map[uid] then
-                local entry=cache.manifest.chapters[uid]
-                local clean_body,clean_style=cache_load_base(cache,entry)
-                if clean_body then
-                    entry.annotation_done=false
-                    entry.annotation_pending=true
-                    entry.annotation_error=entry.annotation_error or "批注待补全"
-                    finalize_chapter(chapter,index,entry,clean_body,clean_style,nil,
-                        "批注暂不可用，正在生成纯净版")
-                    failure_map[uid]=nil
-                else
-                    failure_map[uid]=failure_map[uid] or {
-                        uid=uid,title=chapter.title,error="无法读取正文断点以生成纯净版",
-                    }
-                end
-            end
-        end
-        opt.annotations=false
-        opt.annotation_requested=true
-        opt.annotation_pending=true
-        opt.annotation_error_kind=annotation_error_kind
-        opt.annotation_errors=U.copy(annotation_errors)
-    end
 
     -- Rebuild in catalog order from verified checkpoints. This avoids wrong
     -- ordering when a failed item succeeds in a later retry round.
     chapters, assets = {}, {}
     css_list, css_seen = {}, {}
     css_add(css_list, css_seen, BASE_CSS)
-    annotation_summary = {underlines=0, thoughts=0, chapters_ok=0, chapters_failed=0, errors={}}
+    annotation_summary = {underlines=0, thoughts=0, fallbacks=0, chapters_ok=0, chapters_failed=0, errors={}}
     for index, chapter in ipairs(selected) do
         local uid = tostring(chapter.chapterUid or chapter.uid)
         local entry = cache.manifest.chapters[uid]
@@ -1370,6 +1299,7 @@ function Downloader:book(input, opt, progress)
                 annotation_summary.chapters_ok = annotation_summary.chapters_ok + 1
                 annotation_summary.underlines = annotation_summary.underlines + (tonumber(entry.underlines) or 0)
                 annotation_summary.thoughts = annotation_summary.thoughts + (tonumber(entry.thoughts) or 0)
+                annotation_summary.fallbacks = annotation_summary.fallbacks + (tonumber(entry.annotation_fallback) or 0)
             end
         else
             failure_map[uid] = failure_map[uid] or {uid=uid, title=chapter.title, error=tostring(final_style)}
@@ -1381,13 +1311,20 @@ function Downloader:book(input, opt, progress)
         local uid = tostring(chapter.chapterUid or chapter.uid)
         if failure_map[uid] then failures[#failures + 1] = failure_map[uid] end
     end
-    annotation_summary.chapters_failed = requested_annotations and #annotation_errors or 0
-    annotation_summary.pending = annotation_degraded==true
-    annotation_summary.error_kind = annotation_error_kind
-    annotation_summary.errors = U.copy(annotation_errors)
-    if requested_annotations and not annotation_degraded then
-        for _, item in ipairs(failures) do annotation_summary.errors[#annotation_summary.errors + 1] = item end
+    local annotation_errors={}
+    for _,chapter in ipairs(selected) do
+        local uid=tostring(chapter.chapterUid or chapter.uid)
+        if annotation_error_map[uid] then annotation_errors[#annotation_errors+1]=annotation_error_map[uid] end
     end
+    annotation_summary.chapters_failed=requested_annotations and #annotation_errors or 0
+    annotation_summary.pending=#annotation_errors>0
+    annotation_summary.error_kind=annotation_error_kind
+    annotation_summary.errors=U.copy(annotation_errors)
+    opt.annotation_requested=requested_annotations
+    opt.annotation_pending=#annotation_errors>0
+    opt.annotation_fallback=tonumber(annotation_summary.fallbacks or 0)>0
+    opt.annotation_error_kind=annotation_error_kind
+    opt.annotation_errors=U.copy(annotation_errors)
 
     local restricted_count=0
     for _ in pairs(restricted_map) do restricted_count=restricted_count+1 end
@@ -1433,8 +1370,8 @@ function Downloader:book(input, opt, progress)
     opt.checkpointed = true
     local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session)
     record.annotation_summary = annotation_summary
-    if opt.annotation_pending==true then
-        cache.manifest.annotation_pending=true
+    if requested_annotations then
+        cache.manifest.annotation_pending=opt.annotation_pending==true or nil
         cache.manifest.annotation_error_kind=opt.annotation_error_kind
         cache.manifest.annotation_errors=U.copy(opt.annotation_errors or {})
         cache_save(cache)
@@ -1448,6 +1385,14 @@ Downloader._prepare_chapter_body = prepare_chapter_body
 Downloader._namespace_assets = namespace_assets
 Downloader._catalog_signature = catalog_signature
 Downloader._option_key = option_key
-Downloader._validate_epub = validate_epub
+Downloader._validate_epub = function(path,expected)
+    if type(expected)=="number" then
+        local meta,err=EpubInstaller.inspect(path)
+        if not meta then return nil,err end
+        if tonumber(meta._chapter_count)~=tonumber(expected) then return nil,"EPUB 章节数量不一致" end
+        return true,meta
+    end
+    return EpubInstaller.validate(path,expected)
+end
 
 return Downloader

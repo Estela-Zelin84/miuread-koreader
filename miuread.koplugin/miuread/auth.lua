@@ -137,11 +137,12 @@ function Auth:_finish(data)
         ticket_updated_at=(wr_ticket~="" or wr_wrpa~="") and now or 0,
         account={name=account_name,vid=vid,logged_at=now},
         health={
-            state=web_ready and "ok" or "unknown",last_checked_at=now,last_ok_at=web_ready and now or 0,last_error_at=0,
+            state="unknown",last_checked_at=now,last_ok_at=web_ready and now or 0,last_error_at=0,
             last_error_code="",last_error_message="",last_error_channel="",notice_pending=false,
             channels={
                 shelf=Util.copy(ok_channel),progress=Util.copy(ok_channel),
                 download=Util.copy(web_ready and ok_channel or pending_channel),
+                annotations=Util.copy(pending_channel),
                 read_report=Util.copy(web_ready and ok_channel or pending_channel),
             },
         },

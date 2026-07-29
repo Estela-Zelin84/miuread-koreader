@@ -51,6 +51,10 @@ local TARGET_SELECTORS = {
     ".miu-thought-link",
     ".miu-thought-star",
     ".miu-has-thought",
+    -- Legacy selectors are kept only so regenerated books discard stale rules.
+    ".miu-unlocated",
+    ".miu-unlocated-note",
+    ".miu-unlocated-item",
 }
 
 local function strip_marked_block(css, begin_marker, end_marker)

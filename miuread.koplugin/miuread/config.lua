@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "2.3.3",
-    SCHEMA = 59,
+    VERSION = "3.0.0",
+    SCHEMA = 62,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
@@ -32,6 +32,9 @@ local C = {
     -- Coalesce page-turn control snapshots. Reading position stays in memory
     -- and is written at most once per window; suspend/close still flushes now.
     CONTROL_WRITE_DELAY = 30,
+
+    LOW_MEMORY_SETTING = "DGLOBAL_CACHE_FREE_PROPORTION",
+    LOW_MEMORY_RATIO = 0.15,
 
     -- Online features are verified by their real request. Renewal is recovery,
     -- never a prerequisite. Diagnostics never include account secrets.

@@ -4,6 +4,7 @@ local LuaSettings=require("luasettings")
 local Config=require("miuread.config")
 local Json=require("miuread.json")
 local U=require("miuread.util")
+local logger=require("logger")
 local Store={}; Store.__index=Store
 local defaults={
  schema=Config.SCHEMA,
@@ -15,9 +16,10 @@ local defaults={
              shelf={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              progress={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              download={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
+             annotations={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,time_notice_enabled=false,progress_enabled=true,progress_notice_mode="off",manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",memory_mode={enabled=false,previous_known=false,previous_ratio=false},thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
@@ -53,6 +55,51 @@ local function invalidate_upload_health_table(auth)
     end
     return auth
 end
+local function settings_file_valid(path)
+    if not path or lfs.attributes(path,"mode")~="file" then return false,"missing" end
+    local size=U.file_size(path) or 0
+    if size<=0 then return false,"empty" end
+    local loader,err=loadfile(path)
+    return loader~=nil,err
+end
+
+local function restore_settings_file(path,backup_path)
+    if not path or lfs.attributes(path,"mode")~="file" then return false end
+    local valid,reason=settings_file_valid(path)
+    if valid then return false end
+    local candidates={backup_path,path..".old",path..".previous"}
+    for _,candidate in ipairs(candidates) do
+        local backup_ok=settings_file_valid(candidate)
+        if backup_ok then
+            local restored,restore_error=U.copy_file(candidate,path)
+            if restored then
+                logger.warn("[MiuRead][Store] damaged settings restored",
+                    "source=",tostring(candidate),"reason=",tostring(reason))
+                return true,candidate
+            end
+            logger.warn("[MiuRead][Store] settings restore failed",tostring(restore_error))
+        end
+    end
+    local corrupt=path..".corrupt-"..tostring(os.time())
+    local moved=os.rename(path,corrupt)
+    logger.warn("[MiuRead][Store] damaged settings isolated",
+        "file=",tostring(moved and corrupt or path),"reason=",tostring(reason))
+    return true,nil
+end
+
+local function refresh_settings_backup(path,backup_path)
+    local source=lfs.attributes(path)
+    local backup=lfs.attributes(backup_path)
+    if type(source)~="table" then return false end
+    local needed=type(backup)~="table"
+        or tonumber(source.size or -1)~=tonumber(backup.size or -2)
+        or (tonumber(source.modification or 0)-tonumber(backup.modification or 0))>=300
+    if not needed then return false end
+    local copied,copy_error=U.copy_file(path,backup_path)
+    if not copied then logger.warn("[MiuRead][Store] settings backup failed",tostring(copy_error)) end
+    return copied==true
+end
+
 local function public_documents_root(data_dir)
     local kindle_documents = "/mnt/us/documents"
     if lfs.attributes(kindle_documents,"mode")=="directory" then
@@ -69,6 +116,9 @@ function Store:new(options)
     options=options or {}
     local data=options.data_dir or (DataStorage:getFullDataDir().."/"..Config.DATA_DIR)
     U.mkdir(data); U.mkdir(data.."/books"); U.mkdir(data.."/mp"); U.mkdir(data.."/covers"); U.mkdir(data.."/temp"); U.mkdir(data.."/updates")
+    local settings_path=options.settings_path or (DataStorage:getSettingsDir().."/miuread.lua")
+    local settings_backup_path=settings_path..".miuread-backup"
+    if options.isolated~=true then restore_settings_file(settings_path,settings_backup_path) end
     local o=setmetatable({
         data_dir=data,
         cache_books_dir=data.."/books",
@@ -77,7 +127,8 @@ function Store:new(options)
         covers_dir=data.."/covers",
         temp_dir=data.."/temp",
         updates_dir=data.."/updates",
-        settings_path=options.settings_path or (DataStorage:getSettingsDir().."/miuread.lua"),
+        settings_path=settings_path,
+        settings_backup_path=settings_backup_path,
         download_state_path=data.."/download-state.json",
         isolated=options.isolated==true,
     },self)
@@ -87,6 +138,10 @@ function Store:new(options)
     -- v1.1.45 intentionally disables automatic legacy EPUB relocation. File
     -- moves must never run during every reader/file-manager transition.
     o.db:flush()
+    if not o.isolated then
+        local valid=settings_file_valid(o.settings_path)
+        if valid then refresh_settings_backup(o.settings_path,o.settings_backup_path) end
+    end
     return o
 end
 function Store:migrate()
@@ -748,7 +803,7 @@ function Store:migrate()
             auth.health.last_error_channel=""
             if has_local then
                 auth.health.state="unknown"
-                for _,channel in ipairs({"shelf","progress","download","read_report"}) do
+                for _,channel in ipairs({"shelf","progress","download","annotations","read_report"}) do
                     local previous_row=(auth.health.channels or {})[channel] or {}
                     auth.health.channels[channel]={
                         state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0,
@@ -798,12 +853,59 @@ function Store:migrate()
             if changed>0 then self.db:saveSetting("sessions",cleaned) end
             self.db:saveSetting("auth",invalidate_upload_health_table(self.db:readSetting("auth",{}) or {}))
         end
+        if schema<60 then
+            -- 2.3.4 restores one simple success-notice switch and removes
+            -- accumulated reading-time catch-up. Old pending seconds are
+            -- intentionally discarded so an upgrade can never submit a long
+            -- reading-time batch.
+            p.sync=p.sync or {}
+            p.sync.success_notice_enabled=true
+            p.sync.time_notice_enabled=nil
+            p.sync.progress_notice_mode=nil
+            local sessions=self.db:readSetting("sessions",{}) or {}
+            local changed=false
+            for _,session in pairs(sessions) do
+                if type(session)=="table" then
+                    if tonumber(session.pending_report_seconds or 0)~=0 then changed=true end
+                    session.pending_report_seconds=0
+                end
+            end
+            if changed then self.db:saveSetting("sessions",sessions) end
+        end
+        if schema<61 then
+            -- 3.0.0-beta.2 separates正文下载 from划线与想法 access so a
+            -- successful EPUB no longer hides a persistent annotation HTTP 403.
+            local auth=self.db:readSetting("auth",{}) or {}
+            auth.health=U.merge(defaults.auth.health,auth.health or {})
+            auth.health.channels=auth.health.channels or {}
+            local previous=auth.health.channels.annotations or {}
+            auth.health.channels.annotations={
+                state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0,
+                last_ok_at=tonumber(previous.last_ok_at or 0) or 0,
+            }
+            if tostring(auth.api_key or "")~="" and next(auth.cookies or {})~=nil then
+                local partial=false
+                for _,channel in ipairs({"shelf","progress","download","annotations","read_report"}) do
+                    local state=tostring(((auth.health.channels or {})[channel] or {}).state or "unknown")
+                    if state=="error" or state=="expired" then partial=true; break end
+                end
+                auth.health.state=partial and "partial" or "unknown"
+            else
+                auth.health.state="logged_out"
+            end
+            self.db:saveSetting("auth",U.merge(defaults.auth,auth))
+        end
+        if schema<62 then
+            -- 3.0.0-beta.3 generates compact per-chapter thought indexes outside
+            -- the reader. Existing annotation caches remain intact and are
+            -- upgraded automatically by the idle background worker.
+        end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end
 function Store:get(k,d) local v=self.db:readSetting(k,nil); return v==nil and U.copy(d) or v end
-function Store:set(k,v) self.db:saveSetting(k,v); self.db:flush() end
+function Store:set(k,v) self.db:saveSetting(k,v); self:flush() end
 local function sanitized_auth(value)
     local auth=U.merge(defaults.auth,value or {})
     auth.mp_cookie_header=nil
@@ -1019,44 +1121,52 @@ local function filename_key(path)
     return name:gsub("[%s　]+", "")
 end
 
+local function identity_from_blob(blob,identity)
+    blob=tostring(blob or "")
+    identity=type(identity)=="table" and identity or {}
+    identity.book_id=identity.book_id
+        or blob:match('"book_id"%s*:%s*"([^"]+)"')
+        or blob:match("miuread://book/([^<%s\"]+)")
+    identity.variant=identity.variant or blob:match('"variant"%s*:%s*"([^"]+)"')
+    identity.content_type=identity.content_type or blob:match('"content_type"%s*:%s*"([^"]+)"')
+    if identity.standalone==nil and blob:match('"standalone"%s*:%s*true') then identity.standalone=true end
+    identity.chapter_uid=identity.chapter_uid or blob:match('"chapter_uid"%s*:%s*"?([^",}%s]+)')
+    identity.title=identity.title or xml_unescape(blob:match("<dc:title[^>]*>(.-)</dc:title>"))
+    identity.author=identity.author or xml_unescape(blob:match("<dc:creator[^>]*>(.-)</dc:creator>"))
+    return identity
+end
+
+function Store:epub_identity_light(path)
+    if not path or not U.file_exists(path) or not tostring(path):lower():match("%.epub$") then return nil end
+    local file=io.open(path,"rb")
+    if not file then return nil end
+    local size=file:seek("end") or 0
+    file:seek("set",0)
+    local head=file:read(math.min(size,768*1024)) or ""
+    local tail=""
+    if size>#head then
+        file:seek("set",math.max(0,size-1024*1024))
+        tail=file:read("*a") or ""
+    end
+    file:close()
+    local identity=identity_from_blob(head.."\n"..tail,{})
+    if tostring(identity.book_id or "")~="" or tostring(identity.title or "")~="" then return identity end
+    return nil
+end
+
 function Store:epub_identity(path)
+    local identity=self:epub_identity_light(path) or {}
+    if tostring(identity.book_id or "")~="" then return identity end
     if not path or not U.file_exists(path) or not tostring(path):lower():match("%.epub$") then return nil end
     local quoted=U.shell_quote(path)
-    local identity={}
     local raw=read_pipe("unzip -p "..quoted.." OEBPS/miuread.json 2>/dev/null")
     if raw then
         local ok,value=pcall(Json.decode,raw)
-        if ok and type(value)=="table" then identity=U.copy(value) end
+        if ok and type(value)=="table" then identity=U.merge(identity,value) end
     end
     local opf=read_pipe("unzip -p "..quoted.." OEBPS/package.opf 2>/dev/null")
-    if opf then
-        identity.book_id=identity.book_id
-            or opf:match("miuread://book/([^<%s]+)")
-            or opf:match("miuread%-([^<%s]+)")
-        identity.title=identity.title or xml_unescape(opf:match("<dc:title[^>]*>(.-)</dc:title>"))
-        identity.author=identity.author or xml_unescape(opf:match("<dc:creator[^>]*>(.-)</dc:creator>"))
-    end
-    if tostring(identity.book_id or "")~="" then return identity end
-
-    -- MiuRead-generated EPUB entries are stored without compression. If a
-    -- device lacks a usable unzip -p, inspect only the tail instead of loading
-    -- a large book into memory.
-    local file=io.open(path,"rb")
-    if file then
-        local size=file:seek("end") or 0
-        file:seek("set",math.max(0,size-1024*1024))
-        local tail=file:read("*a") or ""
-        file:close()
-        local id=tail:match('"book_id"%s*:%s*"([^"]+)"') or tail:match("miuread://book/([^<%s]+)")
-        if id then
-            return {
-                book_id=id,
-                variant=tail:match('"variant"%s*:%s*"([^"]+)"'),
-                content_type=tail:match('"content_type"%s*:%s*"([^"]+)"'),
-                standalone=tail:match('"standalone"%s*:%s*true')~=nil,
-            }
-        end
-    end
+    if opf then identity=identity_from_blob(opf,identity) end
+    if tostring(identity.book_id or "")~="" or tostring(identity.title or "")~="" then return identity end
     return nil
 end
 
@@ -1064,133 +1174,193 @@ local function access_from_epub_meta(_meta)
     return nil
 end
 
-function Store:identify_file(path,relink)
+local function metadata_key(value)
+    local text=tostring(value or ""):lower()
+    text=text:gsub("%.epub$","")
+    text=text:gsub("%s*%[[^%]]-%]%s*$","")
+    text=text:gsub("%s*【.-】%s*$","")
+    text=text:gsub("[%s%c%p　]+","")
+    for _,mark in ipairs({"，","。","！","？","：","；","“","”","‘","’","《","》","〈","〉","（","）","【","】","·","—","…"}) do
+        text=text:gsub(mark,"",1e6)
+    end
+    return text
+end
+
+local function relink_saved_record(store,all,book,record,path,current_size,relink)
+    if not relink or type(record)~="table" then return end
+    local changed=false
+    if record.file~=path then
+        record.file=path
+        record.directory=path:match("^(.*)/[^/]+$")
+        changed=true
+    end
+    if current_size and tonumber(record.file_size)~=tonumber(current_size) then
+        record.file_size=current_size
+        changed=true
+    end
+    if record.directory and book.directory~=record.directory then
+        book.directory=record.directory
+        changed=true
+    end
+    if changed then store:set("library",all) end
+end
+
+function Store:file_record_fast(path,relink)
     if not path then return nil end
     local normalized=normalize_path(path)
-    local current_size=U.file_size(path)
+    local current_size
+    local function file_size()
+        if current_size==nil then current_size=U.file_size(path) or false end
+        return current_size~=false and current_size or nil
+    end
     local all=self:library()
     local function match_record(record)
         return type(record)=="table" and record.file and normalize_path(record.file)==normalized
     end
-    local function relink_record(book,record)
-        if not relink or type(record)~="table" then return end
-        if record.file~=path then
-            record.file=path
-            record.directory=path:match("^(.*)/[^/]+$")
+    for _,book in pairs(all) do
+        for kind,record in pairs(book.variants or {}) do
+            if match_record(record) then
+                relink_saved_record(self,all,book,record,path,file_size(),relink)
+                return book,record,kind
+            end
         end
-        record.file_size=current_size or record.file_size
-        book.directory=record.directory or book.directory
-        self:set("library",all)
-    end
-    for _,b in pairs(all) do
-        for kind,r in pairs(b.variants or {}) do
-            if match_record(r) then relink_record(b,r); return b,r,kind end
-        end
-        for uid,row in pairs(b.chapters or {}) do
-            for kind,r in pairs(row or {}) do
-                if match_record(r) then
-                    r.chapter_uid=uid
-                    relink_record(b,r)
-                    return b,r,kind
+        for uid,row in pairs(book.chapters or {}) do
+            for kind,record in pairs(row or {}) do
+                if match_record(record) then
+                    record.chapter_uid=uid
+                    relink_saved_record(self,all,book,record,path,file_size(),relink)
+                    return book,record,kind
                 end
             end
         end
     end
-
-    local meta=self:epub_identity(path)
-    -- For older files without embedded identity, a harmless spacing-only rename
-    -- can still be repaired. Relink only one unambiguous filename candidate.
     local wanted_name=filename_key(path)
-    if not meta and wanted_name~="" then
-        local matches={}
-        for _,b in pairs(all) do
-            for kind,r in pairs(b.variants or {}) do
-                if type(r)=="table" and filename_key(r.file)==wanted_name then
-                    matches[#matches+1]={book=b,record=r,kind=kind}
+    if wanted_name=="" then return nil end
+    local matches={}
+    for _,book in pairs(all) do
+        for kind,record in pairs(book.variants or {}) do
+            if type(record)=="table" and filename_key(record.file)==wanted_name then
+                matches[#matches+1]={book=book,record=record,kind=kind}
+            end
+        end
+        for uid,row in pairs(book.chapters or {}) do
+            for kind,record in pairs(row or {}) do
+                if type(record)=="table" and filename_key(record.file)==wanted_name then
+                    matches[#matches+1]={book=book,record=record,kind=kind,uid=uid}
                 end
             end
-            for uid,row in pairs(b.chapters or {}) do
-                for kind,r in pairs(row or {}) do
-                    if type(r)=="table" and filename_key(r.file)==wanted_name then
-                        matches[#matches+1]={book=b,record=r,kind=kind,uid=uid}
+        end
+    end
+    if #matches==1 then
+        local found=matches[1]
+        if found.uid then found.record.chapter_uid=found.uid end
+        relink_saved_record(self,all,found.book,found.record,path,file_size(),relink)
+        return found.book,found.record,found.kind
+    end
+    return nil
+end
+
+function Store:file_record_from_identity(path,meta,relink)
+    if not path or type(meta)~="table" then return nil end
+    local current_size=U.file_size(path)
+    local all=self:library()
+    local id=tostring(meta.book_id or "")
+    if id=="" then
+        local wanted_title=metadata_key(meta.title)
+        local wanted_author=metadata_key(meta.author)
+        local matches={}
+        if wanted_title~="" then
+            for key,book in pairs(all) do
+                if metadata_key(book.title)==wanted_title then
+                    local author=metadata_key(book.author)
+                    if wanted_author=="" or author=="" or author==wanted_author then
+                        matches[#matches+1]={id=tostring(book.book_id or key),book=book}
                     end
                 end
             end
         end
         if #matches==1 then
-            local found=matches[1]
-            if found.uid then found.record.chapter_uid=found.uid end
-            relink_record(found.book,found.record)
-            return found.book,found.record,found.kind
-        end
+            id=matches[1].id
+            meta.book_id=id
+            meta.recovered_by="embedded_title"
+            logger.info("[MiuRead][Store] legacy EPUB identity recovered by title","book=",id)
+        else return nil end
     end
-
-    local id=meta and tostring(meta.book_id or "") or ""
-    if id=="" then return nil end
     local kind=tostring(meta.variant or "")
-    if kind=="" then kind="notes" end
-    local b=all[id]
+    if kind=="" then
+        local name=tostring(basename(path) or "")
+        if name:find("纯净版",1,true) then kind="clean"
+        elseif name:find("划线与想法版",1,true) or name:find("想法版",1,true) then kind="notes" end
+    end
     local chapters=type(meta.chapters)=="table" and meta.chapters or {}
     local standalone=meta.standalone==true
     local uid=tostring(meta.chapter_uid or ((chapters[1] and (chapters[1].uid or chapters[1].chapter_uid)) or ""))
+    local book=all[id]
+    if kind=="" and book then
+        local available={}
+        for existing_kind,existing_record in pairs(book.variants or {}) do
+            if type(existing_record)=="table" then available[#available+1]=existing_kind end
+        end
+        kind=#available==1 and tostring(available[1]) or "recovered"
+    elseif kind=="" then kind="recovered" end
     local record
-
-    if b then
+    if book then
         if standalone then
-            local row=uid~="" and b.chapters and b.chapters[uid] or nil
-            record=row and (row[kind] or row.notes or row.clean)
+            local row=uid~="" and book.chapters and book.chapters[uid] or nil
+            record=row and row[kind]
             if record then record.chapter_uid=uid end
         else
-            record=b.variants and (b.variants[kind] or b.variants.notes or b.variants.clean)
+            record=book.variants and book.variants[kind]
         end
-        -- Metadata proves the book identity. If its old library row is missing,
-        -- recover a minimal row instead of treating the EPUB as an external book.
         if not record then
             record={
-                book_id=id,title=meta.title or b.title or basename(path),author=meta.author or b.author or "",
+                book_id=id,title=meta.title or book.title or basename(path),author=meta.author or book.author or "",
                 file=path,directory=path:match("^(.*)/[^/]+$"),variant=kind,
                 content_type=meta.content_type,sync_enabled=meta.sync_enabled,read_report_enabled=meta.read_report_enabled,
                 downloaded_at=tonumber(meta.generated_at) or os.time(),chapter_map=chapters,
                 chapter_count=#chapters,complete=meta.complete~=false,file_size=current_size,
                 partial_range=meta.partial_range==true,range_start_index=tonumber(meta.range_start_index),
                 range_end_index=tonumber(meta.range_end_index),range_start_title=meta.range_start_title,
-                range_end_title=meta.range_end_title,
+                range_end_title=meta.range_end_title,annotation_pending=meta.annotation_pending==true or nil,
+                annotation_error_kind=meta.annotation_error_kind,recovered=true,
             }
             if standalone and uid~="" then
                 record.chapter_uid=uid
-                b.chapters=b.chapters or {}; b.chapters[uid]=b.chapters[uid] or {}; b.chapters[uid][kind]=record
+                book.chapters=book.chapters or {}; book.chapters[uid]=book.chapters[uid] or {}; book.chapters[uid][kind]=record
             else
-                b.variants=b.variants or {}; b.variants[kind]=record
+                book.variants=book.variants or {}; book.variants[kind]=record
             end
         end
+        if (#(book.catalog or {})==0) and #chapters>0 then book.catalog=U.copy(chapters) end
     else
-        b={
+        book={
             book_id=id,title=meta.title or tostring(basename(path) or id):gsub("%.epub$",""),
             author=meta.author or "",variants={},chapters={},catalog=chapters,
-            content_type=meta.content_type,
-            directory=path:match("^(.*)/[^/]+$"),updated_at=os.time(),recovered=true,
+            content_type=meta.content_type,directory=path:match("^(.*)/[^/]+$"),updated_at=os.time(),recovered=true,
         }
         record={
-            book_id=id,title=b.title,author=b.author,file=path,directory=b.directory,
-            variant=kind,content_type=meta.content_type,
-            sync_enabled=meta.sync_enabled,read_report_enabled=meta.read_report_enabled,
-            downloaded_at=tonumber(meta.generated_at) or os.time(),
-            chapter_map=chapters,chapter_count=#chapters,complete=meta.complete~=false,
-            file_size=current_size,recovered=true,
+            book_id=id,title=book.title,author=book.author,file=path,directory=book.directory,
+            variant=kind,content_type=meta.content_type,sync_enabled=meta.sync_enabled,
+            read_report_enabled=meta.read_report_enabled,downloaded_at=tonumber(meta.generated_at) or os.time(),
+            chapter_map=chapters,chapter_count=#chapters,complete=meta.complete~=false,file_size=current_size,recovered=true,
             partial_range=meta.partial_range==true,range_start_index=tonumber(meta.range_start_index),
             range_end_index=tonumber(meta.range_end_index),range_start_title=meta.range_start_title,
-            range_end_title=meta.range_end_title,
+            range_end_title=meta.range_end_title,annotation_pending=meta.annotation_pending==true or nil,
+            annotation_error_kind=meta.annotation_error_kind,
         }
-        if standalone and uid~="" then
-            record.chapter_uid=uid; b.chapters[uid]={[kind]=record}
-        else
-            b.variants[kind]=record
-        end
-        all[id]=b
+        if standalone and uid~="" then record.chapter_uid=uid; book.chapters[uid]={[kind]=record}
+        else book.variants[kind]=record end
+        all[id]=book
     end
+    if record and relink then relink_saved_record(self,all,book,record,path,current_size,true) end
+    return book,record,kind
+end
 
-    if record and relink then relink_record(b,record) end
-    return b,record,kind
+function Store:identify_file(path,relink)
+    local book,record,kind=self:file_record_fast(path,relink)
+    if book then return book,record,kind end
+    local meta=self:epub_identity(path)
+    return self:file_record_from_identity(path,meta,relink)
 end
 
 function Store:file_record(path)
@@ -1319,9 +1489,20 @@ function Store:mark_read_report_consumed(stamp)
     for index=#ordered,21,-1 do rows[ordered[index].key]=nil end
     self:set("read_report_consumed",rows)
 end
-function Store:flush() self.db:flush() end
+function Store:flush()
+    self.db:flush()
+    if not self.isolated then
+        local valid=settings_file_valid(self.settings_path)
+        if valid then U.copy_file(self.settings_path,self.settings_backup_path) end
+    end
+end
 function Store:reload()
+    if not self.isolated then restore_settings_file(self.settings_path,self.settings_backup_path) end
     self.db = LuaSettings:open(self.settings_path)
+    if not self.isolated then
+        local valid=settings_file_valid(self.settings_path)
+        if valid then U.copy_file(self.settings_path,self.settings_backup_path) end
+    end
     return self
 end
 return Store
