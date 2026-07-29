@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v2.5.0-beta.1"
+        description: "Release tag, for example v3.0.0-beta.1"
         required: true
         type: string
 
@@ -45,7 +45,7 @@ jobs:
           grep -Fq "version = \"$VERSION\"" miuread.koplugin/_meta.lua
           grep -Fq "VERSION = \"$VERSION\"" miuread.koplugin/miuread/config.lua
           grep -Fq '觅阅 · 微信读书助手' miuread.koplugin/_meta.lua
-          test -f "CHANGELOG.md"
+          test -f "CHANGELOG-$VERSION.txt"
 
           if find miuread.koplugin -type f \( \
               -iname '*.md' -o \
@@ -145,7 +145,7 @@ jobs:
               f"https://github.com/{repo}/releases/download/"
               f"v{version}/{package_name}"
           )
-          notes_path = Path("CHANGELOG.md")
+          notes_path = Path(f"CHANGELOG-{version}.txt")
           notes = notes_path.read_text(encoding="utf-8").strip()
           if not notes:
               notes = "全量更新包。"
@@ -232,7 +232,7 @@ jobs:
           set -euo pipefail
 
           FILE="dist/$PACKAGE_NAME"
-          NOTES_FILE="CHANGELOG.md"
+          NOTES_FILE="CHANGELOG-$VERSION.txt"
           EXTRA_ARGS=()
           case "$VERSION" in
             *-alpha*|*-beta*|*-rc*) EXTRA_ARGS+=(--prerelease) ;;
