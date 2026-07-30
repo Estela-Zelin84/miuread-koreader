@@ -4355,19 +4355,28 @@ function Plugin:_show_thought_href(href)
     local ok,unexpected=xpcall(function()
         local group,err,token=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
         if not group then self:info(tostring(err or "没有想法内容")); return end
-        local text=Thoughts.plain_text(group)
-        if text=="" then self:info("没有想法内容"); return end
-        local shown,mode,show_error=ThoughtPopup.show_plain{
-            fallback_text=text,
-            fallback_title="想法",
+        local prefs=self.store:preferences().thoughts or {}
+        local source_html,html,metrics,html_cache_hit=Thoughts.popup_parts_cached(
+            self.store,info.book_id,info.chapter_uid,info.range,group,token
+        )
+        if html=="" then self:info("没有想法内容"); return end
+        ThoughtPopup.show{
+            source_html=source_html,
+            html=html,
+            font_size=self:_thought_font_size(prefs.font),
+            font_name=self:_thought_font_name(prefs),
+            width_ratio=tonumber(prefs.width_ratio) or 0.91,
+            height_ratio=tonumber(prefs.height_ratio) or 0.60,
+            css=Thoughts.popup_css(),
+            metrics=metrics,
         }
-        if not shown then error(show_error or "想法窗口无法显示") end
         logger.info("[MiuRead][ThoughtPopup] opened",
-            "mode=",tostring(mode or "native"),
+            "mode=","rich",
             "book=",tostring(info.book_id),"chapter=",tostring(info.chapter_uid),
-            "comments=",tostring(Thoughts.comment_count(group)),
+            "comments=",tostring(metrics and metrics.comment_count or 0),
             "source=",token and token.index_hit and "compact_index" or "chapter_cache",
             "cache=",token and token.cache_hit and "hit" or "miss",
+            "html_cache=",html_cache_hit and "hit" or "miss",
             "elapsed_ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
     end,debug.traceback)
     self._thought_popup_busy=false

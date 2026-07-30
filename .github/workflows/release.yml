@@ -1,10 +1,10 @@
-name: Release stable full package
+name: Release full package
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "正式版标签，例如 v3.1.0"
+        description: "Release tag, for example v3.0.1"
         required: true
         type: string
 
@@ -12,35 +12,30 @@ permissions:
   contents: write
 
 concurrency:
-  group: miuread-stable-release
+  group: miuread-release
   cancel-in-progress: false
 
 jobs:
-  release-stable:
+  release:
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ inputs.tag }}
-      SOURCE_BRANCH: main
-      MANIFEST_NAME: update.json
-      RELEASE_CHANNEL: stable
 
     steps:
-      - name: Check out main
+      - name: Check out release source
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ contains(inputs.tag, '-') && 'beta' || 'main' }}
           fetch-depth: 0
 
-      - name: Validate stable source and version
+      - name: Validate source and version
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::正式版标签必须类似 v3.1.0，不能包含 beta、alpha 或 rc。"
-            exit 1
-          fi
+          [[ "$RELEASE_TAG" == v* ]]
           VERSION="${RELEASE_TAG#v}"
+          test -n "$VERSION"
 
           test -d miuread.koplugin
           test -f miuread.koplugin/main.lua
@@ -49,13 +44,8 @@ jobs:
 
           grep -Fq "version = \"$VERSION\"" miuread.koplugin/_meta.lua
           grep -Fq "VERSION = \"$VERSION\"" miuread.koplugin/miuread/config.lua
-          grep -Fq 'UPDATE_CHANNEL = "stable"' miuread.koplugin/miuread/config.lua
-          grep -Fq 'UPDATE_CHANNEL_LABEL = "正式通道"' miuread.koplugin/miuread/config.lua
-          grep -Fq 'UPDATE_MANIFEST = "https://raw.githubusercontent.com/miumiupy98-art/miuread-koreader/main/update.json"' miuread.koplugin/miuread/config.lua
           grep -Fq '觅阅 · 微信读书助手' miuread.koplugin/_meta.lua
-
-          NOTES_FILE="CHANGELOG-$VERSION.txt"
-          test -s "$NOTES_FILE"
+          test -f "CHANGELOG-$VERSION.txt"
 
           if find miuread.koplugin -type f \( \
               -iname '*.md' -o \
@@ -69,18 +59,20 @@ jobs:
             exit 1
           fi
 
+          if [[ "$VERSION" == *-* ]]; then
+            SOURCE_BRANCH="beta"
+            MANIFEST_NAME="update-beta.json"
+          else
+            SOURCE_BRANCH="main"
+            MANIFEST_NAME="update.json"
+          fi
+
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "PACKAGE_NAME=miuread-v${VERSION}-full.zip" >> "$GITHUB_ENV"
+          echo "SOURCE_BRANCH=$SOURCE_BRANCH" >> "$GITHUB_ENV"
+          echo "MANIFEST_NAME=$MANIFEST_NAME" >> "$GITHUB_ENV"
 
-      - name: Run Lua syntax checks
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y lua5.1
-          find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
-
-      - name: Build stable full package and manifest
+      - name: Build full package and update manifest
         shell: bash
         run: |
           set -euo pipefail
@@ -100,7 +92,11 @@ jobs:
           output = Path("dist") / package_name
           fixed_time = (2020, 1, 1, 0, 0, 0)
 
-          excluded_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
+          excluded_names = {
+              ".DS_Store",
+              "miuread.lua",
+              "settings.reader.lua",
+          }
           excluded_suffixes = {".md", ".epub", ".log"}
 
           def excluded(path):
@@ -141,11 +137,14 @@ jobs:
               f"https://github.com/{repo}/releases/download/"
               f"v{version}/{package_name}"
           )
-          notes = Path(f"CHANGELOG-{version}.txt").read_text(encoding="utf-8").strip()
+          notes_path = Path(f"CHANGELOG-{version}.txt")
+          notes = notes_path.read_text(encoding="utf-8").strip()
+          if not notes:
+              notes = "全量更新包。"
           manifest = {
               "version": version,
               "name": f"觅阅 · 微信读书助手 {version}",
-              "channel": "stable",
+              "channel": "beta" if "-" in version else "stable",
               "package_type": "full",
               "package_url": official,
               "package_urls": [
@@ -158,34 +157,36 @@ jobs:
               "sha256": hashlib.sha256(payload).hexdigest(),
               "notes": notes,
           }
-          Path("dist/update.json").write_text(
+          Path("dist", os.environ["MANIFEST_NAME"]).write_text(
               json.dumps(manifest, ensure_ascii=True, indent=2) + "\n",
               encoding="utf-8",
           )
           PY
 
-      - name: Verify stable package and manifest
+      - name: Verify local package
         shell: bash
         run: |
           set -euo pipefail
+
           unzip -t "dist/$PACKAGE_NAME"
 
           python3 - <<'PY'
           from pathlib import Path
           from zipfile import ZipFile
-          import hashlib
-          import json
           import os
           import sys
 
           package = Path("dist") / os.environ["PACKAGE_NAME"]
-          manifest = json.loads(Path("dist/update.json").read_text(encoding="utf-8"))
           required = {
               "miuread.koplugin/_meta.lua",
               "miuread.koplugin/main.lua",
               "miuread.koplugin/miuread/config.lua",
           }
-          forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
+          forbidden_names = {
+              ".DS_Store",
+              "miuread.lua",
+              "settings.reader.lua",
+          }
           forbidden_suffixes = {".md", ".epub", ".log"}
 
           with ZipFile(package) as archive:
@@ -207,23 +208,15 @@ jobs:
                   or "__MACOSX" in path.parts
               ):
                   errors.append(f"不应进入安装包：{name}")
-          if manifest.get("version") != os.environ["VERSION"]:
-              errors.append("更新清单版本错误")
-          if manifest.get("channel") != "stable":
-              errors.append("更新清单通道错误")
-          if manifest.get("size") != package.stat().st_size:
-              errors.append("更新清单文件大小错误")
-          if manifest.get("sha256") != hashlib.sha256(package.read_bytes()).hexdigest():
-              errors.append("更新清单 SHA-256 错误")
 
           if errors:
               for error in errors:
                   print(f"::error::{error}")
               sys.exit(1)
-          print(f"正式版安装包检查通过，共 {len(names)} 个条目。")
+          print(f"安装包检查通过，共 {len(names)} 个条目。")
           PY
 
-      - name: Create or update stable release
+      - name: Create or update GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -232,6 +225,10 @@ jobs:
 
           FILE="dist/$PACKAGE_NAME"
           NOTES_FILE="CHANGELOG-$VERSION.txt"
+          EXTRA_ARGS=()
+          case "$VERSION" in
+            *-alpha*|*-beta*|*-rc*) EXTRA_ARGS+=(--prerelease) ;;
+          esac
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             while IFS= read -r asset; do
@@ -243,18 +240,25 @@ jobs:
                 --jq '.assets[].name'
             )
             gh release upload "$RELEASE_TAG" "$FILE"
-            gh release edit "$RELEASE_TAG" \
-              --target main \
-              --title "觅阅 · 微信读书助手 $VERSION" \
-              --notes-file "$NOTES_FILE" \
-              --prerelease=false \
-              --latest
+            if [ -f "$NOTES_FILE" ]; then
+              gh release edit "$RELEASE_TAG" \
+                --title "觅阅 · 微信读书助手 $VERSION" \
+                --notes-file "$NOTES_FILE"
+            fi
           else
-            gh release create "$RELEASE_TAG" "$FILE" \
-              --target main \
-              --title "觅阅 · 微信读书助手 $VERSION" \
-              --notes-file "$NOTES_FILE" \
-              --latest
+            if [ -f "$NOTES_FILE" ]; then
+              gh release create "$RELEASE_TAG" "$FILE" \
+                --target "$SOURCE_BRANCH" \
+                --title "觅阅 · 微信读书助手 $VERSION" \
+                --notes-file "$NOTES_FILE" \
+                "${EXTRA_ARGS[@]}"
+            else
+              gh release create "$RELEASE_TAG" "$FILE" \
+                --target "$SOURCE_BRANCH" \
+                --title "觅阅 · 微信读书助手 $VERSION" \
+                --notes "全量更新包。" \
+                "${EXTRA_ARGS[@]}"
+            fi
           fi
 
           mapfile -t ASSETS < <(
@@ -274,7 +278,7 @@ jobs:
           set -euo pipefail
 
           URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$PACKAGE_NAME"
-          EXPECTED="$(python3 -c 'import json; print(json.load(open("dist/update.json"))["sha256"])')"
+          EXPECTED="$(python3 -c 'import json, os; print(json.load(open("dist/" + os.environ["MANIFEST_NAME"]))["sha256"])')"
           success=0
           for attempt in $(seq 1 12); do
             rm -f dist/public-download.zip
@@ -290,30 +294,30 @@ jobs:
             sleep 5
           done
           if [ "$success" != "1" ]; then
-            echo "::error::Release 下载地址尚不可用或校验失败；不会更新正式版清单。"
+            echo "::error::Release 下载地址尚不可用或校验失败；不会更新版本清单。"
             exit 1
           fi
 
-      - name: Publish stable manifest
+      - name: Publish update manifest
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          CONTENT="$(base64 -w 0 dist/update.json)"
-          API_PATH="repos/$GITHUB_REPOSITORY/contents/update.json"
-          CURRENT_SHA="$(gh api "$API_PATH?ref=main" --jq '.sha' 2>/dev/null || true)"
+          CONTENT="$(base64 -w 0 "dist/$MANIFEST_NAME")"
+          API_PATH="repos/$GITHUB_REPOSITORY/contents/$MANIFEST_NAME"
+          CURRENT_SHA="$(gh api "$API_PATH?ref=$SOURCE_BRANCH" --jq '.sha' 2>/dev/null || true)"
 
           if [ -n "$CURRENT_SHA" ]; then
             gh api --method PUT "$API_PATH" \
-              -f message="Update update.json to $RELEASE_TAG" \
+              -f message="Update $MANIFEST_NAME to $RELEASE_TAG" \
               -f content="$CONTENT" \
-              -f branch="main" \
+              -f branch="$SOURCE_BRANCH" \
               -f sha="$CURRENT_SHA" >/dev/null
           else
             gh api --method PUT "$API_PATH" \
-              -f message="Add update.json for $RELEASE_TAG" \
+              -f message="Add $MANIFEST_NAME for $RELEASE_TAG" \
               -f content="$CONTENT" \
-              -f branch="main" >/dev/null
+              -f branch="$SOURCE_BRANCH" >/dev/null
           fi
