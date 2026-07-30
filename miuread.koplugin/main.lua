@@ -3814,7 +3814,7 @@ end
 function Plugin:display_settings_menu()
     return {
         {text="显示书架封面",checked_func=function() return self.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("shelf_covers") end},
-        {text="评论显示",post_text="原生轻量窗口",enabled=false},
+        {text="评论字体与字号",sub_item_table_func=function() return self:thought_font_settings_menu() end},
     }
 end
 function Plugin:_memory_mode_label()

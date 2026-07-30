@@ -25,6 +25,7 @@ local CACHE_SCHEMA = 9
 local FOOTNOTE_TRANSFORM_VERSION = 2
 local TITLE_TRANSFORM_VERSION = 2
 local ANNOTATION_TRANSFORM_VERSION = 4
+local ANNOTATION_CACHE_REUSE_SECONDS = 10 * 60
 
 local BASE_CSS = [[
 body { line-height: 1.75; margin: 5%; }
@@ -944,10 +945,26 @@ function Downloader:book(input, opt, progress)
             return cached
         end
 
-        local ok,current=pcall(self.annotations.fetch_chapter,self.annotations,
-            book.bookId,chapter.chapterUid or chapter.uid,function(stage,current_index,total)
-                if report_progress then report_progress(stage,current_index,total) end
-            end)
+        local previous_saved_at=tonumber(previous and previous.saved_at or 0) or 0
+        local force_refresh=previous and previous.complete==true
+            and (previous_saved_at<=0 or os.time()-previous_saved_at>ANNOTATION_CACHE_REUSE_SECONDS)
+        local function persist_checkpoint(snapshot)
+            local merged=self.annotations:merge(previous,snapshot)
+            merged.saved_at=os.time()
+            local saved,save_error=AnnotationCache.save(cache.root,uid,annotation_account_key,self.annotations,merged)
+            if not saved then error("无法保存批注断点："..tostring(save_error)) end
+            previous=AnnotationCache.load(cache.root,uid,annotation_account_key,self.annotations) or merged
+            return previous
+        end
+        local function fetch_once()
+            return self.annotations:fetch_chapter(book.bookId,chapter.chapterUid or chapter.uid,
+                function(stage,current_index,total)
+                    if report_progress then report_progress(stage,current_index,total) end
+                end,
+                {previous=previous,checkpoint=persist_checkpoint,force_refresh=force_refresh})
+        end
+
+        local ok,current=pcall(fetch_once)
         if not ok or type(current)~="table" then
             current={book_id=tostring(book.bookId),chapter_uid=uid,underlines={},review_map={},review_groups={},
                 underline_count=0,thought_count=0,thought_entry_count=0,underline_request_ok=false,
@@ -962,10 +979,7 @@ function Downloader:book(input, opt, progress)
                 "renewed=",tostring(recovered),"book=",tostring(book.bookId),
                 "error=",recovered and "" or tostring(recover_error))
             if recovered then
-                local retry_ok,retry_annotation=pcall(self.annotations.fetch_chapter,self.annotations,
-                    book.bookId,chapter.chapterUid or chapter.uid,function(stage,current_index,total)
-                        if report_progress then report_progress(stage,current_index,total) end
-                    end)
+                local retry_ok,retry_annotation=pcall(fetch_once)
                 if retry_ok and type(retry_annotation)=="table" then
                     current=retry_annotation
                     if current.complete==true or (current.auth_required~=true and current.forbidden~=true) then
@@ -989,22 +1003,34 @@ function Downloader:book(input, opt, progress)
             end
         end
 
+        local merged
+        if current==previous then
+            merged=current
+        else
+            merged=self.annotations:merge(previous,current)
+        end
+        merged.saved_at=os.time()
+        local saved,save_error=AnnotationCache.save(cache.root,uid,annotation_account_key,self.annotations,merged)
+        if not saved then error("无法保存批注断点："..tostring(save_error)) end
+
         if current.auth_required==true then
             error(table.concat(current.errors or {},"; ")~="" and table.concat(current.errors or {},"; ")
                 or "登录状态已失效 [MiuReadAuth]")
         end
         if current.rate_limited==true then
+            annotation_suspended=true
+            annotation_error_kind="rate_limit"
             error(table.concat(current.errors or {},"; ")~="" and table.concat(current.errors or {},"; ")
                 or "请求频率暂时受限 [MiuReadRateLimit]")
         end
         if current.forbidden==true then
             annotation_suspended=true
             annotation_error_kind="forbidden"
+        elseif merged.complete~=true and tostring(current.error_kind or "")~="data" then
+            annotation_suspended=true
+            annotation_error_kind=current.error_kind or "incomplete"
         end
 
-        local merged=self.annotations:merge(previous,current)
-        local saved,save_error=AnnotationCache.save(cache.root,uid,annotation_account_key,self.annotations,merged)
-        if not saved then error("无法保存批注断点："..tostring(save_error)) end
         if type(merged.review_groups)=="table" then
             Thoughts.save(self.store,book.bookId,chapter.chapterUid or chapter.uid,merged.review_groups)
         end
@@ -1170,10 +1196,12 @@ function Downloader:book(input, opt, progress)
                 "to=",tostring(ANNOTATION_TRANSFORM_VERSION))
         end
 
+        local annotation_saved_at=tonumber(entry and entry.annotation_saved_at or 0) or 0
+        local annotation_cache_fresh=annotation_saved_at>0
+            and os.time()-annotation_saved_at<=ANNOTATION_CACHE_REUSE_SECONDS
         local annotation_current=not requested_annotations or (
-            tostring(entry and entry.annotation_run_id or "")==tostring(opt.download_run_id)
-            and tostring(entry and entry.annotation_account_key or "")==tostring(annotation_account_key)
-            and entry.annotation_pending~=true)
+            tostring(entry and entry.annotation_account_key or "")==tostring(annotation_account_key)
+            and entry.annotation_pending~=true and annotation_cache_fresh)
         if entry and entry.complete and annotation_current then
             local cached_path, cached_style = cache_load_final_source(cache, entry)
             if cached_path then
@@ -1234,6 +1262,7 @@ function Downloader:book(input, opt, progress)
             entry.annotation_error_kind=pending and (annotation.error_kind or "incomplete") or nil
             entry.annotation_error=pending and table.concat(annotation.errors or {},"; ") or nil
             entry.annotation_account_key=annotation_account_key
+            entry.annotation_saved_at=tonumber(annotation.saved_at or 0)>0 and tonumber(annotation.saved_at) or os.time()
             entry.annotation_run_id=opt.download_run_id
             if pending then
                 record_annotation_error(chapter,annotation)
@@ -1269,8 +1298,7 @@ function Downloader:book(input, opt, progress)
         for index,chapter in ipairs(selected) do
             local uid=tostring(chapter.chapterUid or chapter.uid)
             local entry=cache.manifest.chapters[uid]
-            if failure_map[uid] or (requested_annotations and entry and entry.annotation_pending==true
-                and entry.annotation_error_kind~="forbidden") then
+            if failure_map[uid] then
                 pending[#pending+1]={chapter=chapter,index=index}
             end
         end
