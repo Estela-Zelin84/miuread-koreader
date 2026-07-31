@@ -1,5 +1,6 @@
 local Json = require("miuread.json")
 local U = require("miuread.util")
+local ResourceRefs = require("miuread.resource_refs")
 local lfs = require("libs/libkoreader-lfs")
 
 local Installer = {}
@@ -75,6 +76,137 @@ local function read_entry(path,entry)
     return data
 end
 
+
+local function read_entry_prefix(path,entry,limit)
+    if not entry or entry.method~=0 then return nil,"EPUB 资源条目不是未压缩格式" end
+    local file,err=io.open(path,"rb")
+    if not file then return nil,err end
+    file:seek("set",entry.offset)
+    local header=file:read(30)
+    if not header or #header~=30 or header:sub(1,4)~="PK\003\004" then file:close(); return nil,"EPUB 本地资源条目损坏" end
+    local name_length=le16(header,27) or 0
+    local extra_length=le16(header,29) or 0
+    file:seek("cur",name_length+extra_length)
+    local length=math.min(tonumber(limit) or 64,tonumber(entry.uncompressed) or 0)
+    local data=file:read(length)
+    file:close()
+    if length>0 and (not data or #data~=length) then return nil,"EPUB 资源读取不完整" end
+    return data or ""
+end
+
+local function decode_entities(value)
+    return tostring(value or "")
+        :gsub("&amp;","&")
+        :gsub("&quot;",'"')
+        :gsub("&#39;","'")
+        :gsub("&lt;","<")
+        :gsub("&gt;",">")
+end
+
+local function url_decode(value)
+    return tostring(value or ""):gsub("%%(%x%x)",function(hex)
+        return string.char(tonumber(hex,16))
+    end)
+end
+
+local function normalize_path(path)
+    path=url_decode(decode_entities(path)):gsub("\\","/")
+    path=path:gsub("[?#].*$","")
+    local parts={}
+    for part in path:gmatch("[^/]+") do
+        if part==".." then
+            if #parts>0 then table.remove(parts) end
+        elseif part~="." and part~="" then
+            parts[#parts+1]=part
+        end
+    end
+    return table.concat(parts,"/")
+end
+
+local function image_signature_ok(mime,data)
+    mime=tostring(mime or ""):lower()
+    data=tostring(data or "")
+    if mime=="image/jpeg" or mime=="image/jpg" then return data:sub(1,3)=="\255\216\255" end
+    if mime=="image/png" then return data:sub(1,8)=="\137PNG\r\n\26\n" end
+    if mime=="image/gif" then return data:sub(1,4)=="GIF8" end
+    if mime=="image/webp" then return data:sub(1,4)=="RIFF" and data:sub(9,12)=="WEBP" end
+    if mime=="image/svg+xml" then return data:lower():find("<svg",1,true)~=nil end
+    -- AVIF and future formats are accepted when non-empty; KOReader support
+    -- depends on the bundled image library, but the EPUB itself is coherent.
+    return mime:match("^image/")~=nil and #data>0
+end
+
+local function validate_resources(path,entries,opt)
+    local opf,opf_error=read_entry(path,entries["OEBPS/package.opf"])
+    if not opf then return nil,opf_error end
+    local manifest={}
+    local image_assets=0
+    for item in opf:gmatch("<[iI][tT][eE][mM][^>]*>") do
+        local href=item:match('[hH][rR][eE][fF]%s*=%s*"([^"]+)"')
+            or item:match("[hH][rR][eE][fF]%s*=%s*'([^']+)'")
+        local mime=item:match('[mM][eE][dD][iI][aA]%-[tT][yY][pP][eE]%s*=%s*"([^"]+)"')
+            or item:match("[mM][eE][dD][iI][aA]%-[tT][yY][pP][eE]%s*=%s*'([^']+)'")
+        if href then
+            local full=normalize_path("OEBPS/"..href)
+            manifest[full]=tostring(mime or "")
+            local is_cover=item:lower():find("cover%-image")~=nil
+            if tostring(mime or ""):lower():match("^image/") and not is_cover then image_assets=image_assets+1 end
+        end
+    end
+
+    local referenced={}
+    local external=0
+    local broken={}
+    local function inspect_document(name)
+        local raw,err=read_entry(path,entries[name])
+        if not raw then broken[#broken+1]=name.."（"..tostring(err).."）"; return end
+        for _,item in ipairs(ResourceRefs.collect(raw,{css=name=="OEBPS/style.css"})) do
+            local target,kind=ResourceRefs.resolve(name,item.value)
+            local relevant=item.kind=="image" or (target and tostring(manifest[target] or ""):lower():match("^image/"))
+                or ResourceRefs.looks_like_image(item.value)
+            if kind=="external" and relevant then
+                external=external+1
+                if #broken<6 then broken[#broken+1]=name.." 仍引用网络图片："..tostring(item.value) end
+            elseif target and relevant and not referenced[target] then
+                referenced[target]=true
+                local entry=entries[target]
+                local mime=manifest[target]
+                if not entry then
+                    if #broken<6 then broken[#broken+1]=name.." 引用不存在的资源："..target end
+                elseif not mime or not tostring(mime):lower():match("^image/") then
+                    if #broken<6 then broken[#broken+1]=target.." 未正确登记为图片" end
+                elseif tonumber(entry.uncompressed or 0)<=0 then
+                    if #broken<6 then broken[#broken+1]=target.." 是空文件" end
+                else
+                    local prefix,prefix_error=read_entry_prefix(path,entry,256)
+                    if not prefix or not image_signature_ok(mime,prefix) then
+                        if #broken<6 then broken[#broken+1]=target.." 图片格式无效"..(prefix_error and "："..prefix_error or "") end
+                    end
+                end
+            end
+        end
+    end
+
+    for name in pairs(entries) do
+        if name:match("^OEBPS/text/.+%.xhtml$") or name=="OEBPS/style.css" then inspect_document(name) end
+    end
+
+    local ref_count=0
+    for _ in pairs(referenced) do ref_count=ref_count+1 end
+    local summary=type(opt and opt.image_summary)=="table" and opt.image_summary or {}
+    local missing=tonumber(summary.required_missing)
+    if missing==nil then missing=tonumber(summary.missing or 0) or 0 end
+    if external>0 then return nil,"EPUB 正文仍包含网络图片引用；"..table.concat(broken,"；") end
+    if #broken>0 then return nil,"EPUB 图片引用或文件无效；"..table.concat(broken,"；") end
+    if missing>0 then return nil,"EPUB 仍有 "..tostring(missing).." 个必需正文图片资源缺失" end
+    -- Zero final image references is valid for text-only books and for books
+    -- whose optional footnote/decorative image markers were converted to text.
+    -- The downloader prunes orphan assets before building the OPF; validation
+    -- only checks resources that the final document actually references.
+    return {references=ref_count,assets=image_assets,external=external,broken=0,
+        orphans=math.max(0,image_assets-ref_count)}
+end
+
 local function uid_set(chapters)
     local set={}
     for _,chapter in ipairs(chapters or {}) do
@@ -145,6 +277,10 @@ function Installer.validate(path,opt)
         local ok,missing=contains_all(type(meta.chapters)=="table" and meta.chapters or {},previous)
         if not ok then return nil,"新 EPUB 缺少旧版本章节："..tostring(missing) end
     end
+    local resource_stats,resource_error=validate_resources(path,entries,opt)
+    if not resource_stats then return nil,resource_error end
+    meta._image_references=resource_stats.references
+    meta._image_assets=resource_stats.assets
     return true,meta
 end
 

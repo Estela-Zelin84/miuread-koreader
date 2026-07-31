@@ -513,7 +513,7 @@ function Thoughts.popup_parts(group)
     local metrics = {source_chars=0, source_units=0, comment_count=0, comment_chars={}, comment_units={}}
     local abstract = Thoughts.group_abstract(group)
     if abstract ~= "" then
-        local source = preview(abstract, 72)
+        local source = preview(abstract, 240)
         metrics.source_chars = codepoint_len(source)
         metrics.source_units = display_units(source)
         fixed[#fixed + 1] = panel_head_html("正文")
@@ -563,6 +563,50 @@ function Thoughts.popup_parts_cached(store, book_id, chapter_uid, range, group, 
     return source_html, html, metrics, false
 end
 
+
+
+
+function Thoughts.native_parts(group)
+    if type(group) ~= "table" then return "", {}, 0 end
+    local source = preview(Thoughts.group_abstract(group), 240)
+    local comments, seen = {}, {}
+    for _, item in ipairs(group.texts or {}) do
+        local content = clean(item.content)
+        if content ~= "" then
+            local author = clean(item.author)
+            if author == "" then author = "微信读书用户" end
+            local review_id = tostring(item.review_id or "")
+            local key = review_id ~= "" and ("id:" .. review_id) or (author .. "\0" .. content)
+            if not seen[key] then
+                seen[key] = true
+                comments[#comments + 1] = {
+                    author = author,
+                    content = content,
+                    likes = tonumber(item.likes or 0) or 0,
+                    review_id = review_id,
+                }
+            end
+        end
+    end
+    return source, comments, #comments
+end
+
+function Thoughts.native_parts_cached(store, book_id, chapter_uid, range, group, token)
+    token = type(token) == "table" and token or {}
+    local path = tostring(token.path or Thoughts.cache_path(store, book_id, chapter_uid))
+    local signature = tostring(token.signature or file_signature(path) or "missing")
+    local key = table.concat({"native", path, signature, tostring(range or "")}, "|")
+    local cached = popup_cache[key]
+    if cached and cached.native == true then
+        cache_touch(popup_cache_order, key)
+        return cached.source, cached.comments, cached.count, true
+    end
+    local source, comments, count = Thoughts.native_parts(group)
+    popup_cache[key] = {native=true, source=source, comments=comments, count=count}
+    cache_touch(popup_cache_order, key)
+    cache_trim(popup_cache, popup_cache_order, POPUP_CACHE_LIMIT)
+    return source, comments, count, false
+end
 
 function Thoughts.plain_text(group)
     if type(group) ~= "table" then return "没有想法内容" end
@@ -702,6 +746,82 @@ function Thoughts.comment_count(group)
     return count
 end
 
+
+
+local function thought_sources_for_book(store, book_id)
+    local dir = store:book_dir(book_id) .. "/thoughts"
+    if lfs.attributes(dir, "mode") ~= "directory" then return {}, dir end
+    local files = {}
+    for name in lfs.dir(dir) do
+        if name ~= "." and name ~= ".." and name:match("%.json$") then
+            files[#files + 1] = dir .. "/" .. name
+        end
+    end
+    table.sort(files)
+    return files, dir
+end
+
+function Thoughts.inspect_book_indexes(store, book_id, limit)
+    local files = thought_sources_for_book(store, book_id)
+    local report = {book_id=tostring(book_id or ""), sources=0, valid=0, missing=0, errors={}}
+    local maximum = math.max(1, tonumber(limit) or 100000)
+    for _, source_path in ipairs(files) do
+        if report.sources >= maximum then report.truncated = true; break end
+        report.sources = report.sources + 1
+        local index, err = load_compact_index(source_path)
+        if index then
+            report.valid = report.valid + 1
+        else
+            report.missing = report.missing + 1
+            if #report.errors < 5 then report.errors[#report.errors + 1] = tostring(err or "索引不可用") end
+        end
+    end
+    report.issue = report.sources > 0 and report.missing > 0
+    return report
+end
+
+function Thoughts.repair_book_indexes(store, book_id, force)
+    local files = thought_sources_for_book(store, book_id)
+    local result = {book_id=tostring(book_id or ""), checked=0, rebuilt=0, kept=0, failed=0, errors={}}
+    for _, source_path in ipairs(files) do
+        result.checked = result.checked + 1
+        local index = not force and load_compact_index(source_path) or nil
+        if index then
+            result.kept = result.kept + 1
+        else
+            if force then remove_index_files(source_path) end
+            local raw = U.read_file(source_path, true)
+            local ok, rows = false, nil
+            if raw then ok, rows = pcall(Json.decode, raw) end
+            if ok and type(rows) == "table" then
+                local built, err = build_index_from_rows(source_path, rows)
+                if built then result.rebuilt = result.rebuilt + 1
+                else
+                    result.failed = result.failed + 1
+                    if #result.errors < 5 then result.errors[#result.errors + 1] = tostring(err or "索引写入失败") end
+                end
+            else
+                result.failed = result.failed + 1
+                if #result.errors < 5 then result.errors[#result.errors + 1] = "想法缓存损坏" end
+            end
+        end
+    end
+    Thoughts.clear_memory_cache()
+    result.ok = result.failed == 0
+    return result
+end
+
+function Thoughts.remove_invalid_indexes(store, book_id)
+    local files = thought_sources_for_book(store, book_id)
+    local removed = 0
+    for _, source_path in ipairs(files) do
+        local index = load_compact_index(source_path)
+        if not index then remove_index_files(source_path); removed = removed + 1 end
+    end
+    Thoughts.clear_memory_cache()
+    return removed
+end
+
 function Thoughts.clear_memory_cache()
     chapter_cache = {}
     chapter_cache_order = {}
@@ -724,12 +844,13 @@ body{margin:0!important;padding:.18em .26em .20em .26em!important;line-height:1.
 .miu-panel-head{font-size:.52em;font-weight:normal;line-height:1.02;color:#555;margin:0 1.9em .16em 0;padding:0}
 .miu-source{margin:0;padding:0}
 .miu-source-box{font-size:.68em;line-height:1.15;color:#444;margin:0;padding:.17em .23em;border:1px solid #aaa}
-.miu-comment{margin:0;padding:.14em 0 .13em 0;border:0;page-break-inside:avoid;break-inside:avoid-page}
-.miu-comment+.miu-comment{margin-top:.13em;padding-top:.18em;border-top:1px solid #c8c8c8}
+.miu-comment{margin:0;padding:.10em 0 .09em 0;border:0;page-break-inside:avoid;break-inside:avoid-page}
+.miu-comment+.miu-comment{margin-top:.09em;padding-top:.13em;border-top:1px solid #c8c8c8}
 .miu-meta{margin:0;padding:0;line-height:1.02;page-break-after:avoid}
-.miu-author{font-size:.49em;font-weight:normal;color:#666;line-height:1.02}
-.miu-likes{font-size:.47em;font-weight:normal;color:#777;line-height:1.02;white-space:nowrap}
+.miu-author{font-size:.47em;font-weight:normal;color:#666;line-height:1.02}
+.miu-likes{font-size:.45em;font-weight:normal;color:#777;line-height:1.02;white-space:nowrap}
 .miu-content{font-size:.80em;line-height:1.20;margin:.07em 0 0 0;padding:0 0 .08em 0;page-break-before:avoid;orphans:2;widows:2}
+.miu-empty{font-size:.70em;color:#666;margin:.45em 0;text-align:center}
 ]]
 end
 return Thoughts

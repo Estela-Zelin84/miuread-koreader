@@ -5,6 +5,7 @@ local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
+local GestureBridge = require("miuread.gesture_bridge")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local ImageWidget = require("ui/widget/imagewidget")
@@ -27,14 +28,10 @@ local DIVIDER_COLOR = Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
 local function status_text(book)
     if book.status_text and tostring(book.status_text)~="" then return tostring(book.status_text) end
     if book.download_status and tostring(book.download_status)~="" then return tostring(book.download_status) end
-    local state
-    if book.downloaded then state="已生成"
-    elseif book.local_only then state="已生成书籍"
-    else state="未生成" end
     local progress = tonumber(book.progress or 0) or 0
-    if progress >= 100 then return state .. " · 已读完" end
-    if progress > 0 then return state .. " · " .. tostring(math.floor(progress + .5)) .. "%" end
-    return state
+    if progress >= 100 then return "已读完" end
+    if progress > 0 then return "阅读 " .. tostring(math.floor(progress + .5)) .. "%" end
+    return "未开始"
 end
 
 local function supported_image(path)
@@ -53,15 +50,17 @@ end
 local function placeholder(cover_w,cover_h,title)
     local mark=U.utf8_sub(tostring(title or "书"):gsub("^%s+",""),1,1)
     if mark=="" then mark="书" end
+    local border=Size.border.thin
     return FrameContainer:new{
-        width=cover_w,
-        height=cover_h,
-        bordersize=Size.border.thin,
+        bordersize=border,
         padding=0,
         margin=0,
         background=Blitbuffer.COLOR_WHITE,
         CenterContainer:new{
-            dimen=Geom:new{w=cover_w, h=cover_h},
+            dimen=Geom:new{
+                w=math.max(1,cover_w-border*2),
+                h=math.max(1,cover_h-border*2),
+            },
             TextWidget:new{text=mark, face=Font:getFace("cfont", math.min(20,Screen:scaleBySize(17)))},
         },
     }
@@ -75,11 +74,16 @@ local function safe_cover(path,cover_w,cover_h,book_id)
             file=path,
             width=cover_w,
             height=cover_h,
+            scale_factor=0,
             file_do_cache=false,
         }
         image:getSize()
+        image.width=nil
+        image.height=nil
     end)
-    if ok and image then return image end
+    if ok and image then
+        return CenterContainer:new{dimen=Geom:new{w=cover_w,h=cover_h},image}
+    end
     if image and type(image.free)=="function" then pcall(image.free,image) end
     logger.warn("[MiuRead][Cover] render failed","book_id=",tostring(book_id or ""),"path=",tostring(path),"error=",tostring(err))
     return nil,tostring(err or "render failed")
@@ -147,7 +151,7 @@ function ShelfItem:init()
         face=Font:getFace("cfont", math.min(20, Screen:scaleBySize(17))),
         width=text_w,
         height=math.floor(h * .50),
-        height_adjust=true,
+        height_adjust=false,
         height_overflow_show_ellipsis=true,
         alignment="left",
         bold=true,
@@ -161,7 +165,7 @@ function ShelfItem:init()
         face=Font:getFace("smallinfofont", math.min(16, Screen:scaleBySize(13))),
         width=text_w,
         height=math.floor(h * .28),
-        height_adjust=true,
+        height_adjust=false,
         height_overflow_show_ellipsis=true,
         alignment="left",
         fgcolor=Blitbuffer.COLOR_DARK_GRAY,
@@ -226,6 +230,7 @@ function ShelfItem:onUnfocus()
 end
 
 local ShelfMenu = Menu:extend{
+    _miuread_transient = true,
     on_select_callback = nil,
     on_hold_callback = nil,
     on_page_changed = nil,
@@ -234,6 +239,10 @@ local ShelfMenu = Menu:extend{
     _miu_closed = false,
     _suppress_page_callback = false,
 }
+
+function ShelfMenu:handleEvent(event)
+    return GestureBridge.handle(Menu, self, event)
+end
 
 function ShelfMenu:onMenuSelect(entry, pos)
     if entry and (entry._miu_action_row or entry._miu_tab_row) then

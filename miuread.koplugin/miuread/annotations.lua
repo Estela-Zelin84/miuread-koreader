@@ -24,7 +24,7 @@ end
 
 local function call_with_retry(label, fn)
     local last
-    for attempt = 1, 3 do
+    for attempt = 1, 2 do
         local ok, value = pcall(fn)
         if ok and type(value) == "table" then return true, value, false end
         last = ok and (label .. " returned invalid data") or tostring(value)
@@ -32,10 +32,9 @@ local function call_with_retry(label, fn)
         if Http.is_rate_limit_error(last) then return false,last,false,"rate_limit" end
         if Http.is_forbidden_error(last) then return false,last,false,"forbidden" end
         local network_down=is_network_failure(last)
-        local max_attempts=network_down and 2 or 3
-        if attempt < max_attempts then
-            logger.warn("[MiuRead][Annotations] retry", "label=", label, "attempt=", tostring(attempt), "error=", tostring(last))
-            pause(attempt == 1 and 0.6 or 1.4)
+        if network_down and attempt == 1 then
+            logger.warn("[MiuRead][Annotations] network retry", "label=", label, "error=", tostring(last))
+            pause(2.0)
         else
             return false,last,network_down,nil
         end
@@ -154,61 +153,121 @@ end
 
 function Annotations:new(api) return setmetatable({api = api}, self) end
 
-function Annotations:fetch_chapter(book_id, uid, progress)
+function Annotations:fetch_chapter(book_id, uid, progress, options)
+    options=type(options)=="table" and options or {}
+    local previous=type(options.previous)=="table" and options.previous or nil
+    local checkpoint=type(options.checkpoint)=="function" and options.checkpoint or nil
+    progress=progress or function() end
+
+    if previous and previous.complete==true and options.force_refresh~=true then
+        previous.cached=true
+        return previous
+    end
+
     local result={book_id=str(book_id),chapter_uid=str(uid),underlines={},review_map={},review_groups={},
         underline_count=0,thought_count=0,thought_entry_count=0,errors={},underline_request_ok=false,
         underlines_partial=false,completed_ranges={},pending_ranges={},review_complete=false,complete=false}
-    progress=progress or function() end
-    local ok,data,network_down,error_kind=call_with_retry("underlines",function()
-        return self.api:underlines(book_id,uid)
-    end)
-    if not ok then
-        local err=str(data)
-        result.errors[#result.errors+1]=err
-        result.auth_required=error_kind=="authentication"
-        result.forbidden=error_kind=="forbidden"
-        result.rate_limited=error_kind=="rate_limit"
-        result.error_kind=error_kind or (network_down and "network") or "server"
-        logger.warn("[MiuRead][Annotations] underlines failed","book=",result.book_id,
-            "chapter=",result.chapter_uid,"kind=",tostring(result.error_kind),"error=",err)
+
+    local reuse_pending=previous and previous.underline_request_ok==true
+        and previous.underlines_partial~=true and #(previous.underlines or {})>0
+        and #(previous.pending_ranges or {})>0
+    if reuse_pending then
+        result.underlines=previous.underlines
+        result.underline_count=#result.underlines
+        result.underline_request_ok=true
+        progress("underlines",result.underline_count,result.underline_count,"继续未完成的想法")
+    else
+        local ok,data,network_down,error_kind=call_with_retry("underlines",function()
+            return self.api:underlines(book_id,uid)
+        end)
+        if not ok then
+            local err=str(data)
+            result.errors[#result.errors+1]=err
+            result.auth_required=error_kind=="authentication"
+            result.forbidden=error_kind=="forbidden"
+            result.rate_limited=error_kind=="rate_limit"
+            result.error_kind=error_kind or (network_down and "network") or "server"
+            logger.warn("[MiuRead][Annotations] underlines failed","book=",result.book_id,
+                "chapter=",result.chapter_uid,"kind=",tostring(result.error_kind),"error=",err)
+            return result
+        end
+
+        result.underline_request_ok=true
+        local invalid_underlines
+        result.underlines,invalid_underlines=table_entries(array_from(data,{"underlines","updated","bookmarks"}))
+        result.underline_count=#result.underlines
+        if invalid_underlines>0 then
+            result.underlines_partial=true
+            result.error_kind=result.error_kind or "data"
+            result.errors[#result.errors+1]="underline response contained invalid entries"
+            logger.warn("[MiuRead][Annotations] ignored invalid underline entries",
+                "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid_underlines))
+        end
+        progress("underlines",result.underline_count,result.underline_count,"")
+    end
+
+    local active_ranges,active_seen={},{ }
+    for _,row in ipairs(result.underlines) do
+        local key=range_key(row)
+        if key~="" and not active_seen[key] then active_seen[key]=true; active_ranges[#active_ranges+1]=key end
+    end
+    if #active_ranges==0 then
+        result.review_complete=true
+        result.complete=result.underline_request_ok and result.underlines_partial~=true
         return result
     end
 
-    result.underline_request_ok=true
-    local invalid_underlines
-    result.underlines,invalid_underlines=table_entries(array_from(data,{"underlines","updated","bookmarks"}))
-    result.underline_count=#result.underlines
-    if invalid_underlines>0 then
-        result.underlines_partial=true
-        result.error_kind=result.error_kind or "data"
-        result.errors[#result.errors+1]="underline response contained invalid entries"
-        logger.warn("[MiuRead][Annotations] ignored invalid underline entries",
-            "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid_underlines))
+    local target_ranges={}
+    if reuse_pending then
+        for _,key in ipairs(previous.pending_ranges or {}) do
+            key=tostring(key or "")
+            if key~="" and active_seen[key] then target_ranges[#target_ranges+1]=key end
+        end
+    else
+        target_ranges=active_ranges
     end
-
-    local ranges,seen={},{ }
-    for _,row in ipairs(result.underlines) do
-        local key=range_key(row)
-        if key~="" and not seen[key] then seen[key]=true; ranges[#ranges+1]=key end
-    end
-    progress("underlines",result.underline_count,result.underline_count,"")
-    if #ranges==0 then
+    if #target_ranges==0 then
         result.review_complete=true
         result.complete=result.underline_request_ok and result.underlines_partial~=true
         return result
     end
 
     local groups={}
-    local batches=self.api:review_batches(ranges,5)
+    local batches=self.api:review_batches(target_ranges,5)
     local completed,pending={},{}
-    local function mark_batch(batch,target)
+    for _,key in ipairs(target_ranges) do pending[tostring(key)]=true end
+
+    local function mark_batch(batch,target,value)
         for _,item in ipairs(batch or {}) do
             local key=range_key(item)
-            if key~="" then target[key]=true end
+            if key~="" then
+                target[key]=value==nil and true or value
+            end
         end
     end
-    local function mark_remaining(first)
-        for index=first,#batches do mark_batch(batches[index],pending) end
+    local function rebuild_state()
+        local invalid_reviews
+        result.review_map,result.review_groups,result.thought_count,result.thought_entry_count,invalid_reviews=
+            normalize_reviews({reviews=groups})
+        result.completed_ranges={}
+        result.pending_ranges={}
+        for key in pairs(completed) do result.completed_ranges[#result.completed_ranges+1]=key end
+        for key in pairs(pending) do result.pending_ranges[#result.pending_ranges+1]=key end
+        table.sort(result.completed_ranges)
+        table.sort(result.pending_ranges)
+        result.review_complete=#result.pending_ranges==0
+        result.complete=result.underline_request_ok and result.underlines_partial~=true and result.review_complete
+        if invalid_reviews>0 then
+            logger.warn("[MiuRead][Annotations] ignored invalid review entries",
+                "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid_reviews))
+        end
+    end
+    local function save_checkpoint()
+        rebuild_state()
+        if checkpoint then
+            local ok,err=pcall(checkpoint,result)
+            if not ok then error("无法保存批注断点："..tostring(err)) end
+        end
     end
 
     for index,batch in ipairs(batches) do
@@ -220,16 +279,19 @@ function Annotations:fetch_chapter(book_id, uid, progress)
             local rows,invalid=table_entries(array_from(response,{"reviews","updated"}))
             for _,item in ipairs(rows) do groups[#groups+1]=item end
             if invalid>0 then
-                mark_batch(batch,pending)
                 result.error_kind=result.error_kind or "data"
                 result.errors[#result.errors+1]="batch "..tostring(index).." contained invalid review groups"
                 logger.warn("[MiuRead][Annotations] ignored invalid review groups","book=",result.book_id,
                     "chapter=",result.chapter_uid,"batch=",tostring(index),"count=",tostring(invalid))
             else
-                mark_batch(batch,completed)
+                for _,item in ipairs(batch or {}) do
+                    local key=range_key(item)
+                    if key~="" then pending[key]=nil; completed[key]=true end
+                end
             end
+            save_checkpoint()
         elseif is_data_specific_failure(response) then
-            logger.warn("[MiuRead][Annotations] thoughts batch failed; trying individual ranges",
+            logger.warn("[MiuRead][Annotations] thoughts batch failed; isolating ranges",
                 "book=",result.book_id,"chapter=",result.chapter_uid,"batch=",index,"/",#batches)
             local stop=false
             for item_index,item in ipairs(batch) do
@@ -243,24 +305,23 @@ function Annotations:fetch_chapter(book_id, uid, progress)
                     local rows,invalid=table_entries(array_from(single_response,{"reviews","updated"}))
                     for _,row in ipairs(rows) do groups[#groups+1]=row end
                     if invalid>0 then
-                        if key~="" then pending[key]=true end
                         result.error_kind=result.error_kind or "data"
                         result.errors[#result.errors+1]="review range contained invalid entries"
                         logger.warn("[MiuRead][Annotations] ignored invalid review groups",
                             "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid))
                     elseif key~="" then
+                        pending[key]=nil
                         completed[key]=true
                     end
+                    save_checkpoint()
                 else
-                    if key~="" then pending[key]=true end
                     result.errors[#result.errors+1]=str(single_response)
                     result.error_kind=single_kind or (single_network and "network") or "server"
                     result.auth_required=single_kind=="authentication"
                     result.forbidden=single_kind=="forbidden"
                     result.rate_limited=single_kind=="rate_limit"
+                    save_checkpoint()
                     if result.auth_required or result.forbidden or result.rate_limited or single_network then
-                        for rest=item_index+1,#batch do mark_batch({batch[rest]},pending) end
-                        mark_remaining(index+1)
                         stop=true
                         break
                     end
@@ -268,7 +329,6 @@ function Annotations:fetch_chapter(book_id, uid, progress)
             end
             if stop then break end
         else
-            mark_remaining(index)
             result.errors[#result.errors+1]="batch "..tostring(index)..": "..str(response)
             result.error_kind=batch_kind or (batch_network and "network") or "server"
             result.auth_required=batch_kind=="authentication"
@@ -277,21 +337,12 @@ function Annotations:fetch_chapter(book_id, uid, progress)
             logger.warn("[MiuRead][Annotations] thoughts batch deferred","book=",result.book_id,
                 "chapter=",result.chapter_uid,"batch=",tostring(index),"/",tostring(#batches),
                 "kind=",tostring(result.error_kind))
+            save_checkpoint()
             break
         end
     end
 
-    local invalid_reviews
-    result.review_map,result.review_groups,result.thought_count,result.thought_entry_count,invalid_reviews=
-        normalize_reviews({reviews=groups})
-    for key in pairs(completed) do result.completed_ranges[#result.completed_ranges+1]=key end
-    for key in pairs(pending) do result.pending_ranges[#result.pending_ranges+1]=key end
-    table.sort(result.completed_ranges)
-    table.sort(result.pending_ranges)
-    result.review_complete=#result.pending_ranges==0
-    result.complete=result.underline_request_ok and result.underlines_partial~=true and result.review_complete
-    if invalid_reviews>0 then logger.warn("[MiuRead][Annotations] ignored invalid review entries",
-        "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid_reviews)) end
+    rebuild_state()
     logger.info("[MiuRead][Annotations] chapter fetched","book=",result.book_id,"chapter=",result.chapter_uid,
         "underlines=",result.underline_count,"thought_groups=",result.thought_count,
         "thought_entries=",result.thought_entry_count,"pending_ranges=",#result.pending_ranges)

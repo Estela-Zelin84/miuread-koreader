@@ -541,6 +541,20 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
     end
     local done_ok,done=pcall(FFIUtil.isSubProcessDone,pid,false)
     local alive=process_exists(pid)
+    local result_ready=read_json(self.job.result_path)
+    local recovery_ready=self.job.recovery_path and read_json(self.job.recovery_path) or nil
+    local progress_ready=self.job.last_progress_state
+    local completed_snapshot=progress_ready and progress_ready.stage=="done"
+        and usable_recovery_result(progress_ready.recovery_result)
+    -- A finished child without a consumable result is a stale task record, not
+    -- a running task.  Do not attach it and automatically spawn a duplicate
+    -- worker after KOReader starts (especially while the user is reading).
+    if done_ok and done==true and alive~=true
+        and not result_ready and not usable_recovery_result(recovery_ready)
+        and not completed_snapshot then
+        self.job=nil
+        return false,"上次后台下载进程已经结束；断点已保留，请手动继续下载"
+    end
     if not done_ok and alive==nil then
         logger.warn("[MiuRead][DownloadTask] attached with unknown process state",
             "pid=",tostring(pid),"error=",tostring(done))
@@ -549,7 +563,7 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
     self:_hold_awake()
     logger.info("[MiuRead][DownloadTask] attached","pid=",tostring(pid),
         "done=",tostring(done_ok and done or "unknown"),"alive=",tostring(alive))
-    if read_json(self.job.result_path) then
+    if result_ready or usable_recovery_result(recovery_ready) or completed_snapshot then
         local attached_job=self.job
         UIManager:scheduleIn(0,function()
             if self.job==attached_job and self:_owns_job() then self:_finish(attached_job) end
@@ -580,6 +594,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     local clean_book = serializable_copy(book)
     local clean_options = serializable_copy(options or {})
     clean_options.download_run_id=tostring(clean_options.download_run_id or task_token)
+    clean_options.reader_active_path="/tmp/miuread-reader-active.flag"
+    clean_options.reader_busy_path="/tmp/miuread-reader-busy.until"
     local start_auth=self.store:auth()
     local start_account=type(start_auth.account)=="table" and start_auth.account or {}
     local auth_snapshot={

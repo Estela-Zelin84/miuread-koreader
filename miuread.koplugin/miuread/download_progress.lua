@@ -5,6 +5,7 @@ local Device = require("device")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
+local GestureBridge = require("miuread.gesture_bridge")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local ProgressWidget = require("ui/widget/progresswidget")
 local Size = require("ui/size")
@@ -18,9 +19,14 @@ local Screen = Device.screen
 
 local DownloadProgress = InputContainer:extend{
     title = "MiuRead",
+    _miuread_transient = true,
     on_cancel = nil,
     on_background = nil,
 }
+
+function DownloadProgress:handleEvent(event)
+    return GestureBridge.handle(InputContainer, self, event)
+end
 
 local function clamp(v, lo, hi)
     v = tonumber(v) or lo

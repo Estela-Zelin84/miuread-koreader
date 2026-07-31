@@ -1,8 +1,19 @@
 local Device=require("device")
 local logger=require("logger")
-local QRMessage=require("ui/widget/qrmessage")
-local ButtonDialog=require("ui/widget/buttondialog")
-local InputDialog=require("ui/widget/inputdialog")
+local RawQRMessage=require("ui/widget/qrmessage")
+local RawButtonDialog=require("ui/widget/buttondialog")
+local RawInputDialog=require("ui/widget/inputdialog")
+local GestureBridge=require("miuread.gesture_bridge")
+local function gesture_aware_class(base)
+    local class=base:extend{_miuread_transient=true}
+    function class:handleEvent(event)
+        return GestureBridge.handle(base,self,event)
+    end
+    return class
+end
+local QRMessage=gesture_aware_class(RawQRMessage)
+local ButtonDialog=gesture_aware_class(RawButtonDialog)
+local InputDialog=gesture_aware_class(RawInputDialog)
 local UIManager=require("ui/uimanager")
 local Cookies=require("miuread.cookies")
 local Protocol=require("miuread.protocol")

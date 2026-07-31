@@ -1491,6 +1491,36 @@ function Sync:_start_daemon(reason)
     return true
 end
 
+function Sync:_stop_daemon_fast(reason, flush_elapsed)
+    local daemon = self.daemon
+    if self.control_write_task then
+        UIManager:unschedule(self.control_write_task)
+        self.control_write_task = nil
+    end
+    if not daemon then return end
+
+    local extra = {}
+    flush_elapsed = math.floor(tonumber(flush_elapsed) or 0)
+    if daemon.book_id and flush_elapsed >= FINAL_REPORT_MIN_SECONDS then
+        local existing = read_json_file(daemon.paths.control) or {}
+        extra.flush_seq = (tonumber(existing.flush_seq or 0) or 0) + 1
+        extra.flush_elapsed = flush_elapsed
+        extra.flush_reason = tostring(reason or "stop")
+        daemon.final_book_id = daemon.book_id
+        daemon.final_flush_pending = true
+    end
+
+    -- Closing a book or locking the device must not synchronously import the
+    -- worker status and rewrite the full report context. The long-lived worker
+    -- receives one small control-file update and completes the final upload on
+    -- its own. Status/context reconciliation happens after resume or on the
+    -- next normal poll.
+    daemon.active = false
+    self:_write_daemon_control(false, true, extra)
+    self.next_due = 0
+    if not daemon.final_flush_pending then daemon.book_id = nil end
+end
+
 function Sync:_stop_daemon(reason, persist, flush_elapsed)
     local daemon = self.daemon
     if self.control_write_task then UIManager:unschedule(self.control_write_task); self.control_write_task=nil end
@@ -1521,9 +1551,9 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
     end
 end
 
-function Sync:_final_elapsed()
+function Sync:_final_elapsed(skip_status_import)
     if not self.store:preferences().sync.time_enabled or not self:record() then return nil end
-    self:_import_daemon_status(true)
+    if skip_status_import ~= true then self:_import_daemon_status(true) end
     local now = os.time()
     local started = tonumber(self.session_started_at or 0) or 0
     if started <= 0 then started = now end
@@ -1596,6 +1626,16 @@ function Sync:stop(reason, flush_elapsed)
     self.progress_hold = false
     self.state = "stopped"
     logger.info("[MiuRead][ReadReport] stopped", "reason=", tostring(reason))
+end
+
+function Sync:stop_fast(reason, flush_elapsed)
+    self.time_enabled = (self.store:preferences().sync or {}).time_enabled==true
+    self:_stop_daemon_fast(reason, flush_elapsed)
+    self.async:cancel(reason)
+    self.busy = false
+    self.progress_hold = false
+    self.state = "stopped"
+    logger.info("[MiuRead][ReadReport] stopped fast", "reason=", tostring(reason))
 end
 
 function Sync:_cancel_record_retry()
@@ -1734,10 +1774,25 @@ function Sync:on_page(page)
     end
 end
 
+function Sync:_defer_session_flush(delay)
+    if self.session_flush_task then
+        UIManager:unschedule(self.session_flush_task)
+        self.session_flush_task = nil
+    end
+    local task
+    task = function()
+        if self.session_flush_task ~= task then return end
+        self.session_flush_task = nil
+        pcall(self.store.flush, self.store)
+    end
+    self.session_flush_task = task
+    UIManager:scheduleIn(math.max(.3, tonumber(delay) or .8), task)
+end
+
 function Sync:on_suspend()
     self.suspended = true
     local r = self.current or self:record()
-    local pending_elapsed=math.max(0,math.floor(tonumber(self:_final_elapsed()) or 0))
+    local pending_elapsed=math.max(0,math.floor(tonumber(self:_final_elapsed(true)) or 0))
     if r then
         local position = self:local_position()
         local now=os.time()
@@ -1751,11 +1806,12 @@ function Sync:on_suspend()
             last_read_at=now,last_read_path=r.path,
             progress_local_percent=position and position.progress or nil,
             pending_report_seconds=0,
-        })
+        }, false)
+        self:_defer_session_flush(.8)
     end
     -- The background worker may submit only the current 10-30 second tail.
     -- Failed time is discarded and is never carried into the next session.
-    self:stop("suspend", pending_elapsed)
+    self:stop_fast("suspend", pending_elapsed)
 end
 
 function Sync:on_resume(_slept)
@@ -1792,12 +1848,13 @@ function Sync:on_close()
                 last_read_at=now,last_read_path=r.path,
                 progress_local_percent=position and position.progress or nil,
                 last_close_path=path,last_close_at=now,
-            })
+            }, false)
+            self:_defer_session_flush(.8)
         end
     end
     -- Even a duplicate close event must stop this plugin instance's service.
     -- It simply must not emit a second final upload.
-    self:stop("close", duplicate and 0 or self:_final_elapsed())
+    self:stop_fast("close", duplicate and 0 or self:_final_elapsed(true))
     self.current = nil
     self.record_checked_path = nil
 end

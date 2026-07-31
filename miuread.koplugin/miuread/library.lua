@@ -100,6 +100,8 @@ local function book(row,raw_index,archive_map)
         author=b.author or row.author or "",
         cover=b.cover or b.coverUrl or row.cover,
         category=b.category or row.category,
+        description=b.intro or b.description or b.summary or row.intro or row.description or row.summary,
+        publisher=b.publisher or row.publisher,
         updateTime=tonumber(row.updateTime or b.updateTime or row.bookUpdateTime or 0) or 0,
         progress=tonumber(row.progress or row.readingProgress or b.progress or 0) or 0,
         finished=(row.finished==true or tonumber(row.progress or row.readingProgress or 0)>=100),

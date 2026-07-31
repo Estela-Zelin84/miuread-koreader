@@ -13,11 +13,14 @@ local Screen = Device.screen
 
 local Toast = InputContainer:extend{
     title = "",
+    toast = true,
     text = "",
     timeout = 3,
     modal = false,
     _timeout_func = nil,
     on_close_callback = nil,
+    closed = false,
+    _closing_with_refresh = false,
 }
 
 local function repaint(widget, dimen)
@@ -70,13 +73,24 @@ function Toast:init()
     }
 end
 
+function Toast:_close()
+    if self.closed then return true end
+    self.closed = true
+    self._closing_with_refresh = true
+    local region = self.popup_dimen and self.popup_dimen:copy() or nil
+    -- Supplying the known region to close() makes UIManager repaint the
+    -- uncovered ReaderUI and refresh exactly the former toast rectangle.
+    UIManager:close(self, "partial", region)
+    return true
+end
+
 function Toast:onShow()
     repaint(self, self.popup_dimen)
     local timeout = tonumber(self.timeout)
     if timeout and timeout > 0 then
         self._timeout_func = function()
             self._timeout_func = nil
-            UIManager:close(self)
+            self:_close()
         end
         UIManager:scheduleIn(timeout, self._timeout_func)
     end
@@ -85,6 +99,7 @@ end
 
 function Toast:onCloseWidget()
     local old_dimen = self.popup_dimen and self.popup_dimen:copy() or nil
+    self.closed = true
     if self._timeout_func then
         UIManager:unschedule(self._timeout_func)
         self._timeout_func = nil
@@ -94,7 +109,10 @@ function Toast:onCloseWidget()
         self.on_close_callback = nil
         pcall(callback)
     end
-    repaint(nil, old_dimen)
+    -- Fallback for an external direct UIManager:close() call. Normal timeout
+    -- and replacement paths already pass the region directly to close().
+    if not self._closing_with_refresh then repaint(nil, old_dimen) end
+    self._closing_with_refresh = false
 end
 
 local M = {}
@@ -103,7 +121,7 @@ local active_toast = nil
 function M.show(opts)
     opts = opts or {}
     if active_toast then
-        pcall(UIManager.close, UIManager, active_toast)
+        pcall(active_toast._close, active_toast)
         active_toast = nil
     end
 

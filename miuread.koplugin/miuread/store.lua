@@ -19,7 +19,7 @@ local defaults={
              annotations={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",home_ui={enabled=false,local_root="",auto_scan=true},memory_mode={enabled=false,previous_known=false,previous_ratio=false},thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",download_dir="",shelf_section="account",account_shelf_kind="books",home_ui={enabled=true,layout_version=21,layout_style="desk",local_root="",auto_scan=true,page_by_section={},source_order={"account","generated","local","mp"}},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=true,show_status=true,quick_items={home=true,toc=true,progress=true,font=true,typeset=true,sync=true,current_book=true,downloads=false,full_refresh=false,koreader_menu=false,sleep=false,more=true},quick_order={"home","toc","progress","font","typeset","sync","current_book","downloads","full_refresh","koreader_menu","sleep","more"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,library_scan=true,repair_while_reading=true,mode_switch=true},memory_mode={enabled=false,previous_known=false,previous_ratio=false},thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},repair={auto_check=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
@@ -900,7 +900,229 @@ function Store:migrate()
             -- the reader. Existing annotation caches remain intact and are
             -- upgraded automatically by the idle background worker.
         end
+        if schema<64 then
+            -- 3.1.0-beta.3 promotes the MiuRead bookshelf from an optional
+            -- preview to the default file-manager home. Keep one migration flag
+            -- so a later user choice to disable it is respected.
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.enabled=true
+            p.home_ui.layout_version=2
+            if p.home_ui.auto_scan==nil then p.home_ui.auto_scan=true end
+        end
+        if schema<65 then
+            -- 3.1.0-beta.4 adds the configurable home widget layout and quick center.
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=3
+            if p.home_ui.widgets==nil then p.home_ui.widgets=false end
+            if p.home_ui.preset==nil then p.home_ui.preset="balanced" end
+            if p.home_ui.goal_minutes==nil then p.home_ui.goal_minutes=30 end
+            if p.home_ui.swipe_quick==nil then p.home_ui.swipe_quick=false end
+        end
+        if schema<67 then
+            -- 3.2.0-beta.1 replaces the multi-page widget home with a fixed
+            -- reading desk. Old widget choices are intentionally discarded.
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=7
+            p.home_ui.layout_style="desk"
+            if p.home_ui.auto_scan==nil then p.home_ui.auto_scan=true end
+            p.home_ui.widgets=nil
+            p.home_ui.preset=nil
+            p.home_ui.goal_minutes=nil
+            p.home_ui.swipe_quick=nil
+            p.home_ui.initial_page=nil
+        end
+        if schema<69 then
+            -- 3.2.0-beta.15 moves comments to a lightweight native viewer,
+            -- adds the shared book-repair channel, and removes MiuRead's
+            -- fullscreen swipe interception from the home page.
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=15
+            p.home_ui.layout_style=p.home_ui.layout_style=="compact" and "compact" or "desk"
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            if p.thoughts.display_mode~="native_simple" and p.thoughts.display_mode~="legacy_rich" then
+                p.thoughts.display_mode="native_card"
+            end
+            p.thoughts.height_ratio=math.max(0.52,tonumber(p.thoughts.height_ratio) or 0.70)
+            p.repair=type(p.repair)=="table" and p.repair or {}
+            if p.repair.auto_check==nil then p.repair.auto_check=true end
+        end
+        if schema<70 then
+            -- beta.20 replaces the three comment display modes with one fixed-source,
+            -- paged comment card and exposes its font controls from the reader.
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="unified"
+            p.thoughts.width_ratio=math.max(0.88,math.min(0.94,tonumber(p.thoughts.width_ratio) or 0.92))
+            p.thoughts.height_ratio=math.max(0.58,math.min(0.80,tonumber(p.thoughts.height_ratio) or 0.72))
+        end
+        if schema<71 then
+            -- beta.21 removed beta.20's manual page splitting; beta.22
+            -- migrates this preference again to the native list renderer.
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_list"
+            p.thoughts.comments_per_page=nil
+            p.thoughts.width_ratio=math.max(0.88,math.min(0.94,tonumber(p.thoughts.width_ratio) or 0.92))
+            p.thoughts.height_ratio=math.max(0.56,math.min(0.76,tonumber(p.thoughts.height_ratio) or 0.72))
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=17
+        end
         self.db:saveSetting("preferences",p)
+        if schema<72 then
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_list"
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=17
+            p.home_ui.page_by_section=type(p.home_ui.page_by_section)=="table" and p.home_ui.page_by_section or {}
+            self:save_preferences(p)
+        end
+        if schema<73 then
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_paged"
+            p.thoughts.height_ratio=math.max(0.66,math.min(0.82,tonumber(p.thoughts.height_ratio) or 0.76))
+            self:save_preferences(p)
+        end
+        if schema<74 then
+            -- beta.25 restores the compact v3.0.2 visual hierarchy while
+            -- keeping the safer native renderer. Saved paged-card dimensions
+            -- are intentionally replaced because they produced the oversized
+            -- dialog and visible footer that this migration removes.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_classic"
+            p.thoughts.width_ratio=0.91
+            p.thoughts.height_ratio=0.60
+            p.thoughts.comments_per_page=nil
+            self:save_preferences(p)
+        end
+        if schema<75 then
+            -- beta.27 switches comments to a small-font, click-paged native list,
+            -- adds a configurable quick panel, and limits waiting downloads to one.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_click_paged"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.91
+            p.thoughts.height_ratio=0.66
+            p.download_reader_warning=p.download_reader_warning~=false
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=19
+            self:save_preferences(p)
+            local queue=self.db:readSetting("download_queue",{}) or {}
+            if #queue>1 then self.db:saveSetting("download_queue",{queue[1]}) end
+        end
+        if schema<76 then
+            -- beta.28 replaces beta.27's unsafe comment layout with a guarded
+            -- small-font pager and resets the saved popup dimensions.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_safe_paged"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.91
+            p.thoughts.height_ratio=0.66
+            self:save_preferences(p)
+        end
+        if schema<77 then
+            -- beta.29 uses a borderless adaptive-height comment pager. Text is
+            -- measured before pagination so short and long comments fill pages naturally.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_adaptive_paged"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.92
+            p.thoughts.height_ratio=0.72
+            self:save_preferences(p)
+        end
+        if schema<78 then
+            -- beta.30 keeps one stable opaque rounded frame across comment pages.
+            -- This clears the previous page inside the popup region and avoids
+            -- overlapping text without triggering a full-screen refresh.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_rounded_paged"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.92
+            p.thoughts.height_ratio=0.72
+            self:save_preferences(p)
+        end
+        if schema<79 then
+            -- beta.31 separates the fixed rounded frame from the opaque comment
+            -- page surface. Page turns refresh only the inner content region,
+            -- while short final pages still clear every previous text pixel.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_rounded_layered"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.92
+            p.thoughts.height_ratio=0.72
+            self:save_preferences(p)
+        end
+        if schema<81 then
+            -- beta.33 caps comments at roughly half the screen, fills long
+            -- pages by splitting oversized comments into the remaining space,
+            -- and replaces the boxed shelf badges with lighter status text.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_compact_rounded"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.90
+            p.thoughts.height_ratio=0.55
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=20
+            self:save_preferences(p)
+        end
+        if schema<82 then
+            -- beta.37 separates desktop and plugin operation, restores the native
+            -- bottom typesetting panel, adds a configurable reader control panel,
+            -- centralizes notices, and hard-limits downloads to one active job plus
+            -- one waiting job. Existing account, book, annotation and sync data stay.
+            local p=self:preferences()
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=21
+            p.home_ui.quick_items=type(p.home_ui.quick_items)=="table" and p.home_ui.quick_items or {}
+            p.home_ui.quick_items.sync=true
+            p.home_ui.quick_items.downloads=true
+            p.home_ui.quick_items.restart=false
+            p.home_ui.quick_items.quit=false
+            p.reader_ui=type(p.reader_ui)=="table" and p.reader_ui or {}
+            if p.reader_ui.enabled==nil then p.reader_ui.enabled=true end
+            if p.reader_ui.plugin_mode_enabled==nil then p.reader_ui.plugin_mode_enabled=false end
+            if p.reader_ui.show_title==nil then p.reader_ui.show_title=true end
+            if p.reader_ui.show_status==nil then p.reader_ui.show_status=true end
+            p.reader_ui.quick_items=type(p.reader_ui.quick_items)=="table" and p.reader_ui.quick_items or {}
+            local reader_defaults={home=true,toc=true,progress=true,font=true,typeset=true,sync=true,current_book=true,downloads=false,full_refresh=false,koreader_menu=false,sleep=false,more=true}
+            for key,value in pairs(reader_defaults) do
+                if p.reader_ui.quick_items[key]==nil then p.reader_ui.quick_items[key]=value end
+            end
+            if type(p.reader_ui.quick_order)~="table" then
+                p.reader_ui.quick_order={"home","toc","progress","font","typeset","sync","current_book","downloads","full_refresh","koreader_menu","sleep","more"}
+            end
+            p.notices=type(p.notices)=="table" and p.notices or {}
+            for _,key in ipairs({"reader_download","low_battery","low_storage","full_refresh","lockscreen","library_scan","repair_while_reading","mode_switch"}) do
+                if p.notices[key]==nil then p.notices[key]=true end
+            end
+            if p.download_reader_policy~="allow" and p.download_reader_policy~="after_reading" then
+                p.download_reader_policy="ask"
+            end
+            self:save_preferences(p)
+            local queue=self.db:readSetting("download_queue",{}) or {}
+            local kept,seen={},{}
+            for _,job in ipairs(queue) do
+                local book=type(job)=="table" and type(job.book)=="table" and job.book or {}
+                local id=tostring(book.bookId or book.book_id or "")
+                if #kept<1 and (id=="" or not seen[id]) then
+                    kept[#kept+1]=job
+                    if id~="" then seen[id]=true end
+                end
+            end
+            self.db:saveSetting("download_queue",kept)
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end
@@ -1060,6 +1282,50 @@ function Store:forget_chapter_all(id,uid)
     self:set("library",all)
 end
 function Store:forget_book(id) local all=self:library(); all[tostring(id)]=nil; self:set("library",all) end
+function Store:forget_book_local_state(id)
+    local key=tostring(id or "")
+    if key=="" then return false end
+    local all=self:library(); all[key]=nil; self:set("library",all)
+    local sessions=self:get("sessions",{}); sessions[key]=nil; self:set("sessions",sessions)
+    local covers=self:get("cover_index",{}); covers[key]=nil; self:set("cover_index",covers)
+
+    local queue_out={}
+    for _,job in ipairs(self:download_queue()) do
+        local job_id=tostring((job.book and (job.book.bookId or job.book.book_id)) or job.book_id or "")
+        if job_id~=key then queue_out[#queue_out+1]=job end
+    end
+    self:save_download_queue(queue_out)
+
+    local pending_out={}
+    for _,row in ipairs(self:pending_installs()) do
+        if tostring(row.book_id or "")~=key then pending_out[#pending_out+1]=row end
+    end
+    self:save_pending_installs(pending_out)
+
+    local repair=self:get("book_repair_state",{}); repair[key]=nil; self:set("book_repair_state",repair)
+    local history_out={}
+    for _,row in ipairs(self:get("book_repair_history",{})) do
+        if tostring(row.book_id or "")~=key then history_out[#history_out+1]=row end
+    end
+    self:set("book_repair_history",history_out)
+
+    local shelf=self:shelf_cache()
+    local shelf_changed=false
+    for _,group in ipairs({shelf.books or {},shelf.mp or {}}) do
+        for _,row in ipairs(group) do
+            if tostring(row.bookId or row.book_id or "")==key and row.cover_path~=nil then
+                row.cover_path=nil; shelf_changed=true
+            end
+        end
+    end
+    if shelf_changed then self:save_shelf_cache(shelf) end
+
+    local state=self:download_state()
+    if tostring(state.book_id or (state.book and (state.book.bookId or state.book.book_id)) or "")==key then
+        self:clear_download_state()
+    end
+    return true
+end
 function Store:forget_all_books() self:set("library",{}) end
 function Store:prune_missing_files()
     local all=self:library(); local changed=false
@@ -1383,7 +1649,7 @@ function Store:invalidate_report_contexts(reason)
     return changed,reason
 end
 function Store:session(id) return self:get("sessions",{})[tostring(id)] end
-function Store:save_session(id,patch) local a=self:get("sessions",{}); local k=tostring(id); a[k]=U.merge(a[k] or {},patch or {}); self:set("sessions",a); return a[k] end
+function Store:save_session(id,patch,flush_now) local a=self:get("sessions",{}); local k=tostring(id); a[k]=U.merge(a[k] or {},patch or {}); self.db:saveSetting("sessions",a); if flush_now~=false then self:flush() end; return a[k] end
 function Store:clear_session(id) local a=self:get("sessions",{}); a[tostring(id)]=nil; self:set("sessions",a) end
 function Store:shelf_cache() return U.merge(defaults.shelf_cache,self:get("shelf_cache",{})) end
 function Store:save_shelf_cache(v) self:set("shelf_cache",U.merge(defaults.shelf_cache,v or {})) end
@@ -1422,10 +1688,24 @@ function Store:save_download_state(value)
     return U.atomic_write(self.download_state_path,encoded,true)
 end
 function Store:clear_download_state() os.remove(self.download_state_path) end
-function Store:download_queue() return self:get("download_queue",{}) end
-function Store:save_download_queue(queue) self:set("download_queue",type(queue)=="table" and queue or {}) end
+function Store:download_queue()
+    local queue=self:get("download_queue",{})
+    if type(queue)~="table" then return {} end
+    if #queue<=1 then return queue end
+    return {queue[1]}
+end
+function Store:save_download_queue(queue)
+    queue=type(queue)=="table" and queue or {}
+    local kept={}
+    if type(queue[1])=="table" then kept[1]=U.copy(queue[1]) end
+    self:set("download_queue",kept)
+end
 function Store:enqueue_download(job)
-    local queue=self:download_queue(); queue[#queue+1]=U.copy(job or {}); self:save_download_queue(queue); return #queue
+    local queue=self:download_queue()
+    if #queue>=1 then return nil,"full" end
+    queue[1]=U.copy(job or {})
+    self:save_download_queue(queue)
+    return 1
 end
 function Store:dequeue_download()
     local queue=self:download_queue(); if #queue==0 then return nil end

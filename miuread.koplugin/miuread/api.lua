@@ -184,8 +184,9 @@ local ANNOTATION_REQUEST_OPTIONS={
     retries=0,
     rate_limit_retries=0,
     rate_limit_fail_fast=true,
-    rate_limit_cooldown=300,
+    rate_limit_cooldown=900,
     rate_limit_scope="annotations",
+    min_interval=0.9,
     timeout={10,18},
 }
 

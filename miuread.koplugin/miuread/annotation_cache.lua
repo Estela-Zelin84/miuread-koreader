@@ -28,7 +28,7 @@ function Cache.load(root,uid,account_key,annotations)
     local ok,value=pcall(Json.decode,raw)
     if not ok or type(value)~="table" or tostring(value.account_key or "")~=tostring(account_key) then return nil end
     local restored=annotations:from_cache(value)
-    if type(restored)=="table" then restored.cache_path=path end
+    if type(restored)=="table" then restored.cache_path=path; restored.saved_at=tonumber(value.saved_at or 0) or 0 end
     return restored
 end
 
