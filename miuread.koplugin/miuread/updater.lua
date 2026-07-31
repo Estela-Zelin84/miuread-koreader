@@ -81,16 +81,30 @@ local function clean_notes(value)
     if not U.is_valid_utf8(text) or U.contains_replacement_char(text) then return nil end
     text=text:gsub("\r\n","\n"):gsub("\r","\n")
     text=text:gsub("[•●▪◦]","-")
+    text=text:gsub("：",":"):gsub("，",","):gsub("。","."):gsub("、",",")
+    text=text:gsub("“",""):gsub("”",""):gsub("‘",""):gsub("’","")
+    text=text:gsub("—","-"):gsub("–","-"):gsub("·","-")
     text=text:gsub("[%z\1-\8\11\12\14-\31]","")
-    return text
+    local lines={}
+    for line in text:gmatch("[^\n]+") do
+        line=line:gsub("^%s+",""):gsub("%s+$","")
+        if line~="" then
+            lines[#lines+1]=line
+            if #lines>=4 then break end
+        end
+    end
+    return table.concat(lines,"\n")
 end
 
 local function clean_manifest_text(m)
-    local notes=clean_notes(m and m.notes)
-    local name=clean_notes(m and m.name)
+    local notes=m and m.notes~=nil and clean_notes(m.notes) or nil
+    local summary=m and m.summary~=nil and clean_notes(m.summary) or nil
+    local name=m and m.name~=nil and clean_notes(m.name) or nil
     if m and m.notes~=nil and notes==nil then return nil,"更新说明包含损坏的 UTF-8 文本" end
+    if m and m.summary~=nil and summary==nil then return nil,"更新摘要包含损坏的 UTF-8 文本" end
     if m and m.name~=nil and name==nil then return nil,"更新名称包含损坏的 UTF-8 文本" end
-    return {notes=notes or "",name=name}
+    if summary=="" then summary=nil end
+    return {notes=notes or "",summary=summary or notes or "",name=name}
 end
 
 local function validate_manifest(m)
@@ -127,7 +141,8 @@ function Updater:check()
                 local cleaned,text_error=clean_manifest_text(m)
                 if not cleaned then
                     fallback=fallback or U.copy(m)
-                    fallback.notes="更新说明编码异常；可继续下载安装，安装包仍会执行完整性校验。"
+                    fallback.notes="更新说明显示异常 可继续下载安装"
+                    fallback.summary=fallback.notes
                     fallback.name=tostring(m.name or "")
                     errors[#errors+1]=text_error
                     logger.warn("[MiuRead][Updater] manifest text rejected",url,
@@ -135,6 +150,7 @@ function Updater:check()
                         "reason=",tostring(text_error))
                 else
                     m.notes=cleaned.notes
+                    m.summary=cleaned.summary
                     if cleaned.name~=nil then m.name=cleaned.name end
                     logger.info("[MiuRead][Updater] manifest loaded",url,"version=",tostring(m.version),
                         "notes_utf8_valid=true")

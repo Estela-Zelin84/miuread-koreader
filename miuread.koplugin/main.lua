@@ -7742,11 +7742,13 @@ function Plugin:_present_update(manifest,automatic)
     if automatic and tostring(update.last_prompted_version or "")==tostring(manifest.version or "") then return end
     update.last_prompted_version=tostring(manifest.version or "")
     self:_save_update_preferences(update)
-    local text="发现"..tostring(Config.UPDATE_CHANNEL_LABEL).."版本："..tostring(manifest.version)
-    if manifest.notes and tostring(manifest.notes)~="" then
-        text=text.."\n\n主要更新：\n"..tostring(manifest.notes)
+    local text="发现"..tostring(Config.UPDATE_CHANNEL_LABEL).."版本 "..tostring(manifest.version)
+    local notes=tostring(manifest.summary or "")
+    if notes=="" then notes=tostring(manifest.notes or "") end
+    if notes~="" then
+        text=text.."\n\n更新内容\n"..notes
     end
-    text=text.."\n\n是否下载并安装？"
+    text=text.."\n\n是否下载并安装"
     UIManager:show(ConfirmBox:new{text=text,ok_text="下载并安装",ok_callback=function()
         self:online("install",function()
             local path=self.updater:download(manifest)

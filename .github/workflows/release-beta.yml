@@ -84,6 +84,18 @@ jobs:
               print(f"::error::缺少当前版本更新说明：{changelog}")
               sys.exit(1)
 
+          notes = changelog.read_text(encoding="utf-8").strip()
+          lines = [line.strip() for line in notes.splitlines() if line.strip()]
+          if len(lines) > 4 or len(notes) > 180:
+              print("::error::更新说明必须保持简短，最多 4 行且不超过 180 个字符。")
+              sys.exit(1)
+          for char in notes:
+              code = ord(char)
+              if char == "\n" or 0x20 <= code <= 0x7E or 0x4E00 <= code <= 0x9FFF:
+                  continue
+              print(f"::error::更新说明包含不适合设备弹窗显示的字符：U+{code:04X}")
+              sys.exit(1)
+
           Path("release.env").write_text(
               f"VERSION={version}\n"
               f"RELEASE_TAG=v{version}\n"
@@ -190,6 +202,7 @@ jobs:
               ],
               "size": len(payload),
               "sha256": hashlib.sha256(payload).hexdigest(),
+              "summary": notes,
               "notes": notes,
           }
           Path("dist/update-beta.json").write_text(
@@ -246,8 +259,8 @@ jobs:
               errors.append("更新清单版本错误")
           if manifest.get("channel") != "beta":
               errors.append("更新清单通道错误")
-          if manifest.get("notes") != notes:
-              errors.append("线上更新说明未使用当前 CHANGELOG")
+          if manifest.get("notes") != notes or manifest.get("summary") != notes:
+              errors.append("线上更新摘要未使用当前 CHANGELOG")
           if manifest.get("size") != package.stat().st_size:
               errors.append("更新清单文件大小错误")
           if manifest.get("sha256") != hashlib.sha256(package.read_bytes()).hexdigest():
