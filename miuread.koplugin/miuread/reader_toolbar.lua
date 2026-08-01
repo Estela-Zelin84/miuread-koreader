@@ -77,14 +77,14 @@ end
 local function action_button(entry, width, height, close_callback)
     local enabled = entry.enabled ~= false
     local padding = math.max(6, Screen:scaleBySize(5))
-    local inner_w = math.max(1, width - Size.border.thin * 2 - padding * 2)
-    local inner_h = math.max(1, height - Size.border.thin * 2 - padding * 2)
+    local inner_w = math.max(1, width - padding * 2)
+    local inner_h = math.max(1, height - padding * 2)
     local detail = tostring(entry.detail or "")
     local label_h = detail ~= "" and math.max(22, math.floor(inner_h * .54)) or inner_h
     local detail_h = math.max(1, inner_h - label_h)
 
     local content = VerticalGroup:new{
-        align = "left",
+        align = "center",
         TextBoxWidget:new{
             text = tostring(entry.label or entry.text or ""),
             face = face("cfont", 13, 16),
@@ -93,7 +93,7 @@ local function action_button(entry, width, height, close_callback)
             height = label_h,
             height_adjust = false,
             height_overflow_show_ellipsis = true,
-            alignment = "left",
+            alignment = "center",
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
         },
     }
@@ -105,30 +105,42 @@ local function action_button(entry, width, height, close_callback)
             height = detail_h,
             height_adjust = false,
             height_overflow_show_ellipsis = true,
-            alignment = "left",
+            alignment = "center",
             fgcolor = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
         }
     end
 
+    local layered = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+    layered[#layered + 1] = fixed_frame(width, height, {
+        bordersize = 0,
+        padding = padding,
+        background = Blitbuffer.COLOR_WHITE,
+    }, content)
+    layered[#layered + 1] = OffsetContainer:new{
+        x_off = math.max(6, math.floor(width * .08)),
+        y_off = math.max(0, height - Size.line.thin),
+        LineWidget:new{
+            background = enabled and Blitbuffer.COLOR_GRAY or (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY),
+            dimen = Geom:new{w = math.max(1, width - math.max(12, math.floor(width * .16))), h = Size.line.thin},
+        },
+    }
     local box = TapBox:new{
         dimen = Geom:new{w = width, h = height},
         enabled = enabled,
         callback = function()
-            if entry.keep_open ~= true then close_callback() end
-            if entry.callback then
-                UIManager:nextTick(function()
-                    local ok, err = pcall(entry.callback)
-                    if not ok then logger.warn("[MiuRead][ReaderToolbar] action failed", tostring(err)) end
-                end)
+            if entry.keep_open == true then
+                if entry.callback then
+                    UIManager:nextTick(function()
+                        local ok, err = pcall(entry.callback)
+                        if not ok then logger.warn("[MiuRead][ReaderToolbar] action failed", tostring(err)) end
+                    end)
+                end
+                return
             end
+            close_callback(entry.callback)
         end,
     }
-    box[1] = fixed_frame(width, height, {
-        bordersize = Size.border.thin,
-        padding = padding,
-        background = Blitbuffer.COLOR_WHITE,
-        color = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-    }, content)
+    box[1] = layered
     return box
 end
 
@@ -139,13 +151,19 @@ local Toolbar = InputContainer:extend{
     stop_events_propagation = true,
     opts = nil,
     closed = false,
+    pending_action = nil,
 }
 
 function Toolbar:handleEvent(event)
     return InputContainer.handleEvent(self, event)
 end
 
-function Toolbar:_close()
+function Toolbar:_close(action, cancel_pending)
+    if cancel_pending then
+        self.pending_action = nil
+    elseif action and not self.pending_action then
+        self.pending_action = action
+    end
     if self.closed then return true end
     self.closed = true
     UIManager:close(self)
@@ -187,7 +205,7 @@ function Toolbar:init()
             VerticalGroup:new{
                 align = "left",
                 TextBoxWidget:new{
-                    text = tostring(self.opts.title or "阅读中 · 觅阅"),
+                    text = tostring(self.opts.title or "阅读快捷面板"),
                     face = face("cfont", 17, 21),
                     bold = true,
                     width = title_w,
@@ -239,7 +257,7 @@ function Toolbar:init()
         root[#root + 1] = OffsetContainer:new{
             x_off = margin + col * (button_w + gap),
             y_off = start_y + row * (button_h + gap),
-            action_button(entry, button_w, button_h, function() self:_close() end),
+            action_button(entry, button_w, button_h, function(action) self:_close(action) end),
         }
     end
 
@@ -271,14 +289,22 @@ function Toolbar:onShow()
 end
 function Toolbar:onCloseWidget()
     local region = self.panel_dimen and self.panel_dimen:copy() or nil
+    local action = self.pending_action
+    self.pending_action = nil
     self.closed = true
     if live_toolbar == self then live_toolbar = nil end
     if region then UIManager:setDirty(nil, function() return "ui", region end) end
+    if action then
+        UIManager:scheduleIn(.04, function()
+            local ok, err = pcall(action)
+            if not ok then logger.warn("[MiuRead][ReaderToolbar] action failed", tostring(err)) end
+        end)
+    end
 end
 
 local M = {}
 function M.close()
-    if live_toolbar and not live_toolbar.closed then UIManager:close(live_toolbar) end
+    if live_toolbar and not live_toolbar.closed then live_toolbar:_close(nil, true) end
     live_toolbar = nil
 end
 function M.show(opts)

@@ -147,7 +147,7 @@ function Dialog:init()
         height = percent_h,
         height_adjust = false,
         alignment = "center",
-        fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        fgcolor = Blitbuffer.COLOR_BLACK,
     }
     group[#group + 1] = VerticalSpan:new{height = gap}
 
@@ -172,12 +172,12 @@ function Dialog:init()
     group[#group + 1] = progress_tap
     group[#group + 1] = TextBoxWidget:new{
         text = "点击进度条直接跳转",
-        face = Font:getFace("smallinfofont", math.max(9, Screen:scaleBySize(10))),
+        face = Font:getFace("smallinfofont", math.max(11, Screen:scaleBySize(12))),
         width = content_w,
         height = hint_h,
         height_adjust = false,
         alignment = "center",
-        fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        fgcolor = Blitbuffer.COLOR_BLACK,
     }
     group[#group + 1] = VerticalSpan:new{height = gap}
 
@@ -214,7 +214,9 @@ function Dialog:init()
 
     self.frame = FrameContainer:new{
         background = Blitbuffer.COLOR_WHITE,
+        color = Blitbuffer.COLOR_BLACK,
         bordersize = border,
+        radius = math.max(tonumber(Size.radius.window) or 0, Screen:scaleBySize(7)),
         padding = pad,
         margin = 0,
         CenterContainer:new{

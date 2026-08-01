@@ -85,31 +85,36 @@ end
 
 local function panel_button(entry, width, height, close_callback)
     local label = tostring(entry.label or entry.text or "")
+    local detail = tostring(entry.detail or "")
     local enabled = entry.enabled ~= false
+    local inner_w = math.max(1, width - 16)
+    local label_h = detail ~= "" and math.max(24, math.floor(height * .48)) or math.max(32, math.floor(height * .72))
     local content = VerticalGroup:new{
         align = "center",
         TextBoxWidget:new{
             text = label,
-            face = face("cfont", 13, 16),
+            face = face("cfont", 14, 18),
             bold = true,
-            width = math.max(1, width - 16),
-            height = math.max(24, math.floor(height * .48)),
+            width = inner_w,
+            height = label_h,
             height_adjust = false,
             height_overflow_show_ellipsis = true,
             alignment = "center",
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
         },
-        TextBoxWidget:new{
-            text = tostring(entry.detail or ""),
-            face = face("smallinfofont", 9, 11),
-            width = math.max(1, width - 16),
+    }
+    if detail ~= "" then
+        content[#content + 1] = TextBoxWidget:new{
+            text = detail,
+            face = face("smallinfofont", 11, 14),
+            width = inner_w,
             height = math.max(18, math.floor(height * .28)),
             height_adjust = false,
             height_overflow_show_ellipsis = true,
             alignment = "center",
-            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
-        },
-    }
+            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        }
+    end
     local layered = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
     layered[#layered + 1] = fixed_frame(width, height, {
         bordersize = 0,
@@ -126,13 +131,16 @@ local function panel_button(entry, width, height, close_callback)
     }
     return tappable(width, height, layered, function()
         if not enabled then return end
-        if entry.keep_open ~= true and close_callback then close_callback() end
-        if entry.callback then
-            UIManager:nextTick(function()
-                local ok, err = pcall(entry.callback)
-                if not ok then logger.warn("[MiuRead][QuickPanel] action failed", tostring(err)) end
-            end)
+        if entry.keep_open == true then
+            if entry.callback then
+                UIManager:nextTick(function()
+                    local ok, err = pcall(entry.callback)
+                    if not ok then logger.warn("[MiuRead][QuickPanel] action failed", tostring(err)) end
+                end)
+            end
+            return
         end
+        if close_callback then close_callback(entry.callback) end
     end)
 end
 
@@ -145,6 +153,7 @@ local QuickPanelWidget = InputContainer:extend{
     dimen = nil,
     panel_h = 0,
     _closed = false,
+    pending_action = nil,
 }
 
 function QuickPanelWidget:handleEvent(event)
@@ -163,10 +172,16 @@ function QuickPanelWidget:_add(children, x, y, widget)
     children[#children + 1] = OffsetContainer:new{x_off = x, y_off = y, widget}
 end
 
-function QuickPanelWidget:_close()
-    if self._closed then return end
+function QuickPanelWidget:_close(action, cancel_pending)
+    if cancel_pending then
+        self.pending_action = nil
+    elseif action and not self.pending_action then
+        self.pending_action = action
+    end
+    if self._closed then return true end
     self._closed = true
     UIManager:close(self)
+    return true
 end
 
 function QuickPanelWidget:_build()
@@ -195,7 +210,24 @@ function QuickPanelWidget:_build()
     }))
 
     local close_w = math.max(66, math.min(82, math.floor(sw * .09)))
-    local title_w = math.max(1, sw - margin * 2 - close_w - gap)
+    local header_action = type(self.opts.header_action) == "table" and self.opts.header_action or nil
+    local action_w = header_action and math.max(74, math.min(96, math.floor(sw * .105))) or 0
+    local controls_w = close_w + (header_action and (gap + action_w) or 0)
+    local title_w = math.max(1, sw - margin * 2 - controls_w - gap)
+    local controls = HorizontalGroup:new{align = "center"}
+    if header_action then
+        controls[#controls + 1] = tappable(action_w, math.max(36, title_h - 10), fixed_frame(action_w, math.max(36, title_h - 10), {
+            bordersize = 0,
+            background = Blitbuffer.COLOR_WHITE,
+        }, TextWidget:new{text = tostring(header_action.label or "打开"), face = face("smallinfofont", 12, 15), bold = true}), function()
+            self:_close(header_action.callback)
+        end)
+        controls[#controls + 1] = HorizontalSpan:new{width = gap}
+    end
+    controls[#controls + 1] = tappable(close_w, math.max(36, title_h - 10), fixed_frame(close_w, math.max(36, title_h - 10), {
+        bordersize = 0,
+        background = Blitbuffer.COLOR_WHITE,
+    }, TextWidget:new{text = "收起", face = face("smallinfofont", 12, 15), bold = true}), function() self:_close() end)
     local title_row = HorizontalGroup:new{
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = title_w, h = title_h}, VerticalGroup:new{
@@ -211,19 +243,16 @@ function QuickPanelWidget:_build()
             },
             TextBoxWidget:new{
                 text = tostring(self.opts.subtitle or ""),
-                face = face("smallinfofont", 10, 12),
+                face = face("smallinfofont", 12, 15),
                 width = title_w,
                 height = math.ceil(title_h * .45),
                 height_adjust = false,
                 height_overflow_show_ellipsis = true,
-                fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+                fgcolor = Blitbuffer.COLOR_BLACK,
             },
         }},
         HorizontalSpan:new{width = gap},
-        tappable(close_w, math.max(36, title_h - 10), fixed_frame(close_w, math.max(36, title_h - 10), {
-            bordersize = 0,
-            background = Blitbuffer.COLOR_WHITE,
-        }, TextWidget:new{text = "收起", face = face("smallinfofont", 11, 13), bold = true}), function() self:_close() end),
+        controls,
     }
     self:_add(children, margin, margin, title_row)
 
@@ -240,7 +269,7 @@ function QuickPanelWidget:_build()
         self:_add(children,
             margin + col * (button_w + button_gap),
             y + row * (button_h + button_gap),
-            panel_button(entry, button_w, button_h, function() self:_close() end))
+            panel_button(entry, button_w, button_h, function(action) self:_close(action) end))
     end
     y = y + rows * button_h + math.max(0, rows - 1) * button_gap + gap
 
@@ -251,13 +280,13 @@ function QuickPanelWidget:_build()
             background = Blitbuffer.COLOR_WHITE,
         }, TextBoxWidget:new{
             text = tostring(self.opts.status_text or ""),
-            face = face("smallinfofont", 10, 12),
+            face = face("smallinfofont", 12, 15),
             width = sw - margin * 2 - 20,
             height = status_h - 12,
             height_adjust = false,
             height_overflow_show_ellipsis = true,
             alignment = "left",
-            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            fgcolor = Blitbuffer.COLOR_BLACK,
         }))
     end
 
@@ -300,14 +329,22 @@ end
 
 function QuickPanelWidget:onCloseWidget()
     local region=self.panel_dimen and self.panel_dimen:copy() or nil
+    local action=self.pending_action
+    self.pending_action=nil
     self._closed = true
     if live_panel == self then live_panel = nil end
     if region then UIManager:setDirty(nil,function() return "ui",region end) end
+    if action then
+        UIManager:scheduleIn(.04,function()
+            local ok,err=pcall(action)
+            if not ok then logger.warn("[MiuRead][QuickPanel] action failed",tostring(err)) end
+        end)
+    end
 end
 
 local QuickPanel = {}
 function QuickPanel.close()
-    if live_panel and not live_panel._closed then UIManager:close(live_panel) end
+    if live_panel and not live_panel._closed then live_panel:_close(nil,true) end
     live_panel = nil
 end
 function QuickPanel.show(opts)

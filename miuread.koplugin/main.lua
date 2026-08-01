@@ -47,6 +47,7 @@ local Thoughts=require("miuread.thoughts")
 local ThoughtNativePopup=require("miuread.thought_native_popup")
 local ReaderToolbar=require("miuread.reader_toolbar")
 local ReaderProgressDialog=require("miuread.reader_progress_dialog")
+local ReaderSettingsDialog=require("miuread.reader_settings_dialog")
 local BookRepair=require("miuread.book_repair")
 local StatusToast=require("miuread.status_toast")
 local Actions=require("miuread.actions")
@@ -71,10 +72,26 @@ local COVER_GUARD_WINDOW=6*60*60
 local HOME_LOCAL_CACHE_TTL=15*60
 local HOME_SHELF_REFRESH_TTL=90
 local HOME_SECTION_ORDER={"account","generated","local","mp"}
-local HOME_QUICK_ITEM_ORDER={"wifi","frontlight","refresh_shelf","full_refresh","settings","koreader_menu","downloads","sync","night","rotate","sleep","restart","quit"}
-local HOME_QUICK_ITEM_DEFAULT={wifi=true,frontlight=true,refresh_shelf=true,full_refresh=true,settings=true,koreader_menu=true,downloads=true,sync=true,night=false,rotate=false,sleep=true,restart=false,quit=false}
-local READER_QUICK_ITEM_ORDER={"home","toc","progress","font","typeset","sync","current_book","downloads","full_refresh","koreader_menu","sleep","more"}
-local READER_QUICK_ITEM_DEFAULT={home=true,toc=true,progress=true,font=true,typeset=true,sync=true,current_book=true,downloads=false,full_refresh=false,koreader_menu=false,sleep=false,more=true}
+local HOME_QUICK_ITEM_LEGACY_ORDER={"wifi","frontlight","refresh_shelf","full_refresh","settings","koreader_menu","downloads","sync","night","rotate","sleep","restart","quit"}
+local HOME_QUICK_ITEM_LEGACY_DEFAULT={wifi=true,frontlight=true,refresh_shelf=true,full_refresh=true,settings=true,koreader_menu=true,downloads=true,sync=true,night=false,rotate=false,sleep=true,restart=false,quit=false}
+local HOME_QUICK_ITEM_ORDER={"wifi","frontlight","refresh_shelf","downloads","sync","settings","night","rotate","full_refresh","sleep","restart","quit","koreader_menu"}
+local HOME_QUICK_ITEM_DEFAULT={wifi=true,frontlight=true,refresh_shelf=true,downloads=true,sync=true,settings=true,night=false,rotate=false,full_refresh=false,sleep=false,restart=false,quit=false,koreader_menu=false}
+local READER_QUICK_ITEM_LEGACY_ORDER={"home","toc","progress","font","typeset","sync","current_book","downloads","full_refresh","koreader_menu","sleep","more"}
+local READER_QUICK_ITEM_LEGACY_DEFAULT={home=true,toc=true,progress=true,font=true,typeset=true,sync=true,current_book=true,downloads=false,full_refresh=false,koreader_menu=false,sleep=false,more=true}
+local READER_QUICK_ITEM_ORDER={"home","toc","progress","font","sync","more","typeset","current_book","downloads","full_refresh","koreader_menu","sleep"}
+local READER_QUICK_ITEM_DEFAULT={home=true,toc=true,progress=true,font=true,sync=true,more=true,typeset=false,current_book=false,downloads=false,full_refresh=false,koreader_menu=false,sleep=false}
+local function quick_boolean_layout_matches(actual,expected,order)
+    if type(actual)~="table" then return false end
+    for _,key in ipairs(order or {}) do
+        if (actual[key]==true)~=(expected[key]==true) then return false end
+    end
+    return true
+end
+local function quick_order_matches(actual,expected)
+    if type(actual)~="table" or #actual~=#expected then return false end
+    for index,key in ipairs(expected) do if actual[index]~=key then return false end end
+    return true
+end
 -- ReaderUI and FileManager create separate plugin instances. Keep navigation
 -- state in _G so opening/closing a document does not lose its MiuRead origin.
 local HOME_SESSION=rawget(_G,"__MIUREAD_HOME_SESSION")
@@ -229,6 +246,21 @@ function Plugin:init()
     self._reader_checkpoint_task=nil
     self._reader_checkpoint_last=0
     self._reader_checkpoint_dirty=false
+    self._reader_returning=false
+    self._reader_return_generation=0
+    self._reader_return_started=0
+    self._reader_return_finish_task=nil
+    self._reader_return_completed_generation=nil
+    self._reader_native_menu_opening=false
+    self._post_reader_work_task=nil
+    self._post_reader_work_generation=0
+    -- Opening state is shared with the FileManager-side plugin instance so a
+    -- slow tap cannot start the same ReaderUI transition twice.
+    if tonumber(HOME_SESSION.opening_at or 0)>0
+        and os.time()-tonumber(HOME_SESSION.opening_at or 0)>30 then
+        HOME_SESSION.opening_file=nil
+        HOME_SESSION.opening_at=0
+    end
     if self._reader_context then
         U.atomic_write(self._thought_index_pause_path,"1",true)
         U.atomic_write(self._reader_active_path,"1",true)
@@ -818,13 +850,13 @@ function Plugin:home_menu()
                 self:show_miuread_home(false)
             end
         end)},
-        {text="运行模式",post_text=self:_home_mode_label(),sub_item_table_func=function() return self:home_mode_menu() end},
         {text="我的书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)},
         {text="搜索书籍",callback=self:safe("search",function() self:search_dialog() end)},
         {text=self:_download_menu_text(),callback=self:safe("downloads",function() self:show_downloads() end)},
         {text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end},
         account,
         {text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end},
+        {text="KOReader 菜单",callback=function() self:_show_native_koreader_menu() end},
     }
     local health=self:_auth_health()
     self:_recompute_auth_health(health)
@@ -837,25 +869,47 @@ function Plugin:home_menu()
     return out
 end
 
+function Plugin:_confirm_current_book_rebuild(book,annotations)
+    local label=annotations and "划线与想法版" or "纯净版"
+    UIManager:show(ConfirmBox:new{
+        text="重新生成当前书籍的"..label.."？\n\n新文件会在生成完成后替换对应版本。",
+        ok_text="重新生成",
+        cancel_text="取消",
+        ok_callback=function() self:choose_download_mode(book,{annotations=annotations},false) end,
+    })
+end
+
+function Plugin:current_book_download_menu(book)
+    local items={
+        {text="下载当前章",callback=function() self:download_current_chapters(1) end},
+        {text="当前章及后续 5 章",callback=function() self:download_current_chapters(6) end},
+        {text="当前章及后续 10 章",callback=function() self:download_current_chapters(11) end},
+        {text="选择章节范围",callback=function() self:chapters(book) end},
+    }
+    if self:_has_range_variant(book.bookId) then
+        items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(book) end}
+    end
+    return items
+end
+
+function Plugin:current_book_rebuild_menu(book)
+    return {
+        {text="检查与修复本书",callback=function() self:repair_current_book() end},
+        {text="重新生成纯净版",callback=function() self:_confirm_current_book_rebuild(book,false) end},
+        {text="重新生成划线与想法版",callback=function() self:_confirm_current_book_rebuild(book,true) end},
+    }
+end
+
 function Plugin:current_book_menu()
     local r=self:_current_book_record()
     if not r or not r.book then return {{text="未识别当前觅阅书籍",enabled=false}} end
     local b={bookId=r.book.book_id,title=r.book.title,author=r.book.author,cover=r.book.cover}
-    local items={
-        {text="检查与修复本书",callback=function() self:repair_current_book() end},
-        {text="重新生成纯净版",callback=function() self:choose_download_mode(b,{annotations=false},false) end},
-        {text="重新生成划线与想法版",callback=function() self:choose_download_mode(b,{annotations=true},false) end},
-        {text="下载当前章",callback=function() self:download_current_chapters(1) end},
-        {text="下载当前章及后续 5 章",callback=function() self:download_current_chapters(6) end},
-        {text="下载当前章及后续 10 章",callback=function() self:download_current_chapters(11) end},
-        {text="选择章节范围",callback=function() self:chapters(b) end},
+    return {
+        {text="书籍详情",callback=function() self:book_details(b) end},
+        {text="下载章节",sub_item_table_func=function() return self:current_book_download_menu(b) end},
+        {text="重新生成与修复",sub_item_table_func=function() return self:current_book_rebuild_menu(b) end},
+        {text="管理本地文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end},
     }
-    if self:_has_range_variant(b.bookId) then
-        items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(b) end}
-    end
-    items[#items+1]={text="管理本书文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end}
-    items[#items+1]={text="书籍详情",callback=function() self:book_details(b) end}
-    return items
 end
 
 function Plugin:current_mp_article_menu(mp_context)
@@ -892,8 +946,8 @@ function Plugin:reader_menu()
             {text="下一篇",callback=self:safe("mp-next",function() self:open_mp_neighbor(1) end)},
             {text="当前文章",sub_item_table_func=function() return self:current_mp_article_menu(mp_context) end},
             {text=self:_download_menu_text(),callback=function() self:show_downloads() end},
-            {text=self:_account_status_label(),callback=function() self:show_account_status() end},
             {text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end},
+            {text="KOReader 菜单",callback=function() self:_show_koreader_reader_menu() end},
         }
     end
     return {
@@ -904,8 +958,8 @@ function Plugin:reader_menu()
         {text="当前书籍",sub_item_table_func=function() return self:current_book_menu() end},
         {text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end},
         {text=self:_download_menu_text(),callback=function() self:show_downloads() end},
-        {text=self:_account_status_label(),callback=function() self:show_account_status() end},
         {text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end},
+        {text="KOReader 菜单",callback=function() self:_show_koreader_reader_menu() end},
     }
 end
 
@@ -1699,10 +1753,23 @@ function Plugin:_home_preferences()
     home.source_order=source_order
     if home.auto_hide_empty==nil then home.auto_hide_empty=false; changed=true end
     if type(home.quick_items)~="table" then home.quick_items={}; changed=true end
+    if type(home.quick_order)~="table" then home.quick_order={}; changed=true end
+    if (tonumber(home.quick_layout_version) or 0)<2 then
+        local empty_items=next(home.quick_items)==nil
+        local empty_order=#home.quick_order==0
+        local legacy_default=quick_boolean_layout_matches(home.quick_items,HOME_QUICK_ITEM_LEGACY_DEFAULT,HOME_QUICK_ITEM_LEGACY_ORDER)
+            and quick_order_matches(home.quick_order,HOME_QUICK_ITEM_LEGACY_ORDER)
+        if empty_items or empty_order or legacy_default then
+            home.quick_items={}
+            for _,key in ipairs(HOME_QUICK_ITEM_ORDER) do home.quick_items[key]=HOME_QUICK_ITEM_DEFAULT[key]==true end
+            home.quick_order=U.copy(HOME_QUICK_ITEM_ORDER)
+        end
+        home.quick_layout_version=2
+        changed=true
+    end
     for _,key in ipairs(HOME_QUICK_ITEM_ORDER) do
         if home.quick_items[key]==nil then home.quick_items[key]=HOME_QUICK_ITEM_DEFAULT[key]==true; changed=true end
     end
-    if type(home.quick_order)~="table" then home.quick_order={}; changed=true end
     local quick_seen,quick_order={},{}
     for _,key in ipairs(home.quick_order) do
         if HOME_QUICK_ITEM_DEFAULT[key]~=nil and not quick_seen[key] then quick_seen[key]=true; quick_order[#quick_order+1]=key end
@@ -2193,10 +2260,6 @@ local HOME_QUICK_LABELS={
 }
 
 function Plugin:_home_toggle_quick_item(key)
-    if key=="settings" or key=="koreader_menu" then
-        self:toast("觅阅设置和 KOReader 菜单需要保留",2)
-        return false
-    end
     local home,preferences=self:_home_preferences()
     local currently=home.quick_items[key]==true
     local count=0
@@ -2261,13 +2324,14 @@ function Plugin:home_quick_panel_settings_menu()
         }
     end
     rows[#rows+1]={text="调整顺序",sub_item_table_func=function() return self:home_quick_panel_order_menu() end}
-    rows[#rows+1]={text="恢复默认",callback=function()
+    rows[#rows+1]={text="恢复推荐布局",callback=function()
         local home,preferences=self:_home_preferences()
         home.quick_items={}
         for _,key in ipairs(HOME_QUICK_ITEM_ORDER) do home.quick_items[key]=HOME_QUICK_ITEM_DEFAULT[key]==true end
         home.quick_order=U.copy(HOME_QUICK_ITEM_ORDER)
+        home.quick_layout_version=2
         self:_save_home_preferences(home,preferences)
-        self:toast("快捷面板已恢复默认")
+        self:toast("快捷面板已恢复推荐布局")
     end}
     return rows
 end
@@ -2287,10 +2351,23 @@ function Plugin:_reader_preferences()
     if reader.show_title==nil then reader.show_title=true; changed=true end
     if reader.show_status==nil then reader.show_status=true; changed=true end
     if type(reader.quick_items)~="table" then reader.quick_items={}; changed=true end
+    if type(reader.quick_order)~="table" then reader.quick_order={}; changed=true end
+    if (tonumber(reader.quick_layout_version) or 0)<2 then
+        local empty_items=next(reader.quick_items)==nil
+        local empty_order=#reader.quick_order==0
+        local legacy_default=quick_boolean_layout_matches(reader.quick_items,READER_QUICK_ITEM_LEGACY_DEFAULT,READER_QUICK_ITEM_LEGACY_ORDER)
+            and quick_order_matches(reader.quick_order,READER_QUICK_ITEM_LEGACY_ORDER)
+        if empty_items or empty_order or legacy_default then
+            reader.quick_items={}
+            for _,key in ipairs(READER_QUICK_ITEM_ORDER) do reader.quick_items[key]=READER_QUICK_ITEM_DEFAULT[key]==true end
+            reader.quick_order=U.copy(READER_QUICK_ITEM_ORDER)
+        end
+        reader.quick_layout_version=2
+        changed=true
+    end
     for _,key in ipairs(READER_QUICK_ITEM_ORDER) do
         if reader.quick_items[key]==nil then reader.quick_items[key]=READER_QUICK_ITEM_DEFAULT[key]==true; changed=true end
     end
-    if type(reader.quick_order)~="table" then reader.quick_order={}; changed=true end
     local seen,order={},{}
     for _,key in ipairs(reader.quick_order) do
         if READER_QUICK_ITEM_DEFAULT[key]~=nil and not seen[key] then seen[key]=true; order[#order+1]=key end
@@ -2372,13 +2449,14 @@ function Plugin:reader_quick_panel_items_menu()
         end,keep_menu_open=true,callback=function() self:_toggle_reader_quick_item(item_key) end}
     end
     rows[#rows+1]={text="调整顺序",sub_item_table_func=function() return self:reader_quick_panel_order_menu() end}
-    rows[#rows+1]={text="恢复默认",callback=function()
+    rows[#rows+1]={text="恢复推荐布局",callback=function()
         local reader,preferences=self:_reader_preferences()
         reader.quick_items={}
         for _,key in ipairs(READER_QUICK_ITEM_ORDER) do reader.quick_items[key]=READER_QUICK_ITEM_DEFAULT[key]==true end
         reader.quick_order=U.copy(READER_QUICK_ITEM_ORDER)
+        reader.quick_layout_version=2
         self:_save_reader_preferences(reader,preferences)
-        self:toast("阅读面板已恢复默认")
+        self:toast("阅读面板已恢复推荐布局")
     end}
     return rows
 end
@@ -2388,17 +2466,17 @@ function Plugin:reader_quick_panel_settings_menu()
         {text="启用觅阅阅读面板",checked_func=function() return self:_reader_preferences().enabled~=false end,keep_menu_open=true,callback=function()
             local reader,preferences=self:_reader_preferences(); reader.enabled=reader.enabled==false; self:_save_reader_preferences(reader,preferences)
         end},
-        {text="插件模式下也接管顶部入口",post_text="默认关闭，避免影响其他 UI",checked_func=function() return self:_reader_preferences().plugin_mode_enabled==true end,keep_menu_open=true,callback=function()
+        {text="插件模式下显示阅读面板",post_text="默认关闭，避免影响其他 UI",checked_func=function() return self:_reader_preferences().plugin_mode_enabled==true end,keep_menu_open=true,callback=function()
             local reader,preferences=self:_reader_preferences(); reader.plugin_mode_enabled=reader.plugin_mode_enabled~=true; self:_save_reader_preferences(reader,preferences)
             self:toast("重开书籍后生效",2)
         end},
         {text="显示书名",checked_func=function() return self:_reader_preferences().show_title~=false end,keep_menu_open=true,callback=function()
             local reader,preferences=self:_reader_preferences(); reader.show_title=reader.show_title==false; self:_save_reader_preferences(reader,preferences)
         end},
-        {text="显示进度、字号与同步状态",checked_func=function() return self:_reader_preferences().show_status~=false end,keep_menu_open=true,callback=function()
+        {text="显示阅读状态",checked_func=function() return self:_reader_preferences().show_status~=false end,keep_menu_open=true,callback=function()
             local reader,preferences=self:_reader_preferences(); reader.show_status=reader.show_status==false; self:_save_reader_preferences(reader,preferences)
         end},
-        {text="显示项目与顺序",sub_item_table_func=function() return self:reader_quick_panel_items_menu() end},
+        {text="快捷项目与顺序",sub_item_table_func=function() return self:reader_quick_panel_items_menu() end},
     }
 end
 
@@ -2512,6 +2590,7 @@ function Plugin:_show_standalone_menu(title,items,options)
     items=type(items)=="table" and items or {}
     if #items==0 then self:info("没有可用选项"); return nil end
     local menu
+    local close_standalone
     local rows={}
     for _,entry in ipairs(items) do
         local source=entry
@@ -2546,19 +2625,27 @@ function Plugin:_show_standalone_menu(title,items,options)
             row.callback=function(...)
                 logger.info("[MiuRead][Menu] standalone item tapped",tostring(source.text or ""))
                 local args={...}
-                local ok,err=xpcall(function() return source.callback(unpack_args(args)) end,debug.traceback)
-                if not ok then
-                    logger.warn("[MiuRead][Menu] standalone action failed",tostring(source.text or ""),tostring(err))
-                    self:info("这个入口暂时无法打开。\n\n"..tostring(err))
-                    return
+                local function run_action()
+                    local ok,err=xpcall(function() return source.callback(unpack_args(args)) end,debug.traceback)
+                    if not ok then
+                        logger.warn("[MiuRead][Menu] standalone action failed",tostring(source.text or ""),tostring(err))
+                        self:info("这个入口暂时无法打开。\n\n"..tostring(err))
+                        return
+                    end
+                    if source.keep_menu_open==true and menu and UIManager:isWidgetShown(menu) then
+                        UIManager:scheduleIn(.05,function()
+                            if menu and UIManager:isWidgetShown(menu) then
+                                local refreshed=self:_standalone_rows(title,items,menu)
+                                if refreshed then menu.item_table=refreshed; pcall(menu.updateItems,menu) end
+                            end
+                        end)
+                    end
                 end
-                if source.keep_menu_open==true and menu and UIManager:isWidgetShown(menu) then
-                    UIManager:scheduleIn(.05,function()
-                        if menu and UIManager:isWidgetShown(menu) then
-                            local refreshed=self:_standalone_rows(title,items,menu)
-                            if refreshed then menu.item_table=refreshed; pcall(menu.updateItems,menu) end
-                        end
-                    end)
+                if source.close_before_action==true and close_standalone then
+                    if close_standalone()~=false then UIManager:scheduleIn(.04,run_action)
+                    else run_action() end
+                else
+                    run_action()
                 end
             end
         end
@@ -2574,7 +2661,7 @@ function Plugin:_show_standalone_menu(title,items,options)
     -- Replacing Menu:onClose on this concrete instance is sufficient and avoids
     -- mutating already-built child button fields that differ across KOReader
     -- versions.
-    local function close_standalone()
+    close_standalone=function()
         if not menu or menu._miuread_closing then return true end
         menu._miuread_closing=true
         local ok,err=pcall(UIManager.close,UIManager,menu)
@@ -3646,24 +3733,28 @@ function Plugin:show_home_quick_panel()
         if ok then wifi_on=value==true end
     end
 
+    local download_detail=""
+    if self:_has_download_status() or #self.store:download_queue()>0 then
+        download_detail=self:_download_menu_text():gsub("^下载管理%s*[·：]?%s*","")
+    end
     local definitions={
-        wifi={label="Wi-Fi",detail=wifi_on==nil and "网络控制" or (wifi_on and "已开启 · 点击关闭" or "已关闭 · 点击开启"),callback=function() self:_home_wifi_toggle() end},
-        refresh_shelf={label="刷新书架",detail="更新书籍与封面",callback=function() self:_home_manual_refresh() end},
-        full_refresh={label="全屏刷新",detail="清除墨水屏残影",callback=function() self:_home_full_refresh() end},
-        settings={label="觅阅设置",detail="书架、下载与显示",callback=function() self:_show_standalone_menu("觅阅设置",self:settings_menu()) end},
-        koreader_menu={label="KOReader 菜单",detail="系统与插件功能",callback=function() self:_show_native_koreader_menu() end},
-        downloads={label="下载管理",detail=self:_download_menu_text():gsub("^下载管理%s*[·：]?%s*",""),callback=function() self:show_downloads() end},
+        wifi={label="Wi-Fi",detail=wifi_on==nil and "状态未知" or (wifi_on and "已开启" or "已关闭"),callback=function() self:_home_wifi_toggle() end},
+        refresh_shelf={label="刷新书架",detail="",callback=function() self:_home_manual_refresh() end},
+        full_refresh={label="全屏刷新",detail="",callback=function() self:_home_full_refresh() end},
+        settings={label="觅阅设置",detail="",callback=function() self:_show_standalone_menu("觅阅设置",self:settings_menu()) end},
+        koreader_menu={label="KOReader 菜单",detail="",callback=function() self:_show_native_koreader_menu() end},
+        downloads={label="下载管理",detail=download_detail,callback=function() self:show_downloads() end},
         sync={label="阅读同步",detail=self:progress_sync_label(),callback=function() self:_show_standalone_menu("阅读同步",self:sync_menu()) end},
-        night={label="夜间模式",detail="切换黑白显示",callback=function() self:_home_toggle_night() end},
-        rotate={label="旋转屏幕",detail="切换屏幕方向",callback=function() self:_home_rotate() end},
-        restart={label="重启 KOReader",detail="重新载入程序",callback=function() self:_restart_koreader() end},
-        quit={label="退出 KOReader",detail="安全退出程序",callback=function() self:_quit_koreader() end},
+        night={label="夜间模式",detail="",callback=function() self:_home_toggle_night() end},
+        rotate={label="旋转屏幕",detail="",callback=function() self:_home_rotate() end},
+        restart={label="重启 KOReader",detail="",callback=function() self:_restart_koreader() end},
+        quit={label="退出 KOReader",detail="",callback=function() self:_quit_koreader() end},
     }
     if Device:hasFrontlight() then
-        definitions.frontlight={label="前光",detail="亮度与暖光",callback=function() self:_home_frontlight() end}
+        definitions.frontlight={label="前光",detail="",callback=function() self:_home_frontlight() end}
     end
     if Device:canSuspend() then
-        definitions.sleep={label="休眠",detail="进入设备休眠",callback=function() self:_home_sleep() end}
+        definitions.sleep={label="休眠",detail="",callback=function() self:_home_sleep() end}
     end
 
     local home=self:_home_preferences()
@@ -3676,12 +3767,20 @@ function Plugin:show_home_quick_panel()
     local battery=tonumber(state.battery) and (tostring(math.floor(state.battery+.5)).."%") or "未知"
     local connection=wifi_on==nil and "网络状态未知" or (wifi_on and "Wi-Fi 已开启" or "Wi-Fi 已关闭")
     local notice=self:_home_download_notice()
-    local status_text="账号："..self:_home_account_name()
-    if notice then status_text=status_text.."　"..tostring(notice.title or "") end
+    local status_text
+    if notice then
+        status_text=tostring(notice.title or "")
+        if notice.detail and notice.detail~="" then status_text=status_text.." · "..tostring(notice.detail) end
+    end
+    local header_action
+    if home.quick_items.koreader_menu~=true then
+        header_action={label="KOReader",callback=function() self:_show_native_koreader_menu() end}
+    end
     local panel,err=HomeQuickPanel.show{
         title=os.date("%H:%M").."　电量 "..battery,
-        subtitle=connection.."　点击面板外收起",
+        subtitle=connection,
         status_text=status_text,
+        header_action=header_action,
         buttons=buttons,
     }
     if not panel then
@@ -3865,8 +3964,49 @@ function Plugin:_show_reader_typeset_menu()
     return false
 end
 
+function Plugin:_thought_font_size_label()
+    local level=tostring((self.store:preferences().thoughts or {}).font or "standard")
+    if level=="large" then return "适中" end
+    if level=="xlarge" then return "接近正文" end
+    return "较小"
+end
+
+function Plugin:_set_thought_font_size(level)
+    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+    p.thoughts.font=level
+    self.store:save_preferences(p)
+    return true
+end
+
+function Plugin:_toggle_thought_follow_body_font()
+    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+    p.thoughts.follow_body_font=p.thoughts.follow_body_font~=true
+    self.store:save_preferences(p)
+    return true
+end
+
 function Plugin:_show_reader_comment_settings()
-    self:_show_standalone_menu("评论显示",self:thought_font_settings_menu(),{native_input=true})
+    ReaderSettingsDialog.show{
+        title="评论显示",
+        subtitle=function()
+            local prefs=self.store:preferences().thoughts or {}
+            return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · "..self:_thought_font_size_label()
+        end,
+        rows=function()
+            local prefs=self.store:preferences().thoughts or {}
+            local follow=prefs.follow_body_font==true
+            local level=tostring(prefs.font or "standard")
+            return {
+                {label="评论字体跟随正文",value=follow and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:_toggle_thought_follow_body_font() end},
+                {label="固定字体",value=self:_thought_font_face_label(prefs),enabled=not follow,callback=function()
+                    self:_show_standalone_menu("评论字体",self:thought_font_face_menu(),{native_input=true})
+                end},
+                {label="较小",value=level=="standard" and "已选择" or "",checked=level=="standard",keep_open=true,callback=function() self:_set_thought_font_size("standard") end},
+                {label="适中",value=level=="large" and "已选择" or "",checked=level=="large",keep_open=true,callback=function() self:_set_thought_font_size("large") end},
+                {label="接近正文",value=level=="xlarge" and "已选择" or "",checked=level=="xlarge",keep_open=true,callback=function() self:_set_thought_font_size("xlarge") end},
+            }
+        end,
+    }
     return true
 end
 
@@ -3906,20 +4046,43 @@ function Plugin:_reader_toolbar_title()
 end
 
 function Plugin:_show_reader_font_panel()
-    local items={
-        {text="当前字体",post_text=self:_reader_font_label(),enabled=false},
-        {text="当前字号",post_text=self:_reader_font_size_label(),enabled=false},
-        {text="字号减小",callback=function() self:_reader_adjust_font_size(-1) end},
-        {text="字号增大",callback=function() self:_reader_adjust_font_size(1) end},
-        {text="正文字体与完整排版",callback=function() self:_show_reader_typeset_menu() end},
-        {text="评论字体设置",callback=function() self:_show_reader_comment_settings() end},
+    ReaderSettingsDialog.show{
+        title="字体与字号",
+        subtitle=function() return self:_reader_font_label().." · 字号 "..self:_reader_font_size_label() end,
+        rows=function()
+            return {
+                {label="字号减小",value="− 1",value_bold=true,keep_open=true,callback=function() self:_reader_adjust_font_size(-1) end},
+                {label="字号增大",value="+ 1",value_bold=true,keep_open=true,callback=function() self:_reader_adjust_font_size(1) end},
+                {label="正文字体与完整排版",value="进入",callback=function() self:_show_reader_typeset_menu() end},
+                {label="评论显示",value=self:_thought_font_size_label(),callback=function() self:_show_reader_comment_settings() end},
+            }
+        end,
     }
-    self:_show_standalone_menu("字体与字号",items,{native_input=true})
     return true
 end
 
 function Plugin:_show_reader_sync_panel()
-    self:_show_standalone_menu("阅读与同步",self:sync_menu(),{native_input=true})
+    ReaderSettingsDialog.show{
+        title="阅读同步",
+        subtitle=function()
+            local sync=self.store:preferences().sync or {}
+            return "进度"..(sync.progress_enabled~=false and "开" or "关").." · 时间"..(sync.time_enabled==true and "开" or "关")
+        end,
+        rows=function()
+            local sync=self.store:preferences().sync or {}
+            return {
+                {label="同步状态",value=self:progress_sync_label(),callback=function() self:show_sync_status(false) end},
+                {label="自动同步阅读进度",value=sync.progress_enabled~=false and "已开启" or "已关闭",value_bold=true,callback=function() self:toggle_progress_sync() end},
+                {label="自动同步阅读时间",value=sync.time_enabled==true and "已开启" or "已关闭",value_bold=true,callback=function() self:toggle_time_sync() end},
+                {label="同步成功提醒",value=self:_sync_success_notice_enabled() and "已开启" or "已关闭",callback=function() self:toggle_sync_success_notice() end},
+                {label="立即上传当前进度",value="执行",callback=function() self:upload_local_progress(true) end},
+                {label="重新读取云端进度",value="执行",callback=function() self:manual_sync() end},
+                {label="同步诊断",value="进入",callback=function()
+                    self:_show_standalone_menu("同步诊断",self:sync_diagnostics_menu(),{native_input=true})
+                end},
+            }
+        end,
+    }
     return true
 end
 
@@ -3929,20 +4092,51 @@ function Plugin:_show_reader_current_book_panel()
 end
 
 function Plugin:_show_koreader_reader_menu()
-    local menu=self.ui and self.ui.menu
-    if menu and type(menu.onShowMenu)=="function" then menu:onShowMenu()
-    elseif self.ui then self.ui:handleEvent(Event:new("ShowMenu")) end
+    local current_ui=self.ui
+    if not (current_ui and current_ui.document) then return false end
+    if self._reader_native_menu_opening then return true end
+    local current_menu=current_ui.menu
+    if current_menu and current_menu.menu_container and UIManager:isWidgetShown(current_menu.menu_container) then return true end
+    self._reader_native_menu_opening=true
+    self:_close_miuread_transients()
+    UIManager:scheduleIn(.04,function()
+        local ui=self.ui
+        local menu=ui and ui.menu or nil
+        if not (ui and ui.document) then
+            self._reader_native_menu_opening=false
+            return
+        end
+        if menu and menu.menu_container and UIManager:isWidgetShown(menu.menu_container) then
+            self._reader_native_menu_opening=false
+            return
+        end
+        local ok,err=xpcall(function()
+            if menu and type(menu.onShowMenu)=="function" then menu:onShowMenu()
+            else ui:handleEvent(Event:new("ShowMenu")) end
+        end,debug.traceback)
+        self._reader_native_menu_opening=false
+        if not ok then
+            logger.warn("[MiuRead][Reader] native menu open failed",tostring(err))
+            self:_close_miuread_transients()
+            self:info("KOReader 菜单暂时无法打开")
+        end
+    end)
     return true
 end
 
 function Plugin:show_reader_more_panel()
     if not (self.ui and self.ui.document) then return false end
     local items={
+        {text="书籍",enabled=false},
+        {text="当前书籍",sub_item_table_func=function() return self:current_book_menu() end},
         {text="评论显示",callback=function() self:_show_reader_comment_settings() end},
         {text="下载管理",callback=function() self:show_downloads() end},
+        {text="显示",enabled=false},
+        {text="完整排版",callback=function() self:_show_reader_typeset_menu() end},
         {text="全屏刷新",callback=function() self:_home_full_refresh() end},
-        {text="KOReader 菜单",callback=function() self:_show_koreader_reader_menu() end},
+        {text="KOReader 菜单",close_before_action=true,callback=function() self:_show_koreader_reader_menu() end},
     }
+    if Device:hasFrontlight() or Device:canSuspend() then items[#items+1]={text="设备",enabled=false} end
     if Device:hasFrontlight() then items[#items+1]={text="前光",callback=function() self:_home_frontlight() end} end
     if Device:canSuspend() then items[#items+1]={text="休眠",callback=function() self:_home_sleep() end} end
     self:_show_standalone_menu("更多阅读功能",items,{native_input=true})
@@ -3980,10 +4174,12 @@ function Plugin:show_reader_quick_panel()
         if reader.quick_items[key]==true and definitions[key] then buttons[#buttons+1]=definitions[key] end
         if #buttons>=8 then break end
     end
+    local screen=Device.screen
+    local columns=(screen:getWidth()<screen:getHeight()) and 3 or 4
     local panel,err=ReaderToolbar.show{
-        title="阅读中 · 觅阅",
-        subtitle=(reader.show_title~=false and title or "")..(reader.show_status~=false and ((reader.show_title~=false and "　" or "")..status) or ""),
-        columns=4,
+        title=reader.show_title~=false and title or "阅读快捷面板",
+        subtitle=reader.show_status~=false and status or "",
+        columns=columns,
         buttons=buttons,
     }
     if not panel then
@@ -3997,6 +4193,7 @@ end
 function Plugin:_close_miuread_transients()
     HomeQuickPanel.close()
     ReaderToolbar.close()
+    ReaderSettingsDialog.close()
     local pending={}
     for index=#(UIManager._window_stack or {}),1,-1 do
         local window=UIManager._window_stack[index]
@@ -4037,75 +4234,70 @@ end
 
 function Plugin:_install_reader_quick_panel_zone()
     local readerui=self.ui
-    if not readerui or not readerui.document or type(readerui.registerTouchZones)~="function" then return false end
-    if not self:_reader_panel_active() then return false end
+    if not readerui or not readerui.document then return false end
+    -- Keep KOReader's own touch-zone geometry and priority. The menu bridge
+    -- below redirects only the native menu handler after links, footnotes,
+    -- highlights and normal page gestures have had their normal chance.
+    if not readerui._miuread_native_menu_zone_preserved then
+        readerui._miuread_native_menu_zone_preserved=true
+        logger.info("[MiuRead][ReaderToolbar] native menu touch zones preserved")
+    end
+    return true
+end
 
-    local function read_zone(name,fallback)
-        local value
-        if G_defaults and type(G_defaults.readSetting)=="function" then
-            local ok,result=pcall(G_defaults.readSetting,G_defaults,name)
-            if ok and type(result)=="table" then value=result end
+function Plugin:_install_reader_menu_bridge()
+    local readerui=self.ui
+    local menu=readerui and readerui.menu or nil
+    if not readerui or not readerui.document or not menu then return false end
+    if menu._miuread_bridge_owner==self then return true end
+
+    local original_tap=menu.onTapShowMenu
+    local original_swipe=menu.onSwipeShowMenu
+    local original_press=menu.onPressMenu
+    local original_key=menu.onKeyPressShowMenu
+    local plugin=self
+
+    menu._miuread_bridge_owner=self
+    menu._miuread_original_onTapShowMenu=original_tap
+    menu._miuread_original_onSwipeShowMenu=original_swipe
+    menu._miuread_original_onPressMenu=original_press
+    menu._miuread_original_onKeyPressShowMenu=original_key
+
+    menu.onTapShowMenu=function(native_menu,ges)
+        if plugin and plugin.ui==readerui and readerui.document and plugin:_reader_panel_active() then
+            local activation=native_menu.activation_menu
+                or (G_reader_settings and G_reader_settings:readSetting("activate_menu")) or "swipe_tap"
+            if activation~="swipe" then return plugin:show_reader_quick_panel() end
+            return nil
         end
-        value=value or fallback
-        return {
-            ratio_x=tonumber(value.x) or fallback.x,
-            ratio_y=tonumber(value.y) or fallback.y,
-            ratio_w=tonumber(value.w) or fallback.w,
-            ratio_h=tonumber(value.h) or fallback.h,
-        }
+        if type(original_tap)=="function" then return original_tap(native_menu,ges) end
     end
-
-    -- Replace only KOReader's top menu handlers. The bottom configuration
-    -- handlers remain native so font, spacing, margins and other typesetting
-    -- controls are always available through KOReader's normal bottom panel.
-    local menu_zone=read_zone("DTAP_ZONE_MENU",{x=0,y=0,w=1,h=1/8})
-    local menu_ext_zone=read_zone("DTAP_ZONE_MENU_EXT",{x=1/4,y=0,w=2/4,h=1/5})
-    local activation=(readerui.menu and readerui.menu.activation_menu)
-        or (G_reader_settings and G_reader_settings:readSetting("activate_menu")) or "swipe_tap"
-
-    local function allowed()
-        return self:_reader_panel_active()==true and self.ui and self.ui.document
+    menu.onSwipeShowMenu=function(native_menu,ges)
+        if plugin and plugin.ui==readerui and readerui.document and plugin:_reader_panel_active() then
+            local activation=native_menu.activation_menu
+                or (G_reader_settings and G_reader_settings:readSetting("activate_menu")) or "swipe_tap"
+            if activation~="tap" and ges and ges.direction=="south" then
+                local shown=plugin:show_reader_quick_panel()
+                if shown then readerui:handleEvent(Event:new("HandledAsSwipe")) end
+                return shown
+            end
+            return nil
+        end
+        if type(original_swipe)=="function" then return original_swipe(native_menu,ges) end
     end
-    local function tap_panel()
-        if not allowed() or activation=="swipe" then return false end
-        self:show_reader_quick_panel()
-        return true
+    menu.onPressMenu=function(native_menu,...)
+        if plugin and plugin.ui==readerui and readerui.document and plugin:_reader_panel_active() then
+            return plugin:show_reader_quick_panel()
+        end
+        if type(original_press)=="function" then return original_press(native_menu,...) end
     end
-    local function swipe_panel(ges)
-        if not allowed() or activation=="tap" or not ges or ges.direction~="south" then return false end
-        self:show_reader_quick_panel()
-        readerui:handleEvent(Event:new("HandledAsSwipe"))
-        return true
+    menu.onKeyPressShowMenu=function(native_menu,...)
+        if plugin and plugin.ui==readerui and readerui.document and plugin:_reader_panel_active() then
+            return plugin:show_reader_quick_panel()
+        end
+        if type(original_key)=="function" then return original_key(native_menu,...) end
     end
-
-    readerui:registerTouchZones({
-        {
-            id="readermenu_tap",ges="tap",screen_zone=menu_zone,
-            overrides={"tap_forward","tap_backward"},handler=tap_panel,
-        },
-        {
-            id="readermenu_ext_tap",ges="tap",screen_zone=menu_ext_zone,
-            overrides={"readermenu_tap"},handler=tap_panel,
-        },
-        {
-            id="readermenu_swipe",ges="swipe",screen_zone=menu_zone,
-            overrides={"rolling_swipe","paging_swipe"},handler=swipe_panel,
-        },
-        {
-            id="readermenu_ext_swipe",ges="swipe",screen_zone=menu_ext_zone,
-            overrides={"readermenu_swipe"},handler=swipe_panel,
-        },
-        {
-            id="readermenu_pan",ges="pan",screen_zone=menu_zone,
-            overrides={"rolling_pan","paging_pan"},handler=swipe_panel,
-        },
-        {
-            id="readermenu_ext_pan",ges="pan",screen_zone=menu_ext_zone,
-            overrides={"readermenu_pan"},handler=swipe_panel,
-        },
-    })
-    readerui._miuread_reader_quick_panel_zone=true
-    logger.info("[MiuRead][ReaderToolbar] top menu touch zones replaced; bottom typesetting kept native")
+    logger.info("[MiuRead][ReaderToolbar] native menu handlers redirected; touch zones unchanged")
     return true
 end
 
@@ -4133,12 +4325,8 @@ function Plugin:_install_reader_home_bridge()
                 HOME_RETURN_FILE=path or HOME_RETURN_FILE
                 mark_reader_origin(path)
                 logger.info("[MiuRead][Reader] FileManager transition suppressed; returning to MiuRead")
-                -- Recreate FileManager only as a hidden native base, then move
-                -- the existing MiuRead root above it before the next repaint.
-                plugin:_ensure_filemanager_base(path)
-                plugin:_close_miuread_transients()
-                HomeView.raise()
-                plugin:_restore_home_after_reader_close(1)
+                local generation=plugin:_begin_reader_return("native filemanager",path)
+                plugin:_schedule_reader_return_finish(generation,.02,"native filemanager")
                 return true
             end
             return original_show_filemanager(ui,file,...)
@@ -4394,7 +4582,104 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
     return shown
 end
 
-function Plugin:return_to_miuread_home()
+function Plugin:_begin_reader_return(reason,file)
+    local now=os.time()
+    if self._reader_returning then
+        local age=now-(tonumber(self._reader_return_started) or now)
+        if age>=0 and age<30 then
+            return tonumber(self._reader_return_generation) or 0,false
+        end
+        logger.warn("[MiuRead][Reader] stale return state reset",tostring(self._reader_return_reason or "unknown"))
+        self:_clear_reader_return(self._reader_return_generation,"stale state")
+    end
+    self._reader_return_generation=(tonumber(self._reader_return_generation) or 0)+1
+    self._reader_returning=true
+    self._reader_return_started=now
+    self._reader_return_reason=tostring(reason or "return home")
+    self._reader_return_completed_generation=nil
+    self._home_reader_transition=true
+    if self._reader_return_finish_task then
+        UIManager:unschedule(self._reader_return_finish_task)
+        self._reader_return_finish_task=nil
+    end
+    local path=self:_reader_file(self:_active_reader_ui(),file)
+    HOME_RETURN_FILE=path or HOME_RETURN_FILE
+    if path then mark_reader_origin(path) end
+    return self._reader_return_generation,true
+end
+
+function Plugin:_clear_reader_return(generation,reason)
+    if generation and generation~=self._reader_return_generation then return false end
+    if self._reader_return_finish_task then
+        UIManager:unschedule(self._reader_return_finish_task)
+        self._reader_return_finish_task=nil
+    end
+    self._reader_returning=false
+    self._reader_return_started=0
+    self._reader_return_reason=nil
+    self._home_reader_transition=false
+    self._miuread_return_requested=false
+    logger.info("[MiuRead][Reader] return state cleared",tostring(reason or "complete"))
+    return true
+end
+
+function Plugin:_schedule_reader_return_finish(generation,delay,reason)
+    if generation~=self._reader_return_generation
+        or self._reader_return_completed_generation==generation then return false end
+    if self._reader_return_finish_task then
+        UIManager:unschedule(self._reader_return_finish_task)
+        self._reader_return_finish_task=nil
+    end
+    local task
+    task=function()
+        if self._reader_return_finish_task~=task then return end
+        self._reader_return_finish_task=nil
+        self:_finish_reader_return(generation,1,reason)
+    end
+    self._reader_return_finish_task=task
+    UIManager:scheduleIn(math.max(0,tonumber(delay) or .02),task)
+    return true
+end
+
+function Plugin:_finish_reader_return(generation,attempt,reason)
+    if generation~=self._reader_return_generation then return false end
+    if self._reader_return_completed_generation==generation then return true end
+    attempt=tonumber(attempt) or 1
+    if self:_active_reader_ui() then
+        if attempt<80 then
+            local task
+            task=function()
+                if self._reader_return_finish_task~=task then return end
+                self._reader_return_finish_task=nil
+                self:_finish_reader_return(generation,attempt+1,reason)
+            end
+            self._reader_return_finish_task=task
+            UIManager:scheduleIn(attempt<10 and .12 or .35,task)
+        else
+            logger.warn("[MiuRead][Reader] reader still active after close request",tostring(reason or "return"))
+            self:_clear_reader_return(generation,"close wait expired")
+            self:info("书籍仍在关闭中，请稍后再试")
+        end
+        return false
+    end
+
+    -- Mark this generation complete before any repaint. CloseDocument and a
+    -- watchdog may arrive together, but only the first one is allowed to raise
+    -- and redraw the MiuRead home screen.
+    self._reader_return_completed_generation=generation
+    if self._reader_return_finish_task then
+        UIManager:unschedule(self._reader_return_finish_task)
+        self._reader_return_finish_task=nil
+    end
+    self:_ensure_filemanager_base(HOME_RETURN_FILE or HOME_READER_FILE)
+    self:_close_miuread_transients()
+    HomeView.raise()
+    self:_restore_home_after_reader_close(1)
+    self:_clear_reader_return(generation,reason or "home restored")
+    return true
+end
+
+function Plugin:return_to_miuread_home(reason)
     sync_home_session()
     if HOME_EXITING or UIManager._exit_code~=nil then return false end
     self:_cancel_native_menu_guard()
@@ -4407,26 +4692,31 @@ function Plugin:return_to_miuread_home()
     local readerui=self:_active_reader_ui()
     if readerui then
         local file=self:_reader_file(readerui,HOME_RETURN_FILE)
-        HOME_RETURN_FILE=file or HOME_RETURN_FILE
-        mark_reader_origin(file)
-        self._home_reader_transition=true
+        local generation,started=self:_begin_reader_return(reason or "explicit return",file)
+        if not started then return true end
+        self:_close_miuread_transients()
         UIManager:nextTick(function()
-            pcall(function() readerui:handleEvent(Event:new("CloseReaderMenu")) end)
-            pcall(function() readerui:handleEvent(Event:new("CloseConfigMenu")) end)
+            if generation~=self._reader_return_generation then return end
+            local active=self:_active_reader_ui() or readerui
+            if not active or not active.document then
+                self:_schedule_reader_return_finish(generation,.02,"reader already closed")
+                return
+            end
+            pcall(function() active:handleEvent(Event:new("CloseReaderMenu")) end)
+            pcall(function() active:handleEvent(Event:new("CloseConfigMenu")) end)
             local ok_close,err_close=xpcall(function()
-                readerui:onClose(false)
+                active:onClose(false)
             end,debug.traceback)
             if not ok_close then
                 logger.warn("[MiuRead][Reader] return home close failed",tostring(err_close))
+                self:_clear_reader_return(generation,"close failed")
+                if active.dialog then pcall(UIManager.setDirty,UIManager,active.dialog,"ui") end
+                self:info("书籍暂时无法关闭，请稍后重试")
+                return
             end
-            -- Never call ReaderUI:showFileManager here. FileManager is only a
-            -- hidden base for KOReader; revealing it is the exact leak this
-            -- route is meant to prevent.
-            self:_ensure_filemanager_base(file)
-            self._home_reader_transition=false
-            self:_close_miuread_transients()
-            HomeView.raise()
-            self:_restore_home_after_reader_close(1)
+            -- CloseDocument is the primary completion signal. This watchdog is
+            -- deliberately slow and is cancelled as soon as that event arrives.
+            self:_schedule_reader_return_finish(generation,5,"return watchdog")
         end)
         return true
     end
@@ -5968,7 +6258,23 @@ function Plugin:chapter_menu(b,ch)
 end
 
 function Plugin:_open_file_direct(path)
+    path=normalized_reader_file(path)
+    if not path or not U.file_exists(path) then self:info(_("No cached file")); return false end
     sync_home_session()
+    local now=os.time()
+    local opening=tostring(HOME_SESSION.opening_file or "")
+    local opening_age=now-(tonumber(HOME_SESSION.opening_at) or 0)
+    if opening~="" and opening_age>=0 and opening_age<12 then
+        if opening==path then
+            logger.info("[MiuRead][Reader] duplicate open ignored",opening)
+            self:status_toast("正在打开书籍","请稍候",2)
+            return true
+        end
+        logger.info("[MiuRead][Reader] replacing pending open target",opening,"with",path)
+    end
+    HOME_SESSION.opening_file=path
+    HOME_SESSION.opening_at=now
+
     if self:_home_enabled() and not HOME_NATIVE_VISIT and not HOME_SESSION_SUPPRESSED then
         HOME_RETURN_FILE=path
         mark_reader_origin(path)
@@ -5979,14 +6285,37 @@ function Plugin:_open_file_direct(path)
         -- shelf or settings dialogs.
         self:_close_miuread_transients()
     end
-    if self.ui and self.ui.document and type(self.ui.switchDocument)=="function" then
-        return self.ui:switchDocument(path)
+
+    local function fail(err)
+        if tostring(HOME_SESSION.opening_file or "")==path then
+            HOME_SESSION.opening_file=nil
+            HOME_SESSION.opening_at=0
+        end
+        self._home_reader_transition=false
+        logger.warn("[MiuRead][Reader] open failed",path,tostring(err))
+        local active=self:_active_reader_ui()
+        if active and active.dialog then pcall(UIManager.setDirty,UIManager,active.dialog,"ui")
+        else HomeView.raise() end
+        self:info("书籍暂时无法打开：\n"..U.first_line(err,120))
+        return false
     end
-    local Event=require("ui/event")
+
+    if self.ui and self.ui.document and type(self.ui.switchDocument)=="function" then
+        local ok,result=xpcall(function() return self.ui:switchDocument(path) end,debug.traceback)
+        if not ok then return fail(result) end
+        if result==false then return fail("KOReader 拒绝切换到目标书籍") end
+        return result==nil and true or result
+    end
     local ReaderUI=require("apps/reader/readerui")
-    UIManager:broadcastEvent(Event:new("SetupShowReader"))
-    return ReaderUI:showReader(path)
+    local ok,result=xpcall(function()
+        UIManager:broadcastEvent(Event:new("SetupShowReader"))
+        return ReaderUI:showReader(path)
+    end,debug.traceback)
+    if not ok then return fail(result) end
+    if result==false then return fail("KOReader 拒绝打开目标书籍") end
+    return result==nil and true or result
 end
+
 function Plugin:open_file(path)
     if not path then self:info(_("No cached file")); return end
     local book=self.store:identify_file(path,false)
@@ -6609,11 +6938,11 @@ end
 function Plugin:sync_menu()
     return {
         {text="同步状态",callback=function() self:show_sync_status(false) end},
-        {text="上传当前进度",callback=function() self:upload_local_progress(true) end},
-        {text="读取云端进度",callback=function() self:manual_sync() end},
         {text="自动同步阅读进度",checked_func=function() return self.store:preferences().sync.progress_enabled~=false end,keep_menu_open=true,callback=function() self:toggle_progress_sync() end},
         {text="自动同步阅读时间",checked_func=function() return self.store:preferences().sync.time_enabled==true end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
         {text="同步成功提醒",checked_func=function() return self:_sync_success_notice_enabled() end,keep_menu_open=true,callback=function() self:toggle_sync_success_notice() end},
+        {text="立即上传当前进度",callback=function() self:upload_local_progress(true) end},
+        {text="重新读取云端进度",callback=function() self:manual_sync() end},
         {text="同步诊断",sub_item_table_func=function() return self:sync_diagnostics_menu() end},
     }
 end
@@ -7471,7 +7800,7 @@ function Plugin:download_settings_menu()
         items[#items+1]={text="恢复缓存设置",callback=function() self:restore_memory_mode() end}
     end
     items[#items+1]={text="下载目录",post_text=self:_download_dir_label(),callback=function() self:directory_dialog() end}
-    items[#items+1]={text="存储与清理",callback=function() self:show_downloads() end}
+    items[#items+1]={text="下载管理与清理",callback=function() self:show_downloads() end}
     return items
 end
 function Plugin:mp_settings_menu()
@@ -7480,29 +7809,44 @@ function Plugin:mp_settings_menu()
         {text="公众号缓存管理",sub_item_table_func=function() return self:mp_global_cache_menu() end},
     }
 end
-function Plugin:account_update_settings_menu()
+function Plugin:account_sync_settings_menu()
     local rows={
         {text="账号状态",post_text=self:_account_status_label(),callback=function() self:show_account_status() end},
         {text=self:logged_in() and "重新扫码登录" or "扫码登录",callback=function() self.auth_flow:start() end},
     }
     if self:logged_in() then rows[#rows+1]={text="退出登录",callback=function() self:confirm_logout() end} end
-    rows[#rows+1]={text="更新设置",sub_item_table_func=function() return self:update_settings_menu() end}
+    for _,row in ipairs(self:sync_menu()) do rows[#rows+1]=row end
     return rows
+end
+
+function Plugin:more_settings_menu()
+    return {
+        {text="提醒与确认",sub_item_table_func=function() return self:notice_settings_menu() end},
+        {text="书籍检查与修复",sub_item_table_func=function() return self:book_repair_settings_menu() end},
+        {text="更新设置",sub_item_table_func=function() return self:update_settings_menu() end},
+        {text="关于觅阅",callback=self:safe("about",function() self:show_about() end)},
+    }
+end
+
+function Plugin:_download_settings_summary()
+    local state=self:_download_state()
+    local queue=self.store:download_queue()
+    if state.status=="active" then return tostring(self:_download_percent(state)).."%" end
+    if self:_has_download_status() then return self:_download_status_label():gsub("^后台下载%s*[·：]?%s*","") end
+    if #queue>0 then return tostring(#queue).." 项等待" end
+    return nil
 end
 
 function Plugin:settings_menu()
     return {
         {text="运行模式",post_text=self:_home_mode_label(),sub_item_table_func=function() return self:home_mode_menu() end},
-        {text="阅读与同步",post_text=self:progress_sync_label(),sub_item_table_func=function() return self:sync_menu() end},
-        {text="阅读快捷面板",post_text="常用阅读功能与手势",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end},
-        {text="首页与书架",sub_item_table_func=function() return self:display_settings_menu() end},
+        {text="首页与书架",post_text="布局、来源与快捷面板",sub_item_table_func=function() return self:display_settings_menu() end},
+        {text="阅读界面",post_text="快捷面板与阅读状态",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end},
         {text="评论与标注",post_text=self:_thought_display_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
-        {text="下载与存储",post_text="一本下载 · 一本等待",sub_item_table_func=function() return self:download_settings_menu() end},
-        {text="提醒与确认",sub_item_table_func=function() return self:notice_settings_menu() end},
-        {text="书籍检查与修复",sub_item_table_func=function() return self:book_repair_settings_menu() end},
+        {text="账号与同步",post_text=self:progress_sync_label(),sub_item_table_func=function() return self:account_sync_settings_menu() end},
+        {text="下载与存储",post_text=self:_download_settings_summary(),sub_item_table_func=function() return self:download_settings_menu() end},
         {text="公众号阅读",sub_item_table_func=function() return self:mp_settings_menu() end},
-        {text="账号与更新",sub_item_table_func=function() return self:account_update_settings_menu() end},
-        {text="关于觅阅",callback=self:safe("about",function() self:show_about() end)},
+        {text="更多设置",sub_item_table_func=function() return self:more_settings_menu() end},
     }
 end
 
@@ -7805,9 +8149,9 @@ function Plugin:show_about()
     local memory_note=""
     local memory_status=self.memory_mode:status()
     if memory_status.enabled then
-        memory_note="\n\n低内存模式当前已开启。卸载觅阅前，请在“下载选项”中恢复缓存设置。"
+        memory_note="\n\n低内存模式当前已开启。卸载觅阅前，请在“下载与存储”中恢复缓存设置。"
     elseif memory_status.residual then
-        memory_note="\n\n检测到外部或遗留的低内存设置，可在“下载选项”中检查并恢复。"
+        memory_note="\n\n检测到外部或遗留的低内存设置，可在“下载与存储”中检查并恢复。"
     end
     self:info(Config.NAME.." "..self.version
         .."\n\n微信读书内容下载、书架管理与阅读同步。"
@@ -8210,7 +8554,10 @@ function Plugin:onReaderReady()
     logger.info("[MiuRead][Sync] reader ready")
     UIManager:scheduleIn(.05,function()
         if not (self.ui and self.ui.document) then return end
+        self:_install_reader_menu_bridge()
         self:_install_reader_quick_panel_zone()
+        HOME_SESSION.opening_file=nil
+        HOME_SESSION.opening_at=0
         local path=self:_current_document_path()
         local record,variant
         if path then
@@ -8245,6 +8592,16 @@ function Plugin:onReaderReady()
     -- the next-tick block above, so this does not delay reading interaction.
     UIManager:scheduleIn(.35,task)
 end
+function Plugin:onSetDimensions()
+    if self.ui and self.ui.document then
+        UIManager:nextTick(function()
+            if self.ui and self.ui.document then
+                self:_install_reader_menu_bridge()
+                self:_install_reader_quick_panel_zone()
+            end
+        end)
+    end
+end
 function Plugin:onPageUpdate(page)
     self:_mark_reader_busy(3)
     self.sync:on_page(page)
@@ -8269,6 +8626,14 @@ end
 function Plugin:onResume()
     if self._reader_active_path then U.atomic_write(self._reader_active_path,"1",true) end
     self:_mark_reader_busy(5)
+    if self.ui and self.ui.document then
+        UIManager:nextTick(function()
+            if self.ui and self.ui.document then
+                self:_install_reader_menu_bridge()
+                self:_install_reader_quick_panel_zone()
+            end
+        end)
+    end
     local slept=self._suspended_at and os.time()-self._suspended_at or 0
     self._suspended_at=nil
     local prefs=self.store:preferences().sync or {}
@@ -8290,6 +8655,61 @@ function Plugin:onResume()
         end,{minimum_delay=6,max_wait=75,interval=3})
     end
 end
+function Plugin:_run_post_reader_work(generation)
+    if generation~=self._post_reader_work_generation then return false end
+    self._post_reader_work_task=nil
+    local phase=tostring(HOME_SESSION.post_reader_work_phase or "")
+    if phase=="" then return true end
+    if self:_active_reader_ui() then
+        logger.info("[MiuRead][Download] post-reader work deferred",phase)
+        return false
+    end
+    if phase=="install" then
+        local ok,err=pcall(self._install_pending_downloads,self,true)
+        if not ok then logger.warn("[MiuRead][Download] pending install failed",tostring(err)) end
+        HOME_SESSION.post_reader_work_phase="queue"
+        local task
+        task=function()
+            if self._post_reader_work_task~=task then return end
+            self._post_reader_work_task=nil
+            self:_run_post_reader_work(generation)
+        end
+        self._post_reader_work_task=task
+        UIManager:scheduleIn(.5,task)
+        return true
+    end
+    if phase=="queue" then
+        local ok,err=pcall(self._start_next_queued_download,self)
+        if not ok then logger.warn("[MiuRead][Download] queued start failed",tostring(err)) end
+        HOME_SESSION.post_reader_work_phase=nil
+        return true
+    end
+    HOME_SESSION.post_reader_work_phase=nil
+    return true
+end
+
+function Plugin:_schedule_post_reader_work(reason,delay)
+    if not HOME_SESSION.post_reader_work_phase then
+        HOME_SESSION.post_reader_work_phase="install"
+    end
+    self._post_reader_work_generation=(tonumber(self._post_reader_work_generation) or 0)+1
+    local generation=self._post_reader_work_generation
+    if self._post_reader_work_task then
+        UIManager:unschedule(self._post_reader_work_task)
+        self._post_reader_work_task=nil
+    end
+    local task
+    task=function()
+        if self._post_reader_work_task~=task then return end
+        self._post_reader_work_task=nil
+        self:_run_post_reader_work(generation)
+    end
+    self._post_reader_work_task=task
+    UIManager:scheduleIn(math.max(0,tonumber(delay) or .8),task)
+    logger.info("[MiuRead][Download] post-reader work scheduled",tostring(reason or "close"),tostring(HOME_SESSION.post_reader_work_phase))
+    return true
+end
+
 function Plugin:onCloseDocument()
     if self._reader_checkpoint_dirty==true then
         self:_flush_reader_checkpoint("close_document",true)
@@ -8300,7 +8720,15 @@ function Plugin:onCloseDocument()
         UIManager:unschedule(self._reader_checkpoint_task)
         self._reader_checkpoint_task=nil
     end
-    self._home_reader_transition=false
+    if not self._reader_returning then self._home_reader_transition=false end
+    local closing_path=tostring(self:_current_document_path() or "")
+    local opening_path=tostring(HOME_SESSION.opening_file or "")
+    -- During switchDocument the old ReaderUI closes while the target book is
+    -- still opening. Keep that target guard until the new ReaderReady event.
+    if opening_path=="" or opening_path==closing_path then
+        HOME_SESSION.opening_file=nil
+        HOME_SESSION.opening_at=0
+    end
     self:_cancel_network_waits()
     if self.repair_async and self.repair_async.job and self.repair_async.job.label=="book-repair-check" then
         self.repair_async:cancel("document closed")
@@ -8320,16 +8748,21 @@ function Plugin:onCloseDocument()
         self._reader_sync_ready_task=nil
     end
     self:_teardown_thought_tap(); self._progress_prompted_book_id=nil; self._progress_check_running=false; self.sync:on_close()
-    UIManager:scheduleIn(.2,function() self:_install_pending_downloads(true) end)
-    UIManager:scheduleIn(1.0,function() self:_start_next_queued_download() end)
+    -- Keep post-close work pending until a non-reading surface is available.
+    -- Opening another book quickly no longer drops installation or queue work.
+    self:_schedule_post_reader_work("document closed",.8)
     sync_home_session()
     if self:_home_enabled() and HOME_READER_ORIGIN and not HOME_SESSION_SUPPRESSED
         and not HOME_NATIVE_VISIT and not HOME_EXITING then
-        local delay=self._miuread_return_requested and .04 or .12
+        local delay=self._miuread_return_requested and .02 or .12
         self._miuread_return_requested=false
+        local generation=self._reader_return_generation
+        if not self._reader_returning then
+            generation=self:_begin_reader_return("close document",closing_path)
+        end
         UIManager:scheduleIn(delay,function()
             pcall(function()
-                self:_restore_home_after_reader_close(1)
+                self:_schedule_reader_return_finish(generation,0,"close document")
             end)
         end)
     end

@@ -31,6 +31,25 @@ function OffsetContainer:paintTo(bb, x, y)
     self[1]:paintTo(bb, x + self.x_off, y + self.y_off)
 end
 
+local CloseButton = InputContainer:extend{dimen = nil, callback = nil}
+function CloseButton:init()
+    self.dimen = self.dimen or Geom:new{w = 1, h = 1}
+    self.ges_events = {
+        TapClose = {GestureRange:new{ges = "tap", range = self.dimen}},
+    }
+end
+function CloseButton:getSize()
+    return Geom:new{w = self.dimen.w, h = self.dimen.h}
+end
+function CloseButton:paintTo(bb, x, y)
+    self.dimen.x, self.dimen.y = x, y
+    if self[1] then self[1]:paintTo(bb, x, y) end
+end
+function CloseButton:onTapClose()
+    if self.callback then return self.callback() end
+    return true
+end
+
 local function clamp(value, minimum, maximum)
     value = tonumber(value) or minimum
     if value < minimum then return minimum end
@@ -86,20 +105,13 @@ local function make_face(name, size, fallback)
     return Font:getFace(fallback or "cfont", size)
 end
 
-local function union_dimen(a, b)
-    if not a then return b and b:copy() or nil end
-    if not b then return a:copy() end
-    local x1 = math.min(a.x or 0, b.x or 0)
-    local y1 = math.min(a.y or 0, b.y or 0)
-    local x2 = math.max((a.x or 0) + (a.w or 0), (b.x or 0) + (b.w or 0))
-    local y2 = math.max((a.y or 0) + (a.h or 0), (b.y or 0) + (b.h or 0))
-    return Geom:new{x = x1, y = y1, w = x2 - x1, h = y2 - y1}
-end
-
 local NativePopup = InputContainer:extend{
     name = "miuread_thought_native_popup",
     _miuread_transient = true,
-    covers_fullscreen = true,
+    -- This is a transparent full-screen input layer around a smaller popup.
+    -- Marking it as opaque prevents ReaderUI from repainting areas exposed when
+    -- a dynamically sized page becomes shorter.
+    covers_fullscreen = false,
     stop_events_propagation = true,
     source_text = "",
     comments = nil,
@@ -116,8 +128,6 @@ local NativePopup = InputContainer:extend{
     page_changing = false,
     paint_failed = false,
     comments_dimen = nil,
-    comment_inner_w = nil,
-    comment_metrics = nil,
     page_refresh_count = 0,
 }
 
@@ -459,8 +469,8 @@ function NativePopup:_build(reset_pages)
     local close_inset = math.max(2, Screen:scaleBySize(2))
 
     local width_ratio = clamp(self.width_ratio, 0.88, 0.94)
-    -- The comment layer should preserve the reading context. Even a dense
-    -- page is capped at roughly half the screen; short sets stay smaller.
+    -- Preserve the reading context: dense pages stay around half-screen and
+    -- short pages keep their natural height.
     local height_ratio = clamp(self.height_ratio, 0.42, 0.56)
     local side_margin = math.max(14, math.floor(sw * 0.02))
     local vertical_margin = math.max(18, math.floor(sh * 0.03))
@@ -484,11 +494,6 @@ function NativePopup:_build(reset_pages)
     end
 
     local comment_group, comments_h = self:_build_comment_page(comment_w, metrics)
-    local current_comments_h = math.max(1, comments_h)
-
-    -- Keep the actual laid-out page as the frame child. A separately sized
-    -- white surface could remain taller than the text and was the source of the
-    -- visible blank block at the bottom.
     local guarded_comments = HorizontalGroup:new{
         HorizontalSpan:new{width = frame_guard},
         comment_group,
@@ -513,32 +518,32 @@ function NativePopup:_build(reset_pages)
     }
     local natural_size = surface:getSize()
     local height = math.max(natural_size.h, close_size + inset * 2)
+    local popup_x = math.floor((sw - width) / 2)
+    local popup_y = math.floor((sh - maximum_height) / 2)
+    local close_x = width - close_size - inset + close_inset
+    local close_y = inset - close_inset
 
     self.width, self.height = width, height
-    self.popup_dimen = Geom:new{
-        x = math.floor((sw - width) / 2),
-        -- Keep the top edge and close button fixed while page height changes.
-        -- Only the bottom edge moves, reducing visual movement on e-ink.
-        y = math.floor((sh - maximum_height) / 2),
-        w = width,
-        h = height,
-    }
+    self.popup_dimen = Geom:new{x = popup_x, y = popup_y, w = width, h = height}
     self.comments_dimen = Geom:new{
-        x = self.popup_dimen.x + inset + frame_guard,
-        y = self.popup_dimen.y + inset + source_h + source_gap,
+        x = popup_x + inset + frame_guard,
+        y = popup_y + inset + source_h + source_gap,
         w = comment_w,
-        h = current_comments_h,
+        h = math.max(1, comments_h),
     }
     self.close_dimen = Geom:new{
-        x = self.popup_dimen.x + width - close_size - inset + close_inset,
-        y = self.popup_dimen.y + inset - close_inset,
+        x = popup_x + close_x,
+        y = popup_y + close_y,
         w = close_size,
         h = close_size,
     }
-
     self.frame_style = {bordersize = border, radius = radius}
 
-    local close = CenterContainer:new{
+    local close = CloseButton:new{
+        dimen = Geom:new{w = close_size, h = close_size},
+        callback = function() return self:_close() end,
+    }
+    close[1] = CenterContainer:new{
         dimen = Geom:new{w = close_size, h = close_size},
         TextWidget:new{
             text = "×",
@@ -547,26 +552,80 @@ function NativePopup:_build(reset_pages)
             fgcolor = Blitbuffer.COLOR_DARK_GRAY,
         },
     }
+
     local popup_group = OverlapGroup:new{
         dimen = Geom:new{w = width, h = height},
         allow_mirroring = false,
         surface,
-        OffsetContainer:new{
-            x_off = width - close_size - inset + close_inset,
-            y_off = inset - close_inset,
-            close,
-        },
+        OffsetContainer:new{x_off = close_x, y_off = close_y, close},
     }
+    local root_offset = OffsetContainer:new{x_off = popup_x, y_off = popup_y, popup_group}
     self[1] = OverlapGroup:new{
         dimen = self.dimen:copy(),
         allow_mirroring = false,
-        OffsetContainer:new{x_off = self.popup_dimen.x, y_off = self.popup_dimen.y, popup_group},
+        root_offset,
     }
+
+    self._layout = {
+        inset = inset,
+        close_size = close_size,
+        width = width,
+        comment_w = comment_w,
+        metrics = metrics,
+    }
+    self.comment_group = comment_group
+    self.guarded_comments = guarded_comments
+    self.content_group = content_group
+    self.surface = surface
+    self.popup_group = popup_group
+    self.close_button = close
+
     if previous_root and previous_root ~= self[1] and type(previous_root.free) == "function" then
         pcall(previous_root.free, previous_root)
     end
-    self.comment_inner_w = comment_w
-    self.comment_metrics = metrics
+end
+
+-- Keep the source, frame and close control alive across page turns. Only the
+-- comment subtree is replaced, then the cached layout sizes are recalculated.
+function NativePopup:_replace_comment_page()
+    local layout = self._layout
+    if not layout or not self.guarded_comments or not self.content_group or not self.surface then
+        local previous = self.popup_dimen and self.popup_dimen:copy() or nil
+        self:_build(false)
+        return previous, self.popup_dimen and self.popup_dimen:copy() or nil
+    end
+
+    local previous_popup = self.popup_dimen and self.popup_dimen:copy() or nil
+    local previous_group = self.comment_group
+    local comment_group, comments_h = self:_build_comment_page(layout.comment_w, layout.metrics)
+
+    self.guarded_comments[2] = comment_group
+    self.comment_group = comment_group
+    if self.guarded_comments.resetLayout then self.guarded_comments:resetLayout() end
+    if self.content_group.resetLayout then self.content_group:resetLayout() end
+
+    local natural_size = self.surface:getSize()
+    local height = math.max(natural_size.h, layout.close_size + layout.inset * 2)
+    self.height = height
+    self.popup_dimen.h = height
+    self.comments_dimen.h = math.max(1, comments_h)
+
+    if self.surface.dimen then
+        self.surface.dimen.w = natural_size.w
+        self.surface.dimen.h = natural_size.h
+    end
+    if self.popup_group then
+        self.popup_group.dimen.w = layout.width
+        self.popup_group.dimen.h = height
+        self.popup_group._size = self.popup_group._size or {}
+        self.popup_group._size.w = layout.width
+        self.popup_group._size.h = height
+    end
+
+    if previous_group and previous_group ~= comment_group and type(previous_group.free) == "function" then
+        pcall(previous_group.free, previous_group)
+    end
+    return previous_popup, self.popup_dimen:copy()
 end
 
 function NativePopup:_change_page(delta)
@@ -578,14 +637,29 @@ function NativePopup:_change_page(delta)
     self.page_changing = true
     local previous_index = self.page_index
     local ok, err = xpcall(function()
-        local previous_popup = self.popup_dimen and self.popup_dimen:copy() or nil
         self.page_index = target
-        self:_build(false)
+        local previous_popup, current_popup = self:_replace_comment_page()
         self.page_refresh_count = (tonumber(self.page_refresh_count) or 0) + 1
-        local dirty = union_dimen(previous_popup, self.popup_dimen)
-        -- Repaint both ReaderUI and the popup inside the old/new union. Passing
-        -- nil would refresh old screen pixels without painting the new layout.
-        UIManager:setDirty("all", function() return "ui", dirty end)
+
+        local dirty=current_popup or previous_popup
+        if previous_popup and current_popup then
+            local left=math.min(previous_popup.x,current_popup.x)
+            local top=math.min(previous_popup.y,current_popup.y)
+            local right=math.max(previous_popup.x+previous_popup.w,current_popup.x+current_popup.w)
+            local bottom=math.max(previous_popup.y+previous_popup.h,current_popup.y+current_popup.h)
+            dirty=Geom:new{x=left,y=top,w=right-left,h=bottom-top}
+        end
+        if previous_popup and current_popup
+            and (previous_popup.x~=current_popup.x or previous_popup.y~=current_popup.y
+                or previous_popup.w~=current_popup.w or previous_popup.h~=current_popup.h) then
+            -- A size change exposes or covers ReaderUI pixels. Repaint the
+            -- complete old/new union from bottom to top, then draw the new
+            -- popup once. This preserves MiuRead's dynamic height without
+            -- leaving the previous page below it.
+            UIManager:setDirty("all",function() return "ui",dirty end)
+        else
+            UIManager:setDirty(self,function() return "ui",dirty end)
+        end
     end, debug.traceback)
     if not ok then
         self.page_changing = false
@@ -593,9 +667,9 @@ function NativePopup:_change_page(delta)
         self:_fail("page", err)
     else
         if self.on_interact_callback then pcall(self.on_interact_callback) end
-        UIManager:scheduleIn(.14, function()
+        UIManager:scheduleIn(.10, function()
             if not self.closing then self.page_changing = false end
-            collectgarbage("step", 20)
+            collectgarbage("step", 12)
         end)
     end
     return true
@@ -649,7 +723,7 @@ function NativePopup:onCloseWidget()
         self.on_close_callback = nil
         pcall(callback)
     end
-    if region then UIManager:setDirty(nil, function() return "partial", region end) end
+    if region then UIManager:setDirty("all", function() return "partial", region end) end
 end
 
 local M = {}

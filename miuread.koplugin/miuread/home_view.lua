@@ -103,9 +103,9 @@ local function text_button(text, width, height, callback, options)
         background = Blitbuffer.COLOR_WHITE,
     }, TextWidget:new{
         text = tostring(text or ""),
-        face = face(options.font or "smallinfofont", options.size or 11, options.maximum or 15),
+        face = face(options.font or "smallinfofont", options.size or 12, options.maximum or 16),
         bold = options.bold ~= false,
-        fgcolor = options.fgcolor or Blitbuffer.COLOR_DARK_GRAY,
+        fgcolor = options.fgcolor or Blitbuffer.COLOR_BLACK,
     }), callback)
 end
 
@@ -164,15 +164,15 @@ local function section_header(title, width, height, on_more)
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = left_w, h = height}, TextWidget:new{
             text = tostring(title or ""),
-            face = face("cfont", 16, 19),
+            face = face("cfont", 17, 21),
             bold = true,
         }},
     }
     if on_more then
         table.insert(row, text_button("全部 ›", right_w, height, on_more, {
             borderless = true,
-            size = 11,
-            maximum = 14,
+            size = 12,
+            maximum = 16,
         }))
     end
     return row
@@ -190,13 +190,13 @@ local function notice_strip(item, width, height)
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = detail_w, h = height - pad * 2}, TextBoxWidget:new{
             text = text,
-            face = face("smallinfofont", 11, 14),
-            bold = item.important == true,
+            face = face("smallinfofont", 12, 16),
+            bold = true,
             width = detail_w,
             height = height - pad * 2,
             height_adjust = false,
             height_overflow_show_ellipsis = true,
-            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            fgcolor = Blitbuffer.COLOR_BLACK,
         }},
     }
     if progress_w > 0 then
@@ -267,17 +267,17 @@ local function hero_card(book, width, height, callback, compact)
     local text = VerticalGroup:new{align = "left"}
     table.insert(text, TextBoxWidget:new{
         text = tostring(book.heading or "最近阅读"),
-        face = face("smallinfofont", 10, 12),
+        face = face("smallinfofont", 11, 14),
         bold = true,
         width = text_w,
         height = heading_h,
         height_adjust = false,
         height_overflow_show_ellipsis = true,
-        fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        fgcolor = Blitbuffer.COLOR_BLACK,
     })
     table.insert(text, TextBoxWidget:new{
         text = tostring(book.title or "未命名"),
-        face = face("cfont", compact and 15 or 17, compact and 18 or 21),
+        face = face("cfont", compact and 17 or 19, compact and 21 or 24),
         bold = true,
         width = text_w,
         height = title_h,
@@ -287,22 +287,23 @@ local function hero_card(book, width, height, callback, compact)
     for _, row in ipairs({meta_parts, detail_parts, source_parts}) do
         table.insert(text, TextBoxWidget:new{
             text = table.concat(row or {}, " · "),
-            face = face("smallinfofont", 10, 12),
+            face = face("smallinfofont", 11, 14),
             width = text_w,
             height = line_h,
             height_adjust = false,
             height_overflow_show_ellipsis = true,
-            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            fgcolor = Blitbuffer.COLOR_BLACK,
         })
     end
     table.insert(text, TextBoxWidget:new{
         text = progress_text,
-        face = face("smallinfofont", 11, 13),
+        face = face("smallinfofont", 12, 15),
+        bold = true,
         width = text_w,
         height = line_h,
         height_adjust = false,
         height_overflow_show_ellipsis = true,
-        fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        fgcolor = Blitbuffer.COLOR_BLACK,
     })
     local used_h = heading_h + title_h + line_h * 4
     if used_h < inner_h then table.insert(text, Widget:new{dimen = Geom:new{w = 1, h = inner_h - used_h}}) end
@@ -337,8 +338,8 @@ local function welcome_card(width, height, callback)
         VerticalSpan:new{height = 7},
         TextWidget:new{
             text = "从微信书架选择一本书",
-            face = face("smallinfofont", 12, 14),
-            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            face = face("smallinfofont", 13, 16),
+            fgcolor = Blitbuffer.COLOR_BLACK,
         },
     }), callback)
 end
@@ -384,7 +385,7 @@ local function shelf_book_card(book, width, height, callback)
                 background = Blitbuffer.COLOR_BLACK,
             }, TextWidget:new{
                 text = reading_badge,
-                face = face("smallinfofont", 8, 10),
+                face = face("smallinfofont", 9, 11),
                 bold = true,
                 fgcolor = Blitbuffer.COLOR_WHITE,
             }),
@@ -397,7 +398,7 @@ local function shelf_book_card(book, width, height, callback)
         VerticalSpan:new{height = 4},
         TextBoxWidget:new{
             text = tostring(book.title or "未命名"),
-            face = face("cfont", 12, 15),
+            face = face("cfont", 13, 17),
             bold = true,
             width = inner_w,
             height = title_h,
@@ -407,14 +408,14 @@ local function shelf_book_card(book, width, height, callback)
         },
         TextBoxWidget:new{
             text = status,
-            face = face("smallinfofont", 8, 10),
-            bold = status_important and true or false,
+            face = face("smallinfofont", 10, 13),
+            bold = status ~= "",
             width = inner_w,
             height = status_h,
             height_adjust = false,
             height_overflow_show_ellipsis = true,
             alignment = "center",
-            fgcolor = status_important and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
+            fgcolor = Blitbuffer.COLOR_BLACK,
         },
     }
     return tappable(width, height,
@@ -434,14 +435,14 @@ local function category_tabs(tabs, width, height)
         local item = OverlapGroup:new{dimen = Geom:new{w = item_w, h = height}, allow_mirroring = false}
         item[#item + 1] = CenterContainer:new{dimen = Geom:new{w = item_w, h = height}, TextBoxWidget:new{
             text = label,
-            face = face("smallinfofont", 10, 13),
-            bold = tab.selected == true,
+            face = face("smallinfofont", 11, 15),
+            bold = true,
             width = math.max(1, item_w - 8),
             height = math.max(18, height - 8),
             height_adjust = false,
             height_overflow_show_ellipsis = true,
             alignment = "center",
-            fgcolor = tab.selected and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
+            fgcolor = Blitbuffer.COLOR_BLACK,
         }}
         if tab.selected then
             local line_w = math.max(28, math.floor(item_w * .54))
@@ -464,10 +465,11 @@ local function empty_section(width, height, text, callback)
         background = Blitbuffer.COLOR_WHITE,
     }, TextBoxWidget:new{
         text = tostring(text or "暂时没有内容"),
-        face = face("smallinfofont", 12, 14),
+        face = face("smallinfofont", 13, 17),
+        bold = true,
         width = math.max(1, width - 32),
         alignment = "center",
-        fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        fgcolor = Blitbuffer.COLOR_BLACK,
     }), callback)
 end
 
@@ -561,25 +563,26 @@ function HomeWidget:_build_header(children, m)
         HorizontalSpan:new{width = gap},
         tappable(status_w, m.header_h, TextBoxWidget:new{
             text = tostring(self.opts.status_line or ""),
-            face = face("smallinfofont", 11, 13),
+            face = face("smallinfofont", 12, 16),
+            bold = true,
             width = status_w,
             height = math.max(22, math.floor(m.header_h * .52)),
             height_adjust = false,
             height_overflow_show_ellipsis = true,
             alignment = "right",
-            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            fgcolor = Blitbuffer.COLOR_BLACK,
         }, self.opts.on_quick_panel),
         HorizontalSpan:new{width = gap},
         tappable(account_w, m.header_h, TextBoxWidget:new{
             text = tostring(self.opts.account_name or "账户"),
-            face = face("smallinfofont", 11, 13),
+            face = face("smallinfofont", 12, 16),
             width = account_w,
             height = math.max(22, math.floor(m.header_h * .52)),
             height_adjust = false,
             height_overflow_show_ellipsis = true,
             alignment = "right",
             bold = true,
-            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            fgcolor = Blitbuffer.COLOR_BLACK,
         }, self.opts.on_account),
         HorizontalSpan:new{width = gap},
         text_button("⋯", menu_w, math.max(40, m.header_h - 6), function()
@@ -645,9 +648,9 @@ local function page_footer(width, height, page, pages, on_page)
     }))
     table.insert(row, CenterContainer:new{dimen = Geom:new{w = middle_w, h = height}, TextWidget:new{
         text = tostring(page) .. " / " .. tostring(pages),
-        face = face("smallinfofont", 10, 12),
+        face = face("smallinfofont", 11, 14),
         bold = true,
-        fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        fgcolor = Blitbuffer.COLOR_BLACK,
     }})
     table.insert(row, text_button("›", arrow_w, height, page < pages and function() on_page(1) end or nil, {
         borderless = true, font = "cfont", size = 19, maximum = 24,
