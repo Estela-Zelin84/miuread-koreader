@@ -599,6 +599,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     local start_auth=self.store:auth()
     local start_account=type(start_auth.account)=="table" and start_auth.account or {}
     local auth_snapshot={
+        login_session_id=tostring(start_auth.login_session_id or ""),
         vid=tostring(start_account.vid or ""),
         logged_at=tonumber(start_account.logged_at or 0) or 0,
         ticket_updated_at=tonumber(start_auth.ticket_updated_at or 0) or 0,

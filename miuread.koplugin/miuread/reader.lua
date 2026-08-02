@@ -683,6 +683,7 @@ function Reader:_recover_login_session()
     self._renewing_session = true
 
     local before = self.store:auth()
+    local before_login_session_id=tostring(before.login_session_id or "")
     local before_vid = tostring((before.account or {}).vid or (before.cookies or {}).wr_vid or "")
     local ok, result = pcall(function()
         local renewed, meta = self:renew()
@@ -702,13 +703,17 @@ function Reader:_recover_login_session()
         end
 
         local after = self.store:auth()
+        if before_login_session_id=="" or tostring(after.login_session_id or "")~=before_login_session_id then
+            error("登录状态已变化，已忽略旧续期结果")
+        end
         local after_vid = tostring((after.account or {}).vid or (after.cookies or {}).wr_vid or "")
         local after_skey = tostring((after.cookies or {}).wr_skey or "")
         if after_vid == "" or after_skey == "" then
             error("续期后仍缺少正文下载所需的登录凭据")
         end
         if before_vid ~= "" and after_vid ~= "" and before_vid ~= after_vid then
-            self.store:save_auth(before)
+            local current=self.store:auth()
+            if tostring(current.login_session_id or "")==before_login_session_id then self.store:save_auth(before) end
             error("续期返回了不同账户，已保留原账户凭据")
         end
         return {meta=meta, verified=true, skills_verified=skills_ok, vid=after_vid}
@@ -1030,6 +1035,7 @@ end
 -- are retained; browser-session cookies are deliberately discarded.
 function Reader:repair_login_session()
     local auth = self.store:auth()
+    local login_session_id=tostring(auth.login_session_id or "")
     local jar = Util.copy(auth.cookies or {})
     local account = auth.account or {}
     local vid = tostring(jar.wr_vid or account.vid or account.user_vid or "")
@@ -1081,6 +1087,10 @@ function Reader:repair_login_session()
         name = tostring(type(user) == "table" and user.name or account.name or ""),
         vid = vid,
     })
+    local current=self.store:auth()
+    if login_session_id=="" or tostring(current.login_session_id or "")~=login_session_id then
+        error("登录状态已变化，已忽略旧修复结果")
+    end
     self.store:save_auth(auth)
     return {repaired=true, cookie_count=(function()
         local n=0; for _ in pairs(jar) do n=n+1 end; return n

@@ -1,8 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
-local Font = require("ui/font")
-local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
@@ -11,13 +9,13 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
-local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local UIManager = require("ui/uimanager")
-local VerticalGroup = require("ui/widget/verticalgroup")
-local VerticalSpan = require("ui/widget/verticalspan")
+local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local Skin = require("miuread.reader_skin")
+local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
 local live_dialog
@@ -42,6 +40,9 @@ function TapBox:onTapSelect()
     if self.enabled ~= false and self.callback then self.callback() end
     return true
 end
+function TapBox:handleEvent(event)
+    return InputContainer.handleEvent(self, event)
+end
 
 local Dialog = InputContainer:extend{
     name = "miuread_reader_settings_dialog",
@@ -57,26 +58,45 @@ function Dialog:handleEvent(event)
     return InputContainer.handleEvent(self, event)
 end
 
-function Dialog:_rows()
-    local rows = self.opts and self.opts.rows or {}
-    if type(rows) == "function" then
-        local ok, result = pcall(rows)
-        if ok and type(result) == "table" then return result end
-        if not ok then logger.warn("[MiuRead][ReaderSettingsDialog] rows failed", tostring(result)) end
-        return {}
+local function resolved(value, fallback)
+    if type(value) == "function" then
+        local ok, result = pcall(value)
+        if ok then return result end
+        logger.warn("[MiuRead][ReaderSettingsDialog] provider failed", tostring(result))
+        return fallback
     end
+    if value == nil then return fallback end
+    return value
+end
+
+function Dialog:_rows()
+    local rows = resolved(self.opts and self.opts.rows, {})
     return type(rows) == "table" and rows or {}
 end
 
-function Dialog:_subtitle()
-    local subtitle = self.opts and self.opts.subtitle or ""
-    if type(subtitle) == "function" then
-        local ok, result = pcall(subtitle)
-        if ok then return tostring(result or "") end
-        logger.warn("[MiuRead][ReaderSettingsDialog] subtitle failed", tostring(result))
-        return ""
+function Dialog:_sections()
+    local sections = resolved(self.opts and self.opts.sections, nil)
+    if type(sections) == "table" and #sections > 0 then
+        local normalized = {}
+        for _, section in ipairs(sections) do
+            local rows = resolved(section.rows or section.items, {})
+            normalized[#normalized + 1] = {
+                title = tostring(section.title or ""),
+                rows = type(rows) == "table" and rows or {},
+            }
+        end
+        return normalized
     end
-    return tostring(subtitle or "")
+    return {{title = "", rows = self:_rows()}}
+end
+
+function Dialog:_subtitle()
+    return tostring(resolved(self.opts and self.opts.subtitle, "") or "")
+end
+
+function Dialog:_hero()
+    local hero = resolved(self.opts and self.opts.hero, nil)
+    return type(hero) == "table" and hero or nil
 end
 
 function Dialog:_close(action, cancel_pending)
@@ -94,13 +114,13 @@ end
 function Dialog:_run_row(row)
     if not row or row.enabled == false then return true end
     if row.keep_open == true then
-        local ok, err = pcall(row.callback or function() end)
-        if not ok then logger.warn("[MiuRead][ReaderSettingsDialog] action failed", tostring(err)) end
-        if not self.closed then
-            UIManager:scheduleIn(.04, function()
-                if not self.closed then self:_rebuild() end
-            end)
+        if row.callback then
+            local ok, err = pcall(row.callback)
+            if not ok then logger.warn("[MiuRead][ReaderSettingsDialog] action failed", tostring(err)) end
         end
+        UIManager:scheduleIn(.04, function()
+            if not self.closed then self:_rebuild() end
+        end)
         return true
     end
     return self:_close(row.callback)
@@ -108,150 +128,266 @@ end
 
 function Dialog:_row_widget(row, width, height)
     local enabled = row.enabled ~= false
-    local value = tostring(row.value or "")
-    local value_w = value ~= "" and math.max(92, math.floor(width * .34)) or 0
-    local gap = value_w > 0 and math.max(8, Screen:scaleBySize(7)) or 0
-    local label_w = math.max(1, width - value_w - gap)
-    local row_content = HorizontalGroup:new{
-        align = "center",
-        LeftContainer:new{dimen = Geom:new{w = label_w, h = height}, TextBoxWidget:new{
-            text = tostring(row.label or row.text or ""),
-            face = Font:getFace("cfont", math.max(14, Screen:scaleBySize(15))),
-            bold = row.bold == true,
-            width = label_w,
-            height = height,
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "left",
+    local pad = Skin.dp(8, 6, 11)
+    local icon = tostring(row.icon or "")
+    local value = tostring(row.value or row.detail or "")
+    local arrow = row.arrow ~= false and row.callback ~= nil and row.keep_open ~= true
+    local icon_w = icon ~= "" and Skin.dp(28, 23, 38) or 0
+    local arrow_w = arrow and Skin.dp(17, 14, 23) or 0
+    local value_w = value ~= "" and math.max(Skin.dp(74, 58, 102), math.floor(width * .28)) or 0
+    local gap = Skin.dp(4, 3, 6)
+    local label_w = math.max(1, width - pad * 2 - icon_w - value_w - arrow_w
+        - gap * ((icon_w > 0 and 1 or 0) + (value_w > 0 and 1 or 0) + (arrow_w > 0 and 1 or 0)))
+    local inner_h = math.max(1, height - pad * 2)
+    local row_content = HorizontalGroup:new{align = "center"}
+
+    if icon_w > 0 then
+        row_content[#row_content + 1] = Ui.icon(icon, icon_w, inner_h, Skin.dp(20, 17, 27), {
+            icon_key = icon,
+            face = Skin.face("cfont", 12.7, 17.2, 10.8),
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-        }},
-    }
+        })
+        row_content[#row_content + 1] = HorizontalSpan:new{width = gap}
+    end
+
+    row_content[#row_content + 1] = Ui.textbox(tostring(row.label or row.text or ""), label_w, inner_h,
+        Skin.face("cfont", 10.9, 14.8, 9.4), {
+            bold = row.bold == true, alignment = "left",
+            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        })
+
     if value_w > 0 then
         row_content[#row_content + 1] = HorizontalSpan:new{width = gap}
-        row_content[#row_content + 1] = TextBoxWidget:new{
-            text = value,
-            face = Font:getFace("smallinfofont", math.max(12, Screen:scaleBySize(13))),
-            bold = row.value_bold == true or row.checked == true,
-            width = value_w,
-            height = height,
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "right",
-            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-        }
+        row_content[#row_content + 1] = Ui.textbox(value, value_w, inner_h,
+            Skin.face("smallinfofont", 8.8, 11.7, 7.5), {
+                bold = row.value_bold == true, alignment = "right", halign = "right",
+                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
+            })
     end
-    local layer = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
-    layer[#layer + 1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, row_content}
-    layer[#layer + 1] = OffsetContainer:new{
-        x_off = 0,
-        y_off = math.max(0, height - Size.line.thin),
-        LineWidget:new{
-            background = enabled and Blitbuffer.COLOR_GRAY or (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY),
-            dimen = Geom:new{w = width, h = Size.line.thin},
-        },
-    }
+
+    if arrow_w > 0 then
+        row_content[#row_content + 1] = HorizontalSpan:new{width = gap}
+        row_content[#row_content + 1] = Ui.icon("chevron-right", arrow_w, inner_h, Skin.dp(15, 13, 20), {
+            face = Skin.face("cfont", 13.4, 18, 11),
+            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
+        })
+    end
+
     local tap = TapBox:new{
         dimen = Geom:new{w = width, h = height},
         enabled = enabled,
         callback = function() self:_run_row(row) end,
     }
-    tap[1] = layer
+    tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, row_content}
     return tap
+end
+
+function Dialog:_section_widget(section, width, row_h)
+    local rows = type(section.rows) == "table" and section.rows or {}
+    local height = math.max(row_h, #rows * row_h)
+    local layers = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+    layers[#layers + 1] = Skin.frame(width, height, {
+        bordersize = Skin.line("thin"),
+        radius = Skin.radius(7, 5, 11),
+        background = Blitbuffer.COLOR_WHITE,
+        color = Blitbuffer.COLOR_DARK_GRAY,
+    }, Widget:new{dimen = Geom:new{w = 1, h = 1}})
+    local border_inset = Skin.line("thick")
+    for index = 1, #rows - 1 do
+        layers[#layers + 1] = OffsetContainer:new{
+            x_off = border_inset,
+            y_off = index * row_h,
+            Skin.divider(math.max(1, width - border_inset * 2), Blitbuffer.COLOR_GRAY),
+        }
+    end
+    for index, row in ipairs(rows) do
+        layers[#layers + 1] = OffsetContainer:new{
+            x_off = 0,
+            y_off = (index - 1) * row_h,
+            self:_row_widget(row, width, row_h),
+        }
+    end
+    if #rows == 0 then
+        layers[#layers + 1] = CenterContainer:new{
+            dimen = Geom:new{w = width, h = height},
+            Ui.textbox("当前没有可用设置", width - Skin.dp(18, 14, 26), height,
+                Skin.face("smallinfofont", 9.4, 12.4, 8), {
+                    alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+                }),
+        }
+    end
+    return layers, height
+end
+
+function Dialog:_hero_widget(hero, width, height)
+    local button_w = math.max(Skin.dp(54, 46, 76), math.floor(width * .14))
+    local value_w = math.max(Skin.dp(86, 72, 120), width - button_w * 2 - math.floor(width * .16))
+    local gap = math.max(Skin.dp(8, 6, 12), math.floor((width - button_w * 2 - value_w) / 2))
+    local button_h = math.max(Skin.dp(46, 40, 61), math.min(height, Skin.dp(58, 48, 72)))
+
+    local function step_button(label, callback)
+        local tap = TapBox:new{
+            dimen = Geom:new{w = button_w, h = button_h},
+            enabled = callback ~= nil,
+            callback = function()
+                if callback then
+                    local ok, err = pcall(callback)
+                    if not ok then logger.warn("[MiuRead][ReaderSettingsDialog] hero action failed", tostring(err)) end
+                    UIManager:scheduleIn(.04, function()
+                        if not self.closed then self:_rebuild() end
+                    end)
+                end
+            end,
+        }
+        tap[1] = Skin.frame(button_w, button_h, {
+            bordersize = Skin.line("thin"),
+            radius = Skin.radius(6, 5, 10),
+            background = Blitbuffer.COLOR_WHITE,
+            color = Blitbuffer.COLOR_DARK_GRAY,
+        }, Ui.icon(label == "+" and "plus" or "minus",
+            button_w - Skin.dp(8, 6, 12), button_h - Skin.dp(4, 2, 6), Skin.dp(22, 19, 30), {
+                face = Skin.face("cfont", 20, 25, 17),
+            }))
+        return tap
+    end
+
+    return CenterContainer:new{
+        dimen = Geom:new{w = width, h = height},
+        HorizontalGroup:new{
+            align = "center",
+            step_button("−", hero.on_decrease),
+            HorizontalSpan:new{width = gap},
+            Ui.textbox(tostring(hero.value or ""), value_w, button_h, Skin.face("cfont", 27, 34, 22), {
+                bold = true, alignment = "center", halign = "center",
+            }),
+            HorizontalSpan:new{width = gap},
+            step_button("+", hero.on_increase),
+        },
+    }
 end
 
 function Dialog:_build_content()
     local sw, sh = Screen:getWidth(), Screen:getHeight()
-    local rows = self:_rows()
-    local width = math.max(math.floor(sw * .78), math.min(math.floor(sw * .86), Screen:scaleBySize(760)))
-    width = math.min(width, sw - math.max(30, math.floor(sw * .07)))
-    local border = Size.border.window
-    local radius = math.max(tonumber(Size.radius.window) or 0, Screen:scaleBySize(7))
-    local pad = math.max(13, Screen:scaleBySize(11))
-    local title_h = math.max(42, Screen:scaleBySize(40))
+    local portrait = sw < sh
+    local sections = self:_sections()
+    local hero = self:_hero()
+    local outer_margin = Skin.dp(10, 8, 18)
+    local top_inset = Skin.dp(3, 2, 5)
+    local pad = Skin.dp(11, 9, 17)
+    local gap = Skin.dp(7, 5, 10)
+    local panel_w = sw - outer_margin * 2
+    local content_w = panel_w - pad * 2
+    local header_h = math.max(Skin.dp(39, 34, 52), math.floor(sh * .039))
     local subtitle = self:_subtitle()
-    local subtitle_h = subtitle ~= "" and math.max(30, Screen:scaleBySize(28)) or 0
-    local row_h = math.max(54, Screen:scaleBySize(52))
-    local close_h = math.max(52, Screen:scaleBySize(50))
-    local gap = math.max(9, Screen:scaleBySize(8))
-    local content_w = width - (border + pad) * 2
-    local content_h = title_h + subtitle_h + gap + #rows * row_h + gap + close_h
-    local height = content_h + (border + pad) * 2
-    local max_h = sh - math.max(38, math.floor(sh * .08))
-    if height > max_h then
-        row_h = math.max(44, math.floor((max_h - (border + pad) * 2 - title_h - subtitle_h - gap * 2 - close_h) / math.max(1, #rows)))
-        content_h = title_h + subtitle_h + gap + #rows * row_h + gap + close_h
-        height = content_h + (border + pad) * 2
+    local subtitle_h = subtitle ~= "" and Skin.dp(25, 21, 33) or 0
+    local hero_h = hero and math.max(Skin.dp(68, 58, 92), math.floor(sh * (portrait and .068 or .10))) or 0
+    local section_title_h = Skin.dp(24, 20, 31)
+    local handle_h = Skin.dp(18, 15, 25)
+    local row_count = 0
+    local titled_count = 0
+    for _, section in ipairs(sections) do
+        row_count = row_count + #(section.rows or {})
+        if tostring(section.title or "") ~= "" then titled_count = titled_count + 1 end
     end
-
+    row_count = math.max(1, row_count)
+    local natural_row_h = math.max(Skin.dp(47, 40, 61), math.floor(sh * (portrait and .044 or .062)))
+    local max_h = sh - top_inset - math.max(28, math.floor(sh * .052))
+    local fixed_h = pad * 2 + header_h + subtitle_h + (hero_h > 0 and gap + hero_h or 0)
+        + gap + titled_count * section_title_h + math.max(0, #sections - 1) * gap + handle_h
+    local available_rows = math.max(row_count * Skin.dp(38, 34, 48), max_h - fixed_h)
+    local row_h = math.min(natural_row_h, math.max(Skin.dp(38, 34, 48), math.floor(available_rows / row_count)))
+    local body_h = row_count * row_h + titled_count * section_title_h + math.max(0, #sections - 1) * gap
+    local content_h = header_h + subtitle_h + (hero_h > 0 and gap + hero_h or 0) + gap + body_h + handle_h
+    self.panel_h = math.min(max_h, pad * 2 + content_h)
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
-    self.frame_dimen = Geom:new{
-        x = math.floor((sw - width) / 2),
-        y = math.floor((sh - height) / 2),
-        w = width,
-        h = height,
+    self.frame_dimen = Geom:new{x = outer_margin, y = top_inset, w = panel_w, h = self.panel_h}
+
+    local root = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+    root[#root + 1] = OffsetContainer:new{
+        x_off = outer_margin,
+        y_off = top_inset,
+        Skin.paper(panel_w, self.panel_h, {accent = false, seed = 7}, Widget:new{dimen = Geom:new{w = 1, h = 1}}),
     }
 
-    local group = VerticalGroup:new{align = "center"}
-    group[#group + 1] = TextBoxWidget:new{
-        text = tostring(self.opts.title or "阅读设置"),
-        face = Font:getFace("cfont", math.max(18, Screen:scaleBySize(20))),
-        bold = true,
-        width = content_w,
-        height = title_h,
-        height_adjust = false,
-        height_overflow_show_ellipsis = true,
-        alignment = "center",
-        fgcolor = Blitbuffer.COLOR_BLACK,
+    local y = top_inset + pad
+    local back_w = Skin.dp(44, 38, 58)
+    local title_w = math.max(1, content_w - back_w * 2)
+    local back_action = self.opts and self.opts.on_back or nil
+    local back_tap = TapBox:new{
+        dimen = Geom:new{w = back_w, h = header_h},
+        callback = function() self:_close(back_action) end,
     }
+    back_tap[1] = Ui.icon("back", back_w, header_h, Skin.dp(21, 18, 28), {
+        face = Skin.face("cfont", 21, 26, 18),
+    })
+    local home_action = self.opts and self.opts.on_home or nil
+    local home_tap = TapBox:new{
+        dimen = Geom:new{w = back_w, h = header_h},
+        enabled = type(home_action) == "function",
+        callback = function() self:_close(home_action) end,
+    }
+    home_tap[1] = Ui.icon("home", back_w, header_h, Skin.dp(21, 18, 28), {
+        face = Skin.face("cfont", 15.8, 20.8, 13.2),
+        fgcolor = type(home_action) == "function" and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+    })
+    local header = HorizontalGroup:new{
+        align = "center",
+        back_tap,
+        Ui.textbox(tostring(self.opts.title or "阅读设置"), title_w, header_h,
+            Skin.face("cfont", 16.2, 20.8, 13.6), {
+                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+            }),
+        home_tap,
+    }
+    root[#root + 1] = OffsetContainer:new{x_off = outer_margin + pad, y_off = y, header}
+    y = y + header_h
+
     if subtitle_h > 0 then
-        group[#group + 1] = TextBoxWidget:new{
-            text = subtitle,
-            face = Font:getFace("smallinfofont", math.max(12, Screen:scaleBySize(13))),
-            width = content_w,
-            height = subtitle_h,
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "center",
-            fgcolor = Blitbuffer.COLOR_BLACK,
+        root[#root + 1] = OffsetContainer:new{
+            x_off = outer_margin + pad,
+            y_off = y,
+            Ui.textbox(subtitle, content_w, subtitle_h, Skin.face("smallinfofont", 8.8, 11.7, 7.5), {
+                alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+            }),
         }
+        y = y + subtitle_h
     end
-    group[#group + 1] = VerticalSpan:new{height = gap}
-    for _, row in ipairs(rows) do group[#group + 1] = self:_row_widget(row, content_w, row_h) end
-    group[#group + 1] = VerticalSpan:new{height = gap}
 
-    local close = TapBox:new{
-        dimen = Geom:new{w = content_w, h = close_h},
-        callback = function() self:_close() end,
-    }
-    close[1] = FrameContainer:new{
-        background = Blitbuffer.COLOR_WHITE,
-        bordersize = Size.border.thin,
-        radius = math.max(3, math.floor(radius * .55)),
-        padding = 0,
-        margin = 0,
-        CenterContainer:new{dimen = Geom:new{w = content_w - Size.border.thin * 2, h = close_h - Size.border.thin * 2}, TextBoxWidget:new{
-            text = "关闭",
-            face = Font:getFace("cfont", math.max(14, Screen:scaleBySize(15))),
-            bold = true,
-            width = content_w - 12,
-            height = close_h - 4,
-            height_adjust = false,
-            alignment = "center",
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        }},
-    }
-    group[#group + 1] = close
+    if hero_h > 0 then
+        y = y + gap
+        root[#root + 1] = OffsetContainer:new{x_off = outer_margin + pad, y_off = y, self:_hero_widget(hero, content_w, hero_h)}
+        y = y + hero_h
+    end
 
-    self.frame = FrameContainer:new{
-        background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_BLACK,
-        bordersize = border,
-        radius = radius,
-        padding = pad,
-        margin = 0,
-        CenterContainer:new{dimen = Geom:new{w = content_w, h = content_h}, group},
+    y = y + gap
+    for section_index, section in ipairs(sections) do
+        if tostring(section.title or "") ~= "" then
+            root[#root + 1] = OffsetContainer:new{
+                x_off = outer_margin + pad,
+                y_off = y,
+                Ui.textbox(tostring(section.title), content_w, section_title_h,
+                    Skin.face("smallinfofont", 9.4, 12.4, 8.1), {
+                        bold = true, alignment = "left", fgcolor = Blitbuffer.COLOR_BLACK,
+                    }),
+            }
+            y = y + section_title_h
+        end
+        local section_widget, section_h = self:_section_widget(section, content_w, row_h)
+        root[#root + 1] = OffsetContainer:new{x_off = outer_margin + pad, y_off = y, section_widget}
+        y = y + section_h
+        if section_index < #sections then y = y + gap end
+    end
+
+    local handle_w = Skin.dp(34, 28, 48)
+    root[#root + 1] = OffsetContainer:new{
+        x_off = outer_margin + math.floor((panel_w - handle_w) / 2),
+        y_off = top_inset + self.panel_h - math.floor(handle_h * .55),
+        LineWidget:new{
+            background = Blitbuffer.COLOR_DARK_GRAY,
+            dimen = Geom:new{w = handle_w, h = math.max(1, Skin.line("thin"))},
+        },
     }
-    self[1] = CenterContainer:new{dimen = self.dimen:copy(), self.frame}
+    self[1] = root
 end
 
 function Dialog:_rebuild()
@@ -266,15 +402,16 @@ function Dialog:_rebuild()
             h = math.max(old.y + old.h, self.frame_dimen.y + self.frame_dimen.h) - math.min(old.y, self.frame_dimen.y),
         }
     end
-    UIManager:setDirty(self, function() return "ui", dirty end)
+    UIManager:setDirty(self, function() return "ui", Skin.expand_region(dirty) end)
 end
 
 function Dialog:init()
     self.opts = self.opts or {}
     self:_build_content()
-    if Device:isTouchDevice() then
-        self.ges_events = {TapDismiss = {GestureRange:new{ges = "tap", range = self.dimen}}}
-    end
+    self.ges_events = {
+        TapDismiss = {GestureRange:new{ges = "tap", range = self.dimen}},
+        SwipeDismiss = {GestureRange:new{ges = "swipe", range = self.dimen}},
+    }
     if Device:hasKeys() and Device.input and Device.input.group and Device.input.group.Back then
         self.key_events = {Close = {{Device.input.group.Back}}}
     end
@@ -282,15 +419,23 @@ end
 
 function Dialog:onTapDismiss(_, ges)
     local pos = ges and ges.pos
-    if pos and pos:notIntersectWith(self.frame_dimen) then return self:_close() end
+    if pos and (pos.y > self.frame_dimen.y + self.frame_dimen.h or pos.x < self.frame_dimen.x or pos.x > self.frame_dimen.x + self.frame_dimen.w) then
+        return self:_close(self.opts and self.opts.on_back or nil)
+    end
     return false
 end
-function Dialog:onClose() return self:_close() end
+function Dialog:onSwipeDismiss(_, ges)
+    if ges and ges.direction == "north" then return self:_close(self.opts and self.opts.on_back or nil) end
+    return false
+end
+function Dialog:onClose()
+    return self:_close(self.opts and self.opts.on_back or nil)
+end
 function Dialog:onShow()
-    UIManager:setDirty(self, function() return "ui", self.frame_dimen end)
+    UIManager:setDirty(self, function() return "ui", Skin.expand_region(self.frame_dimen) end)
 end
 function Dialog:onCloseWidget()
-    local region = self.frame_dimen and self.frame_dimen:copy() or nil
+    local region = self.frame_dimen and Skin.expand_region(self.frame_dimen) or nil
     local action = self.pending_action
     self.pending_action = nil
     self.closed = true

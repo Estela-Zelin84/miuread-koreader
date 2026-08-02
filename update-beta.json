@@ -1,16 +1,12 @@
 {
+  "name": "觅阅 4.0.0-beta.1",
+  "version": "4.0.0-beta.1",
   "channel": "beta",
-  "version": "3.2.0-beta.43",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 3.2.0-beta.43 \u5185\u6d4b\u7248",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v3.2.0-beta.43/miuread-v3.2.0-beta.43-full.zip",
-  "package_urls": [
-    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v3.2.0-beta.43/miuread-v3.2.0-beta.43-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v3.2.0-beta.43/miuread-v3.2.0-beta.43-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v3.2.0-beta.43/miuread-v3.2.0-beta.43-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v3.2.0-beta.43/miuread-v3.2.0-beta.43-full.zip"
-  ],
-  "size": 338850,
-  "sha256": "6865edc5ede2472dbfd6ad00b0d5a58e08f29f253360ee45e1d817c1fbb19e95",
-  "notes": "\u9605\u8bfb\u5b57\u4f53\u3001\u8fdb\u5ea6\u3001\u8bc4\u8bba\u4e0e\u540c\u6b65\u6539\u4e3a\u5706\u89d2\u5f39\u7a97\n\u589e\u5927\u4e3b\u9875\u4e66\u540d\u3001\u72b6\u6001\u3001\u5206\u7c7b\u4e0e\u5feb\u6377\u9762\u677f\u6587\u5b57\n\u63d0\u9ad8\u58a8\u6c34\u5c4f\u6587\u5b57\u5bf9\u6bd4\u5ea6\uff0c\u51cf\u5c11\u6d45\u7070\u4fe1\u606f\n\u4fdd\u7559\u590d\u6742\u8bbe\u7f6e\u7684\u539f\u83dc\u5355\u4e0e\u73b0\u6709\u6838\u5fc3\u6d41\u7a0b"
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v4.0.0-beta.1/miuread-v4.0.0-beta.1-full.zip",
+  "sha256": "d446b30013f5ee8dd55f44039d781619c32fb26dee5181614d5e4dc95940f931",
+  "size": 421160,
+  "published_at": "2026-08-03",
+  "summary": "4.0 内测首版，基于 3.5.0-beta.16 功能代码整理。",
+  "notes": "- 4.0 内测首版，基于 3.5.0-beta.16 功能代码整理。\n- 统一主页与阅读菜单的图标尺寸、文字位置和垂直居中。\n- 修复阅读进度区域重叠，并统一二级、三级菜单的返回关系。\n- 内测更新固定读取 beta 分支的 update-beta.json。"
 }

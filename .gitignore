@@ -1,5 +1,4 @@
 dist/
-release.env
-*.zip
-*.sha256
+__pycache__/
+*.pyc
 .DS_Store

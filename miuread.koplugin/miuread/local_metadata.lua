@@ -3,6 +3,7 @@ local logger = require("logger")
 local U = require("miuread.util")
 
 local LocalMetadata = {}
+local METADATA_EXTRACTOR_VERSION = 3
 
 local function trim(value)
     return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -10,6 +11,22 @@ end
 
 local function file_exists(path)
     return type(path) == "string" and path ~= "" and lfs.attributes(path, "mode") == "file"
+end
+
+
+local function normalize_isbn(value)
+    value = tostring(value or ""):upper():gsub("[^0-9X]", "")
+    if #value == 10 or #value == 13 then return value end
+    return nil
+end
+
+local function find_isbn(value)
+    value = tostring(value or "")
+    for token in value:gmatch("[%dXx][%dXx%-%s]+") do
+        local isbn = normalize_isbn(token)
+        if isbn then return isbn end
+    end
+    return normalize_isbn(value)
 end
 
 local function normalize_progress(value)
@@ -38,6 +55,95 @@ local function authors_text(value)
     value = trim(value)
     if value == "" then return nil end
     return value:gsub("%s*\n%s*", "、")
+end
+
+
+local function shell_read(command, limit)
+    local pipe = io.popen(command, "r")
+    if not pipe then return nil end
+    local data = pipe:read(limit and tonumber(limit) or "*a")
+    pipe:close()
+    return data
+end
+
+local function xml_unescape(value)
+    value = tostring(value or "")
+    return value:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"')
+        :gsub("&apos;", "'"):gsub("&amp;", "&")
+end
+
+local function xml_value(source, names)
+    source = tostring(source or "")
+    for _, name in ipairs(names or {}) do
+        local value = source:match("<" .. name .. "[^>]*>(.-)</" .. name .. ">")
+            or source:match("<[%w_%-]+:" .. name .. "[^>]*>(.-)</[%w_%-]+:" .. name .. ">")
+        if value and value ~= "" then return xml_unescape(value) end
+    end
+    return nil
+end
+
+local function read_epub_package(filepath, out)
+    if tostring(filepath):lower():sub(-5) ~= ".epub" then return false end
+    local quoted = U.shell_quote(filepath)
+    local container = shell_read("unzip -p " .. quoted .. " META-INF/container.xml 2>/dev/null") or ""
+    local opf_path = container:match('full%-path=["\']([^"\']+)["\']') or "OEBPS/package.opf"
+    local opf = shell_read("unzip -p " .. quoted .. " " .. U.shell_quote(opf_path) .. " 2>/dev/null")
+    if not opf or opf == "" then return false end
+    local title = plain_text(xml_value(opf, {"title"}))
+    local author = authors_text(plain_text(xml_value(opf, {"creator", "author"})))
+    local description = plain_text(xml_value(opf, {"description", "summary"}))
+    local subject = plain_text(xml_value(opf, {"subject"}))
+    local publisher = plain_text(xml_value(opf, {"publisher"}))
+    local language = plain_text(xml_value(opf, {"language"}))
+    local isbn = find_isbn(xml_value(opf, {"identifier", "isbn"}))
+    if not isbn then
+        for value in opf:gmatch("<[%w_%-:]*identifier[^>]*>(.-)</[%w_%-:]*identifier>") do
+            isbn = find_isbn(xml_unescape(value))
+            if isbn then break end
+        end
+    end
+    if title then out.title = out.title or title end
+    if author then out.author = out.author or author end
+    if description then out.description = out.description or U.utf8_truncate(description, 360, "…") end
+    if subject then out.category = out.category or U.utf8_truncate(subject, 80, "…") end
+    if publisher then out.publisher = out.publisher or publisher end
+    if language then out.language = out.language or language end
+    if isbn then out.isbn = out.isbn or isbn end
+
+    if not out.description then
+        local names = shell_read("unzip -Z1 " .. quoted .. " 2>/dev/null") or ""
+        local candidates = {}
+        for name in names:gmatch("[^\r\n]+") do
+            local lower = name:lower()
+            if lower:match("%.x?html?$") then
+                local priority = lower:match("intro") or lower:match("description") or lower:match("summary")
+                    or lower:match("preface") or lower:match("bookinfo") or lower:match("metadata")
+                if priority then table.insert(candidates, 1, name)
+                elseif #candidates < 5 then candidates[#candidates + 1] = name end
+            end
+            if #candidates >= 8 then break end
+        end
+        for _, name in ipairs(candidates) do
+            local html = shell_read("unzip -p " .. quoted .. " " .. U.shell_quote(name) .. " 2>/dev/null")
+            if html and html ~= "" then
+                html = html:gsub("<[sS][tT][yY][lL][eE][^>]*>.-</[sS][tT][yY][lL][eE]>", " ")
+                    :gsub("<[sS][cC][rR][iI][pP][tT][^>]*>.-</[sS][cC][rR][iI][pP][tT]>", " ")
+                local text = plain_text(html:gsub("<[^>]+>", " "))
+                if text and #text >= 40 then
+                    local start = text:find("内容简介", 1, true) or text:find("图书简介", 1, true)
+                        or text:find("作品简介", 1, true) or text:find("编辑推荐", 1, true)
+                    if start then text = text:sub(start) end
+                    out.description = U.utf8_truncate(text, 360, "…")
+                    break
+                end
+            end
+        end
+    end
+    if out.title or out.author or out.description or out.publisher or out.category then
+        out.metadata_source = out.metadata_source or "epub_package"
+        return true
+    end
+    return false
 end
 
 local function safe_hash(value)
@@ -106,8 +212,14 @@ local function apply_props(out, props)
     if series ~= "" then out.series = series end
     local language = trim(props.language or props.Language)
     if language ~= "" then out.language = language end
-    local description = plain_text(props.description or props.Description or props.subject)
+    local description = plain_text(props.description or props.Description or props.summary)
     if description then out.description = description end
+    local category = plain_text(props.subject or props.category or props.categories)
+    if category then out.category = category end
+    local publisher = plain_text(props.publisher or props.Publisher)
+    if publisher then out.publisher = publisher end
+    local isbn = find_isbn(props.isbn or props.ISBN or props.identifier or props.identifiers)
+    if isbn then out.isbn = isbn end
     local pages = tonumber(props.pages or props.page_count)
     if pages and pages > 0 then out.pages = math.floor(pages) end
 end
@@ -168,7 +280,10 @@ local function read_bim(filepath, cache_dir, out)
         series = info.series,
         language = info.language,
         description = info.description,
+        subject = info.subject or info.category,
+        publisher = info.publisher,
         pages = info.page_count or info.pages,
+        isbn = info.isbn or info.ISBN or info.identifier,
     })
     if info.cover_bb then
         out.cover_path = write_cover(info.cover_bb, cache_dir, filepath) or out.cover_path
@@ -245,12 +360,14 @@ function LocalMetadata.read(filepath, cache_dir, options)
     out.cover_path = custom_cover(filepath)
     read_sidecar(filepath, out)
     read_custom_metadata(filepath, out)
+    read_epub_package(filepath, out)
 
     if options.use_bim ~= false then read_bim(filepath, cache_dir, out) end
-    if options.open_document == true and (not out.cover_path or not out.title or not out.author) then
+    if options.open_document == true and (not out.cover_path or not out.title or not out.author or not out.description) then
         read_document(filepath, cache_dir, out)
     end
     out.metadata_complete = options.open_document == true
+    out.metadata_extractor_version = METADATA_EXTRACTOR_VERSION
     return out
 end
 
@@ -268,6 +385,10 @@ function LocalMetadata.merge(book, metadata)
     set("series", metadata.series)
     set("language", metadata.language)
     set("description", metadata.description)
+    set("category", metadata.category)
+    set("publisher", metadata.publisher)
+    set("published_date", metadata.published_date)
+    set("isbn", metadata.isbn)
     set("pages", metadata.pages)
     set("cover_path", metadata.cover_path)
     set("last_read_at", metadata.last_read_at)
@@ -275,7 +396,7 @@ function LocalMetadata.merge(book, metadata)
         book.progress = metadata.progress
         changed = true
     end
-    for _, key in ipairs({"metadata_source", "metadata_mtime", "metadata_checked_at", "metadata_complete"}) do
+    for _, key in ipairs({"metadata_source", "metadata_mtime", "metadata_checked_at", "metadata_complete", "metadata_extractor_version"}) do
         if metadata[key] ~= nil and book[key] ~= metadata[key] then
             book[key] = metadata[key]
             changed = true
@@ -289,7 +410,10 @@ function LocalMetadata.needs_refresh(book, full)
     local mtime = tonumber(lfs.attributes(book.file, "modification")) or 0
     if tonumber(book.metadata_mtime or -1) ~= mtime then return true end
     if full then
+        if tonumber(book.metadata_extractor_version or 0) < METADATA_EXTRACTOR_VERSION then return true end
         if book.metadata_complete ~= true then return true end
+        local description = trim(book.description or book.intro or book.summary)
+        if description == "" then return true end
         if book.cover_path and not file_exists(book.cover_path) then return true end
         return false
     end

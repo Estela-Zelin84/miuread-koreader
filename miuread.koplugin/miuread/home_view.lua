@@ -23,18 +23,49 @@ local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local U = require("miuread.util")
+local UiScale = require("miuread.ui_scale")
+local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
 local live_widget
 
-local function face(name, nominal, maximum)
-    return Font:getFace(name, math.min(maximum or nominal, Screen:scaleBySize(nominal)))
+local function face(name, nominal, maximum, minimum)
+    return UiScale.face(name, nominal, maximum, minimum)
 end
 
 local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
 function OffsetContainer:getSize() return self[1]:getSize() end
 function OffsetContainer:paintTo(bb, x, y)
     self[1]:paintTo(bb, x + self.x_off, y + self.y_off)
+end
+
+local RoundedImageContainer = WidgetContainer:extend{width = 1, height = 1, radius = 0, ink_boost = 0}
+function RoundedImageContainer:getSize()
+    return Geom:new{w = self.width, h = self.height}
+end
+function RoundedImageContainer:paintTo(bb, x, y)
+    if self[1] then self[1]:paintTo(bb, x, y) end
+    local boost = math.max(0, math.min(.18, tonumber(self.ink_boost) or 0))
+    if boost > 0 and bb and type(bb.darkenRect) == "function" then
+        -- A light contrast lift keeps pale covers legible on e-ink without
+        -- turning dark covers into solid blocks.
+        pcall(bb.darkenRect, bb, x, y, self.width, self.height, boost)
+    end
+    local r = math.max(0, math.min(math.floor(self.radius or 0), math.floor(math.min(self.width, self.height) / 2)))
+    if r <= 1 or not bb or type(bb.paintRect) ~= "function" then return end
+    -- Mask only the four corner pixels. This keeps the image flush with its
+    -- box while giving the cover itself rounded corners, without a padded frame.
+    for row = 0, r - 1 do
+        local dy = r - row
+        local inside = math.sqrt(math.max(0, r * r - dy * dy))
+        local inset = math.max(0, math.floor(r - inside + .5))
+        if inset > 0 then
+            bb:paintRect(x, y + row, inset, 1, Blitbuffer.COLOR_WHITE)
+            bb:paintRect(x + self.width - inset, y + row, inset, 1, Blitbuffer.COLOR_WHITE)
+            bb:paintRect(x, y + self.height - 1 - row, inset, 1, Blitbuffer.COLOR_WHITE)
+            bb:paintRect(x + self.width - inset, y + self.height - 1 - row, inset, 1, Blitbuffer.COLOR_WHITE)
+        end
+    end
 end
 
 local function fixed_frame(width, height, options, content)
@@ -64,11 +95,12 @@ local function background(width, height)
     return fixed_frame(width, height, {background = Blitbuffer.COLOR_WHITE})
 end
 
-local TapBox = InputContainer:extend{dimen = nil, callback = nil}
+local TapBox = InputContainer:extend{dimen = nil, callback = nil, hold_callback = nil}
 function TapBox:init()
     self.dimen = self.dimen or Geom:new{w = 1, h = 1}
     self.ges_events = {
         TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}},
+        HoldSelect = {GestureRange:new{ges = "hold", range = self.dimen}},
     }
 end
 function TapBox:getSize() return Geom:new{w = self.dimen.w, h = self.dimen.h} end
@@ -77,8 +109,15 @@ function TapBox:paintTo(bb, x, y)
     if self[1] then self[1]:paintTo(bb, x, y) end
 end
 function TapBox:onTapSelect()
-    if self.callback then self.callback() end
+    local now=os.clock()
+    if now<(tonumber(self._miu_tap_block_until) or 0) then return true end
+    self._miu_tap_block_until=now+.20
+    if self.callback then self.callback(self.dimen and self.dimen:copy() or nil) end
     return true
+end
+function TapBox:onHoldSelect()
+    if self.hold_callback then self.hold_callback(self.dimen and self.dimen:copy() or nil) end
+    return self.hold_callback ~= nil
 end
 function TapBox:handleEvent(event)
     -- Child cards only own taps. Let swipes reach HomeWidget first so the
@@ -86,10 +125,11 @@ function TapBox:handleEvent(event)
     return InputContainer.handleEvent(self, event)
 end
 
-local function tappable(width, height, child, callback)
+local function tappable(width, height, child, callback, hold_callback)
     local tap = TapBox:new{
         dimen = Geom:new{w = width, h = height},
         callback = callback,
+        hold_callback = hold_callback,
     }
     tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, child}
     return tap
@@ -98,8 +138,8 @@ end
 local function text_button(text, width, height, callback, options)
     options = options or {}
     return tappable(width, height, fixed_frame(width, height, {
-        bordersize = options.borderless and 0 or Size.border.thin,
-        padding = math.max(3, Screen:scaleBySize(3)),
+        bordersize = options.borderless and 0 or UiScale.line("thin"),
+        padding = UiScale.dp(3, 2, 6),
         background = Blitbuffer.COLOR_WHITE,
     }, TextWidget:new{
         text = tostring(text or ""),
@@ -109,7 +149,7 @@ local function text_button(text, width, height, callback, options)
     }), callback)
 end
 
-local function image_widget(path, width, height)
+local function image_widget(path, width, height, ink_boost)
     if not path or path == "" then return nil end
     local image
     local ok = pcall(function()
@@ -117,18 +157,22 @@ local function image_widget(path, width, height)
             file = path,
             width = width,
             height = height,
-            scale_factor = 0,
+            -- Stretch into the cover box. Book covers are already close to the
+            -- target ratio, and this avoids the visible inner blank frame that
+            -- scale-to-fit produced on Kindle.
+            scale_factor = nil,
             file_do_cache = true,
         }
         image:getSize()
-        -- ImageWidget reports the requested box when width/height are set.
-        -- Clear them after rendering so CenterContainer can center the actual
-        -- aspect-preserving bitmap inside the cover box.
-        image.width = nil
-        image.height = nil
     end)
     if ok and image then
-        return CenterContainer:new{dimen = Geom:new{w = width, h = height}, image}
+        return RoundedImageContainer:new{
+            width = width,
+            height = height,
+            radius = UiScale.radius(7, 5, 13),
+            ink_boost = tonumber(ink_boost) or .08,
+            image,
+        }
     end
     if image and image.free then pcall(image.free, image) end
     return nil
@@ -138,7 +182,8 @@ local function placeholder(width, height, title)
     local mark = U.utf8_sub(tostring(title or "书"):gsub("^%s+", ""), 1, 1)
     if mark == "" then mark = "书" end
     return fixed_frame(width, height, {
-        bordersize = Size.border.thin,
+        bordersize = UiScale.line("thin"),
+        radius = UiScale.radius(6, 4, 12),
         background = Blitbuffer.COLOR_WHITE,
     }, TextWidget:new{text = mark, face = face("cfont", 18, 22), bold = true})
 end
@@ -158,28 +203,29 @@ local function progress_bar(width, height, progress)
 end
 
 local function section_header(title, width, height, on_more)
-    local right_w = on_more and math.max(76, math.floor(width * .18)) or 0
+    -- Keep the full-shelf function without letting a large “全部” label steal
+    -- cover space. The grid icon opens the same 4-column full-screen shelf.
+    local right_w = on_more and math.max(UiScale.dp(38, 34, 56), math.floor(width * .075)) or 0
     local left_w = width - right_w
     local row = HorizontalGroup:new{
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = left_w, h = height}, TextWidget:new{
             text = tostring(title or ""),
-            face = face("cfont", 17, 21),
+            face = face("cfont", 15, 19),
             bold = true,
         }},
     }
     if on_more then
-        table.insert(row, text_button("全部 ›", right_w, height, on_more, {
-            borderless = true,
-            size = 12,
-            maximum = 16,
-        }))
+        table.insert(row, tappable(right_w, height,
+            Ui.icon("grid", right_w, height, UiScale.dp(21, 18, 28), {
+                face = UiScale.iconFace("cfont", 16, 22, 13),
+            }), on_more))
     end
     return row
 end
 
 local function notice_strip(item, width, height)
-    local pad = math.max(7, Screen:scaleBySize(6))
+    local pad = UiScale.dp(6, 5, 10)
     local progress_w = item.progress and math.max(92, math.floor(width * .20)) or 0
     local detail_w = math.max(1, width - progress_w - pad * 3)
     local text = tostring(item.title or "")
@@ -190,7 +236,7 @@ local function notice_strip(item, width, height)
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = detail_w, h = height - pad * 2}, TextBoxWidget:new{
             text = text,
-            face = face("smallinfofont", 12, 16),
+            face = face("smallinfofont", 10.5, 15),
             bold = true,
             width = detail_w,
             height = height - pad * 2,
@@ -201,32 +247,31 @@ local function notice_strip(item, width, height)
     }
     if progress_w > 0 then
         table.insert(row, HorizontalSpan:new{width = pad})
-        table.insert(row, progress_bar(progress_w, math.max(3, Screen:scaleBySize(3)), item.progress))
+        table.insert(row, progress_bar(progress_w, UiScale.dp(3, 2, 5), item.progress))
     end
     return tappable(width, height, fixed_frame(width, height, {
-        bordersize = item.important == true and Size.border.thick or Size.border.thin,
+        bordersize = item.important == true and UiScale.line("thick") or UiScale.line("thin"),
         padding = pad,
         background = Blitbuffer.COLOR_WHITE,
     }, row), item.on_tap)
 end
 
-local function hero_card(book, width, height, callback, compact)
-    local pad = math.max(9, math.min(15, math.floor(math.min(width, height) * .042)))
+local function hero_card(book, width, height, callback, compact, hold_callback)
+    local pad = math.max(UiScale.dp(7, 6, 12), math.min(UiScale.dp(12, 10, 18), math.floor(math.min(width, height) * .030)))
     local inner_w = math.max(1, width - pad * 2)
     local inner_h = math.max(1, height - pad * 2)
-    -- Keep the cover clearly visible without sacrificing the much more useful
-    -- metadata column on the right.
-    local cover_w = math.max(58, math.min(
-        math.floor(inner_w * (compact and .17 or .19)),
-        math.floor(inner_h * .62)
+    local cover_w = math.max(UiScale.dp(76, 64, 110), math.min(
+        math.floor(inner_w * (compact and .24 or .27)),
+        math.floor(inner_h * .82)
     ))
-    local cover_h = math.max(84, math.min(inner_h, math.floor(cover_w / .68)))
-    local cover = image_widget(book.cover_path, cover_w, cover_h) or placeholder(cover_w, cover_h, book.title)
-    local gap = math.max(12, math.floor(width * .020))
+    local cover_h = math.max(UiScale.dp(108, 92, 155), math.min(inner_h, math.floor(cover_w / .68)))
+    local cover = image_widget(book.cover_path, cover_w, cover_h, .10) or placeholder(cover_w, cover_h, book.title)
+    local gap = math.max(UiScale.dp(9, 7, 14), math.floor(width * .014))
     local text_w = math.max(1, inner_w - cover_w - gap)
-    local heading_h = math.max(17, math.floor(inner_h * .08))
-    local title_h = math.max(42, math.floor(inner_h * (compact and .25 or .27)))
-    local line_h = math.max(21, math.floor(inner_h * .12))
+    local heading_h = UiScale.dp(22, 20, 30)
+    local title_h = UiScale.dp(compact and 44 or 54, compact and 40 or 48, compact and 64 or 76)
+    local line_h = UiScale.dp(27, 23, 36)
+    local description_h = math.max(UiScale.dp(52, 44, 78), inner_h - heading_h - title_h - line_h * 3)
     local progress_value = math.max(0, math.min(100, tonumber(book.progress) or 0))
     local progress_text = progress_value > 0
         and ("阅读至 " .. tostring(math.floor(progress_value + .5)) .. "%")
@@ -234,226 +279,273 @@ local function hero_card(book, width, height, callback, compact)
     if book.last_read_text and tostring(book.last_read_text) ~= "" then
         progress_text = progress_text .. " · " .. tostring(book.last_read_text)
     end
-
-    local function unique_parts(values, used)
-        local out = {}
-        used = used or {}
-        for _, value in ipairs(values or {}) do
+    local author = U.trim(tostring(book.author or ""))
+    local source = U.trim(tostring(book.source_text or ""))
+    local category = U.trim(tostring(book.category or ""))
+    local publisher = U.trim(tostring(book.publisher or ""))
+    local published_date = U.trim(tostring(book.published_date or book.publish_date or ""))
+    published_date = published_date:match("^(%d%d%d%d)") or published_date
+    local meta = {}
+    for _, value in ipairs({author, category}) do
+        if value ~= "" then meta[#meta + 1] = value end
+    end
+    local source_meta = {}
+    for _, value in ipairs({source, publisher, published_date}) do
+        if value ~= "" then source_meta[#source_meta + 1] = value end
+    end
+    local description = U.trim(tostring(book.description or book.intro or book.summary or ""))
+    if description == "" then
+        local substitutes = {}
+        for _, value in ipairs({book.translator, book.series, book.language}) do
             value = U.trim(tostring(value or ""))
-            if value ~= "" and not used[value] then
-                used[value] = true
-                out[#out + 1] = value
-            end
+            if value ~= "" then substitutes[#substitutes + 1] = value end
         end
-        return out, used
+        description = #substitutes > 0 and table.concat(substitutes, " · ") or "点击查看详情或继续阅读"
     end
-
-    local meta_parts, used = unique_parts({book.author, book.category, book.translator})
-    local bibliographic = {book.publisher, book.series}
-    local words = tonumber(book.wordCount or book.word_count)
-    if words and words > 0 then
-        bibliographic[#bibliographic + 1] = words >= 10000
-            and (tostring(math.floor(words / 10000 + .5)) .. "万字")
-            or (tostring(math.floor(words + .5)) .. "字")
-    elseif tonumber(book.pages) and tonumber(book.pages) > 0 then
-        bibliographic[#bibliographic + 1] = tostring(math.floor(tonumber(book.pages) + .5)) .. "页"
-    end
-    local format = U.trim(tostring(book.format or "")):upper()
-    if format ~= "" then bibliographic[#bibliographic + 1] = format end
-    local detail_parts
-    detail_parts, used = unique_parts(bibliographic, used)
-    local source_parts = unique_parts({book.source_text, book.status_text, book.edition_text, book.language}, used)
 
     local text = VerticalGroup:new{align = "left"}
     table.insert(text, TextBoxWidget:new{
         text = tostring(book.heading or "最近阅读"),
-        face = face("smallinfofont", 11, 14),
-        bold = true,
-        width = text_w,
-        height = heading_h,
-        height_adjust = false,
-        height_overflow_show_ellipsis = true,
-        fgcolor = Blitbuffer.COLOR_BLACK,
+        face = face("smallinfofont", 10.5, 15), bold = true,
+        width = text_w, height = heading_h, height_adjust = false,
+        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
     })
     table.insert(text, TextBoxWidget:new{
         text = tostring(book.title or "未命名"),
-        face = face("cfont", compact and 17 or 19, compact and 21 or 24),
-        bold = true,
-        width = text_w,
-        height = title_h,
-        height_adjust = false,
+        face = face("cfont", compact and 17 or 19, compact and 22 or 25), bold = true,
+        width = text_w, height = title_h, height_adjust = false,
         height_overflow_show_ellipsis = true,
     })
-    for _, row in ipairs({meta_parts, detail_parts, source_parts}) do
-        table.insert(text, TextBoxWidget:new{
-            text = table.concat(row or {}, " · "),
-            face = face("smallinfofont", 11, 14),
-            width = text_w,
-            height = line_h,
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        })
-    end
+    table.insert(text, TextBoxWidget:new{
+        text = table.concat(meta, " · "),
+        face = face("smallinfofont", 10.5, 15),
+        width = text_w, height = line_h, height_adjust = false,
+        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
+    })
     table.insert(text, TextBoxWidget:new{
         text = progress_text,
-        face = face("smallinfofont", 12, 15),
-        bold = true,
-        width = text_w,
-        height = line_h,
-        height_adjust = false,
-        height_overflow_show_ellipsis = true,
-        fgcolor = Blitbuffer.COLOR_BLACK,
+        face = face("smallinfofont", 10.5, 15), bold = true,
+        width = text_w, height = line_h, height_adjust = false,
+        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
     })
-    local used_h = heading_h + title_h + line_h * 4
-    if used_h < inner_h then table.insert(text, Widget:new{dimen = Geom:new{w = 1, h = inner_h - used_h}}) end
+    table.insert(text, TextBoxWidget:new{
+        text = table.concat(source_meta, " · "),
+        face = face("smallinfofont", 10, 14),
+        width = text_w, height = line_h, height_adjust = false,
+        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
+    })
+    table.insert(text, TextBoxWidget:new{
+        text = description,
+        face = face("smallinfofont", 11.5, 17),
+        width = text_w, height = description_h, height_adjust = false,
+        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
+    })
 
     local content = fixed_frame(width, height, {
-        bordersize = 0,
+        bordersize = UiScale.line("thin"),
+        radius = UiScale.radius(9, 6, 15),
         padding = pad,
         background = Blitbuffer.COLOR_WHITE,
+        color = Blitbuffer.COLOR_DARK_GRAY,
     }, HorizontalGroup:new{
         align = "center",
         cover,
         HorizontalSpan:new{width = gap},
         text,
     })
-    local layered = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
-    layered[#layered + 1] = content
-    layered[#layered + 1] = OffsetContainer:new{
-        x_off = 0,
-        y_off = math.max(0, height - Size.line.thin),
-        LineWidget:new{background = Blitbuffer.COLOR_GRAY, dimen = Geom:new{w = width, h = Size.line.thin}},
-    }
-    return tappable(width, height, layered, callback)
+    return tappable(width, height, content, callback, function(anchor)
+        if hold_callback then hold_callback(book, anchor) end
+    end)
 end
 
 local function welcome_card(width, height, callback)
     return tappable(width, height, fixed_frame(width, height, {
-        bordersize = Size.border.thin,
+        bordersize = UiScale.line("thin"),
+        radius = UiScale.radius(9, 6, 15),
         background = Blitbuffer.COLOR_WHITE,
     }, VerticalGroup:new{
         align = "center",
-        TextWidget:new{text = "开始阅读", face = face("cfont", 18, 22), bold = true},
-        VerticalSpan:new{height = 7},
+        TextWidget:new{text = "开始阅读", face = UiScale.iconFace("cfont", 18, 24), bold = true},
+        VerticalSpan:new{height = UiScale.dp(7, 5, 10)},
         TextWidget:new{
             text = "从微信书架选择一本书",
-            face = face("smallinfofont", 13, 16),
+            face = face("smallinfofont", 11, 14),
             fgcolor = Blitbuffer.COLOR_BLACK,
         },
     }), callback)
 end
 
-local function shelf_book_card(book, width, height, callback)
-    local pad = math.max(3, math.floor(width * .022))
+local function shelf_book_card(book, width, height, callback, hold_callback)
+    local pad = math.max(UiScale.dp(1, 0, 2), math.floor(width * .004))
     local inner_w = math.max(1, width - pad * 2)
-    local title_h = math.max(28, math.min(40, math.floor(height * .16)))
-    local status_h = math.max(16, math.min(22, math.floor(height * .08)))
-    local cover_h = math.max(48, height - title_h - status_h - 10)
-    local cover_w = math.max(36, math.min(inner_w, math.floor(cover_h * .70)))
-    local cover = image_widget(book.cover_path, cover_w, cover_h) or placeholder(cover_w, cover_h, book.title)
     local progress = math.max(0, math.min(100, tonumber(book.progress) or 0))
     local status = U.trim(tostring(book.status_text or ""))
+    local downloaded = status == "已生成" or status == "已下载" or book.generated == true
+        or book.downloaded == true or tostring(book.shelf_section or "") == "generated"
+        or (book.file and tostring(book.file) ~= "" and U.file_exists(tostring(book.file)))
     local reading_badge = ""
-    if progress >= 100 then
-        reading_badge = "已读"
-    elseif progress > 0 then
-        reading_badge = tostring(math.floor(progress + .5)) .. "%"
-    end
+    if progress >= 100 then reading_badge = "已读"
+    elseif progress > 0 then reading_badge = tostring(math.floor(progress + .5)) .. "%" end
 
-    if status == "未生成" or status == "未开始" or status == "已读完"
-        or status:match("^阅读%s+%d+%%$") then
+    if status == "已生成" or status == "已下载" or status == "未生成" or status == "未开始"
+        or status == "已读完" or status:match("^阅读%s+%d+%%$") then
         status = ""
     end
     status = U.utf8_truncate(status, 10, "")
     local status_important = status:match("下载中") or status:match("生成中")
         or status == "失败" or status == "待修复" or status == "排队中"
+    if not status_important then status = "" end
+
+    local title_h = math.max(UiScale.dp(29, 25, 40), math.min(UiScale.dp(39, 32, 47), math.floor(height * .155)))
+    local status_h = status ~= "" and UiScale.dp(18, 15, 25) or 0
+    local vgap = UiScale.dp(2, 2, 4)
+    local cover_h = math.max(UiScale.dp(78, 64, 108), height - title_h - status_h - vgap * (status_h > 0 and 2 or 1))
+    local cover_w = math.max(UiScale.dp(54, 46, 78), math.min(math.floor(inner_w * .995), math.floor(cover_h * .715)))
+    local cover = image_widget(book.cover_path, cover_w, cover_h, .13) or placeholder(cover_w, cover_h, book.title)
 
     local cover_layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
     cover_layer[#cover_layer + 1] = cover
+    if downloaded then
+        local badge = UiScale.dp(20, 17, 27)
+        local inset = UiScale.dp(2, 1, 4)
+        cover_layer[#cover_layer + 1] = OffsetContainer:new{
+            x_off = inset, y_off = inset,
+            fixed_frame(badge, badge, {
+                bordersize = UiScale.line("thin"), radius = UiScale.radius(5, 4, 8), padding = 0,
+                background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_BLACK,
+            }, TextWidget:new{text = "✓", face = face("cfont", 9.2, 13), bold = true, fgcolor = Blitbuffer.COLOR_BLACK}),
+        }
+    end
     if reading_badge ~= "" then
         local chars = math.max(2, U.utf8_len(reading_badge))
-        local badge_w = math.max(34, math.min(66, 16 + chars * 9))
-        local badge_h = math.max(18, math.min(24, math.floor(cover_h * .10)))
+        local badge_w = math.max(UiScale.dp(31, 26, 45), UiScale.dp(11, 9, 16) + chars * UiScale.dp(7, 6, 10))
+        local badge_h = UiScale.dp(20, 17, 27)
+        local inset = UiScale.dp(2, 1, 4)
         cover_layer[#cover_layer + 1] = OffsetContainer:new{
-            x_off = math.max(0, cover_w - badge_w),
-            y_off = 0,
+            x_off = math.max(0, cover_w - badge_w - inset), y_off = inset,
             fixed_frame(badge_w, badge_h, {
-                bordersize = 0,
-                radius = math.max(3, Screen:scaleBySize(3)),
-                padding = 2,
-                background = Blitbuffer.COLOR_BLACK,
-            }, TextWidget:new{
-                text = reading_badge,
-                face = face("smallinfofont", 9, 11),
-                bold = true,
-                fgcolor = Blitbuffer.COLOR_WHITE,
-            }),
+                bordersize = UiScale.line("thin"), radius = UiScale.radius(5, 4, 8), padding = UiScale.dp(1, 1, 2),
+                background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_BLACK,
+            }, TextWidget:new{text = reading_badge, face = face("smallinfofont", 9.2, 13), bold = true, fgcolor = Blitbuffer.COLOR_BLACK}),
         }
     end
 
-    local body = VerticalGroup:new{
-        align = "center",
-        cover_layer,
-        VerticalSpan:new{height = 4},
-        TextBoxWidget:new{
-            text = tostring(book.title or "未命名"),
-            face = face("cfont", 13, 17),
-            bold = true,
-            width = inner_w,
-            height = title_h,
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "center",
-        },
-        TextBoxWidget:new{
-            text = status,
-            face = face("smallinfofont", 10, 13),
-            bold = status ~= "",
-            width = inner_w,
-            height = status_h,
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "center",
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        },
+    local body = VerticalGroup:new{align = "center", cover_layer, VerticalSpan:new{height = vgap}}
+    body[#body + 1] = TextBoxWidget:new{
+        text = tostring(book.title or "未命名"),
+        face = face("cfont", 11.5, 16), bold = true, width = inner_w, height = title_h,
+        height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
     }
-    return tappable(width, height,
-        CenterContainer:new{dimen = Geom:new{w = width, h = height}, body},
-        function() if callback then callback(book) end end)
+    if status_h > 0 then
+        body[#body + 1] = TextBoxWidget:new{
+            text = status, face = face("smallinfofont", 8.5, 12), bold = true, width = inner_w, height = status_h,
+            height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+        }
+    end
+    return tappable(width, height, CenterContainer:new{dimen = Geom:new{w = width, h = height}, body},
+        function(anchor) if callback then callback(book, anchor) end end,
+        function(anchor) if hold_callback then hold_callback(book, anchor) end end)
 end
 
-local function category_tabs(tabs, width, height)
+local function home_action_icon(icon, width, height, enabled)
+    local size = math.min(width, height, UiScale.dp(25, 22, 34))
+    return Ui.icon(icon, width, height, size, {
+        icon_key = icon,
+        face = UiScale.iconFace("cfont", 20, 27, 17),
+        fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+    })
+end
+
+local function action_button(entry, width, height)
+    local enabled = entry.enabled ~= false
+    local icon_h = math.max(UiScale.dp(24, 21, 33), math.floor(height * .42))
+    local gap_h = UiScale.dp(2, 1, 4)
+    local label_h = math.max(UiScale.dp(17, 15, 23), math.floor(height * .27))
+    local body = VerticalGroup:new{
+        align = "center",
+        home_action_icon(tostring(entry.icon_key or entry.icon or "•"), width, icon_h, enabled),
+        VerticalSpan:new{height = gap_h},
+        CenterContainer:new{
+            dimen = Geom:new{w = width, h = label_h},
+            TextWidget:new{
+                text = tostring(entry.label or ""),
+                face = face("smallinfofont", 9.5, 13),
+                bold = true,
+                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+            },
+        },
+    }
+    local child = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+    child[#child + 1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, body}
+    if entry.badge and tostring(entry.badge) ~= "" then
+        local badge_w = math.max(UiScale.dp(22, 18, 32), math.min(UiScale.dp(42, 34, 56), UiScale.dp(12, 10, 18) + U.utf8_len(tostring(entry.badge)) * UiScale.dp(8, 6, 10)))
+        local badge_h = math.max(UiScale.dp(18, 15, 24), math.floor(height * .24))
+        child[#child + 1] = OffsetContainer:new{
+            x_off = math.max(0, width - badge_w - UiScale.dp(4, 3, 7)), y_off = UiScale.dp(2, 1, 4),
+            fixed_frame(badge_w, badge_h, {
+                bordersize = UiScale.line("thin"),
+                radius = UiScale.radius(4, 3, 7),
+                padding = UiScale.dp(1, 1, 3),
+                background = Blitbuffer.COLOR_WHITE,
+            }, TextWidget:new{text = tostring(entry.badge), face = face("smallinfofont", 9, 11), bold = true}),
+        }
+    end
+    return tappable(width, height, child, enabled and entry.callback or nil, enabled and entry.hold_callback or nil)
+end
+
+local function action_bar(actions, width, height)
+    actions = actions or {}
+    if #actions == 0 then return fixed_frame(width, height, {background = Blitbuffer.COLOR_WHITE}) end
+    local gap = UiScale.dp(2, 2, 5)
+    local item_w = math.floor((width - gap * (#actions - 1)) / #actions)
+    local row = HorizontalGroup:new{align = "center"}
+    for index, entry in ipairs(actions) do
+        row[#row + 1] = action_button(entry, item_w, height)
+        if index < #actions then row[#row + 1] = HorizontalSpan:new{width = gap} end
+    end
+    local layered = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+    layered[#layered + 1] = row
+    layered[#layered + 1] = OffsetContainer:new{
+        x_off = 0, y_off = math.max(0, height - UiScale.line("thin")),
+        LineWidget:new{background = Blitbuffer.COLOR_GRAY, dimen = Geom:new{w = width, h = UiScale.line("thin")}},
+    }
+    return layered
+end
+
+local function category_tabs(tabs, width, height, on_more)
     tabs = tabs or {}
     if #tabs == 0 then return fixed_frame(width, height, {background = Blitbuffer.COLOR_WHITE}) end
-    local gap = math.max(3, Screen:scaleBySize(3))
-    local item_w = math.floor((width - gap * (#tabs - 1)) / #tabs)
+    local gap = UiScale.dp(3, 2, 6)
+    local more_w = on_more and math.max(UiScale.dp(34, 30, 50), math.floor(width * .055)) or 0
+    local tabs_w = math.max(1, width - (more_w > 0 and more_w + gap or 0))
+    local item_w = math.floor((tabs_w - gap * (#tabs - 1)) / #tabs)
     local row = HorizontalGroup:new{align = "center"}
     for index, tab in ipairs(tabs) do
         local label = tostring(tab.title or "")
         if tonumber(tab.count) then label = label .. " " .. tostring(tab.count) end
         local item = OverlapGroup:new{dimen = Geom:new{w = item_w, h = height}, allow_mirroring = false}
-        item[#item + 1] = CenterContainer:new{dimen = Geom:new{w = item_w, h = height}, TextBoxWidget:new{
-            text = label,
-            face = face("smallinfofont", 11, 15),
-            bold = true,
-            width = math.max(1, item_w - 8),
-            height = math.max(18, height - 8),
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "center",
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        }}
+        item[#item + 1] = Ui.textbox(label, math.max(1, item_w - 8), height,
+            face("smallinfofont", 10.8, 15), {
+                bold = true, alignment = "center", halign = "center",
+                fgcolor = Blitbuffer.COLOR_BLACK,
+            })
         if tab.selected then
             local line_w = math.max(28, math.floor(item_w * .54))
             item[#item + 1] = OffsetContainer:new{
                 x_off = math.floor((item_w - line_w) / 2),
-                y_off = math.max(0, height - Size.line.thick),
-                LineWidget:new{background = Blitbuffer.COLOR_BLACK, dimen = Geom:new{w = line_w, h = Size.line.thick}},
+                y_off = math.max(0, height - UiScale.line("thick")),
+                LineWidget:new{background = Blitbuffer.COLOR_BLACK, dimen = Geom:new{w = line_w, h = UiScale.line("thick")}},
             }
         end
-        table.insert(row, tappable(item_w, height, item, tab.on_tap))
-        if index < #tabs then table.insert(row, HorizontalSpan:new{width = gap}) end
+        row[#row + 1] = tappable(item_w, height, item, tab.on_tap)
+        if index < #tabs then row[#row + 1] = HorizontalSpan:new{width = gap} end
+    end
+    if on_more then
+        row[#row + 1] = HorizontalSpan:new{width = gap}
+        row[#row + 1] = tappable(more_w, height,
+            Ui.icon("grid", more_w, height, UiScale.dp(20, 17, 27), {
+                face = UiScale.iconFace("cfont", 15, 21, 12),
+            }), on_more)
     end
     return row
 end
@@ -461,16 +553,12 @@ end
 local function empty_section(width, height, text, callback)
     return tappable(width, height, fixed_frame(width, height, {
         bordersize = 0,
-        padding = math.max(8, Screen:scaleBySize(7)),
+        padding = UiScale.dp(7, 6, 12),
         background = Blitbuffer.COLOR_WHITE,
-    }, TextBoxWidget:new{
-        text = tostring(text or "暂时没有内容"),
-        face = face("smallinfofont", 13, 17),
-        bold = true,
-        width = math.max(1, width - 32),
-        alignment = "center",
-        fgcolor = Blitbuffer.COLOR_BLACK,
-    }), callback)
+    }, Ui.textbox(tostring(text or "暂时没有内容"), math.max(1, width - 32),
+        math.max(1, height - UiScale.dp(14, 12, 24)), face("smallinfofont", 11, 15), {
+            bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+        })), callback)
 end
 
 local HomeWidget = InputContainer:extend{
@@ -483,6 +571,7 @@ local HomeWidget = InputContainer:extend{
     content_dimen = nil,
     section_dimen = nil,
     _miu_closed = false,
+    _quick_panel_pending = false,
 }
 
 
@@ -495,6 +584,13 @@ function HomeWidget:handleEvent(event)
         local shelf_owned=(direction=="west" or direction=="east") and pos and self.section_dimen
             and pos.x>=self.section_dimen.x and pos.x<=self.section_dimen.x+self.section_dimen.w
             and pos.y>=self.section_dimen.y and pos.y<=self.section_dimen.y+self.section_dimen.h
+        local top_owned=direction=="south" and pos and self.top_swipe_dimen
+            and pos.x>=self.top_swipe_dimen.x and pos.x<=self.top_swipe_dimen.x+self.top_swipe_dimen.w
+            and pos.y>=self.top_swipe_dimen.y and pos.y<=self.top_swipe_dimen.y+self.top_swipe_dimen.h
+        if top_owned and (gesture == "swipe" or gesture == "pan_release")
+            and self:_open_quick_panel_from_gesture(ges) then
+            return true
+        end
         -- Forward unowned swipe-style gestures before the fullscreen home can
         -- stop propagation. Taps and holds remain owned by books and buttons.
         local pointer_action=gesture=="tap" or gesture=="hold" or gesture=="hold_release"
@@ -510,34 +606,78 @@ function HomeWidget:_add(children, x, y, widget)
 end
 
 function HomeWidget:_metrics()
-    local sw, sh = Screen:getWidth(), Screen:getHeight()
-    local portrait = sw < sh
-    local margin = math.max(12, math.min(24, math.floor(sw * .022)))
+    local scale = UiScale.metrics()
+    local sw, sh = scale.sw, scale.sh
+    local portrait = scale.portrait
+    local margin = math.max(UiScale.dp(7, 7, 15), math.min(UiScale.dp(12, 9, 18), math.floor(scale.short * .016)))
     local header_h = portrait
-        and math.max(54, math.min(68, math.floor(sh * .055)))
-        or math.max(48, math.min(60, math.floor(sh * .075)))
-    local gap = math.max(8, math.min(14, math.floor(sh * .009)))
+        and math.max(UiScale.dp(42, 42, 58), math.min(UiScale.dp(56, 48, 64), math.floor(sh * .052)))
+        or math.max(UiScale.dp(38, 38, 52), math.min(UiScale.dp(48, 42, 56), math.floor(sh * .068)))
+    local gap = math.max(UiScale.dp(4, 4, 8), math.min(UiScale.dp(7, 5, 10), math.floor(sh * .006)))
+    local line = UiScale.line("thin")
     return {
         sw = sw,
         sh = sh,
         portrait = portrait,
         margin = margin,
         gap = gap,
+        line = line,
         content_w = sw - margin * 2,
         header_h = header_h,
-        body_y = margin + header_h + Size.line.thin + gap,
-        body_h = sh - (margin + header_h + Size.line.thin + gap) - margin,
+        body_y = margin + header_h + line + gap,
+        body_h = sh - (margin + header_h + line + gap) - margin,
     }
 end
 
 function HomeWidget:_register_top_swipe(m)
     if not Device:isTouchDevice() then self.ges_events={}; return end
+    -- Own only the true status/header strip. The previous 18–26% zone
+    -- overlapped the recent-reading card and competed with KOReader gestures,
+    -- which made a pull-down feel delayed on Kindle.
+    local top_h = math.max(m.header_h + m.margin + m.gap, math.floor(m.sh * .10))
+    top_h = math.min(math.floor(m.sh * .14), math.max(top_h, UiScale.dp(82, 72, 118)))
+    self.top_swipe_dimen = Geom:new{x = 0, y = 0, w = m.sw, h = math.min(m.sh, top_h)}
     self.ges_events={
+        HomeQuickPanelSwipe={GestureRange:new{
+            ges="swipe",
+            range=function() return self.top_swipe_dimen end,
+        }},
+        HomeQuickPanelPanRelease={GestureRange:new{
+            ges="pan_release",
+            range=function() return self.top_swipe_dimen end,
+        }},
         HomeShelfSwipe={GestureRange:new{
             ges="swipe",
             range=function() return self.section_dimen or self.content_dimen end,
         }},
     }
+end
+
+function HomeWidget:_open_quick_panel_from_gesture(ges)
+    local direction = ges and ges.direction
+    local start = ges and (ges.start_pos or ges.pos)
+    local in_top = start and self.top_swipe_dimen
+        and start.x >= self.top_swipe_dimen.x and start.x <= self.top_swipe_dimen.x + self.top_swipe_dimen.w
+        and start.y >= self.top_swipe_dimen.y and start.y <= self.top_swipe_dimen.y + self.top_swipe_dimen.h
+    if direction == "south" and in_top and self.opts and self.opts.on_quick_panel then
+        if self._quick_panel_pending then return true end
+        self._quick_panel_pending=true
+        -- Finish the gesture dispatch before building the panel. This avoids
+        -- competing with the underlying Gesture Manager in the same event.
+        UIManager:nextTick(function()
+            if self._miu_closed then return end
+            self._quick_panel_pending=false
+            if self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel() end
+        end)
+        return true
+    end
+    return false
+end
+function HomeWidget:onHomeQuickPanelSwipe(_, ges)
+    return self:_open_quick_panel_from_gesture(ges)
+end
+function HomeWidget:onHomeQuickPanelPanRelease(_, ges)
+    return self:_open_quick_panel_from_gesture(ges)
 end
 
 function HomeWidget:onHomeShelfSwipe(_,ges)
@@ -548,78 +688,62 @@ function HomeWidget:onHomeShelfSwipe(_,ges)
 end
 
 function HomeWidget:_build_header(children, m)
-    local menu_w = math.max(72, math.min(92, math.floor(m.content_w * .10)))
-    local title_w = math.max(92, math.min(132, math.floor(m.content_w * .15)))
-    local account_w = math.max(150, math.min(280, math.floor(m.content_w * .27)))
+    local menu_w = math.max(UiScale.dp(64, 58, 88), math.min(UiScale.dp(84, 68, 100), math.floor(m.content_w * .11)))
+    local title_w = math.max(UiScale.dp(78, 72, 108), math.min(UiScale.dp(108, 86, 126), math.floor(m.content_w * .14)))
+    local account_w = math.max(UiScale.dp(118, 108, 190), math.min(UiScale.dp(210, 150, 250), math.floor(m.content_w * .25)))
     local gap = math.max(5, math.floor(m.content_w * .009))
     local status_w = math.max(1, m.content_w - title_w - account_w - menu_w - gap * 3)
     local header = HorizontalGroup:new{
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = title_w, h = m.header_h}, TextWidget:new{
             text = self.opts.title or "觅阅",
-            face = face("cfont", 21, 25),
+            face = face("cfont", 16, 20),
             bold = true,
         }},
         HorizontalSpan:new{width = gap},
-        tappable(status_w, m.header_h, TextBoxWidget:new{
-            text = tostring(self.opts.status_line or ""),
-            face = face("smallinfofont", 12, 16),
-            bold = true,
-            width = status_w,
-            height = math.max(22, math.floor(m.header_h * .52)),
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "right",
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        }, self.opts.on_quick_panel),
+        tappable(status_w, m.header_h, Ui.textbox(tostring(self.opts.status_line or ""),
+            status_w, m.header_h, face("smallinfofont", 10, 14), {
+                bold = true, alignment = "right", halign = "right", fgcolor = Blitbuffer.COLOR_BLACK,
+            }), self.opts.on_quick_panel),
         HorizontalSpan:new{width = gap},
-        tappable(account_w, m.header_h, TextBoxWidget:new{
-            text = tostring(self.opts.account_name or "账户"),
-            face = face("smallinfofont", 12, 16),
-            width = account_w,
-            height = math.max(22, math.floor(m.header_h * .52)),
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "right",
-            bold = true,
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        }, self.opts.on_account),
+        tappable(account_w, m.header_h, Ui.textbox(tostring(self.opts.account_name or "账户"),
+            account_w, m.header_h, face("smallinfofont", 10, 14), {
+                bold = true, alignment = "right", halign = "right", fgcolor = Blitbuffer.COLOR_BLACK,
+            }), self.opts.on_account),
         HorizontalSpan:new{width = gap},
-        text_button("⋯", menu_w, math.max(40, m.header_h - 6), function()
-            logger.info("[MiuRead][Home] menu tapped")
-            if self.opts and self.opts.on_menu then self.opts.on_menu() end
-        end, {
-            font = "cfont",
-            size = 12,
-            maximum = 22,
-            borderless = true,
-        }),
+        tappable(menu_w, math.max(UiScale.dp(34, 32, 44), m.header_h - UiScale.dp(4, 3, 8)),
+            Ui.icon("more", menu_w, math.max(UiScale.dp(34, 32, 44), m.header_h - UiScale.dp(4, 3, 8)),
+                UiScale.dp(22, 19, 30), {face = UiScale.iconFace("cfont", 16, 22, 13)}), function()
+            logger.info("[MiuRead][Home] quick panel tapped")
+            if self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel()
+            elseif self.opts and self.opts.on_menu then self.opts.on_menu() end
+        end),
     }
     self:_add(children, m.margin, m.margin, header)
     self:_add(children, m.margin, m.margin + m.header_h,
         LineWidget:new{
             background = Blitbuffer.COLOR_GRAY,
-            dimen = Geom:new{w = m.content_w, h = Size.line.thin},
+            dimen = Geom:new{w = m.content_w, h = m.line or UiScale.line("thin")},
         })
 end
 
 function HomeWidget:_grid_geometry(m, width, available_h, count, force_rows)
-    local columns = m.portrait and 3 or 4
-    -- Keep every page on the same 3×2 / 4×2 grid. The last page leaves empty
+    local columns = 4
+    -- Keep every page on the same 4×2 grid. The last page leaves empty
     -- slots instead of enlarging the remaining covers.
     local rows = force_rows or 2
     rows = math.max(1, math.min(rows, 2))
-    local col_gap = math.max(10, m.gap)
-    local row_gap = math.max(8, m.gap)
-    if rows == 2 and math.floor((available_h - row_gap) / 2) < Screen:scaleBySize(118) then rows = 1 end
+    local col_gap = math.max(UiScale.dp(2, 2, 4), math.floor(m.gap * .55))
+    local row_gap = math.max(UiScale.dp(3, 2, 5), math.floor(m.gap * .65))
+    if rows == 2 and math.floor((available_h - row_gap) / 2) < UiScale.dp(118, 96, 170) then rows = 1 end
     local card_w = math.max(1, math.floor((width - col_gap * (columns - 1)) / columns))
     local raw_card_h = math.max(1, math.floor((available_h - row_gap * (rows - 1)) / rows))
-    local preferred_card_h = math.max(Screen:scaleBySize(142), math.floor(card_w * 1.62))
+    local preferred_card_h = math.max(UiScale.dp(160, 132, 228), math.floor(card_w * 1.80))
     local card_h = math.min(raw_card_h, preferred_card_h)
     return columns, rows, col_gap, row_gap, card_w, card_h
 end
 
-function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_open, force_rows)
+function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_open, on_hold, force_rows)
     if #books == 0 then return 0 end
     local columns, rows, col_gap, row_gap, card_w, card_h = self:_grid_geometry(m, width, height, #books, force_rows)
     local capacity = columns * rows
@@ -631,7 +755,7 @@ function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_ope
         self:_add(children,
             start_x + col * (card_w + col_gap),
             y + row * (card_h + row_gap),
-            shelf_book_card(books[index], card_w, card_h, on_open))
+            shelf_book_card(books[index], card_w, card_h, on_open, on_hold))
     end
     return rows * card_h + math.max(0, rows - 1) * row_gap
 end
@@ -639,91 +763,114 @@ end
 local function page_footer(width, height, page, pages, on_page)
     page = math.max(1, tonumber(page) or 1)
     pages = math.max(1, tonumber(pages) or 1)
-    local arrow_w = math.max(64, math.floor(width * .18))
+    local arrow_w = math.max(UiScale.dp(54, 48, 88), math.floor(width * .18))
     local middle_w = math.max(1, width - arrow_w * 2)
     local row = HorizontalGroup:new{align = "center"}
     table.insert(row, text_button("‹", arrow_w, height, page > 1 and function() on_page(-1) end or nil, {
-        borderless = true, font = "cfont", size = 19, maximum = 24,
+        borderless = true, font = "cfont", size = 17, maximum = 21,
         fgcolor = page > 1 and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
     }))
     table.insert(row, CenterContainer:new{dimen = Geom:new{w = middle_w, h = height}, TextWidget:new{
         text = tostring(page) .. " / " .. tostring(pages),
-        face = face("smallinfofont", 11, 14),
+        face = face("smallinfofont", 9, 12),
         bold = true,
         fgcolor = Blitbuffer.COLOR_BLACK,
     }})
     table.insert(row, text_button("›", arrow_w, height, page < pages and function() on_page(1) end or nil, {
-        borderless = true, font = "cfont", size = 19, maximum = 24,
+        borderless = true, font = "cfont", size = 17, maximum = 21,
         fgcolor = page < pages and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
     }))
     return row
 end
 
-function HomeWidget:_build_sections(children, m, compact)
+function HomeWidget:_build_sections(children, m, compact, mode)
+    local build_static = mode ~= "section"
+    local build_section = mode ~= "static"
     local x, y, w, gap = m.margin, m.body_y, m.content_w, m.gap
     local bottom = m.body_y + m.body_h
     local notice = (self.opts.alerts or {})[1] or self.opts.download_notice
     if notice then
         local h = math.max(42, math.min(52, math.floor(m.body_h * .07)))
-        self:_add(children, x, y, notice_strip(notice, w, h))
+        if build_static then self:_add(children, x, y, notice_strip(notice, w, h)) end
         y = y + h + gap
     end
 
-    local tabs_h = math.max(40, math.min(48, math.floor(m.body_h * .065)))
-    local section_h = math.max(32, math.min(40, math.floor(m.body_h * .052)))
+    local action_h = math.max(UiScale.dp(58, 54, 76), math.min(UiScale.dp(76, 64, 86), math.floor(m.body_h * .070)))
+    local actions = self.opts.home_actions or {}
+    local tabs_h = math.max(UiScale.dp(34, 31, 44), math.min(UiScale.dp(46, 37, 52), math.floor(m.body_h * .050)))
     local books = self.opts.shelf_books or {}
-    local title = tostring(self.opts.shelf_title or "书架")
+    local title = tostring(self.opts.shelf_title or "")
+    local section_h = title ~= "" and math.max(UiScale.dp(22, 20, 30), math.min(UiScale.dp(29, 25, 35), math.floor(m.body_h * .031))) or 0
 
     if not m.portrait then
+        if #actions > 0 and y + action_h < bottom then
+            if build_static then self:_add(children, x, y, action_bar(actions, w, action_h)) end
+            y = y + action_h + gap
+        end
         local available_h = math.max(1, bottom - y)
-        local hero_w = math.max(230, math.min(math.floor(w * .35), 390))
+        local hero_w = math.max(UiScale.dp(230, 205, 360), math.min(math.floor(w * .33), UiScale.dp(390, 330, 520)))
         local shelf_x = x + hero_w + gap
         local shelf_w = math.max(1, w - hero_w - gap)
-        if self.opts.hero then
-            self:_add(children, x, y, hero_card(self.opts.hero, hero_w, available_h, self.opts.hero.on_tap, compact))
-        else
-            self:_add(children, x, y, welcome_card(hero_w, available_h, self.opts.on_empty_account))
+        if build_static then
+            if self.opts.hero then
+                self:_add(children, x, y, hero_card(self.opts.hero, hero_w, available_h, self.opts.hero.on_tap, compact, self.opts.on_hold_book))
+            else
+                self:_add(children, x, y, welcome_card(hero_w, available_h, self.opts.on_empty_account))
+            end
         end
         self.section_dimen = Geom:new{x = shelf_x, y = y, w = shelf_w, h = available_h}
-        self:_add(children, shelf_x, y, category_tabs(self.opts.tabs, shelf_w, tabs_h))
-        local sy = y + tabs_h + math.max(5, math.floor(gap * .6))
-        self:_add(children, shelf_x, sy, section_header(title, shelf_w, section_h, self.opts.on_shelf_all))
-        sy = sy + section_h + math.max(4, math.floor(gap * .5))
-        local footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
-        local grid_h = math.max(1, bottom - sy - footer_h)
-        if #books > 0 then
-            self:_render_grid(children, m, shelf_x, sy, shelf_w, grid_h, books, self.opts.on_open_book, 2)
-        else
-            self:_add(children, shelf_x, sy, empty_section(shelf_w, grid_h, self.opts.empty_text or "暂时没有内容", self.opts.on_shelf_all))
+        if build_section then
+            self:_add(children, shelf_x, y, category_tabs(self.opts.tabs, shelf_w, tabs_h, self.opts.on_shelf_all))
+            local sy = y + tabs_h + math.max(3, math.floor(gap * .35))
+            if section_h > 0 then
+                self:_add(children, shelf_x, sy, section_header(title, shelf_w, section_h, nil))
+                sy = sy + section_h + math.max(2, math.floor(gap * .25))
+            end
+            local footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
+            local grid_h = math.max(1, bottom - sy - footer_h)
+            if #books > 0 then
+                self:_render_grid(children, m, shelf_x, sy, shelf_w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 2)
+            else
+                self:_add(children, shelf_x, sy, empty_section(shelf_w, grid_h, self.opts.empty_text or "暂时没有内容", self.opts.on_shelf_all))
+            end
+            self:_add(children, shelf_x, bottom - footer_h, page_footer(shelf_w, footer_h, self.opts.shelf_page, self.opts.shelf_pages, self.opts.on_shelf_page or function() end))
         end
-        self:_add(children, shelf_x, bottom - footer_h, page_footer(shelf_w, footer_h, self.opts.shelf_page, self.opts.shelf_pages, self.opts.on_shelf_page or function() end))
         return
     end
 
+    local has_description = self.opts.hero and U.trim(tostring(self.opts.hero.description or self.opts.hero.intro or self.opts.hero.summary or "")) ~= ""
+    local hero_ratio = has_description and .285 or .235
     local hero_h = compact
-        and math.max(225, math.min(285, math.floor(m.body_h * .22)))
-        or math.max(300, math.min(350, math.floor(m.body_h * .27)))
+        and math.max(UiScale.dp(190, 180, 245), math.min(UiScale.dp(250, 220, 285), math.floor(m.body_h * .205)))
+        or math.max(UiScale.dp(245, 230, 315), math.min(UiScale.dp(330, 275, 360), math.floor(m.body_h * hero_ratio)))
     if y + hero_h < bottom then
-        if self.opts.hero then
-            self:_add(children, x, y, hero_card(self.opts.hero, w, hero_h, self.opts.hero.on_tap, compact))
-        else
-            self:_add(children, x, y, welcome_card(w, hero_h, self.opts.on_empty_account))
+        if build_static then
+            if self.opts.hero then
+                self:_add(children, x, y, hero_card(self.opts.hero, w, hero_h, self.opts.hero.on_tap, compact, self.opts.on_hold_book))
+            else
+                self:_add(children, x, y, welcome_card(w, hero_h, self.opts.on_empty_account))
+            end
         end
         y = y + hero_h + gap
     end
-    self.section_dimen = Geom:new{x = x, y = y, w = w, h = math.max(1, bottom - y)}
-    if y + tabs_h < bottom then
-        self:_add(children, x, y, category_tabs(self.opts.tabs, w, tabs_h))
-        y = y + tabs_h + math.max(5, math.floor(gap * .6))
+    if #actions > 0 and y + action_h < bottom then
+        if build_static then self:_add(children, x, y, action_bar(actions, w, action_h)) end
+        y = y + action_h + gap
     end
-    if y + section_h < bottom then
-        self:_add(children, x, y, section_header(title, w, section_h, self.opts.on_shelf_all))
-        y = y + section_h + math.max(4, math.floor(gap * .5))
+    self.section_dimen = Geom:new{x = x, y = y, w = w, h = math.max(1, bottom - y)}
+    if not build_section then return end
+    if y + tabs_h < bottom then
+        self:_add(children, x, y, category_tabs(self.opts.tabs, w, tabs_h, self.opts.on_shelf_all))
+        y = y + tabs_h + math.max(3, math.floor(gap * .35))
+    end
+    if section_h > 0 and y + section_h < bottom then
+        self:_add(children, x, y, section_header(title, w, section_h, nil))
+        y = y + section_h + math.max(2, math.floor(gap * .25))
     end
     local footer_h = math.max(36, math.min(48, math.floor(m.body_h * .045)))
     local grid_h = math.max(1, bottom - y - footer_h)
     if #books > 0 then
-        self:_render_grid(children, m, x, y, w, grid_h, books, self.opts.on_open_book, 2)
+        self:_render_grid(children, m, x, y, w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 2)
     else
         self:_add(children, x, y, empty_section(w, grid_h, self.opts.empty_text or "暂时没有内容", self.opts.on_shelf_all))
     end
@@ -731,7 +878,10 @@ function HomeWidget:_build_sections(children, m, compact)
 end
 
 function HomeWidget:_rebuild()
+    UiScale.setDisplayMode(self.opts and self.opts.display_size or "standard")
     local m = self:_metrics()
+    self._last_screen_w, self._last_screen_h = m.sw, m.sh
+    self._metrics_cache = m
     self.dimen = Geom:new{x = 0, y = 0, w = m.sw, h = m.sh}
     self.header_dimen = Geom:new{x = 0, y = 0, w = m.sw, h = math.min(m.sh, m.body_y)}
     self.content_dimen = Geom:new{x = 0, y = m.body_y, w = m.sw, h = math.max(1, m.sh - m.body_y)}
@@ -740,7 +890,16 @@ function HomeWidget:_rebuild()
     local children = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     children[#children + 1] = background(m.sw, m.sh)
     self:_build_header(children, m)
-    self:_build_sections(children, m, tostring(self.opts.layout_style or "standard") == "compact")
+    local compact = tostring(self.opts.layout_style or "standard") == "compact"
+    local static_body_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+    self:_build_sections(static_body_layer, m, compact, "static")
+    children[#children + 1] = static_body_layer
+    self._static_body_layer = static_body_layer
+    local section_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+    self:_build_sections(section_layer, m, compact, "section")
+    children[#children + 1] = section_layer
+    self._section_layer = section_layer
+    self._section_layer_index = #children
     local previous = self[1]
     self[1] = children
     if previous and previous ~= children and previous.free then pcall(previous.free, previous) end
@@ -758,6 +917,12 @@ function HomeWidget:_mark_dirty(kind, previous_region)
     if previous_region and region then region = previous_region:combine(region)
     else region = region or previous_region end
     if region then
+        local safety=UiScale.dp(4,3,7)
+        local x=math.max(0,(region.x or 0)-safety)
+        local y=math.max(0,(region.y or 0)-safety)
+        local right=math.min(Screen:getWidth(),(region.x or 0)+(region.w or 1)+safety)
+        local bottom=math.min(Screen:getHeight(),(region.y or 0)+(region.h or 1)+safety)
+        region=Geom:new{x=x,y=y,w=math.max(1,right-x),h=math.max(1,bottom-y)}
         UIManager:setDirty(self, function() return "ui", region end)
     else
         UIManager:setDirty(self, "full")
@@ -782,11 +947,29 @@ function HomeWidget:updateSection(opts)
     self.opts.shelf_books = opts.shelf_books or {}
     self.opts.empty_text = opts.empty_text or self.opts.empty_text
     self.opts.on_open_book = opts.on_open_book or self.opts.on_open_book
+    self.opts.on_hold_book = opts.on_hold_book or self.opts.on_hold_book
+    self.opts.home_actions = opts.home_actions or self.opts.home_actions
     self.opts.on_shelf_all = opts.on_shelf_all or self.opts.on_shelf_all
     self.opts.on_shelf_page = opts.on_shelf_page or self.opts.on_shelf_page
     self.opts.shelf_page = opts.shelf_page or self.opts.shelf_page
     self.opts.shelf_pages = opts.shelf_pages or self.opts.shelf_pages
-    return self:update(self.opts, "section")
+
+    local m = self._metrics_cache
+    local root = self[1]
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    if not m or not root or sw ~= self._last_screen_w or sh ~= self._last_screen_h
+        or not self._section_layer_index then
+        return self:update(self.opts, "section")
+    end
+    local previous_region = self.section_dimen and self.section_dimen:copy() or nil
+    local section_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+    self:_build_sections(section_layer, m, tostring(self.opts.layout_style or "standard") == "compact", "section")
+    local old = root[self._section_layer_index]
+    root[self._section_layer_index] = section_layer
+    self._section_layer = section_layer
+    if old and old ~= section_layer and old.free then pcall(old.free, old) end
+    self:_mark_dirty("section", previous_region)
+    return self
 end
 
 function HomeWidget:init()
@@ -834,8 +1017,25 @@ function HomeWidget:onSetDimensions()
     UIManager:setDirty(self, "full")
     return true
 end
-function HomeWidget:onScreenResize() return self:onSetDimensions() end
-function HomeWidget:onRotation() return self:onSetDimensions() end
+function HomeWidget:_schedule_dimension_refresh()
+    self._dimension_refresh_generation = (tonumber(self._dimension_refresh_generation) or 0) + 1
+    local generation = self._dimension_refresh_generation
+    -- E-ink devices may publish the new framebuffer dimensions a little after
+    -- the rotation event. Reflow in a few bounded passes so text, icons, lines,
+    -- cards and hit regions all end up using the final dimensions.
+    for _, delay in ipairs({.08, .24, .55}) do
+        UIManager:scheduleIn(delay, function()
+            if self._miu_closed or generation ~= self._dimension_refresh_generation then return end
+            local sw, sh = Screen:getWidth(), Screen:getHeight()
+            if delay == .55 or sw ~= self._last_screen_w or sh ~= self._last_screen_h then
+                self:onSetDimensions()
+            end
+        end)
+    end
+    return true
+end
+function HomeWidget:onScreenResize() return self:_schedule_dimension_refresh() end
+function HomeWidget:onRotation() return self:_schedule_dimension_refresh() end
 
 function HomeWidget:onCloseWidget()
     self._miu_closed = true

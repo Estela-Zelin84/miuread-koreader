@@ -76,6 +76,30 @@ local function should_skip_dir(name, full, root)
     return false
 end
 
+
+local function normalized_path(path)
+    return tostring(path or ""):gsub("\\","/"):gsub("/+","/"):lower()
+end
+
+function LocalLibrary.is_likely_dictionary(path, title)
+    local normalized=normalized_path(path)
+    local ext=extension(path)
+    if normalized:find("/dictionaries/",1,true) or normalized:find("/dictionary/",1,true)
+        or normalized:find("/dict/",1,true) or normalized:find("/system/dictionaries/",1,true) then
+        return true
+    end
+    -- Kindle dictionaries are commonly AZW/MOBI files placed among ordinary
+    -- downloads. Restrict name-based filtering to those container formats so
+    -- a normal EPUB whose title mentions a dictionary is not hidden by mistake.
+    if ext=="azw" or ext=="azw3" or ext=="mobi" then
+        local name=(tostring(title or "").." "..basename(path)):lower()
+        for _,token in ipairs({"词典","字典","辞典","dictionary","thesaurus","lexicon"}) do
+            if name:find(token,1,true) then return true end
+        end
+    end
+    return false
+end
+
 function LocalLibrary.is_supported(path)
     return SUPPORTED[extension(path)]==true
 end
@@ -104,9 +128,11 @@ function LocalLibrary.scan(root, options)
                 if attr and attr.mode=="directory" then
                     if not should_skip_dir(name,full,root) then walk(full,depth+1) end
                 elseif attr and attr.mode=="file" and LocalLibrary.is_supported(full) then
+                    local title=title_from_path(full)
+                    if options.include_dictionaries==true or not LocalLibrary.is_likely_dictionary(full,title) then
                     rows[#rows+1]={
                         file=full,
-                        title=title_from_path(full),
+                        title=title,
                         author="",
                         format=extension(full):upper(),
                         size=tonumber(attr.size) or 0,
@@ -114,6 +140,7 @@ function LocalLibrary.scan(root, options)
                         cover_path=cover_path(full),
                     }
                     if #rows>=limit then stopped=true; break end
+                    end
                 end
             end
         end

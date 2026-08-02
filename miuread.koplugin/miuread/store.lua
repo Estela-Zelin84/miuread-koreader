@@ -6,9 +6,12 @@ local Json=require("miuread.json")
 local U=require("miuread.util")
 local logger=require("logger")
 local Store={}; Store.__index=Store
+local function generate_login_session_id()
+    return tostring(os.time()).."-"..tostring(math.random(100000,999999))
+end
 local defaults={
  schema=Config.SCHEMA,
- auth={api_key="",cookies={},wr_ticket="",wr_wrpa="",ticket_updated_at=0,
+ auth={login_session_id="",api_key="",cookies={},wr_ticket="",wr_wrpa="",ticket_updated_at=0,
      account={name="",vid="",logged_at=0},
      health={state="unknown",last_checked_at=0,last_ok_at=0,last_error_at=0,
          last_error_code="",last_error_message="",last_error_channel="",notice_pending=false,
@@ -19,22 +22,30 @@ local defaults={
              annotations={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",download_dir="",shelf_section="account",account_shelf_kind="books",home_ui={enabled=true,layout_version=21,layout_style="desk",local_root="",auto_scan=true,page_by_section={},source_order={"account","generated","local","mp"}},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=true,show_status=true,quick_items={home=true,toc=true,progress=true,font=true,typeset=true,sync=true,current_book=true,downloads=false,full_refresh=false,koreader_menu=false,sleep=false,more=true},quick_order={"home","toc","progress","font","typeset","sync","current_book","downloads","full_refresh","koreader_menu","sleep","more"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,library_scan=true,repair_while_reading=true,mode_switch=true},memory_mode={enabled=false,previous_known=false,previous_ratio=false},thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},repair={auto_check=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",download_dir="",shelf_section="account",account_shelf_kind="books",home_ui={enabled=true,layout_version=22,layout_style="desk",local_root="",auto_scan=true,page_by_section={},source_order={"account","generated","local","mp"},action_items={refresh=true,search=true,downloads=true,sync=true,frontlight=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false},action_order={"refresh","search","downloads","sync","frontlight","miuread_settings","all_books","history","file_manager","screenshot"},action_layout_version=1,panel_items={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false},panel_order={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","frontlight","sync","miuread_settings","downloads","restart","sleep","full_refresh"},panel_layout_version=1,more_expanded=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=true,show_status=true,show_recent=true,recent_actions={},quick_layout_version=4,quick_items={toc=true,progress=true,font=true,frontlight=true,sync=true,all_functions=true,page_display=false,home=false,typeset=false,current_book=false,downloads=false,full_refresh=false,koreader_menu=false,sleep=false},quick_order={"toc","progress","font","frontlight","sync","all_functions","page_display","home","typeset","current_book","downloads","full_refresh","koreader_menu","sleep"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,library_scan=true,repair_while_reading=true,mode_switch=true},memory_mode={enabled=false,previous_known=false,previous_ratio=false},thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},repair={auto_check=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
 local function invalidate_report_contexts_table(sessions)
     sessions=type(sessions)=="table" and sessions or {}
     local changed=0
+    local clear_keys={
+        "legacy_report_context","report_context","psvts","pclts","token","reader_url",
+        "context_updated_at","report_login_session_id","verification_login_session_id",
+        "remote","remote_sources","remote_checked_at","remote_web_error","remote_agent_error",
+        "remote_verified","verified_at","verified_reason","verified_local_percent","verified_remote_percent",
+        "progress_sync_state","progress_sync_message","progress_upload_state","progress_upload_error",
+        "progress_upload_verified_at","progress_upload_source","progress_upload_at","progress_upload_percent",
+        "last_response_summary","last_http_code","last_http_length","last_payload_public","last_path",
+        "last_stage","last_error","last_attempts",
+    }
     for _,session in pairs(sessions) do
         if type(session)=="table" then
-            if session.legacy_report_context~=nil then session.legacy_report_context=nil; changed=changed+1 end
-            if session.report_context~=nil then session.report_context=nil; changed=changed+1 end
-            if session.last_error~=nil then session.last_error=nil; changed=changed+1 end
-            if tonumber(session.consecutive_failures or 0)~=0 then session.consecutive_failures=0; changed=changed+1 end
-            for _,key in ipairs({"last_response_summary","last_http_code","last_http_length","last_payload_public","last_path","last_stage"}) do
+            for _,key in ipairs(clear_keys) do
                 if session[key]~=nil then session[key]=nil; changed=changed+1 end
             end
+            if tonumber(session.consecutive_failures or 0)~=0 then session.consecutive_failures=0; changed=changed+1 end
+            if tonumber(session.pending_report_seconds or 0)~=0 then session.pending_report_seconds=0; changed=changed+1 end
         end
     end
     return sessions,changed
@@ -1123,6 +1134,63 @@ function Store:migrate()
             end
             self.db:saveSetting("download_queue",kept)
         end
+        if schema<84 then
+            -- 3.5 separates the six always-visible homepage actions from the
+            -- pull-down device/KOReader controls. Existing books, downloads,
+            -- comments, reading positions and account data remain unchanged.
+            local p=self:preferences()
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=22
+            p.home_ui.action_items={refresh=true,search=true,downloads=true,sync=true,frontlight=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false}
+            p.home_ui.action_order={"refresh","search","downloads","sync","frontlight","miuread_settings","all_books","history","file_manager","screenshot"}
+            p.home_ui.action_layout_version=1
+            p.home_ui.panel_items={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
+            p.home_ui.panel_order={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","frontlight","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
+            p.home_ui.panel_layout_version=1
+            p.home_ui.more_expanded=false
+            p.home_ui.quick_items=nil
+            p.home_ui.quick_order=nil
+            self:save_preferences(p)
+        end
+        if schema<85 then
+            -- Keep network metadata enrichment opt-in at the feature level but
+            -- enabled by default for the recent-reading card. Results are
+            -- cached and never block the initial home render.
+            local p=self:preferences()
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            if p.home_ui.network_metadata==nil then p.home_ui.network_metadata=true end
+            p.home_ui.more_expanded=false
+            self:save_preferences(p)
+        end
+        if schema<88 then
+            -- beta.9 replaces the reader's default shortcut layout with the
+            -- self-contained MiuRead control center. Existing user-customized
+            -- layouts remain readable and are migrated again in main.lua.
+            local p=self:preferences()
+            p.reader_ui=type(p.reader_ui)=="table" and p.reader_ui or {}
+            if p.reader_ui.show_recent==nil then p.reader_ui.show_recent=true end
+            p.reader_ui.recent_actions=type(p.reader_ui.recent_actions)=="table" and p.reader_ui.recent_actions or {}
+            -- Shortcut migration is completed in main.lua where the plugin can
+            -- distinguish an old recommended layout from a real customization.
+            self:save_preferences(p)
+        end
+        if schema<90 then
+            -- beta.15 separates durable book identity from one QR-login session.
+            -- Old EPUBs, chapter maps, local positions and annotations stay intact;
+            -- only account-bound upload contexts are discarded and rebuilt lazily.
+            local auth=U.merge(defaults.auth,self.db:readSetting("auth",{}) or {})
+            local account=type(auth.account)=="table" and auth.account or {}
+            if tostring(auth.login_session_id or "")==""
+                and tostring(account.vid or "")~=""
+                and tostring(auth.api_key or "")~=""
+                and next(auth.cookies or {})~=nil then
+                auth.login_session_id=generate_login_session_id()
+            end
+            self.db:saveSetting("auth",invalidate_upload_health_table(auth))
+            local sessions=self.db:readSetting("sessions",{}) or {}
+            local cleaned,changed=invalidate_report_contexts_table(sessions)
+            if changed>0 then self.db:saveSetting("sessions",cleaned) end
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end
@@ -1139,6 +1207,17 @@ local function sanitized_auth(value)
 end
 function Store:auth() return sanitized_auth(self:get("auth",{})) end
 function Store:save_auth(v) self:set("auth",sanitized_auth(v)) end
+function Store:generate_login_session_id() return generate_login_session_id() end
+function Store:ensure_login_session_id()
+    local auth=self:auth()
+    local account=type(auth.account)=="table" and auth.account or {}
+    if tostring(auth.login_session_id or "")=="" and tostring(account.vid or "")~=""
+        and tostring(auth.api_key or "")~="" and next(auth.cookies or {})~=nil then
+        auth.login_session_id=generate_login_session_id()
+        self:save_auth(auth)
+    end
+    return tostring(auth.login_session_id or "")
+end
 function Store:auth_health()
     local auth=self:auth()
     return U.merge(defaults.auth.health,auth.health or {})
@@ -1151,6 +1230,11 @@ function Store:update_auth_health(patch)
     return auth.health
 end
 function Store:clear_auth() self:set("auth",U.copy(defaults.auth)) end
+function Store:clear_account_shelf_cache()
+    local cache=self:shelf_cache()
+    cache.books={}; cache.mp={}; cache.updated_at=0
+    self:save_shelf_cache(cache)
+end
 function Store:preferences() return U.merge(defaults.preferences,self:get("preferences",{})) end
 function Store:save_preferences(v) self:set("preferences",U.merge(defaults.preferences,v or {})) end
 function Store:books_root() local p=self:preferences().download_dir; if p=="" then p=self.default_books_dir end; U.mkdir(p); return p end
@@ -1641,12 +1725,17 @@ function Store:mark_last_read(id,path,progress)
     if progress~=nil then patch.progress_local_percent=tonumber(progress) end
     self:save_session(id,patch)
 end
-function Store:invalidate_report_contexts(reason)
+function Store:clear_login_bound_sessions(reason)
     local sessions=self:get("sessions",{})
     local cleaned,changed=invalidate_report_contexts_table(sessions)
     if changed>0 then self:set("sessions",cleaned) end
     self:save_auth(invalidate_upload_health_table(self:get("auth",{})))
+    logger.info("[MiuRead][Store] login-bound sessions cleared",
+        "reason=",tostring(reason or "unknown"),"fields=",tostring(changed))
     return changed,reason
+end
+function Store:invalidate_report_contexts(reason)
+    return self:clear_login_bound_sessions(reason)
 end
 function Store:session(id) return self:get("sessions",{})[tostring(id)] end
 function Store:save_session(id,patch,flush_now) local a=self:get("sessions",{}); local k=tostring(id); a[k]=U.merge(a[k] or {},patch or {}); self.db:saveSetting("sessions",a); if flush_now~=false then self:flush() end; return a[k] end

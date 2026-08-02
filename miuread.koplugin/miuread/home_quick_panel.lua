@@ -1,7 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
-local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -12,7 +11,6 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
-local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
@@ -21,12 +19,14 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local UiScale = require("miuread.ui_scale")
+local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
 local live_panel
 
-local function face(name, nominal, maximum)
-    return Font:getFace(name, math.min(maximum or nominal, Screen:scaleBySize(nominal)))
+local function face(name, nominal, maximum, minimum)
+    return UiScale.face(name, nominal, maximum, minimum)
 end
 
 local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
@@ -60,9 +60,7 @@ end
 local TapBox = InputContainer:extend{dimen = nil, callback = nil}
 function TapBox:init()
     self.dimen = self.dimen or Geom:new{w = 1, h = 1}
-    self.ges_events = {
-        TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}},
-    }
+    self.ges_events = {TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}}}
 end
 function TapBox:getSize() return Geom:new{w = self.dimen.w, h = self.dimen.h} end
 function TapBox:paintTo(bb, x, y)
@@ -70,77 +68,72 @@ function TapBox:paintTo(bb, x, y)
     if self[1] then self[1]:paintTo(bb, x, y) end
 end
 function TapBox:onTapSelect()
-    if self.callback then self.callback() end
+    if self.callback then self.callback(self.dimen and self.dimen:copy() or nil) end
     return true
 end
 
 local function tappable(width, height, child, callback)
-    local tap = TapBox:new{
-        dimen = Geom:new{w = width, h = height},
-        callback = callback,
-    }
+    local tap = TapBox:new{dimen = Geom:new{w = width, h = height}, callback = callback}
     tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, child}
     return tap
 end
 
-local function panel_button(entry, width, height, close_callback)
+local function panel_button(entry, width, height, close_callback, compact)
     local label = tostring(entry.label or entry.text or "")
     local detail = tostring(entry.detail or "")
+    local icon = tostring(entry.icon_key or entry.icon or "")
     local enabled = entry.enabled ~= false
-    local inner_w = math.max(1, width - 16)
-    local label_h = detail ~= "" and math.max(24, math.floor(height * .48)) or math.max(32, math.floor(height * .72))
+    local pad = UiScale.dp(compact and 3 or 4, 2, 7)
+    local inner_w = math.max(1, width - pad * 2)
+    local gap_h = UiScale.dp(2, 1, 4)
+    local icon_slot_h = UiScale.dp(compact and 27 or 31, compact and 24 or 27, compact and 37 or 43)
+    local label_slot_h = UiScale.dp(compact and 20 or 22, compact and 18 or 20, compact and 27 or 31)
+    -- Always reserve the detail slot. Buttons without a subtitle keep the same
+    -- icon and title axes as buttons that do have one.
+    local detail_slot_h = UiScale.dp(compact and 16 or 18, compact and 14 or 16, compact and 22 or 25)
+    local icon_size = UiScale.dp(compact and 22 or 25, compact and 20 or 22, compact and 30 or 34)
+
     local content = VerticalGroup:new{
         align = "center",
-        TextBoxWidget:new{
-            text = label,
-            face = face("cfont", 14, 18),
-            bold = true,
-            width = inner_w,
-            height = label_h,
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "center",
+        Ui.icon(icon, inner_w, icon_slot_h, icon_size, {
+            icon_key = icon,
+            icon_path = entry.icon_path,
+            face = UiScale.iconFace("cfont", compact and 18 or 21, compact and 24 or 29, compact and 15 or 17),
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-        },
+        }),
+        VerticalSpan:new{height = gap_h},
+        Ui.textbox(label, inner_w, label_slot_h,
+            face("smallinfofont", compact and 9.2 or 10.5, compact and 13 or 15), {
+                bold = true, alignment = "center", halign = "center",
+                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+            }),
+        Ui.textbox(detail, inner_w, detail_slot_h, face("smallinfofont", 8.2, 11.5), {
+            alignment = "center", halign = "center",
+            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        }),
     }
-    if detail ~= "" then
-        content[#content + 1] = TextBoxWidget:new{
-            text = detail,
-            face = face("smallinfofont", 11, 14),
-            width = inner_w,
-            height = math.max(18, math.floor(height * .28)),
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "center",
-            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-        }
-    end
-    local layered = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
-    layered[#layered + 1] = fixed_frame(width, height, {
-        bordersize = 0,
-        padding = math.max(5, Screen:scaleBySize(4)),
+
+    local card = fixed_frame(width, height, {
+        bordersize = UiScale.line("thin"),
+        padding = pad,
+        radius = UiScale.radius(6, 4, 10),
         background = Blitbuffer.COLOR_WHITE,
-    }, content)
-    layered[#layered + 1] = OffsetContainer:new{
-        x_off = math.max(6, math.floor(width * .08)),
-        y_off = math.max(0, height - Size.line.thin),
-        LineWidget:new{
-            background = enabled and Blitbuffer.COLOR_GRAY or (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY),
-            dimen = Geom:new{w = math.max(1, width - math.max(12, math.floor(width * .16))), h = Size.line.thin},
-        },
-    }
-    return tappable(width, height, layered, function()
+        color = enabled and Blitbuffer.COLOR_GRAY or (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY),
+    }, CenterContainer:new{dimen = Geom:new{w = inner_w, h = math.max(1, height - pad * 2)}, content})
+    return tappable(width, height, card, function(anchor)
         if not enabled then return end
         if entry.keep_open == true then
             if entry.callback then
                 UIManager:nextTick(function()
-                    local ok, err = pcall(entry.callback)
+                    local ok, err = pcall(entry.callback, anchor)
                     if not ok then logger.warn("[MiuRead][QuickPanel] action failed", tostring(err)) end
                 end)
             end
             return
         end
-        if close_callback then close_callback(entry.callback) end
+        if close_callback then
+            close_callback(entry.callback and function() return entry.callback(anchor) end or nil)
+        end
     end)
 end
 
@@ -157,15 +150,15 @@ local QuickPanelWidget = InputContainer:extend{
 }
 
 function QuickPanelWidget:handleEvent(event)
-    if event and event.handler=="onGesture" then
-        local ges=event.args and event.args[1]
-        local gesture=ges and ges.ges
-        local pointer_action=gesture=="tap" or gesture=="hold" or gesture=="hold_release"
-            or gesture=="double_tap" or gesture=="two_finger_tap"
-        if not pointer_action and not (ges and ges.direction=="north")
+    if event and event.handler == "onGesture" then
+        local ges = event.args and event.args[1]
+        local gesture = ges and ges.ges
+        local pointer_action = gesture == "tap" or gesture == "hold" or gesture == "hold_release"
+            or gesture == "double_tap" or gesture == "two_finger_tap"
+        if not pointer_action and not (ges and ges.direction == "north")
             and GestureBridge.dispatch(ges) then return true end
     end
-    return InputContainer.handleEvent(self,event)
+    return InputContainer.handleEvent(self, event)
 end
 
 function QuickPanelWidget:_add(children, x, y, widget)
@@ -185,119 +178,144 @@ function QuickPanelWidget:_close(action, cancel_pending)
 end
 
 function QuickPanelWidget:_build()
-    local sw, sh = Screen:getWidth(), Screen:getHeight()
-    local margin = math.max(12, math.min(22, math.floor(sw * .022)))
-    local gap = math.max(7, math.min(12, math.floor(sh * .008)))
+    local scale = UiScale.metrics()
+    local sw, sh = scale.sw, scale.sh
+    local portrait = scale.portrait
+    -- Leave a little breathing room around the control center. The previous
+    -- edge-to-edge cards looked cramped, especially in large text mode.
+    local margin = math.max(UiScale.dp(10, 9, 18), math.floor(scale.short * .018))
+    local gap = UiScale.dp(7, 5, 12)
     local buttons = type(self.opts.buttons) == "table" and self.opts.buttons or {}
-    local columns = sw < sh and 3 or 4
+    local more_buttons = type(self.opts.more_buttons) == "table" and self.opts.more_buttons or {}
+    local more_expanded = self.opts.more_expanded == true
+
+    local preferred_columns = portrait and 6 or 8
+    local min_button_w = UiScale.dp(78, 70, 112)
+    local possible_columns = math.max(1, math.floor((sw - margin * 2 + gap) / (min_button_w + gap)))
+    local columns = math.max(1, math.min(preferred_columns, possible_columns, math.max(1, #buttons)))
     local rows = math.max(1, math.ceil(#buttons / columns))
-    local title_h = math.max(54, math.min(68, math.floor(sh * .055)))
-    local status_h = (self.opts.status_text and self.opts.status_text ~= "") and math.max(38, math.min(48, math.floor(sh * .038))) or 0
-    local button_h = math.max(62, math.min(78, math.floor(sh * .060)))
-    self.panel_h = math.min(sh - margin, margin * 2 + title_h + status_h + gap * (rows + 2) + button_h * rows)
+    local more_columns = math.max(1, math.min(preferred_columns, possible_columns, math.max(1, #more_buttons)))
+    local more_rows = more_expanded and math.max(1, math.ceil(#more_buttons / more_columns)) or 0
+
+    local title_h = UiScale.dp(54, 50, 74)
+    local status_h = (self.opts.status_text and self.opts.status_text ~= "") and UiScale.dp(30, 27, 42) or 0
+    local button_h = UiScale.dp(82, 74, 112)
+    local more_button_h = UiScale.dp(74, 66, 102)
+    local more_title_h = #more_buttons > 0 and UiScale.dp(40, 35, 52) or 0
+    local line = UiScale.line("thin")
+
+    self.panel_h = margin * 2 + title_h + line + gap * 3
+        + rows * button_h + math.max(0, rows - 1) * gap
+    if more_title_h > 0 then
+        self.panel_h = self.panel_h + more_title_h + gap
+        if more_expanded then
+            self.panel_h = self.panel_h + more_rows * more_button_h + math.max(0, more_rows - 1) * gap
+        end
+    end
+    if status_h > 0 then self.panel_h = self.panel_h + status_h + gap end
+    self.panel_h = math.min(sh - margin, self.panel_h)
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
     self.panel_dimen = Geom:new{x = 0, y = 0, w = sw, h = self.panel_h}
-
     self.ges_events = {
         TapDismiss = {GestureRange:new{ges = "tap", range = self.dimen}},
         SwipeDismiss = {GestureRange:new{ges = "swipe", range = self.dimen}},
     }
 
     local children = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
-    self:_add(children, 0, 0, fixed_frame(sw, self.panel_h, {
-        bordersize = 0,
-        background = Blitbuffer.COLOR_WHITE,
-    }))
+    self:_add(children, 0, 0, fixed_frame(sw, self.panel_h, {background = Blitbuffer.COLOR_WHITE}))
 
-    local close_w = math.max(66, math.min(82, math.floor(sw * .09)))
-    local header_action = type(self.opts.header_action) == "table" and self.opts.header_action or nil
-    local action_w = header_action and math.max(74, math.min(96, math.floor(sw * .105))) or 0
-    local controls_w = close_w + (header_action and (gap + action_w) or 0)
-    local title_w = math.max(1, sw - margin * 2 - controls_w - gap)
-    local controls = HorizontalGroup:new{align = "center"}
-    if header_action then
-        controls[#controls + 1] = tappable(action_w, math.max(36, title_h - 10), fixed_frame(action_w, math.max(36, title_h - 10), {
-            bordersize = 0,
-            background = Blitbuffer.COLOR_WHITE,
-        }, TextWidget:new{text = tostring(header_action.label or "打开"), face = face("smallinfofont", 12, 15), bold = true}), function()
-            self:_close(header_action.callback)
-        end)
-        controls[#controls + 1] = HorizontalSpan:new{width = gap}
-    end
-    controls[#controls + 1] = tappable(close_w, math.max(36, title_h - 10), fixed_frame(close_w, math.max(36, title_h - 10), {
-        bordersize = 0,
-        background = Blitbuffer.COLOR_WHITE,
-    }, TextWidget:new{text = "收起", face = face("smallinfofont", 12, 15), bold = true}), function() self:_close() end)
+    local close_w = UiScale.dp(62, 58, 78)
+    local title_w = math.max(1, sw - margin * 2 - close_w - gap)
     local title_row = HorizontalGroup:new{
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = title_w, h = title_h}, VerticalGroup:new{
             align = "left",
-            TextBoxWidget:new{
-                text = tostring(self.opts.title or "快捷控制"),
-                face = face("cfont", 18, 22),
-                bold = true,
-                width = title_w,
-                height = math.floor(title_h * .55),
-                height_adjust = false,
-                height_overflow_show_ellipsis = true,
-            },
-            TextBoxWidget:new{
-                text = tostring(self.opts.subtitle or ""),
-                face = face("smallinfofont", 12, 15),
-                width = title_w,
-                height = math.ceil(title_h * .45),
-                height_adjust = false,
-                height_overflow_show_ellipsis = true,
-                fgcolor = Blitbuffer.COLOR_BLACK,
-            },
+            Ui.textbox(tostring(self.opts.title or "快捷控制"), title_w, math.floor(title_h * .56),
+                face("cfont", 18.5, 26), {bold = true, alignment = "left"}),
+            Ui.textbox(tostring(self.opts.subtitle or ""), title_w, math.ceil(title_h * .44),
+                face("smallinfofont", 10.6, 15.5), {alignment = "left", fgcolor = Blitbuffer.COLOR_BLACK}),
         }},
         HorizontalSpan:new{width = gap},
-        controls,
+        tappable(close_w, title_h, fixed_frame(close_w, math.max(1, title_h - gap), {
+            bordersize = line,
+            radius = UiScale.radius(5, 4, 9),
+            background = Blitbuffer.COLOR_WHITE,
+            color = Blitbuffer.COLOR_GRAY,
+        }, Ui.text("收起", close_w - UiScale.dp(8, 6, 12), math.max(1, title_h - gap),
+            face("smallinfofont", 10, 14), {bold = true})), function()
+            self:_close()
+        end),
     }
     self:_add(children, margin, margin, title_row)
 
     local y = margin + title_h + gap
-    self:_add(children, margin, y,
-        LineWidget:new{background = Blitbuffer.COLOR_GRAY, dimen = Geom:new{w = sw - margin * 2, h = Size.line.thin}})
-    y = y + Size.line.thin + gap
+    self:_add(children, margin, y, LineWidget:new{
+        background = Blitbuffer.COLOR_GRAY,
+        dimen = Geom:new{w = sw - margin * 2, h = line},
+    })
+    y = y + line + gap
 
-    local button_gap = math.max(7, gap)
-    local button_w = math.floor((sw - margin * 2 - button_gap * (columns - 1)) / columns)
+    local button_w = math.floor((sw - margin * 2 - gap * (columns - 1)) / columns)
     for index, entry in ipairs(buttons) do
         local row = math.floor((index - 1) / columns)
         local col = (index - 1) % columns
-        self:_add(children,
-            margin + col * (button_w + button_gap),
-            y + row * (button_h + button_gap),
-            panel_button(entry, button_w, button_h, function(action) self:_close(action) end))
+        self:_add(children, margin + col * (button_w + gap), y + row * (button_h + gap),
+            panel_button(entry, button_w, button_h, function(action) self:_close(action) end, false))
     end
-    y = y + rows * button_h + math.max(0, rows - 1) * button_gap + gap
+    y = y + rows * button_h + math.max(0, rows - 1) * gap + gap
+
+    if more_title_h > 0 and y + more_title_h <= self.panel_h then
+        local marker = more_expanded and "⌃" or "⌄"
+        local more_header = tappable(sw - margin * 2, more_title_h, fixed_frame(sw - margin * 2, more_title_h, {
+            bordersize = 0,
+            background = Blitbuffer.COLOR_WHITE,
+        }, HorizontalGroup:new{
+            align = "center",
+            Ui.text("更多功能", sw - margin * 2 - UiScale.dp(42, 38, 50), more_title_h,
+                face("cfont", 14.2, 20), {bold = true, halign = "left"}),
+            Ui.text(marker, UiScale.dp(42, 38, 50), more_title_h, face("cfont", 14.5, 19), {bold = true}),
+        }), function()
+            self:_close(function()
+                if self.opts.on_toggle_more then self.opts.on_toggle_more(not more_expanded) end
+            end)
+        end)
+        self:_add(children, margin, y, more_header)
+        y = y + more_title_h + gap
+    end
+
+    if more_expanded and #more_buttons > 0 then
+        local more_w = math.floor((sw - margin * 2 - gap * (more_columns - 1)) / more_columns)
+        for index, entry in ipairs(more_buttons) do
+            local row = math.floor((index - 1) / more_columns)
+            local col = (index - 1) % more_columns
+            if y + row * (more_button_h + gap) + more_button_h <= self.panel_h then
+                self:_add(children, margin + col * (more_w + gap), y + row * (more_button_h + gap),
+                    panel_button(entry, more_w, more_button_h, function(action) self:_close(action) end, true))
+            end
+        end
+        y = y + more_rows * more_button_h + math.max(0, more_rows - 1) * gap + gap
+    end
 
     if status_h > 0 and y + status_h <= self.panel_h - gap then
         self:_add(children, margin, y, fixed_frame(sw - margin * 2, status_h, {
-            bordersize = 0,
-            padding = math.max(5, Screen:scaleBySize(4)),
+            bordersize = line,
+            padding = UiScale.dp(3, 2, 5),
+            radius = UiScale.radius(4, 3, 8),
             background = Blitbuffer.COLOR_WHITE,
-        }, TextBoxWidget:new{
-            text = tostring(self.opts.status_text or ""),
-            face = face("smallinfofont", 12, 15),
-            width = sw - margin * 2 - 20,
-            height = status_h - 12,
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "left",
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        }))
+            color = Blitbuffer.COLOR_GRAY,
+        }, Ui.textbox(tostring(self.opts.status_text or ""),
+            sw - margin * 2 - UiScale.dp(12, 10, 18), status_h - UiScale.dp(6, 4, 10),
+            face("smallinfofont", 9.2, 13), {alignment = "left", fgcolor = Blitbuffer.COLOR_BLACK})))
     end
 
-    self:_add(children, 0, self.panel_h - Size.line.thick,
-        LineWidget:new{background = Blitbuffer.COLOR_BLACK, dimen = Geom:new{w = sw, h = Size.line.thick}})
+    self:_add(children, 0, self.panel_h - UiScale.line("thick"), LineWidget:new{
+        background = Blitbuffer.COLOR_BLACK,
+        dimen = Geom:new{w = sw, h = UiScale.line("thick")},
+    })
     self[1] = children
 end
 
-function QuickPanelWidget:init()
-    self:_build()
-end
+function QuickPanelWidget:init() self:_build() end
 
 function QuickPanelWidget:onTapDismiss(_, ges)
     if not (ges and ges.pos) then return false end
@@ -305,8 +323,6 @@ function QuickPanelWidget:onTapDismiss(_, ges)
         self:_close()
         return true
     end
-    -- Let the matching child button receive the tap. The fullscreen panel's
-    -- stop_events_propagation still prevents taps from reaching FileManager.
     return false
 end
 
@@ -324,27 +340,27 @@ function QuickPanelWidget:onBack()
 end
 
 function QuickPanelWidget:onShow()
-    UIManager:setDirty(self,function() return "ui",self.panel_dimen end)
+    UIManager:setDirty(self, function() return "ui", self.panel_dimen end)
 end
 
 function QuickPanelWidget:onCloseWidget()
-    local region=self.panel_dimen and self.panel_dimen:copy() or nil
-    local action=self.pending_action
-    self.pending_action=nil
+    local region = self.panel_dimen and self.panel_dimen:copy() or nil
+    local action = self.pending_action
+    self.pending_action = nil
     self._closed = true
     if live_panel == self then live_panel = nil end
-    if region then UIManager:setDirty(nil,function() return "ui",region end) end
+    if region then UIManager:setDirty(nil, function() return "ui", region end) end
     if action then
-        UIManager:scheduleIn(.04,function()
-            local ok,err=pcall(action)
-            if not ok then logger.warn("[MiuRead][QuickPanel] action failed",tostring(err)) end
+        UIManager:scheduleIn(.04, function()
+            local ok, err = pcall(action)
+            if not ok then logger.warn("[MiuRead][QuickPanel] action failed", tostring(err)) end
         end)
     end
 end
 
 local QuickPanel = {}
 function QuickPanel.close()
-    if live_panel and not live_panel._closed then live_panel:_close(nil,true) end
+    if live_panel and not live_panel._closed then live_panel:_close(nil, true) end
     live_panel = nil
 end
 function QuickPanel.show(opts)

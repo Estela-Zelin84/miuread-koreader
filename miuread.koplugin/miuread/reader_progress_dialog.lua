@@ -1,23 +1,31 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
-local Font = require("ui/font")
-local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
-local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local ProgressWidget = require("ui/widget/progresswidget")
-local Size = require("ui/size")
+local LeftContainer = require("ui/widget/container/leftcontainer")
+local LineWidget = require("ui/widget/linewidget")
+local OverlapGroup = require("ui/widget/overlapgroup")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local UIManager = require("ui/uimanager")
-local VerticalGroup = require("ui/widget/verticalgroup")
-local VerticalSpan = require("ui/widget/verticalspan")
+local Widget = require("ui/widget/widget")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local logger = require("logger")
+local Skin = require("miuread.reader_skin")
+local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
+local live_dialog
 
-local TapBox = InputContainer:extend{dimen = nil, callback = nil}
+local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
+function OffsetContainer:getSize() return self[1]:getSize() end
+function OffsetContainer:paintTo(bb, x, y)
+    self[1]:paintTo(bb, x + self.x_off, y + self.y_off)
+end
+
+local TapBox = InputContainer:extend{dimen = nil, callback = nil, enabled = true}
 function TapBox:init()
     self.dimen = self.dimen or Geom:new{w = 1, h = 1}
     self.ges_events = {TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}}}
@@ -28,7 +36,7 @@ function TapBox:paintTo(bb, x, y)
     if self[1] then self[1]:paintTo(bb, x, y) end
 end
 function TapBox:onTapSelect(_, ges)
-    if self.callback then self.callback(ges) end
+    if self.enabled ~= false and self.callback then self.callback(ges) end
     return true
 end
 function TapBox:handleEvent(event)
@@ -45,36 +53,6 @@ function ProgressTap:onTapSelect(_, ges)
     return true
 end
 
-local function button(label, width, height, callback, primary)
-    local border = primary and Size.border.window or Size.border.thin
-    local inner_w = math.max(1, width - border * 2)
-    local inner_h = math.max(1, height - border * 2)
-    local box = TapBox:new{
-        dimen = Geom:new{w = width, h = height},
-        callback = callback,
-    }
-    box[1] = FrameContainer:new{
-        background = Blitbuffer.COLOR_WHITE,
-        bordersize = border,
-        padding = 0,
-        margin = 0,
-        CenterContainer:new{
-            dimen = Geom:new{w = inner_w, h = inner_h},
-            TextBoxWidget:new{
-                text = tostring(label or ""),
-                face = Font:getFace("cfont", math.max(13, Screen:scaleBySize(14))),
-                bold = primary == true,
-                width = math.max(1, inner_w - 8),
-                height = inner_h,
-                height_adjust = false,
-                height_overflow_show_ellipsis = true,
-                alignment = "center",
-            },
-        },
-    }
-    return box
-end
-
 local Dialog = InputContainer:extend{
     name = "miuread_reader_progress_dialog",
     _miuread_transient = true,
@@ -84,173 +62,261 @@ local Dialog = InputContainer:extend{
     on_goto_percent = nil,
     on_adjust = nil,
     on_jump = nil,
+    on_prev_chapter = nil,
+    on_next_chapter = nil,
+    on_back = nil,
+    on_home = nil,
     closed = false,
+    pending_action = nil,
 }
 
 function Dialog:handleEvent(event)
     return InputContainer.handleEvent(self, event)
 end
-function Dialog:_close()
+
+function Dialog:_close(action, cancel_pending)
+    if cancel_pending then
+        self.pending_action = nil
+    elseif action and not self.pending_action then
+        self.pending_action = action
+    end
     if self.closed then return true end
     self.closed = true
     UIManager:close(self)
     return true
 end
 
+function Dialog:_button(label, width, height, callback, primary)
+    local tap = TapBox:new{
+        dimen = Geom:new{w = width, h = height},
+        enabled = callback ~= nil,
+        callback = function() self:_close(callback) end,
+    }
+    tap[1] = Skin.frame(width, height, {
+        bordersize = primary and Skin.line("thick") or Skin.line("thin"),
+        radius = Skin.radius(6, 5, 10),
+        background = Blitbuffer.COLOR_WHITE,
+        color = callback and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
+    }, Ui.textbox(tostring(label or ""), width - Skin.dp(10, 8, 15),
+        height - Skin.dp(4, 2, 6), Skin.face("cfont", 11.4, 15.2, 9.8), {
+            bold = primary == true, alignment = "center", halign = "center",
+            fgcolor = callback and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        }))
+    return tap
+end
+
 function Dialog:init()
     local sw, sh = Screen:getWidth(), Screen:getHeight()
-    local width = math.max(math.floor(sw * .72), math.min(math.floor(sw * .84), Screen:scaleBySize(760)))
-    width = math.min(width, sw - math.max(28, math.floor(sw * .06)))
-    local border = Size.border.window
-    local pad = math.max(12, Screen:scaleBySize(10))
-    local gap = math.max(8, Screen:scaleBySize(7))
-    local title_h = math.max(38, Screen:scaleBySize(36))
-    local percent_h = math.max(28, Screen:scaleBySize(26))
-    local progress_h = math.max(44, Screen:scaleBySize(42))
-    local hint_h = math.max(26, Screen:scaleBySize(24))
-    local row_h = math.max(52, Screen:scaleBySize(50))
-    local row_gap = math.max(8, Screen:scaleBySize(7))
-    local content_h = title_h + percent_h + gap + progress_h + hint_h + gap + row_h + row_gap + row_h
-    local height = content_h + (border + pad) * 2
-    height = math.min(height, sh - math.max(36, math.floor(sh * .08)))
-
+    local portrait = sw < sh
+    local outer_margin = Skin.dp(10, 8, 18)
+    local top_inset = Skin.dp(3, 2, 5)
+    local pad = Skin.dp(11, 9, 17)
+    local gap = Skin.dp(8, 6, 11)
+    local panel_w = sw - outer_margin * 2
+    local content_w = panel_w - pad * 2
+    local header_h = math.max(Skin.dp(40, 34, 53), math.floor(sh * .04))
+    local value_h = math.max(Skin.dp(38, 32, 52), math.floor(sh * (portrait and .036 or .052)))
+    local value_track_gap = Skin.dp(8, 6, 12)
+    local track_h = math.max(Skin.dp(24, 20, 34), math.floor(sh * (portrait and .024 or .035)))
+    local progress_h = value_h + value_track_gap + track_h
+    local small_h = math.max(Skin.dp(42, 36, 55), math.floor(sh * (portrait and .04 or .058)))
+    local wide_h = math.max(Skin.dp(45, 39, 58), math.floor(sh * (portrait and .043 or .062)))
+    local handle_h = Skin.dp(18, 15, 25)
+    local content_h = header_h + progress_h + gap + small_h + gap + wide_h + gap + wide_h + handle_h
+    self.panel_h = math.min(sh - top_inset - math.max(28, math.floor(sh * .052)), pad * 2 + content_h)
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
-    self.frame_dimen = Geom:new{
-        x = math.floor((sw - width) / 2),
-        y = math.floor((sh - height) / 2),
-        w = width,
-        h = height,
+    self.frame_dimen = Geom:new{x = outer_margin, y = top_inset, w = panel_w, h = self.panel_h}
+    self.ges_events = {
+        TapDismiss = {GestureRange:new{ges = "tap", range = self.dimen}},
+        SwipeDismiss = {GestureRange:new{ges = "swipe", range = self.dimen}},
     }
-    if Device:isTouchDevice() then
-        self.ges_events = {TapDismiss = {GestureRange:new{ges = "tap", range = self.dimen}}}
-    end
     if Device:hasKeys() and Device.input and Device.input.group and Device.input.group.Back then
         self.key_events = {Close = {{Device.input.group.Back}}}
     end
 
-    local content_w = width - (border + pad) * 2
-    local group = VerticalGroup:new{align = "center"}
-    group[#group + 1] = TextBoxWidget:new{
-        text = "阅读进度",
-        face = Font:getFace("cfont", math.max(16, Screen:scaleBySize(18))),
-        bold = true,
-        width = content_w,
-        height = title_h,
-        height_adjust = false,
-        alignment = "center",
+    local root = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+    root[#root + 1] = OffsetContainer:new{
+        x_off = outer_margin,
+        y_off = top_inset,
+        Skin.paper(panel_w, self.panel_h, {accent = false, seed = 9}, Widget:new{dimen = Geom:new{w = 1, h = 1}}),
     }
-    group[#group + 1] = TextBoxWidget:new{
-        text = tostring(math.floor((tonumber(self.percent) or 0) + .5)) .. "%",
-        face = Font:getFace("cfont", math.max(14, Screen:scaleBySize(16))),
-        bold = true,
-        width = content_w,
-        height = percent_h,
-        height_adjust = false,
-        alignment = "center",
-        fgcolor = Blitbuffer.COLOR_BLACK,
-    }
-    group[#group + 1] = VerticalSpan:new{height = gap}
 
-    self.progress = ProgressWidget:new{
-        width = content_w,
-        height = math.max(18, Screen:scaleBySize(18)),
-        percentage = math.max(0, math.min(1, (tonumber(self.percent) or 0) / 100)),
-        fillcolor = Blitbuffer.COLOR_BLACK,
-        padding = Size.padding.small,
-        margin = 0,
+    local y = top_inset + pad
+    local back_w = Skin.dp(44, 38, 58)
+    local title_w = math.max(1, content_w - back_w * 2)
+    local back_tap = TapBox:new{
+        dimen = Geom:new{w = back_w, h = header_h},
+        callback = function() self:_close(self.on_back) end,
+    }
+    back_tap[1] = Ui.icon("back", back_w, header_h, Skin.dp(21, 18, 28), {
+        face = Skin.face("cfont", 21, 26, 18),
+    })
+    local home_tap = TapBox:new{
+        dimen = Geom:new{w = back_w, h = header_h},
+        enabled = type(self.on_home) == "function",
+        callback = function() self:_close(self.on_home) end,
+    }
+    home_tap[1] = Ui.icon("home", back_w, header_h, Skin.dp(21, 18, 28), {
+        face = Skin.face("cfont", 15.8, 20.8, 13.2),
+        fgcolor = type(self.on_home) == "function" and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+    })
+    local header = HorizontalGroup:new{
+        align = "center",
+        back_tap,
+        Ui.textbox("当前进度", title_w, header_h, Skin.face("cfont", 16.2, 20.8, 13.6), {
+            bold = true, alignment = "center", halign = "center",
+        }),
+        home_tap,
+    }
+    root[#root + 1] = OffsetContainer:new{x_off = outer_margin + pad, y_off = y, header}
+    y = y + header_h
+
+    root[#root + 1] = OffsetContainer:new{
+        x_off = outer_margin + pad,
+        y_off = y,
+        Ui.textbox(tostring(math.floor((tonumber(self.percent) or 0) + .5)) .. "%",
+            content_w, value_h, Skin.face("cfont", 22, 28, 18.5), {
+                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+            }),
+    }
+
+    local bar_w = math.max(1, content_w - math.floor(content_w * .04))
+    local bar_h = math.max(2, Skin.line("thick"))
+    local pct = math.max(0, math.min(100, tonumber(self.percent) or 0))
+    local filled = math.max(1, math.floor(bar_w * pct / 100))
+    local marker = Skin.dp(13, 10, 18)
+    local bar_x = outer_margin + pad + math.floor((content_w - bar_w) / 2)
+    local track_y = y + value_h + value_track_gap
+    local bar_y = track_y + math.floor((track_h - bar_h) / 2)
+    root[#root + 1] = OffsetContainer:new{x_off = bar_x, y_off = bar_y, LineWidget:new{
+        background = Blitbuffer.COLOR_GRAY,
+        dimen = Geom:new{w = bar_w, h = bar_h},
+    }}
+    root[#root + 1] = OffsetContainer:new{x_off = bar_x, y_off = bar_y, LineWidget:new{
+        background = Blitbuffer.COLOR_BLACK,
+        dimen = Geom:new{w = math.min(bar_w, filled), h = bar_h},
+    }}
+    root[#root + 1] = OffsetContainer:new{
+        x_off = bar_x + math.max(0, math.min(bar_w - marker, filled - math.floor(marker / 2))),
+        y_off = track_y + math.floor((track_h - marker) / 2),
+        Skin.frame(marker, marker, {
+            bordersize = 0,
+            radius = math.floor(marker / 2),
+            background = Blitbuffer.COLOR_BLACK,
+            color = Blitbuffer.COLOR_BLACK,
+        }, Widget:new{dimen = Geom:new{w = 1, h = 1}}),
     }
     local progress_tap = ProgressTap:new{
-        dimen = Geom:new{w = content_w, h = progress_h},
+        dimen = Geom:new{w = bar_w, h = value_track_gap + track_h},
         callback = function(target)
-            self:_close()
-            if self.on_goto_percent then
-                UIManager:nextTick(function() self.on_goto_percent(target) end)
-            end
+            self:_close(function() if self.on_goto_percent then self.on_goto_percent(target) end end)
         end,
     }
-    progress_tap[1] = CenterContainer:new{dimen = progress_tap.dimen:copy(), self.progress}
-    group[#group + 1] = progress_tap
-    group[#group + 1] = TextBoxWidget:new{
-        text = "点击进度条直接跳转",
-        face = Font:getFace("smallinfofont", math.max(11, Screen:scaleBySize(12))),
-        width = content_w,
-        height = hint_h,
-        height_adjust = false,
-        alignment = "center",
-        fgcolor = Blitbuffer.COLOR_BLACK,
-    }
-    group[#group + 1] = VerticalSpan:new{height = gap}
+    progress_tap[1] = Widget:new{dimen = Geom:new{w = bar_w, h = value_track_gap + track_h}}
+    root[#root + 1] = OffsetContainer:new{x_off = bar_x, y_off = y + value_h, progress_tap}
+    y = y + progress_h + gap
 
-    local function adjust(delta)
-        self:_close()
-        if self.on_adjust then UIManager:nextTick(function() self.on_adjust(delta) end) end
+    local small_gap = Skin.dp(6, 4, 9)
+    local small_w = math.max(1, math.floor((content_w - small_gap * 3) / 4))
+    local deltas = {-5, -1, 1, 5}
+    local labels = {"−5%", "−1%", "+1%", "+5%"}
+    for index, delta in ipairs(deltas) do
+        local value = delta
+        root[#root + 1] = OffsetContainer:new{
+            x_off = outer_margin + pad + (index - 1) * (small_w + small_gap),
+            y_off = y,
+            self:_button(labels[index], small_w, small_h, function()
+                if self.on_adjust then self.on_adjust(value) end
+            end, false),
+        }
     end
-    local function jump()
-        self:_close()
-        if self.on_jump then UIManager:nextTick(self.on_jump) end
-    end
+    y = y + small_h + gap
 
-    local small_gap = math.max(6, Screen:scaleBySize(5))
-    local small_w = math.floor((content_w - small_gap * 3) / 4)
-    group[#group + 1] = HorizontalGroup:new{
-        align = "center",
-        button("−5%", small_w, row_h, function() adjust(-5) end),
-        HorizontalSpan:new{width = small_gap},
-        button("−1%", small_w, row_h, function() adjust(-1) end),
-        HorizontalSpan:new{width = small_gap},
-        button("+1%", small_w, row_h, function() adjust(1) end),
-        HorizontalSpan:new{width = small_gap},
-        button("+5%", small_w, row_h, function() adjust(5) end),
+    local wide_gap = Skin.dp(8, 6, 12)
+    local wide_w = math.max(1, math.floor((content_w - wide_gap) / 2))
+    root[#root + 1] = OffsetContainer:new{
+        x_off = outer_margin + pad,
+        y_off = y,
+        self:_button("上一章", wide_w, wide_h, self.on_prev_chapter, false),
     }
-    group[#group + 1] = VerticalSpan:new{height = row_gap}
-    local wide_gap = math.max(8, Screen:scaleBySize(7))
-    local wide_w = math.floor((content_w - wide_gap) / 2)
-    group[#group + 1] = HorizontalGroup:new{
-        align = "center",
-        button("输入位置", wide_w, row_h, jump, true),
-        HorizontalSpan:new{width = wide_gap},
-        button("关闭", wide_w, row_h, function() self:_close() end, false),
+    root[#root + 1] = OffsetContainer:new{
+        x_off = outer_margin + pad + wide_w + wide_gap,
+        y_off = y,
+        self:_button("下一章", wide_w, wide_h, self.on_next_chapter, false),
+    }
+    y = y + wide_h + gap
+
+    root[#root + 1] = OffsetContainer:new{
+        x_off = outer_margin + pad,
+        y_off = y,
+        self:_button("输入位置", content_w, wide_h, self.on_jump, true),
     }
 
-    self.frame = FrameContainer:new{
-        background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_BLACK,
-        bordersize = border,
-        radius = math.max(tonumber(Size.radius.window) or 0, Screen:scaleBySize(7)),
-        padding = pad,
-        margin = 0,
-        CenterContainer:new{
-            dimen = Geom:new{w = content_w, h = content_h},
-            group,
+    local handle_w = Skin.dp(34, 28, 48)
+    root[#root + 1] = OffsetContainer:new{
+        x_off = outer_margin + math.floor((panel_w - handle_w) / 2),
+        y_off = top_inset + self.panel_h - math.floor(handle_h * .55),
+        LineWidget:new{
+            background = Blitbuffer.COLOR_DARK_GRAY,
+            dimen = Geom:new{w = handle_w, h = math.max(1, Skin.line("thin"))},
         },
     }
-    self[1] = CenterContainer:new{dimen = self.dimen:copy(), self.frame}
+    self[1] = root
 end
 
 function Dialog:onTapDismiss(_, ges)
     local pos = ges and ges.pos
-    if pos and pos:notIntersectWith(self.frame_dimen) then return self:_close() end
+    if pos and (pos.y > self.frame_dimen.y + self.frame_dimen.h or pos.x < self.frame_dimen.x or pos.x > self.frame_dimen.x + self.frame_dimen.w) then
+        return self:_close(self.on_back)
+    end
     return false
 end
-function Dialog:onClose() return self:_close() end
+function Dialog:onSwipeDismiss(_, ges)
+    if ges and ges.direction == "north" then return self:_close(self.on_back) end
+    return false
+end
+function Dialog:onClose() return self:_close(self.on_back) end
 function Dialog:onShow()
-    UIManager:setDirty(self, function() return "ui", self.frame_dimen end)
+    UIManager:setDirty(self, function() return "ui", Skin.expand_region(self.frame_dimen) end)
 end
 function Dialog:onCloseWidget()
-    local region = self.frame_dimen and self.frame_dimen:copy() or nil
+    local region = self.frame_dimen and Skin.expand_region(self.frame_dimen) or nil
+    local action = self.pending_action
+    self.pending_action = nil
     self.closed = true
+    if live_dialog == self then live_dialog = nil end
     if region then UIManager:setDirty(nil, function() return "ui", region end) end
+    if action then
+        UIManager:scheduleIn(.04, function()
+            local ok, err = pcall(action)
+            if not ok then logger.warn("[MiuRead][ReaderProgressDialog] action failed", tostring(err)) end
+        end)
+    end
 end
 
 local M = {}
+function M.close()
+    if live_dialog and not live_dialog.closed then live_dialog:_close(nil, true) end
+    live_dialog = nil
+end
 function M.show(opts)
     opts = opts or {}
-    local dialog = Dialog:new{
+    M.close()
+    local ok, dialog = pcall(Dialog.new, Dialog, {
         percent = opts.percent,
         on_goto_percent = opts.on_goto_percent,
         on_adjust = opts.on_adjust,
         on_jump = opts.on_jump,
-    }
+        on_prev_chapter = opts.on_prev_chapter,
+        on_next_chapter = opts.on_next_chapter,
+        on_back = opts.on_back,
+        on_home = opts.on_home,
+    })
+    if not ok or not dialog then
+        logger.warn("[MiuRead][ReaderProgressDialog] build failed", tostring(dialog))
+        return nil, tostring(dialog)
+    end
+    live_dialog = dialog
     UIManager:show(dialog, "ui", dialog.frame_dimen)
     return dialog
 end
