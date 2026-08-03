@@ -10094,7 +10094,8 @@ function Plugin:update_settings_menu()
         {text="更新通道 · "..tostring(Config.UPDATE_CHANNEL_LABEL),enabled=false},
     }
 end
-function Plugin:_restart_koreader()
+function Plugin:_restart_koreader(source)
+    if self._koreader_restart_requested then return true end
     if (self.download_task and self.download_task:busy()) or self._download_runtime~=nil then
         self:info("当前任务尚未完成，暂不重启。\n\n请等待任务结束，或先在下载管理中取消任务。")
         return false
@@ -10111,32 +10112,79 @@ function Plugin:_restart_koreader()
         self:info("Android 版 KOReader 无法保证由插件自动重新启动。\n\n请关闭并重新打开 KOReader。")
         return false
     end
-    local function restart()
-        self:_begin_koreader_exit("restart")
-        if Device and Device.saveSettings then pcall(Device.saveSettings,Device) end
-        UIManager:nextTick(function() UIManager:broadcastEvent(Event:new("Restart")) end)
+    if Device and type(Device.canRestart)=="function" and not Device:canRestart() then
+        self:info("当前设备不支持由 KOReader 自动重新启动。\n\n请关闭并重新打开 KOReader。")
+        return false
     end
-    local menu=self.ui and self.ui.menu
-    if menu and type(menu.exitOrRestart)=="function" then
-        menu:exitOrRestart(restart)
-    else
-        restart()
+
+    self._koreader_restart_requested=true
+    source=tostring(source or "manual")
+    logger.info("[MiuRead][Restart] KOReader restart requested","source=",source,"expected_exit=85")
+
+    -- Save everything before asking KOReader to restart. Do not call
+    -- the native menu close helper here: on a replacement home it closes the native
+    -- root first, which can empty UIManager's stack and turn the request into
+    -- a normal exit (code 0) before the Restart event gets handled.
+    pcall(function() self:_flush_home_preferences() end)
+    pcall(function() self:onFlushSettings() end)
+    if Device and Device.saveSettings then pcall(Device.saveSettings,Device) end
+
+    local dispatched,dispatch_error=pcall(function()
+        UIManager:broadcastEvent(Event:new("Restart"))
+    end)
+    if not dispatched then
+        logger.warn("[MiuRead][Restart] Restart event failed",tostring(dispatch_error))
+    end
+
+    -- KOReader's launcher recognises exit code 85 as "restart KOReader".
+    -- Keep a direct fallback because custom full-screen homes may leave no
+    -- native root widget to consume the broadcast event. This never calls the
+    -- device Reboot event and therefore cannot request a Kindle/Kobo reboot.
+    if tonumber(UIManager._exit_code)~=85 then
+        logger.info("[MiuRead][Restart] enforcing KOReader exit code 85")
+        if not HOME_EXITING then self:_begin_koreader_exit("restart fallback") end
+        UIManager:quit(85)
     end
     return true
+end
+function Plugin:_show_update_complete_dialog(version,allow_restart)
+    if self._update_complete_dialog then
+        pcall(function() UIManager:close(self._update_complete_dialog) end)
+        self._update_complete_dialog=nil
+    end
+    local dialog
+    local buttons={}
+    if allow_restart~=false then
+        buttons[#buttons+1]={{text="立即重启 KOReader",callback=function()
+            -- Keep this dialog on the stack until the restart request has
+            -- been accepted. It prevents an empty-stack normal exit.
+            self:_restart_koreader("update-confirmed")
+        end}}
+    end
+    buttons[#buttons+1]={{text="稍后重启",callback=function()
+        UIManager:close(dialog)
+        self._update_complete_dialog=nil
+        self:toast("新版本将在下次启动 KOReader 时生效",3)
+    end}}
+    dialog=ButtonDialog:new{
+        title="更新文件已安装："..tostring(version).."。\n\n当前仍在运行 "..tostring(self.version).."，重启 KOReader 后才会切换到新版本。",
+        title_align="center",
+        buttons=buttons,
+    }
+    self._update_complete_dialog=dialog
+    UIManager:show(dialog)
 end
 function Plugin:_after_update_installed(manifest)
     local _,update=self:_update_preferences()
     local version=tostring(manifest and manifest.version or "新版本")
+    logger.info("[MiuRead][Updater] presenting installed update","version=",version,"restart_mode=",tostring(update.restart_mode))
     if update.restart_mode=="never" then
-        self:info("觅阅已更新至 "..version.."。\n\n请稍后手动重启 KOReader。")
+        self:_show_update_complete_dialog(version,false)
     elseif update.restart_mode=="auto" then
         self:status_toast("更新完成","正在重启 KOReader",3)
-        UIManager:scheduleIn(.8,function() self:_restart_koreader() end)
+        UIManager:scheduleIn(.35,function() self:_restart_koreader("update-auto") end)
     else
-        UIManager:show(ConfirmBox:new{
-            text="更新文件已安装："..version.."。\n\n当前仍在运行 "..tostring(self.version).."，重启 KOReader 后才会切换到新版本。",
-            ok_text="立即重启",cancel_text="稍后重启",ok_callback=function() self:_restart_koreader() end,
-        })
+        self:_show_update_complete_dialog(version,true)
     end
 end
 function Plugin:_present_update(manifest,automatic)
