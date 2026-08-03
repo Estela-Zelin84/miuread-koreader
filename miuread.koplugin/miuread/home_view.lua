@@ -877,7 +877,53 @@ function HomeWidget:_build_sections(children, m, compact, mode)
     self:_add(children, x, bottom - footer_h, page_footer(w, footer_h, self.opts.shelf_page, self.opts.shelf_pages, self.opts.on_shelf_page or function() end))
 end
 
+function HomeWidget:_section_cache_id(opts)
+    opts=opts or self.opts or {}
+    local key=tostring(opts.section_cache_key or "")
+    local revision=tostring(opts.section_revision or "")
+    if key=="" or revision=="" then return nil end
+    return key.."|"..revision
+end
+
+function HomeWidget:_clear_inactive_section_cache()
+    local cache=self._section_layer_cache
+    if type(cache)~="table" then return end
+    for _,entry in pairs(cache) do
+        local layer=type(entry)=="table" and entry.layer or nil
+        if layer and layer~=self._section_layer and layer.free then pcall(layer.free,layer) end
+    end
+    self._section_layer_cache=nil
+    self._section_cache_clock=0
+end
+
+function HomeWidget:_remember_section_layer(cache_id,layer,region)
+    if not cache_id or not layer then return end
+    self._section_layer_cache=type(self._section_layer_cache)=="table" and self._section_layer_cache or {}
+    self._section_cache_clock=(tonumber(self._section_cache_clock) or 0)+1
+    self._section_layer_cache[cache_id]={
+        layer=layer,
+        region=region and region:copy() or nil,
+        used=self._section_cache_clock,
+    }
+    local count=0
+    for _ in pairs(self._section_layer_cache) do count=count+1 end
+    while count>8 do
+        local oldest_id,oldest_entry
+        for id,entry in pairs(self._section_layer_cache) do
+            if entry.layer~=self._section_layer
+                and (not oldest_entry or (tonumber(entry.used) or 0)<(tonumber(oldest_entry.used) or 0)) then
+                oldest_id,oldest_entry=id,entry
+            end
+        end
+        if not oldest_id then break end
+        self._section_layer_cache[oldest_id]=nil
+        if oldest_entry.layer and oldest_entry.layer.free then pcall(oldest_entry.layer.free,oldest_entry.layer) end
+        count=count-1
+    end
+end
+
 function HomeWidget:_rebuild()
+    self:_clear_inactive_section_cache()
     UiScale.setDisplayMode(self.opts and self.opts.display_size or "standard")
     local m = self:_metrics()
     self._last_screen_w, self._last_screen_h = m.sw, m.sh
@@ -900,6 +946,7 @@ function HomeWidget:_rebuild()
     children[#children + 1] = section_layer
     self._section_layer = section_layer
     self._section_layer_index = #children
+    self:_remember_section_layer(self:_section_cache_id(self.opts),section_layer,self.section_dimen)
     local previous = self[1]
     self[1] = children
     if previous and previous ~= children and previous.free then pcall(previous.free, previous) end
@@ -941,6 +988,7 @@ function HomeWidget:update(opts, refresh_kind)
 end
 
 function HomeWidget:updateSection(opts)
+    local started=os.clock()
     opts = opts or {}
     self.opts.tabs = opts.tabs or self.opts.tabs
     self.opts.shelf_title = opts.shelf_title or self.opts.shelf_title
@@ -953,6 +1001,8 @@ function HomeWidget:updateSection(opts)
     self.opts.on_shelf_page = opts.on_shelf_page or self.opts.on_shelf_page
     self.opts.shelf_page = opts.shelf_page or self.opts.shelf_page
     self.opts.shelf_pages = opts.shelf_pages or self.opts.shelf_pages
+    self.opts.section_cache_key = opts.section_cache_key or self.opts.section_cache_key
+    self.opts.section_revision = opts.section_revision or self.opts.section_revision
 
     local m = self._metrics_cache
     local root = self[1]
@@ -962,13 +1012,29 @@ function HomeWidget:updateSection(opts)
         return self:update(self.opts, "section")
     end
     local previous_region = self.section_dimen and self.section_dimen:copy() or nil
-    local section_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
-    self:_build_sections(section_layer, m, tostring(self.opts.layout_style or "standard") == "compact", "section")
+    local cache_id=self:_section_cache_id(self.opts)
+    local cache=type(self._section_layer_cache)=="table" and self._section_layer_cache or {}
+    local cached=cache_id and cache[cache_id] or nil
+    local section_layer=cached and cached.layer or nil
+    local cache_hit=section_layer~=nil
+    if not section_layer then
+        section_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+        self:_build_sections(section_layer, m, tostring(self.opts.layout_style or "standard") == "compact", "section")
+        self:_remember_section_layer(cache_id,section_layer,self.section_dimen)
+    elseif cached.region then
+        self.section_dimen=cached.region:copy()
+        self._section_cache_clock=(tonumber(self._section_cache_clock) or 0)+1
+        cached.used=self._section_cache_clock
+    end
     local old = root[self._section_layer_index]
     root[self._section_layer_index] = section_layer
     self._section_layer = section_layer
-    if old and old ~= section_layer and old.free then pcall(old.free, old) end
+    -- Old layers stay alive in the bounded cache. They are freed on eviction,
+    -- full rebuild or home close, so switching back does not recreate covers.
     self:_mark_dirty("section", previous_region)
+    logger.info("[MiuRead][HomeSwitch] layer",
+        "key=",tostring(cache_id or "none"),"cache_hit=",tostring(cache_hit),
+        "ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
     return self
 end
 
@@ -1039,6 +1105,7 @@ function HomeWidget:onRotation() return self:_schedule_dimension_refresh() end
 
 function HomeWidget:onCloseWidget()
     self._miu_closed = true
+    self:_clear_inactive_section_cache()
     if live_widget == self then live_widget = nil end
     if self.opts and self.opts.on_close then pcall(self.opts.on_close, self) end
 end

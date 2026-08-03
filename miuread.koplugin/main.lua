@@ -351,6 +351,14 @@ function Plugin:init()
     self._home_hero=nil
     self._home_remote_refreshing=false
     self._home_render_refresh_task=nil
+    self._home_render_refresh_generation=0
+    self._home_refresh_debounce_generation=0
+    self._home_state_save_generation=0
+    self._home_state_save_pending=false
+    self._home_interaction_generation=0
+    self._home_data_revision=0
+    self._home_section_revisions={account=0,generated=0,["local"]=0,mp=0}
+    self._home_cover_inflight={}
 
     if not self._reader_context then
         local guard=self.store:cover_guard()
@@ -1838,6 +1846,50 @@ function Plugin:_save_home_preferences(home,preferences)
     self.store:save_preferences(preferences)
 end
 
+function Plugin:_save_home_preferences_deferred(home,preferences,delay)
+    preferences=preferences or self.store:preferences()
+    preferences.home_ui=home
+    if self.store.save_preferences_deferred then
+        self.store:save_preferences_deferred(preferences)
+    else
+        return self:_save_home_preferences(home,preferences)
+    end
+    self._home_state_save_pending=true
+    self._home_state_save_generation=(tonumber(self._home_state_save_generation) or 0)+1
+    local generation=self._home_state_save_generation
+    UIManager:scheduleIn(tonumber(delay) or 1.20,function()
+        if generation~=self._home_state_save_generation or not self._home_state_save_pending then return end
+        self._home_state_save_pending=false
+        self.store:flush()
+        logger.info("[MiuRead][HomeState] preferences saved after idle")
+    end)
+end
+
+function Plugin:_flush_home_preferences()
+    if not self._home_state_save_pending then return false end
+    self._home_state_save_generation=(tonumber(self._home_state_save_generation) or 0)+1
+    self._home_state_save_pending=false
+    self.store:flush()
+    logger.info("[MiuRead][HomeState] preferences saved before leaving home")
+    return true
+end
+
+function Plugin:_home_section_cache_revision(section,page)
+    self._home_section_revisions=type(self._home_section_revisions)=="table"
+        and self._home_section_revisions or {}
+    return table.concat({
+        tostring(tonumber(self._home_data_revision) or 0),
+        tostring(tonumber(self._home_section_revisions[section]) or 0),
+        tostring(tonumber(page) or 1),
+    },":")
+end
+
+function Plugin:_home_bump_section_revision(section)
+    self._home_section_revisions=type(self._home_section_revisions)=="table"
+        and self._home_section_revisions or {}
+    self._home_section_revisions[section]=(tonumber(self._home_section_revisions[section]) or 0)+1
+end
+
 function Plugin:_set_runtime_home_enabled(enabled, quiet)
     enabled=enabled==true
     HOME_SESSION.runtime_home_enabled=enabled
@@ -1978,34 +2030,41 @@ function Plugin:_notify_home_data_changed(refresh_kind)
     elseif not self._home_refresh_pending_kind then
         self._home_refresh_pending_kind=requested
     end
-    if self._home_refresh_task then return end
+    self._home_refresh_debounce_generation=(tonumber(self._home_refresh_debounce_generation) or 0)+1
+    local generation=self._home_refresh_debounce_generation
+    local interaction_generation=tonumber(self._home_interaction_generation) or 0
     local task
     task=function()
-        if self._home_refresh_task~=task then return end
+        if generation~=self._home_refresh_debounce_generation then return end
         self._home_refresh_task=nil
         local kind=self._home_refresh_pending_kind or "content"
         self._home_refresh_pending_kind=nil
         if HomeView.is_shown() and not self:_active_reader_ui() then
+            if interaction_generation~=(tonumber(self._home_interaction_generation) or 0) then
+                self:_notify_home_data_changed(kind)
+                return
+            end
             self._home_refresh_pending=false
             self:_refresh_home_view(nil,kind)
         end
     end
     self._home_refresh_task=task
-    UIManager:scheduleIn(.55,task)
+    UIManager:scheduleIn(.70,task)
 end
 
 function Plugin:_home_schedule_render_refresh(kind)
-    if self._home_render_refresh_task then return end
+    self._home_render_refresh_generation=(tonumber(self._home_render_refresh_generation) or 0)+1
+    local generation=self._home_render_refresh_generation
     local task
     task=function()
-        if self._home_render_refresh_task~=task then return end
+        if generation~=self._home_render_refresh_generation then return end
         self._home_render_refresh_task=nil
         if HomeView.is_shown() and not self:_active_reader_ui() then
             HomeView.refresh(kind or "content")
         end
     end
     self._home_render_refresh_task=task
-    UIManager:scheduleIn(.12,task)
+    UIManager:scheduleIn(.35,task)
 end
 
 function Plugin:_home_apply_cover_path(book_id,path)
@@ -2054,7 +2113,7 @@ function Plugin:_home_refresh_remote(force,user_requested)
             return
         end
         if HomeView.is_shown() and not self:_active_reader_ui() then
-            self:_show_miuread_home_now(false,true,true,"content")
+            self:_notify_home_data_changed("content")
         end
         if user_requested then self:toast("书架已刷新",2) end
     end,true)
@@ -2070,17 +2129,7 @@ function Plugin:_home_manual_refresh()
     self:toast("正在刷新主页…",2)
     local remote=self:_home_refresh_remote(true,false)
     local local_started=self:_home_scan_local(true)
-    UIManager:scheduleIn(.18,function()
-        if HomeView.is_shown() and not self:_active_reader_ui() then
-            self:_show_miuread_home_now(false,true,true,"content")
-        end
-    end)
-    UIManager:scheduleIn(1.25,function()
-        if HomeView.is_shown() and not self:_active_reader_ui() then
-            UIManager:setDirty("all","full")
-            self:toast("主页已更新",1.5)
-        end
-    end)
+    if not remote and not local_started then self:_notify_home_data_changed("content") end
     return remote or local_started or true
 end
 
@@ -2203,7 +2252,8 @@ function Plugin:_home_change_page(delta)
     local target=math.max(1,math.min(total,current+(tonumber(delta) or 0)))
     if target==current then return true end
     home.page_by_section[section]=target
-    self:_save_home_preferences(home,preferences)
+    self._home_interaction_generation=(tonumber(self._home_interaction_generation) or 0)+1
+    self:_save_home_preferences_deferred(home,preferences)
     return self:_home_apply_section(section)
 end
 
@@ -2221,8 +2271,9 @@ function Plugin:_home_apply_section(section)
         local current,preferences=self:_home_preferences()
         current.page_by_section=type(current.page_by_section)=="table" and current.page_by_section or {}
         current.page_by_section[section]=page
-        self:_save_home_preferences(current,preferences)
+        self:_save_home_preferences_deferred(current,preferences)
     end
+    local started=os.clock()
     local updated=HomeView.update_section{
         tabs=self:_home_build_tabs(section),
         shelf_title="",
@@ -2235,24 +2286,27 @@ function Plugin:_home_apply_section(section)
         home_actions=self:_home_action_entries(),
         on_shelf_all=function() self:show_home_all_books() end,
         on_shelf_page=function(delta) self:_home_change_page(delta) end,
+        section_cache_key=section,
+        section_revision=self:_home_section_cache_revision(section,page),
     }
     -- Section switching must remain a pure in-memory operation. Metadata,
     -- cover extraction, local scans and network work are intentionally not
     -- started here; they are handled on initial home load or explicit refresh.
+    logger.info("[MiuRead][HomeSwitch] applied",
+        "section=",tostring(section),"page=",tostring(page),
+        "ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
     return updated
 end
 
 function Plugin:_set_home_section(section)
-    local now=os.clock()
-    if now<(tonumber(self._home_section_busy_until) or 0) then return true end
-    self._home_section_busy_until=now+.22
     local allowed={}
     for _,key in ipairs(self._home_visible_keys or HOME_SECTION_ORDER) do allowed[key]=true end
     section=allowed[section] and section or (self._home_visible_keys and self._home_visible_keys[1]) or "account"
     local home,preferences=self:_home_preferences()
     if home.active_section==section and self._home_active_section==section then return end
     home.active_section=section
-    self:_save_home_preferences(home,preferences)
+    self._home_interaction_generation=(tonumber(self._home_interaction_generation) or 0)+1
+    self:_save_home_preferences_deferred(home,preferences)
     if self:_home_apply_section(section) then
         logger.info("[MiuRead][Home] section updated partial",tostring(section))
     else
@@ -3977,10 +4031,12 @@ function Plugin:_home_alerts()
 end
 
 function Plugin:_home_stop_background(reason)
+    self:_flush_home_preferences()
     self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
     self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
     self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
     self._home_refreshing=false
+    self._home_cover_inflight={}
     if self.home_async then self.home_async:cancel(reason or "home hidden") end
     if self.home_metadata_async then self.home_metadata_async:cancel(reason or "home hidden") end
     if self.home_cover_async then self.home_cover_async:cancel(reason or "home hidden") end
@@ -4020,7 +4076,7 @@ function Plugin:_home_scan_local(force)
             logger.info("[MiuRead][Home] local library refreshed",
                 "root=",tostring(root),"count=",tostring(#(result.value.books or {})),
                 "truncated=",tostring(result.value.truncated==true))
-            if HomeView.is_shown() then UIManager:scheduleIn(.05,function() self:_show_miuread_home_now(false,true,true,"content") end) end
+            if HomeView.is_shown() then self:_notify_home_data_changed("content") end
         else
             logger.warn("[MiuRead][Home] local library refresh failed",tostring(result and result.error or "unknown"))
         end
@@ -4276,20 +4332,54 @@ end
 function Plugin:_home_schedule_remote_covers(books)
     self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
     local generation=self._home_cover_generation
+    self._home_cover_inflight=type(self._home_cover_inflight)=="table" and self._home_cover_inflight or {}
     local queue,seen={},{}
     for _,book in ipairs(books or {}) do
         local id=tostring(book and (book.bookId or book.book_id) or "")
-        if id~="" and not seen[id] and book.cover and book.cover~="" and not book.cover_path then
+        if id~="" and not seen[id] and not self._home_cover_inflight[id]
+            and book.cover and book.cover~="" and not book.cover_path then
             seen[id]=true
             queue[#queue+1]={bookId=id,cover=book.cover,book=book}
             if #queue>=10 then break end
         end
     end
     if #queue==0 or not self.home_cover_async then return end
-    local index,changed_any=1,false
-    local function finish()
-        if changed_any and generation==self._home_cover_generation and HomeView.is_shown() then
+    local index,changed_count=1,0
+    local changed_sections={}
+    local hero_changed=false
+    local function mark_changed(book_id)
+        local hero_id=tostring(self._home_hero and (self._home_hero.bookId or self._home_hero.book_id) or "")
+        if hero_id==book_id then hero_changed=true end
+        for key,section in pairs(self._home_sections or {}) do
+            for _,book in ipairs(section.rows or {}) do
+                if tostring(book.bookId or book.book_id or "")==book_id then
+                    changed_sections[key]=true
+                    break
+                end
+            end
+        end
+    end
+    local function apply_batch()
+        if generation~=self._home_cover_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
+        if changed_count<=0 then return end
+        for section in pairs(changed_sections) do self:_home_bump_section_revision(section) end
+        local active=self._home_active_section or "account"
+        if hero_changed then
+            -- The recent-reading card belongs to the static body. Rebuild the
+            -- content once after the whole cover batch instead of once per book.
             self:_home_schedule_render_refresh("content")
+        elseif changed_sections[active] then
+            self:_home_apply_section(active)
+        end
+        logger.info("[MiuRead][HomeCoverBatch] applied",
+            "changed=",tostring(changed_count),"hero=",tostring(hero_changed),
+            "active=",tostring(active))
+    end
+    local function finish()
+        if changed_count>0 and generation==self._home_cover_generation and HomeView.is_shown() then
+            -- Let the final worker callback leave the input path before one
+            -- bounded e-ink update. A later tab switch wins automatically.
+            UIManager:scheduleIn(.35,apply_batch)
         end
     end
     local function next_cover()
@@ -4297,6 +4387,12 @@ function Plugin:_home_schedule_remote_covers(books)
         if self.home_cover_async:busy() then UIManager:scheduleIn(.3,next_cover); return end
         local item=queue[index]
         if not item then finish(); return end
+        if self._home_cover_inflight[item.bookId] then
+            index=index+1
+            if queue[index] then UIManager:scheduleIn(.02,next_cover) else finish() end
+            return
+        end
+        self._home_cover_inflight[item.bookId]=generation
         local background=self.home_cover_async:available()
         local covers_dir=self.store.covers_dir
         local worker
@@ -4316,26 +4412,37 @@ function Plugin:_home_schedule_remote_covers(books)
                 })
             end
         else
-            worker=function() return self.library:cache_cover(item,{retries=0,timeout={4,7}}) end
+            worker=function()
+                return self.library:cache_cover(item,{
+                    retries=0,timeout={4,7},persist_index=false,skip_index_lookup=true,
+                })
+            end
         end
         local started=self.home_cover_async:run("home-cover",worker,function(result)
+            if self._home_cover_inflight[item.bookId]==generation then
+                self._home_cover_inflight[item.bookId]=nil
+            end
             if generation~=self._home_cover_generation then return end
             if result and result.ok and result.value then
-                if background then self:_remember_cover_path(item.bookId,result.value) end
+                self:_remember_cover_path(item.bookId,result.value)
+                local changed=self:_home_apply_cover_path(item.bookId,result.value)
                 if item.book then item.book.cover_path=result.value end
-                self:_home_apply_cover_path(item.bookId,result.value)
-                changed_any=true
-                -- Update the visible cover as soon as it is ready instead of
-                -- waiting for every item in the page to finish or time out.
-                self:_home_schedule_render_refresh("content")
+                if changed then
+                    changed_count=changed_count+1
+                    mark_changed(item.bookId)
+                end
             elseif result and result.error then
                 logger.warn("[MiuRead][Home] cover download failed",tostring(item.bookId),U.first_line(result.error,120))
             end
             index=index+1
             if queue[index] then UIManager:scheduleIn(.08,next_cover) else finish() end
         end,background and 35 or 14)
-        if not started then UIManager:scheduleIn(.35,next_cover) end
+        if not started then
+            if self._home_cover_inflight[item.bookId]==generation then self._home_cover_inflight[item.bookId]=nil end
+            UIManager:scheduleIn(.35,next_cover)
+        end
     end
+    logger.info("[MiuRead][HomeCoverBatch] queued","count=",tostring(#queue))
     UIManager:scheduleIn(.12,next_cover)
 end
 
@@ -6305,6 +6412,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         ["local"]={title="本地书籍",rows=local_rows,empty="这里还没有本地书籍\n导入书籍后会显示在这里"},
         mp={title="公众号",rows=mp_rows,empty="这里还没有公众号内容"},
     }
+    self._home_data_revision=(tonumber(self._home_data_revision) or 0)+1
     self._home_sections=sections
     local visible_keys=self:_home_visible_section_keys(sections,home)
     self._home_visible_keys=visible_keys
@@ -6316,7 +6424,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     if home.active_section~=active then
         home.active_section=active
         local _,preferences=self:_home_preferences()
-        self:_save_home_preferences(home,preferences)
+        self:_save_home_preferences_deferred(home,preferences)
     end
     self._home_active_section=active
     self._home_hero=hero
@@ -6328,7 +6436,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     if tonumber(home.page_by_section[active])~=shelf_page then
         home.page_by_section[active]=shelf_page
         local _,preferences=self:_home_preferences()
-        self:_save_home_preferences(home,preferences)
+        self:_save_home_preferences_deferred(home,preferences)
     end
     local tabs=self:_home_build_tabs(active)
 
@@ -6358,6 +6466,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         home_actions=self:_home_action_entries(),
         on_shelf_all=function() self:show_home_all_books() end,
         on_shelf_page=function(delta) self:_home_change_page(delta) end,
+        section_cache_key=active,
+        section_revision=self:_home_section_cache_revision(active,shelf_page),
         on_close=function(current)
             if self._home_view==current then self._home_view=nil end
             if HOME_EXPECTED_CLOSE or HOME_NATIVE_VISIT or HOME_EXITING or UIManager._exit_code~=nil then return end

@@ -1196,6 +1196,7 @@ function Store:migrate()
 end
 function Store:get(k,d) local v=self.db:readSetting(k,nil); return v==nil and U.copy(d) or v end
 function Store:set(k,v) self.db:saveSetting(k,v); self:flush() end
+function Store:set_deferred(k,v) self.db:saveSetting(k,v) end
 local function sanitized_auth(value)
     local auth=U.merge(defaults.auth,value or {})
     auth.mp_cookie_header=nil
@@ -1237,6 +1238,7 @@ function Store:clear_account_shelf_cache()
 end
 function Store:preferences() return U.merge(defaults.preferences,self:get("preferences",{})) end
 function Store:save_preferences(v) self:set("preferences",U.merge(defaults.preferences,v or {})) end
+function Store:save_preferences_deferred(v) self:set_deferred("preferences",U.merge(defaults.preferences,v or {})) end
 function Store:books_root() local p=self:preferences().download_dir; if p=="" then p=self.default_books_dir end; U.mkdir(p); return p end
 function Store:epub_root() return self:books_root() end
 function Store:book_cache_path(id) return self.cache_books_dir.."/"..U.id_name(id) end

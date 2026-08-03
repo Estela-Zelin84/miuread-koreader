@@ -4,9 +4,9 @@ KOReader 的微信读书插件，支持 Kindle、Kobo 与 Android 等 KOReader �
 
 ## 当前版本
 
-当前源码为 `4.0.0-beta.1` 内测版，应提交到 `beta` 分支。
+当前源码为 `4.0.0-beta.2` 内测版，应提交到 `beta` 分支。
 
-详细变更见 `CHANGELOG-4.0.0-beta.1.txt`。
+详细变更见 `CHANGELOG-4.0.0-beta.2.txt`。
 
 ## 分支与发布
 
