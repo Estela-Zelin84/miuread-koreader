@@ -359,6 +359,15 @@ function Plugin:init()
     self._home_data_revision=0
     self._home_section_revisions={account=0,generated=0,["local"]=0,mp=0}
     self._home_cover_inflight={}
+    self._home_suspended=false
+    self._home_resume_generation=0
+    self._home_resume_barrier=false
+    self._home_resume_first_frame=false
+    self._home_resume_background_task=nil
+    self._home_resume_pending_kind=nil
+    self._home_resume_pending_work=nil
+    self._home_resume_started_clock=nil
+    self._home_resume_sleep_seconds=0
 
     if not self._reader_context then
         local guard=self.store:cover_guard()
@@ -2009,8 +2018,234 @@ function Plugin:home_mode_menu()
     }
 end
 
+function Plugin:_home_refresh_priority(kind)
+    local priority={header=1,section=2,content=3,full=4}
+    return priority[tostring(kind or "content")] or 3
+end
+
+function Plugin:_home_defer_refresh_kind(kind)
+    kind=tostring(kind or "content")
+    self._home_refresh_pending=true
+    local current=self._home_refresh_pending_kind
+    if not current or self:_home_refresh_priority(kind)>self:_home_refresh_priority(current) then
+        self._home_refresh_pending_kind=kind
+    end
+    if self:_home_background_blocked() then
+        local resume_current=self._home_resume_pending_kind
+        if not resume_current or self:_home_refresh_priority(kind)>self:_home_refresh_priority(resume_current) then
+            self._home_resume_pending_kind=kind
+        end
+    end
+    return kind
+end
+
+function Plugin:_home_background_blocked()
+    return self._home_suspended==true or self._home_resume_barrier==true
+end
+
+function Plugin:_home_unschedule_task(field)
+    local task=self[field]
+    if task then
+        UIManager:unschedule(task)
+        self[field]=nil
+        return true
+    end
+    return false
+end
+
+function Plugin:_home_freeze_for_suspend()
+    if self._home_suspended==true then return true end
+    self._home_suspended=true
+    self._home_resume_barrier=true
+    self._home_resume_first_frame=false
+    self._home_resume_generation=(tonumber(self._home_resume_generation) or 0)+1
+    self._home_resume_started_clock=nil
+
+    self._home_resume_pending_work={
+        scan=self._home_refreshing==true or (self.home_async and self.home_async:busy()) or false,
+        remote=self._home_remote_refreshing==true or (self.shelf_async and self.shelf_async:busy()) or false,
+        metadata=(self.home_metadata_async and self.home_metadata_async:busy()) or false,
+        covers=(self.home_cover_async and self.home_cover_async:busy()) or false,
+        thoughts=(self.thought_index_async and self.thought_index_async:busy()) or THOUGHT_MAINTENANCE.running==true,
+    }
+    if self._home_refresh_pending_kind then self:_home_defer_refresh_kind(self._home_refresh_pending_kind) end
+
+    self:_home_unschedule_task("_home_refresh_task")
+    self:_home_unschedule_task("_home_render_refresh_task")
+    self:_home_unschedule_task("_home_resume_background_task")
+    self._home_refresh_debounce_generation=(tonumber(self._home_refresh_debounce_generation) or 0)+1
+    self._home_render_refresh_generation=(tonumber(self._home_render_refresh_generation) or 0)+1
+    self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
+    self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
+    self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
+    self._shelf_refresh_generation=(tonumber(self._shelf_refresh_generation) or 0)+1
+    self._home_refreshing=false
+    self._home_remote_refreshing=false
+    self._home_cover_inflight={}
+
+    if self.home_async then self.home_async:cancel("device suspended") end
+    if self.home_metadata_async then self.home_metadata_async:cancel("device suspended") end
+    if self.home_cover_async then self.home_cover_async:cancel("device suspended") end
+    if self.shelf_async and self._home_resume_pending_work.remote then self.shelf_async:cancel("device suspended") end
+    if self.thought_index_async then self.thought_index_async:cancel("device suspended") end
+    THOUGHT_MAINTENANCE.running=false
+    if self._thought_index_pause_path then U.atomic_write(self._thought_index_pause_path,"1",true) end
+
+    logger.info("[MiuRead][Resume] home tasks frozen",
+        "generation=",tostring(self._home_resume_generation),
+        "scan=",tostring(self._home_resume_pending_work.scan),
+        "remote=",tostring(self._home_resume_pending_work.remote),
+        "metadata=",tostring(self._home_resume_pending_work.metadata),
+        "covers=",tostring(self._home_resume_pending_work.covers))
+    return true
+end
+
+function Plugin:_home_resume_visible_targets()
+    local current=HomeView.current()
+    local opts=current and current.opts or {}
+    local metadata_targets,cover_targets={},{}
+    if opts.hero then
+        metadata_targets[#metadata_targets+1]=opts.hero
+        cover_targets[#cover_targets+1]=opts.hero
+    end
+    for _,book in ipairs(opts.shelf_books or {}) do
+        metadata_targets[#metadata_targets+1]=book
+        cover_targets[#cover_targets+1]=book
+    end
+    return metadata_targets,cover_targets
+end
+
+function Plugin:_home_finish_resume_background(generation)
+    if generation~=self._home_resume_generation or self._home_suspended==true then return false end
+    self._home_resume_background_task=nil
+    self._home_resume_barrier=false
+    local pending_kind=self._home_resume_pending_kind or self._home_refresh_pending_kind
+    self._home_resume_pending_kind=nil
+    local pending=self._home_resume_pending_work or {}
+    self._home_resume_pending_work=nil
+    if self._thought_index_pause_path then os.remove(self._thought_index_pause_path) end
+
+    logger.info("[MiuRead][Resume] background released",
+        "generation=",tostring(generation),"refresh=",tostring(pending_kind or "none"))
+
+    if pending_kind then
+        self._home_refresh_pending_kind=nil
+        self._home_refresh_pending=false
+        self:_notify_home_data_changed(pending_kind)
+    end
+
+    if pending.scan then
+        UIManager:scheduleIn(.25,function()
+            if generation==self._home_resume_generation and not self:_home_background_blocked() and HomeView.is_shown() then
+                self:_home_scan_local(false)
+            end
+        end)
+    end
+    if pending.remote then
+        UIManager:scheduleIn(.70,function()
+            if generation==self._home_resume_generation and not self:_home_background_blocked() and HomeView.is_shown() then
+                self:_home_refresh_remote(false,false)
+            end
+        end)
+    end
+    if pending.metadata or pending.covers then
+        UIManager:scheduleIn(1.05,function()
+            if generation~=self._home_resume_generation or self:_home_background_blocked() or not HomeView.is_shown() then return end
+            local metadata_targets,cover_targets=self:_home_resume_visible_targets()
+            if pending.metadata then self:_home_schedule_local_metadata(metadata_targets) end
+            if pending.covers then self:_home_schedule_remote_covers(cover_targets) end
+        end)
+    end
+    if pending.thoughts then
+        UIManager:scheduleIn(2.0,function()
+            if generation==self._home_resume_generation and not self:_home_background_blocked() and HomeView.is_shown() then
+                self:_start_thought_index_maintenance()
+            end
+        end)
+    end
+    return true
+end
+
+function Plugin:_home_schedule_resume_background(delay,generation)
+    generation=tonumber(generation) or tonumber(self._home_resume_generation) or 0
+    self:_home_unschedule_task("_home_resume_background_task")
+    local interaction_generation=tonumber(self._home_interaction_generation) or 0
+    local task
+    task=function()
+        if self._home_resume_background_task~=task then return end
+        self._home_resume_background_task=nil
+        if generation~=self._home_resume_generation or self._home_suspended==true then return end
+        if interaction_generation~=(tonumber(self._home_interaction_generation) or 0) then
+            self:_home_schedule_resume_background(2.4,generation)
+            return
+        end
+        self:_home_finish_resume_background(generation)
+    end
+    self._home_resume_background_task=task
+    UIManager:scheduleIn(math.max(.5,tonumber(delay) or 3.5),task)
+    return true
+end
+
+function Plugin:_home_resume_interaction(generation,first,kind)
+    if generation~=self._home_resume_generation or self._home_suspended==true then return end
+    self._home_interaction_generation=(tonumber(self._home_interaction_generation) or 0)+1
+    local elapsed=self._home_resume_started_clock and math.floor((os.clock()-self._home_resume_started_clock)*1000+.5) or -1
+    if first then
+        logger.info("[MiuRead][Resume] first interaction",
+            "kind=",tostring(kind or "input"),"ms=",tostring(elapsed))
+    end
+    if self._home_resume_barrier==true then self:_home_schedule_resume_background(2.4,generation) end
+end
+
+function Plugin:_home_begin_resume(slept)
+    self._home_suspended=false
+    self._home_resume_barrier=true
+    self._home_resume_first_frame=false
+    self._home_resume_generation=(tonumber(self._home_resume_generation) or 0)+1
+    local generation=self._home_resume_generation
+    self._home_resume_started_clock=os.clock()
+    self._home_resume_sleep_seconds=math.max(0,tonumber(slept) or 0)
+
+    logger.info("[MiuRead][Resume] event received",
+        "generation=",tostring(generation),"slept=",tostring(self._home_resume_sleep_seconds))
+    local raised=HomeView.resume{
+        on_interaction=function(first,kind)
+            self:_home_resume_interaction(generation,first,kind)
+        end,
+    }
+    if not raised then
+        self._home_resume_barrier=false
+        self.sync:on_resume(slept)
+        self:_schedule_home_startup(.12)
+        logger.warn("[MiuRead][Resume] existing home unavailable; startup scheduled")
+        return false
+    end
+
+    -- The existing widget is raised and dirtied without rebuilding it. Old
+    -- scans, cover callbacks and shelf refreshes were invalidated on suspend,
+    -- so this is the next bounded UI operation after wake.
+    UIManager:nextTick(function()
+        if generation~=self._home_resume_generation or self._home_suspended==true then return end
+        self._home_resume_first_frame=true
+        local elapsed=math.floor((os.clock()-self._home_resume_started_clock)*1000+.5)
+        logger.info("[MiuRead][Resume] first surface released","ms=",tostring(elapsed))
+        UIManager:scheduleIn(.10,function()
+            if generation==self._home_resume_generation and self._home_suspended~=true then
+                self.sync:on_resume(slept)
+            end
+        end)
+        self:_home_schedule_resume_background(3.5,generation)
+    end)
+    return true
+end
+
 function Plugin:_refresh_home_view(message,refresh_kind)
     if message and message~="" then self:toast(message,2) end
+    if self:_home_background_blocked() then
+        self:_home_defer_refresh_kind(refresh_kind or "content")
+        logger.info("[MiuRead][Resume] home rebuild deferred",tostring(refresh_kind or "content"))
+        return false
+    end
     if HomeView.is_shown() then
         UIManager:scheduleIn(.05,function()
             if HomeView.is_shown() and not self:_active_reader_ui() then
@@ -2021,14 +2256,10 @@ function Plugin:_refresh_home_view(message,refresh_kind)
 end
 
 function Plugin:_notify_home_data_changed(refresh_kind)
-    self._home_refresh_pending=true
-    local priority={header=1,section=2,content=3,full=4}
-    local requested=refresh_kind or "content"
-    local current=self._home_refresh_pending_kind or "header"
-    if (priority[requested] or 3)>(priority[current] or 1) then
-        self._home_refresh_pending_kind=requested
-    elseif not self._home_refresh_pending_kind then
-        self._home_refresh_pending_kind=requested
+    local requested=self:_home_defer_refresh_kind(refresh_kind or "content")
+    if self:_home_background_blocked() then
+        logger.info("[MiuRead][Resume] data refresh deferred",tostring(requested))
+        return true
     end
     self._home_refresh_debounce_generation=(tonumber(self._home_refresh_debounce_generation) or 0)+1
     local generation=self._home_refresh_debounce_generation
@@ -2053,6 +2284,10 @@ function Plugin:_notify_home_data_changed(refresh_kind)
 end
 
 function Plugin:_home_schedule_render_refresh(kind)
+    if self:_home_background_blocked() then
+        self:_home_defer_refresh_kind(kind or "content")
+        return false
+    end
     self._home_render_refresh_generation=(tonumber(self._home_render_refresh_generation) or 0)+1
     local generation=self._home_render_refresh_generation
     local task
@@ -2092,6 +2327,11 @@ function Plugin:_home_apply_cover_path(book_id,path)
 end
 
 function Plugin:_home_refresh_remote(force,user_requested)
+    if self:_home_background_blocked() then
+        self._home_resume_pending_work=self._home_resume_pending_work or {}
+        self._home_resume_pending_work.remote=true
+        return false
+    end
     if self._home_remote_refreshing or self:_active_reader_ui() then return false end
     local _,_,updated_at=self.library:cached()
     local age=math.max(0,os.time()-(tonumber(updated_at) or 0))
@@ -4032,6 +4272,10 @@ end
 
 function Plugin:_home_stop_background(reason)
     self:_flush_home_preferences()
+    self._home_resume_generation=(tonumber(self._home_resume_generation) or 0)+1
+    self:_home_unschedule_task("_home_resume_background_task")
+    self._home_resume_barrier=false
+    self._home_suspended=false
     self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
     self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
     self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
@@ -4045,6 +4289,11 @@ function Plugin:_home_stop_background(reason)
 end
 
 function Plugin:_home_scan_local(force)
+    if self:_home_background_blocked() then
+        self._home_resume_pending_work=self._home_resume_pending_work or {}
+        self._home_resume_pending_work.scan=true
+        return false
+    end
     if self:_active_reader_ui() then return false end
     local root=self:_home_root()
     local cache=self:_home_local_cache()
@@ -4209,6 +4458,11 @@ function Plugin:_home_save_network_metadata(book,patch)
 end
 
 function Plugin:_home_schedule_network_metadata(book,force)
+    if self:_home_background_blocked() then
+        self._home_resume_pending_work=self._home_resume_pending_work or {}
+        self._home_resume_pending_work.metadata=true
+        return false
+    end
     if type(book)~="table" or not HomeView.is_shown() then return false end
     local home=self:_home_preferences()
     if home.network_metadata==false then return false end
@@ -4277,6 +4531,11 @@ function Plugin:_home_schedule_network_metadata(book,force)
 end
 
 function Plugin:_home_schedule_local_metadata(books)
+    if self:_home_background_blocked() then
+        self._home_resume_pending_work=self._home_resume_pending_work or {}
+        self._home_resume_pending_work.metadata=true
+        return false
+    end
     if not HomeView.is_shown() then return end
     self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
     local generation=self._home_metadata_generation
@@ -4330,6 +4589,11 @@ function Plugin:_home_schedule_local_metadata(books)
 end
 
 function Plugin:_home_schedule_remote_covers(books)
+    if self:_home_background_blocked() then
+        self._home_resume_pending_work=self._home_resume_pending_work or {}
+        self._home_resume_pending_work.covers=true
+        return false
+    end
     self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
     local generation=self._home_cover_generation
     self._home_cover_inflight=type(self._home_cover_inflight)=="table" and self._home_cover_inflight or {}
@@ -6349,6 +6613,11 @@ end
 function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kind)
     sync_home_session()
     if HOME_EXITING or UIManager._exit_code~=nil then return false end
+    if self:_home_background_blocked() and HomeView.is_shown() and not self:_active_reader_ui() then
+        self:_home_defer_refresh_kind(refresh_kind or "content")
+        HomeView.raise()
+        return true
+    end
     HOME_SESSION_SUPPRESSED=false
     HOME_NATIVE_VISIT=false
     HOME_EXPECTED_CLOSE=false
@@ -10360,6 +10629,11 @@ local function extract_thought_href(value,seen,depth)
     for _,child in pairs(value) do local found=extract_thought_href(child,seen,depth+1); if found then return found end end
 end
 function Plugin:_start_thought_index_maintenance()
+    if self:_home_background_blocked() then
+        self._home_resume_pending_work=self._home_resume_pending_work or {}
+        self._home_resume_pending_work.thoughts=true
+        return false
+    end
     if not self.thought_index_async or not self.ui or self.ui.document then return false end
     if self:_home_enabled() and not HomeView.is_shown() then return false end
     local now=os.time()
@@ -10727,6 +11001,12 @@ function Plugin:onSuspend()
     if self._reader_checkpoint_dirty==true then
         self:_flush_reader_checkpoint("suspend",true)
     end
+    -- Freeze every home producer before KOReader paints the lock screen.  The
+    -- visible home widget is preserved; only stale work and callbacks are
+    -- invalidated, so wake-up never has to rebuild the page before showing it.
+    if HomeView.is_shown() and not self:_active_reader_ui() then
+        self:_home_freeze_for_suspend()
+    end
     -- Do not let an active download take the CPU while KOReader is preparing
     -- the lock screen. No network request is awaited here.
     self:_mark_reader_busy(10)
@@ -10736,7 +11016,19 @@ end
 function Plugin:onResume()
     if self._reader_active_path then U.atomic_write(self._reader_active_path,"1",true) end
     self:_mark_reader_busy(5)
-    if self.ui and self.ui.document then
+    local slept=self._suspended_at and os.time()-self._suspended_at or 0
+    self._suspended_at=nil
+
+    local reader_active=self.ui and self.ui.document
+    if not reader_active and HomeView.is_shown() then
+        -- Restore the already-built surface and its input ranges first.  Shelf
+        -- refresh, scans, covers, metadata and index maintenance remain behind
+        -- the interaction barrier until the page has been released and idle.
+        self:_home_begin_resume(slept)
+        return
+    end
+
+    if reader_active then
         UIManager:nextTick(function()
             if self.ui and self.ui.document then
                 self:_install_reader_menu_bridge()
@@ -10744,8 +11036,6 @@ function Plugin:onResume()
             end
         end)
     end
-    local slept=self._suspended_at and os.time()-self._suspended_at or 0
-    self._suspended_at=nil
     local prefs=self.store:preferences().sync or {}
     local recheck=prefs.progress_enabled~=false and slept>=math.max(60,tonumber(prefs.resume_after) or 300)
     if recheck then

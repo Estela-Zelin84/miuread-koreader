@@ -575,8 +575,20 @@ local HomeWidget = InputContainer:extend{
 }
 
 
+function HomeWidget:_notify_resume_interaction(kind)
+    local callback=self._miu_resume_interaction_callback
+    if not callback then return end
+    local now=os.clock()
+    if now-(tonumber(self._miu_last_interaction_at) or 0)<.06 then return end
+    self._miu_last_interaction_at=now
+    local first=self._miu_resume_waiting_interaction==true
+    self._miu_resume_waiting_interaction=false
+    pcall(callback,first,tostring(kind or "input"))
+end
+
 function HomeWidget:handleEvent(event)
     if event and event.handler=="onGesture" then
+        self:_notify_resume_interaction("gesture")
         local ges=event.args and event.args[1]
         local direction=ges and ges.direction
         local gesture=ges and ges.ges
@@ -1055,25 +1067,30 @@ function HomeWidget:init()
 end
 
 function HomeWidget:onShelfNext()
+    self:_notify_resume_interaction("page-next")
     if self.opts and self.opts.on_shelf_page then self.opts.on_shelf_page(1) end
     return true
 end
 function HomeWidget:onShelfPrevious()
+    self:_notify_resume_interaction("page-previous")
     if self.opts and self.opts.on_shelf_page then self.opts.on_shelf_page(-1) end
     return true
 end
 
 function HomeWidget:onMenu()
+    self:_notify_resume_interaction("menu")
     logger.info("[MiuRead][Home] physical menu")
     if self.opts and self.opts.on_menu then self.opts.on_menu() end
     return true
 end
 function HomeWidget:onBack()
+    self:_notify_resume_interaction("back")
     -- The MiuRead home is the root page. Back must not leak to FileManager.
     logger.info("[MiuRead][Home] back consumed at root")
     return true
 end
 function HomeWidget:onHome()
+    self:_notify_resume_interaction("home")
     logger.info("[MiuRead][Home] home consumed at root")
     return true
 end
@@ -1118,7 +1135,7 @@ end
 -- FileManager is recreated after ReaderUI closes so KOReader's docless
 -- plugins (including Gesture Manager) remain alive beneath MiuRead. Move the
 -- already-built home above that native base without closing/rebuilding it.
-function HomeView.raise()
+function HomeView.raise(skip_dirty)
     if not HomeView.is_shown() then return false end
     local stack = UIManager._window_stack or {}
     local window, index
@@ -1143,7 +1160,20 @@ function HomeView.raise()
         end
     end
     table.insert(stack, insert_at, window)
-    UIManager:setDirty(live_widget, "ui")
+    if skip_dirty~=true then UIManager:setDirty(live_widget, "ui") end
+    return true
+end
+function HomeView.resume(opts)
+    if not HomeView.is_shown() then return false end
+    opts=opts or {}
+    live_widget._miu_resume_interaction_callback=opts.on_interaction
+    live_widget._miu_resume_waiting_interaction=true
+    live_widget._miu_last_interaction_at=0
+    if live_widget._metrics_cache then live_widget:_register_top_swipe(live_widget._metrics_cache) end
+    HomeView.raise(true)
+    -- Do not call update() or _rebuild() here.  Repaint the existing surface so
+    -- wake-up work is bounded and every current TapBox remains attached.
+    UIManager:setDirty(live_widget,"full")
     return true
 end
 function HomeView.close()
