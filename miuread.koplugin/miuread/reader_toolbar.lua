@@ -17,11 +17,17 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local ok_socket, socket = pcall(require, "socket")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
 local live_toolbar
+
+local function now()
+    if ok_socket and socket and type(socket.gettime) == "function" then return socket.gettime() end
+    return os.time()
+end
 
 local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
 function OffsetContainer:getSize() return self[1]:getSize() end
@@ -96,7 +102,7 @@ local function action_cell(entry, width, height, close_callback)
     local tap = TapBox:new{
         dimen = Geom:new{w = width, h = height},
         enabled = enabled,
-        callback = function() close_callback(entry.callback) end,
+        callback = function() close_callback(entry.callback, entry.label or entry.text or entry.key or "功能") end,
     }
     tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, content}
     return tap
@@ -126,7 +132,7 @@ local function compact_button(entry, width, height, close_callback)
     local tap = TapBox:new{
         dimen = Geom:new{w = width, h = height},
         enabled = enabled,
-        callback = function() close_callback(entry.callback) end,
+        callback = function() close_callback(entry.callback, entry.label or entry.text or entry.key or "最近功能") end,
     }
     tap[1] = Skin.frame(width, height, {
         bordersize = Skin.line("thin"),
@@ -173,10 +179,24 @@ local Toolbar = InputContainer:extend{
     opts = nil,
     closed = false,
     pending_action = nil,
+    opened_at = 0,
+    action_locked = false,
 }
 
 function Toolbar:handleEvent(event)
     return InputContainer.handleEvent(self, event)
+end
+
+function Toolbar:_activate(action, label)
+    if self.closed or self.action_locked then return true end
+    local elapsed = now() - (tonumber(self.opened_at) or 0)
+    if elapsed >= 0 and elapsed < .22 then
+        logger.info("[MiuRead][ReaderToolbar] opening tap ignored", tostring(label or "unknown"))
+        return true
+    end
+    self.action_locked = true
+    logger.info("[MiuRead][ReaderToolbar] tapped", tostring(label or "unknown"))
+    return self:_close(action)
 end
 
 function Toolbar:_close(action, cancel_pending)
@@ -193,6 +213,8 @@ end
 
 function Toolbar:init()
     self.opts = self.opts or {}
+    self.opened_at = now()
+    self.action_locked = false
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     local portrait = sw < sh
     local outer_margin = Skin.dp(10, 8, 18)
@@ -241,7 +263,7 @@ function Toolbar:init()
     local title_w = math.max(1, content_w - side_w * 2)
     local close_tap = TapBox:new{
         dimen = Geom:new{w = side_w, h = title_h},
-        callback = function() self:_close() end,
+        callback = function() self:_activate(nil, "关闭面板") end,
     }
     close_tap[1] = Ui.icon("close", side_w, title_h, Skin.dp(21, 18, 28), {
         face = Skin.face("cfont", 17.5, 22.5, 14.8),
@@ -251,7 +273,7 @@ function Toolbar:init()
     local home_tap = TapBox:new{
         dimen = Geom:new{w = side_w, h = title_h},
         enabled = type(home_action) == "function",
-        callback = function() self:_close(home_action) end,
+        callback = function() self:_activate(home_action, "返回主页") end,
     }
     home_tap[1] = Ui.icon("home", side_w, title_h, Skin.dp(28, 24, 36), {
         face = Skin.face("cfont", 19.2, 25.2, 16.2),
@@ -315,7 +337,7 @@ function Toolbar:init()
     end
 
     y = y + gap
-    local grid, actual_grid_h = action_grid(buttons, content_w, card_h, columns, function(action) self:_close(action) end)
+    local grid, actual_grid_h = action_grid(buttons, content_w, card_h, columns, function(action, label) self:_activate(action, label) end)
     root[#root + 1] = OffsetContainer:new{x_off = outer_margin + pad, y_off = y, grid}
     y = y + actual_grid_h
 
@@ -338,7 +360,7 @@ function Toolbar:init()
             root[#root + 1] = OffsetContainer:new{
                 x_off = outer_margin + pad + (index - 1) * (recent_w + recent_gap),
                 y_off = y,
-                compact_button(recent[index], recent_w, recent_h, function(action) self:_close(action) end),
+                compact_button(recent[index], recent_w, recent_h, function(action, label) self:_activate(action, label) end),
             }
         end
         y = y + recent_h
@@ -350,7 +372,7 @@ function Toolbar:init()
         local footer_tap = TapBox:new{
             dimen = Geom:new{w = content_w, h = footer_h},
             enabled = footer.enabled ~= false,
-            callback = function() self:_close(footer.callback) end,
+            callback = function() self:_activate(footer.callback, footer.label or "全部阅读功能") end,
         }
         local footer_layers = OverlapGroup:new{dimen = Geom:new{w = content_w, h = footer_h}, allow_mirroring = false}
         footer_layers[#footer_layers + 1] = OffsetContainer:new{

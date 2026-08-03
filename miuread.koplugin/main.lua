@@ -57,6 +57,7 @@ local ReaderTocDialog=require("miuread.reader_toc_dialog")
 local ReaderFrontlightDialog=require("miuread.reader_frontlight_dialog")
 local BookRepair=require("miuread.book_repair")
 local StatusToast=require("miuread.status_toast")
+local ReaderTransitionGuard=require("miuread.reader_transition_guard")
 local Actions=require("miuread.actions")
 local function gesture_aware_class(base, attributes)
     local class=base:extend(attributes or {})
@@ -284,6 +285,7 @@ function Plugin:init()
     self._reader_native_menu_opening=false
     self._post_reader_work_task=nil
     self._post_reader_work_generation=0
+    self._reader_recovery_dialog=nil
     -- Opening state is shared with the FileManager-side plugin instance so a
     -- slow tap cannot start the same ReaderUI transition twice.
     if tonumber(HOME_SESSION.opening_at or 0)>0
@@ -5266,6 +5268,8 @@ function Plugin:_begin_koreader_exit(reason)
     persist_home_session()
     self._home_start_generation=(tonumber(self._home_start_generation) or 0)+1
     self:_home_stop_background(reason or "KOReader exit")
+    self:_close_reader_recovery_surface()
+    self:_release_reader_transition_guard("KOReader exit")
     HomeQuickPanel.close()
     HomeView.close()
     self._home_view=nil
@@ -6469,7 +6473,7 @@ function Plugin:_close_miuread_transients()
         local window=UIManager._window_stack[index]
         local widget=window and window.widget or nil
         if widget and widget~=HomeView.current() and widget._miuread_transient==true
-            and UIManager:isWidgetShown(widget) then
+            and widget._miuread_recovery_surface~=true and UIManager:isWidgetShown(widget) then
             pending[#pending+1]=widget
         end
     end
@@ -6633,6 +6637,64 @@ function Plugin:_set_foreground(owner)
         HOME_SESSION.foreground_changed_at=os.time()
     end
     return HOME_SESSION.foreground
+end
+
+function Plugin:_ensure_reader_transition_guard(reason)
+    sync_home_session()
+    if HOME_EXITING or UIManager._exit_code~=nil or HOME_SESSION.suspended==true then return false end
+    if not self:_home_enabled() or not HOME_READER_ORIGIN then return false end
+    local reader=self:_active_reader_ui()
+    if not reader and self.ui and self.ui.document then reader=self.ui end
+    local shown=ReaderTransitionGuard.ensure(reader,reason or "reader session")
+    if shown then HOME_SESSION.transition_guard=true end
+    return shown
+end
+
+function Plugin:_release_reader_transition_guard(reason)
+    HOME_SESSION.transition_guard=false
+    return ReaderTransitionGuard.close(reason or "surface ready")
+end
+
+function Plugin:_close_reader_recovery_surface()
+    local dialog=self._reader_recovery_dialog
+    self._reader_recovery_dialog=nil
+    if dialog and UIManager:isWidgetShown(dialog) then pcall(UIManager.close,UIManager,dialog) end
+end
+
+function Plugin:_show_reader_recovery_surface(detail)
+    if self._reader_recovery_dialog and UIManager:isWidgetShown(self._reader_recovery_dialog) then return true end
+    local dialog
+    local function try_home()
+        if dialog and UIManager:isWidgetShown(dialog) then UIManager:close(dialog) end
+        self._reader_recovery_dialog=nil
+        self:_set_foreground("home_pending")
+        self:_restore_home_after_reader_close(1)
+    end
+    local function try_native()
+        if dialog and UIManager:isWidgetShown(dialog) then UIManager:close(dialog) end
+        self._reader_recovery_dialog=nil
+        if self:_ensure_filemanager_base(HOME_RETURN_FILE or HOME_READER_FILE) then
+            self:_set_foreground("native")
+            self:_release_reader_transition_guard("native recovery ready")
+            UIManager:setDirty("all","full")
+        else
+            UIManager:scheduleIn(.12,function() self:_show_reader_recovery_surface("KOReader 文件管理器仍未就绪") end)
+        end
+    end
+    dialog=ButtonDialog:new{
+        title="页面暂时无法恢复"..((detail and tostring(detail)~="") and ("\n\n"..tostring(detail)) or ""),
+        title_align="center",
+        buttons={
+            {{text="返回觅阅主页",callback=try_home}},
+            {{text="打开 KOReader 文件管理器",callback=try_native}},
+            {{text="重启 KOReader",callback=function() self:_restart_koreader("reader-recovery") end}},
+        },
+    }
+    dialog._miuread_recovery_surface=true
+    self._reader_recovery_dialog=dialog
+    UIManager:show(dialog)
+    logger.warn("[MiuRead][Reader] recovery surface shown",tostring(detail or "unknown"))
+    return true
 end
 
 function Plugin:_cancel_reader_close_settle(reason)
@@ -6907,6 +6969,11 @@ function Plugin:_ensure_filemanager_base(file)
         logger.warn("[MiuRead][Home] failed to recreate FileManager base",tostring(err))
         return false
     end
+    if not FileManager.instance then
+        logger.warn("[MiuRead][Home] FileManager base was not established")
+        return false
+    end
+    logger.info("[MiuRead][Home] FileManager base ready")
     return true
 end
 
@@ -6930,7 +6997,15 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
     local has_base=ok_fm and FileManager and FileManager.instance~=nil
     if HomeView.is_shown() then
         if not has_base then
-            self:_ensure_filemanager_base(HOME_RETURN_FILE or HOME_READER_FILE)
+            has_base=self:_ensure_filemanager_base(HOME_RETURN_FILE or HOME_READER_FILE)==true
+        end
+        if not has_base then
+            if attempt<24 then
+                UIManager:scheduleIn(.12,function() self:_restore_home_after_reader_close(attempt+1,generation) end)
+            else
+                self:_show_reader_recovery_surface("KOReader 文件管理器未能恢复")
+            end
+            return false
         end
         -- FileManager provides KOReader's docless services and gesture manager,
         -- but it must stay below the MiuRead root.
@@ -6940,21 +7015,36 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
         HOME_RETURN_FILE=nil
         persist_home_session()
         self:_set_foreground("home")
+        self:_close_reader_recovery_surface()
+        self:_release_reader_transition_guard("home already visible")
         return true
     end
 
     if not has_base then
-        self:_ensure_filemanager_base(HOME_RETURN_FILE)
-        if attempt<24 then
-            UIManager:scheduleIn(.12,function() self:_restore_home_after_reader_close(attempt+1,generation) end)
+        has_base=self:_ensure_filemanager_base(HOME_RETURN_FILE)==true
+        if not has_base then
+            if attempt<24 then
+                UIManager:scheduleIn(.12,function() self:_restore_home_after_reader_close(attempt+1,generation) end)
+            else
+                self:_show_reader_recovery_surface("KOReader 文件管理器未能恢复")
+            end
+            return false
         end
-        return false
     end
 
-    local shown=self:_show_miuread_home_now(false,false)
+    local shown=self:_show_miuread_home_now(false,false,true)
+    if not shown and attempt<2 then
+        UIManager:scheduleIn(.12,function() self:_restore_home_after_reader_close(attempt+1,generation) end)
+        return false
+    end
     if shown then
         HOME_RETURN_FILE=nil
         self:_set_foreground("home")
+        self:_close_reader_recovery_surface()
+        self:_release_reader_transition_guard("home restored")
+        UIManager:setDirty("all","full")
+    else
+        self:_show_reader_recovery_surface("觅阅主页未能创建，已保留安全退路")
     end
     return shown
 end
@@ -6975,6 +7065,7 @@ function Plugin:_begin_reader_return(reason,file)
     self._reader_return_reason=tostring(reason or "return home")
     self._reader_return_completed_generation=nil
     self._reader_return_session_generation=tonumber(HOME_SESSION.reader_session_generation) or 0
+    self:_ensure_reader_transition_guard("explicit return requested")
     HOME_SESSION.return_requested=true
     HOME_SESSION.return_session_generation=self._reader_return_session_generation
     HOME_SESSION.return_request_file=normalized_reader_file(file) or HOME_SESSION.reader_session_file
@@ -7068,6 +7159,7 @@ function Plugin:_finish_reader_return(generation,attempt,reason)
         UIManager:unschedule(self._reader_return_finish_task)
         self._reader_return_finish_task=nil
     end
+    self:_ensure_reader_transition_guard("finishing reader return")
     self:_ensure_filemanager_base(HOME_RETURN_FILE or HOME_READER_FILE)
     self:_close_miuread_transients()
     self:_set_foreground("home_pending")
@@ -7089,6 +7181,7 @@ function Plugin:return_to_miuread_home(reason)
     HOME_SESSION.return_request_file=normalized_reader_file(HOME_READER_FILE or HOME_RETURN_FILE)
     persist_home_session()
 
+    self:_ensure_reader_transition_guard("return entry")
     local readerui=self:_active_reader_ui()
     if readerui then
         local file=self:_reader_file(readerui,HOME_RETURN_FILE)
@@ -11077,7 +11170,9 @@ function Plugin:onReaderReady()
     HOME_SESSION.reader_session_file=normalized_reader_file(self:_current_document_path())
     self._reader_session_generation=HOME_SESSION.reader_session_generation
     self._home_reader_transition=false
+    self:_close_reader_recovery_surface()
     self:_close_home_for_reader("reader ready")
+    self:_ensure_reader_transition_guard("reader ready")
     if self._reader_active_path then U.atomic_write(self._reader_active_path,"1",true) end
     -- Give EPUB opening and the first visible page priority over a background
     -- book generation task. The worker resumes automatically after this window.
@@ -11224,6 +11319,7 @@ function Plugin:onResume()
     local reader_active=self.ui and self.ui.document
     if reader_active then
         self:_close_home_for_reader("resume into reader")
+        self:_ensure_reader_transition_guard("resume into reader")
         self:_set_foreground("reader")
         UIManager:nextTick(function()
             if self.ui and self.ui.document then
@@ -11282,8 +11378,29 @@ function Plugin:_run_post_reader_work(generation)
     self._post_reader_work_task=nil
     local phase=tostring(HOME_SESSION.post_reader_work_phase or "")
     if phase=="" then return true end
-    if self:_active_reader_ui() then
+    if self:_active_reader_ui() or ReaderTransitionGuard.is_shown() then
         logger.info("[MiuRead][Download] post-reader work deferred",phase)
+        local task
+        task=function()
+            if self._post_reader_work_task~=task then return end
+            self._post_reader_work_task=nil
+            self:_run_post_reader_work(generation)
+        end
+        self._post_reader_work_task=task
+        UIManager:scheduleIn(.8,task)
+        return false
+    end
+    local ok_fm,FileManager=pcall(require,"apps/filemanager/filemanager")
+    if not HomeView.is_shown() and not (ok_fm and FileManager and FileManager.instance) then
+        logger.info("[MiuRead][Download] post-reader work waiting for stable surface",phase)
+        local task
+        task=function()
+            if self._post_reader_work_task~=task then return end
+            self._post_reader_work_task=nil
+            self:_run_post_reader_work(generation)
+        end
+        self._post_reader_work_task=task
+        UIManager:scheduleIn(.8,task)
         return false
     end
     if phase=="install" then
@@ -11333,6 +11450,7 @@ function Plugin:_schedule_post_reader_work(reason,delay)
 end
 
 function Plugin:onCloseDocument()
+    self:_ensure_reader_transition_guard("close document")
     if self._reader_checkpoint_dirty==true then
         self:_flush_reader_checkpoint("close_document",true)
     end
@@ -11372,7 +11490,7 @@ function Plugin:onCloseDocument()
     self:_teardown_thought_tap(); self._progress_prompted_book_id=nil; self._progress_check_running=false; self.sync:on_close()
     -- Keep post-close work pending until a non-reading surface is available.
     -- Opening another book quickly no longer drops installation or queue work.
-    self:_schedule_post_reader_work("document closed",.8)
+    self:_schedule_post_reader_work("document closed",1.4)
     sync_home_session()
     HOME_SESSION.reader_session_active=false
     local session_generation=tonumber(HOME_SESSION.reader_session_generation) or 0
@@ -11400,6 +11518,17 @@ function Plugin:onCloseDocument()
         end
     else
         self:_set_foreground("native")
+        if ReaderTransitionGuard.is_shown() then
+            UIManager:scheduleIn(.08,function()
+                if self:_active_reader_ui() then return end
+                if self:_ensure_filemanager_base(closing_path) then
+                    self:_release_reader_transition_guard("native surface restored")
+                    UIManager:setDirty("all","full")
+                else
+                    self:_show_reader_recovery_surface("KOReader 文件管理器未能恢复")
+                end
+            end)
+        end
     end
 end
 function Plugin:onFlushSettings()
