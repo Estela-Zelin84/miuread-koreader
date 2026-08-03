@@ -237,7 +237,7 @@ function Toolbar:init()
     }
 
     local y = top_inset + pad
-    local side_w = Skin.dp(44, 38, 58)
+    local side_w = Skin.dp(50, 44, 64)
     local title_w = math.max(1, content_w - side_w * 2)
     local close_tap = TapBox:new{
         dimen = Geom:new{w = side_w, h = title_h},
@@ -253,8 +253,8 @@ function Toolbar:init()
         enabled = type(home_action) == "function",
         callback = function() self:_close(home_action) end,
     }
-    home_tap[1] = Ui.icon("home", side_w, title_h, Skin.dp(21, 18, 28), {
-        face = Skin.face("cfont", 15.8, 20.8, 13.2),
+    home_tap[1] = Ui.icon("home", side_w, title_h, Skin.dp(28, 24, 36), {
+        face = Skin.face("cfont", 19.2, 25.2, 16.2),
         fgcolor = type(home_action) == "function" and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
     })
     root[#root + 1] = OffsetContainer:new{

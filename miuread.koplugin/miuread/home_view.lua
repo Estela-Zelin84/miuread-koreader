@@ -1112,8 +1112,10 @@ function HomeWidget:onHome()
 end
 
 function HomeWidget:onSetDimensions()
+    self:_close_rotation_transients()
+    self:_clear_inactive_section_cache()
     self:_rebuild()
-    UIManager:setDirty(self, "full")
+    UIManager:setDirty("all", "full")
     return true
 end
 function HomeWidget:_close_rotation_transients()

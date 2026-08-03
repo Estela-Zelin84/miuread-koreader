@@ -14,6 +14,7 @@ local Screen = Device.screen
 local Toast = InputContainer:extend{
     title = "",
     toast = true,
+    _miuread_transient = true,
     text = "",
     timeout = 3,
     modal = false,
@@ -115,11 +116,27 @@ function Toast:onCloseWidget()
     self._closing_with_refresh = false
 end
 
-local M = {}
+local M = {blocked = false}
 local active_toast = nil
+
+function M.close()
+    if active_toast then
+        local toast=active_toast
+        active_toast=nil
+        pcall(toast._close,toast)
+    end
+    return true
+end
+
+function M.set_blocked(blocked)
+    M.blocked=blocked==true
+    if M.blocked then M.close() end
+    return true
+end
 
 function M.show(opts)
     opts = opts or {}
+    if M.blocked then return nil end
     if active_toast then
         pcall(active_toast._close, active_toast)
         active_toast = nil

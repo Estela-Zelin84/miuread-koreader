@@ -339,10 +339,12 @@ function QuickPanelWidget:onBack()
     return true
 end
 function QuickPanelWidget:onScreenResize()
+    self._rotation_close = true
     self:_close(nil, true)
     return true
 end
 function QuickPanelWidget:onRotation()
+    self._rotation_close = true
     self:_close(nil, true)
     return true
 end
@@ -357,7 +359,13 @@ function QuickPanelWidget:onCloseWidget()
     self.pending_action = nil
     self._closed = true
     if live_panel == self then live_panel = nil end
-    if region then UIManager:setDirty(nil, function() return "ui", region end) end
+    if self._rotation_close then
+        UIManager:scheduleIn(.05, function()
+            if UIManager._exit_code == nil then UIManager:setDirty("all", "full") end
+        end)
+    elseif region then
+        UIManager:setDirty(nil, function() return "ui", region end)
+    end
     if action then
         UIManager:scheduleIn(.04, function()
             local ok, err = pcall(action)
