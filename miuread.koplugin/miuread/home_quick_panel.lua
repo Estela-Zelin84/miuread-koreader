@@ -338,6 +338,14 @@ function QuickPanelWidget:onBack()
     self:_close()
     return true
 end
+function QuickPanelWidget:onScreenResize()
+    self:_close(nil, true)
+    return true
+end
+function QuickPanelWidget:onRotation()
+    self:_close(nil, true)
+    return true
+end
 
 function QuickPanelWidget:onShow()
     UIManager:setDirty(self, function() return "ui", self.panel_dimen end)

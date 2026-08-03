@@ -20,6 +20,7 @@ local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UiScale = require("miuread.ui_scale")
 local U = require("miuread.util")
+local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
 
@@ -274,28 +275,34 @@ function GridShelfWidget:_build()
     local layers = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     self:_add(layers, 0, 0, fixed_frame(sw, sh, {background = Blitbuffer.COLOR_WHITE}))
 
-    local back_w = UiScale.dp(62, 55, 90)
-    local action_w = self.opts.show_actions and UiScale.dp(72, 64, 104) or 0
-    local title_w = math.max(1, sw - margin * 2 - back_w - action_w * 2 - gap * 3)
+    local inner_w = math.max(1, sw - margin * 2)
+    local back_w = UiScale.dp(54, 49, 78)
+    local action_w = self.opts.show_actions and UiScale.dp(62, 56, 92) or 0
+    local action_gap = self.opts.show_actions and UiScale.dp(5, 4, 8) or 0
+    local right_w = self.opts.show_actions and (action_w * 2 + action_gap) or 0
+    local title_gap = UiScale.dp(5, 4, 8)
+    local title_w = math.max(1, inner_w - back_w - title_gap - right_w)
     local header = HorizontalGroup:new{
         align = "center",
-        tappable(back_w, header_h, TextWidget:new{text = "‹", face = UiScale.iconFace("cfont", 20, 28), bold = true}, function() self:_close() end),
-        HorizontalSpan:new{width = gap},
-        LeftContainer:new{dimen = Geom:new{w = title_w, h = header_h}, TextBoxWidget:new{
-            text = tostring(self.opts.title or "全部书籍"),
-            face = face("cfont", 16, 22),
-            bold = true,
-            width = title_w,
-            height = header_h,
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "left",
-        }},
+        tappable(back_w, header_h, Ui.icon("back", back_w, header_h, UiScale.dp(20, 18, 28), {
+            face = UiScale.iconFace("cfont", 20, 28),
+        }), function() self:_close() end),
+        HorizontalSpan:new{width = title_gap},
+        Ui.textbox(tostring(self.opts.title or "全部书籍"), title_w, header_h,
+            face("cfont", 16, 22), {
+                bold = true, alignment = "left", halign = "left", valign = "center",
+            }),
     }
     if self.opts.show_actions then
-        header[#header + 1] = HorizontalSpan:new{width = gap}
-        header[#header + 1] = tappable(action_w, header_h, TextWidget:new{text = "⌕", face = UiScale.iconFace("cfont", 17, 24), bold = true}, self.opts.on_left_action)
-        header[#header + 1] = tappable(action_w, header_h, TextWidget:new{text = "筛选", face = face("smallinfofont", 10, 14), bold = true}, self.opts.on_right_action)
+        header[#header + 1] = tappable(action_w, header_h,
+            Ui.icon("search", action_w, header_h, UiScale.dp(19, 17, 27), {
+                face = UiScale.iconFace("cfont", 17, 24),
+            }), self.opts.on_left_action)
+        header[#header + 1] = HorizontalSpan:new{width = action_gap}
+        header[#header + 1] = tappable(action_w, header_h,
+            Ui.text("筛选", action_w, header_h, face("smallinfofont", 10, 14), {
+                bold = true, halign = "center", valign = "center",
+            }), self.opts.on_right_action)
     end
     self:_add(layers, margin, margin, header)
     self:_add(layers, margin, margin + header_h, LineWidget:new{
@@ -393,8 +400,28 @@ function GridShelfWidget:onSetDimensions()
     UIManager:setDirty(self, "full")
     return true
 end
-function GridShelfWidget:onScreenResize() return self:onSetDimensions() end
-function GridShelfWidget:onRotation() return self:onSetDimensions() end
+function GridShelfWidget:_schedule_dimension_refresh()
+    self._dimension_generation = (tonumber(self._dimension_generation) or 0) + 1
+    local generation = self._dimension_generation
+    local last_w, last_h, stable, attempts = nil, nil, 0, 0
+    local function settle()
+        if self._miu_closed or generation ~= self._dimension_generation then return end
+        attempts = attempts + 1
+        local sw, sh = Screen:getWidth(), Screen:getHeight()
+        if sw == last_w and sh == last_h then stable = stable + 1
+        else last_w, last_h, stable = sw, sh, 0 end
+        if stable >= 1 or attempts >= 8 then
+            self:onSetDimensions()
+            UIManager:setDirty("all", "full")
+            return
+        end
+        UIManager:scheduleIn(.08, settle)
+    end
+    UIManager:scheduleIn(.06, settle)
+    return true
+end
+function GridShelfWidget:onScreenResize() return self:_schedule_dimension_refresh() end
+function GridShelfWidget:onRotation() return self:_schedule_dimension_refresh() end
 
 local FullShelfView = {}
 function FullShelfView.show(opts)

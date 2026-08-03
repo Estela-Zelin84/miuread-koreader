@@ -3,7 +3,9 @@ local Codec=require("miuread.codec")
 local U=require("miuread.util")
 local logger=require("logger")
 local Library={}; Library.__index=Library
-function Library:new(api,http,store) return setmetatable({api=api,http=http,store=store},self) end
+function Library:new(api,http,store)
+    return setmetatable({api=api,http=http,store=store,_sort_cache={}},self)
+end
 
 local COVER_MAX_BYTES=12*1024*1024
 local COVER_EXTENSIONS={
@@ -440,9 +442,35 @@ function Library:combined(remote_books,remote_mp,library_snapshot,sessions_snaps
     return self:merge_books(remote_books,local_books),self:merge_books(remote_mp,local_mp)
 end
 
+local function shelf_rows_fingerprint(rows,section)
+    local parts={tostring(section or ""), tostring(#(rows or {}))}
+    for index,row in ipairs(rows or {}) do
+        parts[#parts+1]=table.concat({
+            tostring(index), tostring(row.bookId or row.file or row.title or ""),
+            tostring(row.title or ""), tostring(row.author or ""),
+            tostring(row.file or ""), tostring(row.cover_path or row.cover or ""),
+            tostring(row.cloudOrder or ""), tostring(row.readUpdateTime or ""),
+            tostring(row.explicitOrder or ""), tostring(row.rawIndex or ""),
+            tostring(row.downloadedAt or row.downloaded_at or ""),
+            tostring(row.progress or ""), tostring(row.status_text or row.download_status or ""),
+            row.isTop==true and "1" or "0",
+            row.in_account_shelf==true and "1" or "0",
+            row.generated==true and "1" or "0",
+            row.downloaded==true and "1" or "0",
+        },":")
+    end
+    return table.concat(parts,"|")
+end
+
 function Library:sort_filter(rows,options)
     options=options or {}
     local section=tostring(options.section or "account")
+    self._sort_cache=type(self._sort_cache)=="table" and self._sort_cache or {}
+    local fingerprint=shelf_rows_fingerprint(rows,section)
+    local cached=self._sort_cache[section]
+    if cached and cached.fingerprint==fingerprint and type(cached.rows)=="table" then
+        return U.copy(cached.rows)
+    end
     local out=U.copy(rows or {})
     if section=="account" then
         -- normalize() already selected the best available server ordering.
@@ -471,6 +499,7 @@ function Library:sort_filter(rows,options)
             return tostring(a.bookId or "")<tostring(b.bookId or "")
         end)
     end
+    self._sort_cache[section]={fingerprint=fingerprint,rows=U.copy(out)}
     logger.info("[MiuRead][ShelfOrder] prepared","count=",tostring(#out),"section=",section)
     return out
 end

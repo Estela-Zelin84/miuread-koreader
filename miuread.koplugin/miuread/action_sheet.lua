@@ -435,6 +435,8 @@ function SheetWidget:onSwipeDismiss(_, ges)
     return false
 end
 function SheetWidget:onBack() return self:_close() end
+function SheetWidget:onScreenResize() return self:_close() end
+function SheetWidget:onRotation() return self:_close() end
 function SheetWidget:onShow()
     UIManager:setDirty(self, function() return "ui", self.bubble_dimen or self.panel_dimen end)
 end

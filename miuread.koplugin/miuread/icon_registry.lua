@@ -1,6 +1,7 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local ImageWidget = require("ui/widget/imagewidget")
 local TextWidget = require("ui/widget/textwidget")
+local lfs = require("libs/libkoreader-lfs")
 
 local Registry = {}
 
@@ -49,7 +50,7 @@ local MAP = {
     ["full-refresh"] = "full-refresh",
     ["return"] = "return",
     ["ko-reader"] = "ko-reader", koreader = "ko-reader",
-    display = "display", tools = "tools", device = "device", book = "book", wifi = "wifi",
+    display = "display", tools = "tools", device = "device", book = "book", wifi = "wifi", ["⌁"] = "wifi",
 }
 
 function Registry.key(value)
@@ -67,7 +68,7 @@ function Registry.widget(value, size, opts)
     opts = opts or {}
     size = math.max(1, math.floor(tonumber(size) or 20))
     local path = opts.path or Registry.path(value)
-    if path and path ~= "" then
+    if path and path ~= "" and lfs.attributes(path, "mode") == "file" then
         local image
         local ok = pcall(function()
             image = ImageWidget:new{

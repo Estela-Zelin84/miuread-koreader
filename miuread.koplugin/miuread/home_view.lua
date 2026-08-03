@@ -257,9 +257,14 @@ local function notice_strip(item, width, height)
 end
 
 local function hero_card(book, width, height, callback, compact, hold_callback)
-    local pad = math.max(UiScale.dp(7, 6, 12), math.min(UiScale.dp(12, 10, 18), math.floor(math.min(width, height) * .030)))
-    local inner_w = math.max(1, width - pad * 2)
-    local inner_h = math.max(1, height - pad * 2)
+    -- Draw the border inside the card's refresh rectangle. A line exactly on
+    -- the outer edge is clipped on a few Kindle/Kobo framebuffer paths.
+    local frame_inset = math.max(1, UiScale.dp(2, 2, 3))
+    local frame_w = math.max(1, width - frame_inset * 2)
+    local frame_h = math.max(1, height - frame_inset * 2)
+    local pad = math.max(UiScale.dp(7, 6, 12), math.min(UiScale.dp(12, 10, 18), math.floor(math.min(frame_w, frame_h) * .030)))
+    local inner_w = math.max(1, frame_w - pad * 2)
+    local inner_h = math.max(1, frame_h - pad * 2)
     local cover_w = math.max(UiScale.dp(76, 64, 110), math.min(
         math.floor(inner_w * (compact and .24 or .27)),
         math.floor(inner_h * .82)
@@ -341,38 +346,49 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
         height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
     })
 
-    local content = fixed_frame(width, height, {
-        bordersize = UiScale.line("thin"),
-        radius = UiScale.radius(9, 6, 15),
-        padding = pad,
-        background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_DARK_GRAY,
-    }, HorizontalGroup:new{
-        align = "center",
-        cover,
-        HorizontalSpan:new{width = gap},
-        text,
-    })
+    local content = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+    content[#content + 1] = OffsetContainer:new{
+        x_off = frame_inset,
+        y_off = frame_inset,
+        fixed_frame(frame_w, frame_h, {
+            bordersize = math.max(UiScale.line("thin"), 1),
+            radius = UiScale.radius(9, 6, 15),
+            padding = pad,
+            background = Blitbuffer.COLOR_WHITE,
+            color = Blitbuffer.COLOR_DARK_GRAY,
+        }, HorizontalGroup:new{
+            align = "center",
+            cover,
+            HorizontalSpan:new{width = gap},
+            text,
+        }),
+    }
     return tappable(width, height, content, callback, function(anchor)
         if hold_callback then hold_callback(book, anchor) end
     end)
 end
 
 local function welcome_card(width, height, callback)
-    return tappable(width, height, fixed_frame(width, height, {
-        bordersize = UiScale.line("thin"),
-        radius = UiScale.radius(9, 6, 15),
-        background = Blitbuffer.COLOR_WHITE,
-    }, VerticalGroup:new{
-        align = "center",
-        TextWidget:new{text = "开始阅读", face = UiScale.iconFace("cfont", 18, 24), bold = true},
-        VerticalSpan:new{height = UiScale.dp(7, 5, 10)},
-        TextWidget:new{
-            text = "从微信书架选择一本书",
-            face = face("smallinfofont", 11, 14),
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        },
-    }), callback)
+    local inset = math.max(1, UiScale.dp(2, 2, 3))
+    local layers = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+    layers[#layers + 1] = OffsetContainer:new{
+        x_off = inset, y_off = inset,
+        fixed_frame(math.max(1, width - inset * 2), math.max(1, height - inset * 2), {
+            bordersize = math.max(UiScale.line("thin"), 1),
+            radius = UiScale.radius(9, 6, 15),
+            background = Blitbuffer.COLOR_WHITE,
+        }, VerticalGroup:new{
+            align = "center",
+            TextWidget:new{text = "开始阅读", face = UiScale.iconFace("cfont", 18, 24), bold = true},
+            VerticalSpan:new{height = UiScale.dp(7, 5, 10)},
+            TextWidget:new{
+                text = "从微信书架选择一本书",
+                face = face("smallinfofont", 11, 14),
+                fgcolor = Blitbuffer.COLOR_BLACK,
+            },
+        }),
+    }
+    return tappable(width, height, layers, callback)
 end
 
 local function shelf_book_card(book, width, height, callback, hold_callback)
@@ -1100,21 +1116,40 @@ function HomeWidget:onSetDimensions()
     UIManager:setDirty(self, "full")
     return true
 end
+function HomeWidget:_close_rotation_transients()
+    local stack = UIManager._window_stack or {}
+    for index = #stack, 1, -1 do
+        local widget = stack[index] and stack[index].widget or nil
+        if widget and widget ~= self and widget._miuread_transient == true
+            and widget.name ~= "miuread_full_shelf"
+            and UIManager:isWidgetShown(widget) then
+            pcall(UIManager.close, UIManager, widget)
+        end
+    end
+end
+
 function HomeWidget:_schedule_dimension_refresh()
     self._dimension_refresh_generation = (tonumber(self._dimension_refresh_generation) or 0) + 1
     local generation = self._dimension_refresh_generation
-    -- E-ink devices may publish the new framebuffer dimensions a little after
-    -- the rotation event. Reflow in a few bounded passes so text, icons, lines,
-    -- cards and hit regions all end up using the final dimensions.
-    for _, delay in ipairs({.08, .24, .55}) do
-        UIManager:scheduleIn(delay, function()
-            if self._miu_closed or generation ~= self._dimension_refresh_generation then return end
-            local sw, sh = Screen:getWidth(), Screen:getHeight()
-            if delay == .55 or sw ~= self._last_screen_w or sh ~= self._last_screen_h then
-                self:onSetDimensions()
-            end
-        end)
+    self:_close_rotation_transients()
+    self:_clear_inactive_section_cache()
+    local last_w, last_h, stable, attempts = nil, nil, 0, 0
+    -- A rotation event and the final framebuffer size do not arrive together
+    -- on every device. Rebuild once, only after two consecutive samples agree.
+    local function settle()
+        if self._miu_closed or generation ~= self._dimension_refresh_generation then return end
+        attempts = attempts + 1
+        local sw, sh = Screen:getWidth(), Screen:getHeight()
+        if sw == last_w and sh == last_h then stable = stable + 1
+        else last_w, last_h, stable = sw, sh, 0 end
+        if stable >= 1 or attempts >= 8 then
+            self:onSetDimensions()
+            UIManager:setDirty("all", "full")
+            return
+        end
+        UIManager:scheduleIn(.08, settle)
     end
+    UIManager:scheduleIn(.06, settle)
     return true
 end
 function HomeWidget:onScreenResize() return self:_schedule_dimension_refresh() end
@@ -1176,9 +1211,14 @@ function HomeView.resume(opts)
     UIManager:setDirty(live_widget,"full")
     return true
 end
-function HomeView.close()
+function HomeView.close(full_refresh)
     if live_widget and not live_widget._miu_closed then UIManager:close(live_widget) end
     live_widget = nil
+    if full_refresh == true then
+        UIManager:scheduleIn(.04, function()
+            if UIManager._exit_code == nil then UIManager:setDirty("all", "full") end
+        end)
+    end
 end
 function HomeView.refresh(kind)
     if not HomeView.is_shown() then return false end

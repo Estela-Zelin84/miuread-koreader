@@ -113,6 +113,15 @@ end
 function Bridge.handle(base, widget, event)
     if event and event.handler == "onGesture" then
         local ges = event.args and event.args[1]
+        local gesture = ges and ges.ges
+        local pointer_action = gesture == "tap" or gesture == "hold"
+            or gesture == "hold_release" or gesture == "double_tap"
+            or gesture == "two_finger_tap"
+        -- Buttons, title bars and close icons on the visible MiuRead page must
+        -- receive pointer input before anything below it. Forwarding these
+        -- gestures first is what made native Menu title-bar close buttons look
+        -- tappable while their tap was actually consumed underneath.
+        if pointer_action then return base.handleEvent(widget, event) end
         if Bridge.dispatch(ges) then return true end
     end
     return base.handleEvent(widget, event)

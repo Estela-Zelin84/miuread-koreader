@@ -158,11 +158,11 @@ if type(THOUGHT_MAINTENANCE)~="table" then
     rawset(_G,"__MIUREAD_THOUGHT_MAINTENANCE",THOUGHT_MAINTENANCE)
 end
 -- Track a temporary KOReader menu visit globally because FileManager and
--- ReaderUI use different plugin instances. A clean fullscreen backdrop hides
--- both native FileManager and MiuRead until the last native menu/dialog closes.
+-- ReaderUI use different plugin instances. MiuRead remains visible underneath
+-- native menus and is raised again after the last native page closes.
 local NATIVE_MENU_GUARD=rawget(_G,"__MIUREAD_NATIVE_MENU_GUARD")
 if type(NATIVE_MENU_GUARD)~="table" then
-    NATIVE_MENU_GUARD={token=0,active=false,finishing=false,menu=nil,container=nil,watch=nil,backdrop=nil,original_close=nil}
+    NATIVE_MENU_GUARD={token=0,active=false,finishing=false,menu=nil,container=nil,watch=nil,backdrop=nil}
     rawset(_G,"__MIUREAD_NATIVE_MENU_GUARD",NATIVE_MENU_GUARD)
 end
 local DIRECT_MENU_INSERTED=false
@@ -1939,7 +1939,8 @@ function Plugin:_disable_runtime_home()
         persist_home_session()
         self:_ensure_filemanager_base(HOME_RETURN_FILE)
         HomeQuickPanel.close()
-        HomeView.close()
+        ActionSheet.close()
+        HomeView.close(true)
         self._home_view=nil
         HOME_EXPECTED_CLOSE=false
         persist_home_session()
@@ -3153,7 +3154,8 @@ function Plugin:_home_close_to_native(show_notice)
     -- Ensure there is always a native page below the fullscreen MiuRead home.
     self:_ensure_filemanager_base(HOME_RETURN_FILE)
     HomeQuickPanel.close()
-    HomeView.close()
+    ActionSheet.close()
+    HomeView.close(true)
     self._home_view=nil
     HOME_EXPECTED_CLOSE=false
     persist_home_session()
@@ -4802,10 +4804,12 @@ function Plugin:_home_account_name()
 end
 
 function Plugin:_cancel_native_menu_guard()
-    local menu=NATIVE_MENU_GUARD.menu
-    local original=NATIVE_MENU_GUARD.original_close
-    if menu and original and menu.onCloseFileManagerMenu~=original then
-        menu.onCloseFileManagerMenu=original
+    -- Clean up a beta.4 callback override if this code is loaded in the same
+    -- process during development; beta.5 never installs a new override.
+    local legacy_menu=NATIVE_MENU_GUARD.menu
+    local legacy_close=NATIVE_MENU_GUARD.original_close
+    if legacy_menu and legacy_close and legacy_menu.onCloseFileManagerMenu~=legacy_close then
+        legacy_menu.onCloseFileManagerMenu=legacy_close
     end
     NATIVE_MENU_GUARD.token=(tonumber(NATIVE_MENU_GUARD.token) or 0)+1
     NATIVE_MENU_GUARD.active=false
@@ -4835,7 +4839,10 @@ function Plugin:_return_from_native_filemanager()
     HOME_READER_FILE=nil
     persist_home_session()
     local shown=self:show_miuread_home(false)
-    if shown then HomeView.raise() end
+    if shown then
+        HomeView.raise(true)
+        UIManager:scheduleIn(.04,function() UIManager:setDirty("all","full") end)
+    end
     return shown
 end
 
@@ -4887,9 +4894,8 @@ function Plugin:_finish_native_menu_visit(token,reason)
             logger.info("[MiuRead][Home] native menu closed into reader",tostring(reason or "closed"))
             return
         end
-        -- Native settings and plugin dialogs sit above the clean backdrop.
-        -- Keep the backdrop until the last native layer is closed so neither
-        -- MiuRead nor FileManager flashes between pages.
+        -- Native settings and plugin dialogs may replace the original menu.
+        -- Wait until the last native layer closes before raising MiuRead again.
         if self:_native_menu_overlay_present() then
             local delay=attempt<20 and .12 or (attempt<80 and .3 or .7)
             UIManager:scheduleIn(delay,function() settle(attempt+1) end)
@@ -4905,10 +4911,12 @@ function Plugin:_finish_native_menu_visit(token,reason)
         persist_home_session()
         logger.info("[MiuRead][Home] native menu closed; MiuRead home revealed",tostring(reason or "closed"))
         if HomeView.is_shown() then
-            HomeView.raise()
+            HomeView.raise(true)
+            UIManager:scheduleIn(.04,function() UIManager:setDirty("all","full") end)
         else
             self:_ensure_filemanager_base(HOME_RETURN_FILE)
             self:_restore_home_after_reader_close(1)
+            UIManager:scheduleIn(.18,function() UIManager:setDirty("all","full") end)
         end
     end
     UIManager:scheduleIn(.04,function() settle(1) end)
@@ -4923,8 +4931,7 @@ function Plugin:_guard_native_koreader_menu(menu)
     NATIVE_MENU_GUARD.finishing=false
     NATIVE_MENU_GUARD.menu=menu
     NATIVE_MENU_GUARD.container=menu.menu_container
-    NATIVE_MENU_GUARD.backdrop=NativeMenuBackdrop.current()
-    NATIVE_MENU_GUARD.original_close=nil
+    NATIVE_MENU_GUARD.backdrop=nil
 
     HOME_SESSION_SUPPRESSED=false
     HOME_NATIVE_VISIT=false
@@ -4932,22 +4939,9 @@ function Plugin:_guard_native_koreader_menu(menu)
     HOME_EXPECTED_CLOSE=false
     persist_home_session()
 
-    if type(menu.onCloseFileManagerMenu)=="function" then
-        local original=menu.onCloseFileManagerMenu
-        NATIVE_MENU_GUARD.original_close=original
-        menu.onCloseFileManagerMenu=function(native_menu,...)
-            if native_menu.onCloseFileManagerMenu~=original then
-                native_menu.onCloseFileManagerMenu=original
-            end
-            if token==NATIVE_MENU_GUARD.token then
-                NATIVE_MENU_GUARD.original_close=nil
-            end
-            local result=original(native_menu,...)
-            self:_finish_native_menu_visit(token,"close callback")
-            return result
-        end
-    end
-
+    -- Do not replace KOReader's close callback. Native settings pages replace
+    -- their menu/container as navigation goes deeper; observing the window
+    -- stack is safer than changing callbacks owned by KOReader.
     local function watch()
         if token~=NATIVE_MENU_GUARD.token or not NATIVE_MENU_GUARD.active then return end
         sync_home_session()
@@ -4970,16 +4964,13 @@ end
 function Plugin:_show_native_koreader_menu()
     sync_home_session()
     if HOME_EXITING or UIManager._exit_code~=nil then return false end
+    -- Ignore repeated taps while a native menu/settings visit is active. This
+    -- prevents duplicate menu stacks and duplicate close watchers.
+    if NATIVE_MENU_GUARD.active then return true end
     self:_cancel_native_menu_guard()
     self:_ensure_filemanager_base(HOME_RETURN_FILE)
-
-    local backdrop,backdrop_err=NativeMenuBackdrop.show()
-    if not backdrop then
-        logger.warn("[MiuRead][Home] native menu backdrop failed",tostring(backdrop_err or "unknown"))
-        if HomeView.is_shown() then HomeView.raise() end
-        self:info("KOReader 菜单暂时无法打开")
-        return false
-    end
+    NativeMenuBackdrop.close()
+    if HomeView.is_shown() then HomeView.raise(true) end
 
     HOME_SESSION_SUPPRESSED=false
     HOME_NATIVE_VISIT=false
@@ -4999,7 +4990,7 @@ function Plugin:_show_native_koreader_menu()
             local ok,err=xpcall(function() menu:onShowMenu() end,debug.traceback)
             if ok then
                 self:_guard_native_koreader_menu(menu)
-                logger.info("[MiuRead][Home] native KOReader menu opened over clean backdrop")
+                logger.info("[MiuRead][Home] native KOReader menu opened over MiuRead home")
                 return true
             end
             logger.warn("[MiuRead][Home] native menu failed",tostring(err))
@@ -6327,7 +6318,7 @@ function Plugin:_reader_control_categories()
         }},
     }
     local device_items={
-        self:_reader_control_item("wifi","Wi-Fi","⌁",function() return self:_reader_wifi_settings(back_to("device")) end),
+        self:_reader_control_item("wifi","Wi-Fi","wifi",function() return self:_reader_wifi_settings(back_to("device")) end),
         self:_reader_control_item("rotation","屏幕方向","↻",function() return self:_home_rotate() end,{value=self:_reader_rotation_label(),arrow=false}),
         self:_reader_control_item("full_refresh","全屏刷新","◉",function() return self:_home_full_refresh() end,{arrow=false}),
     }
