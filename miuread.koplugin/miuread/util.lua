@@ -100,6 +100,21 @@ function U.replacement_char_count(value)
     local _,count=text:gsub("\239\191\189","")
     return count
 end
+function U.clean_utf8(value)
+    value=tostring(value or "")
+    local out,index={},1
+    while index<=#value do
+        local ending,valid=utf8_char_end(value,index)
+        if valid then
+            local chunk=value:sub(index,ending)
+            if chunk~="\239\191\189" then out[#out+1]=chunk end
+            index=ending+1
+        else
+            index=index+1
+        end
+    end
+    return table.concat(out)
+end
 function U.first_line(s,n) local v=tostring(s or ""):match("^[^\r\n]*") or ""; return U.utf8_truncate(v,n or 240) end
 function U.safe_name(s,f) local v=U.trim(tostring(s or ""):gsub("[%z%c/\\:%*%?\"<>|]","_")):gsub("%s+"," "); return v~="" and v or (f or "item") end
 function U.id_name(s) local v=tostring(s or ""):gsub("[^%w%._%-]","_"); return v~="" and v or "unknown" end

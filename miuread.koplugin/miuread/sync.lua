@@ -15,7 +15,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 9
+local READ_REPORT_SERVICE_VERSION = 10
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
 
@@ -320,11 +320,11 @@ function Sync:new(reader, api, store, host, async, identity_async)
         state="stopped", tick_count=0, last_report_clock=0, next_due=0,
         consecutive_failures=0, first_success_notified=false, failure_notified=false,
         verified_book_id=nil, verified_at=0, verified_local_percent=nil,
-        verified_remote_percent=nil, verification_ttl=4 * 60 * 60,
+        verified_remote_percent=nil, verified_login_session_id=nil, verification_ttl=4 * 60 * 60,
         daemon=nil, daemon_poll=nil, daemon_status_stamp=nil,
         daemon_context=nil, daemon_last_persist=0, daemon_generation=0,
         daemon_restart_count=0, auth_recovery_busy=false, auth_recovery_at=0,
-        daemon_auth_retry_at=0,
+        daemon_auth_retry_at=0, auth_transitioning=false,
         control_write_task=nil, session_started_at=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
         time_enabled=(store:preferences().sync or {}).time_enabled==true,
@@ -336,10 +336,9 @@ function Sync:new(reader, api, store, host, async, identity_async)
         object:_retire_legacy_daemon()
         legacy_daemon_retired = true
     end
-    -- Prestart only when the feature is enabled. This keeps the low-memory
-    -- benefit of forking before CREngine opens a large book without imposing a
-    -- permanent polling process on users who disabled reading-time sync.
-    if object.time_enabled then object:_ensure_daemon() end
+    -- Start the lightweight reporter only after a real reading session has
+    -- been verified. Prestarting it on the bookshelf competes with startup I/O
+    -- on older e-ink devices and provides no value before a book is opened.
     return object
 end
 
@@ -426,8 +425,11 @@ function Sync:local_position(ratio)
     local standalone_uid = record.record and record.record.chapter_uid
     if standalone_uid ~= nil and tostring(standalone_uid) ~= "" then
         local session = self.store:session(record.book.book_id) or {}
+        local auth=self.store:auth()
+        local context_matches=tostring(session.report_login_session_id or "")
+            ==tostring(auth.login_session_id or "")
         local context = self.daemon_context
-            or (type(session.legacy_report_context) == "table" and session.legacy_report_context)
+            or (context_matches and type(session.legacy_report_context) == "table" and session.legacy_report_context)
             or {}
         local position = context.catalog_complete == true and map_standalone_position(context.chapters, standalone_uid, ratio, {
             chapter_index = record.record and record.record.chapter_map
@@ -466,8 +468,11 @@ function Sync:jump_remote(remote)
     end
 
     local session = self.store:session(record.book.book_id) or {}
+    local auth=self.store:auth()
+    local context_matches=tostring(session.report_login_session_id or "")
+        ==tostring(auth.login_session_id or "")
     local context = self.daemon_context
-        or (type(session.legacy_report_context) == "table" and session.legacy_report_context)
+        or (context_matches and type(session.legacy_report_context) == "table" and session.legacy_report_context)
         or {}
     if context.catalog_complete ~= true then return false, "完整目录尚未准备好" end
     local chapters = type(context.chapters) == "table" and context.chapters or {}
@@ -499,7 +504,9 @@ end
 
 function Sync:is_verified(book_id)
     book_id = tostring(book_id or "")
-    if book_id == "" or tostring(self.verified_book_id or "") ~= book_id then return false end
+    local auth=self.store:auth()
+    if book_id == "" or tostring(self.verified_book_id or "") ~= book_id
+        or tostring(self.verified_login_session_id or "")~=tostring(auth.login_session_id or "") then return false end
     local age = os.time() - (tonumber(self.verified_at or 0) or 0)
     return age >= 0 and age <= (tonumber(self.verification_ttl) or 14400)
 end
@@ -519,6 +526,7 @@ function Sync:clear_verified(reason)
     self.verified_at = 0
     self.verified_local_percent = nil
     self.verified_remote_percent = nil
+    self.verified_login_session_id = nil
     if old_book then
         self.store:save_session(tostring(old_book), {
             remote_verified=false, verified_at=nil, verified_reason=tostring(reason or "cleared"),
@@ -558,8 +566,11 @@ function Sync:_remote_catalog(book_id)
     local standalone_uid=record.record and record.record.chapter_uid
     if standalone_uid~=nil and tostring(standalone_uid)~="" then
         local session=self.store:session(record.book.book_id) or {}
+        local auth=self.store:auth()
+        local context_matches=tostring(session.report_login_session_id or "")
+            ==tostring(auth.login_session_id or "")
         local context=self.daemon_context
-            or (type(session.legacy_report_context)=="table" and session.legacy_report_context)
+            or (context_matches and type(session.legacy_report_context)=="table" and session.legacy_report_context)
             or {}
         if context.catalog_complete==true and type(context.chapters)=="table" and #context.chapters>0 then
             map=context.chapters
@@ -579,6 +590,10 @@ function Sync:remote(book_id, callback, options)
     self.state = "fetching_remote"
     self.last_stage = "读取云端进度"
     local threshold=tonumber(self.store:preferences().sync.threshold) or 2
+    local auth_snapshot=self.store:auth()
+    local account_snapshot=type(auth_snapshot.account)=="table" and auth_snapshot.account or {}
+    local login_snapshot=tostring(auth_snapshot.login_session_id or "")
+    local vid_snapshot=tostring(account_snapshot.vid or "")
     local ok, err = self.async:run("remote_progress", function()
         local out={}
         local agent_ok,agent=pcall(self.api.progress,self.api,book_id)
@@ -588,6 +603,14 @@ function Sync:remote(book_id, callback, options)
         return out
     end, function(result)
         self.store:reload()
+        local current_auth=self.store:auth()
+        local current_account=type(current_auth.account)=="table" and current_auth.account or {}
+        if login_snapshot=="" or login_snapshot~=tostring(current_auth.login_session_id or "")
+            or vid_snapshot~=tostring(current_account.vid or "") then
+            logger.warn("[MiuRead][Sync] stale remote progress ignored")
+            callback(nil,"登录状态已变化")
+            return
+        end
         self.state = self.progress_hold and "progress_sync" or "waiting"
         if not result.ok or type(result.value)~="table" then
             self.last_error = result.error or "remote progress unavailable"
@@ -644,11 +667,13 @@ function Sync:mark_verified(book_id, reason, local_percent, remote_percent)
     self.verified_at = os.time()
     self.verified_local_percent = tonumber(local_percent)
     self.verified_remote_percent = tonumber(remote_percent)
+    self.verified_login_session_id = tostring(self.store:auth().login_session_id or "")
     self.store:save_session(book_id, {
         remote_verified=true, verified_at=self.verified_at,
         verified_reason=tostring(reason or "confirmed"),
         verified_local_percent=self.verified_local_percent,
         verified_remote_percent=self.verified_remote_percent,
+        verification_login_session_id=self.verified_login_session_id,
         progress_local_percent=self.verified_local_percent, pending=false,
     })
     self.store:update_cached_progress(book_id, self.verified_local_percent)
@@ -728,13 +753,21 @@ function Sync:upload(elapsed, callback, options)
     local book_id = tostring(record.book.book_id)
     local session = self.store:session(book_id) or {}
     local auth = self.store:auth()
+    local account=type(auth.account)=="table" and auth.account or {}
+    local login_snapshot=tostring(auth.login_session_id or "")
+    local vid_snapshot=tostring(account.vid or "")
+    if login_snapshot=="" or vid_snapshot=="" then
+        if callback then callback(false,"当前账号登录会话无效，请重新扫码登录") end
+        return false
+    end
     local ratio = self:local_ratio() or 0
     local auth_channel=options.progress_only and "progress" or "read_report"
     local chapters = (record.record and record.record.chapter_map) or record.book.catalog or {}
     -- Keep the old worker's own field names and cached context isolated from
     -- MiuRead's newer protocol model. On first use it refreshes the reader page,
     -- catalog and reporting context through the isolated compatibility worker.
-    local legacy_book = U.copy(type(session.legacy_report_context) == "table"
+    local context_matches=tostring(session.report_login_session_id or "")==login_snapshot
+    local legacy_book = U.copy(context_matches and type(session.legacy_report_context) == "table"
         and session.legacy_report_context or {})
     legacy_book.book_id = book_id
     legacy_book.title = record.book.title
@@ -761,6 +794,14 @@ function Sync:upload(elapsed, callback, options)
         self.busy = false
         self.state = self.progress_hold and "verification_required" or "waiting"
         self.store:reload()
+        local current_auth=self.store:auth()
+        local current_account=type(current_auth.account)=="table" and current_auth.account or {}
+        if login_snapshot~=tostring(current_auth.login_session_id or "")
+            or vid_snapshot~=tostring(current_account.vid or "") then
+            logger.warn("[MiuRead][ReadReport] stale worker result ignored")
+            if callback then callback(false,"登录状态已变化") end
+            return
+        end
         if not result.ok or type(result.value) ~= "table" then
             self.last_error = result.error or "阅读时间工作器无结果"
             self.last_stage = "工作器失败"
@@ -808,6 +849,7 @@ function Sync:upload(elapsed, callback, options)
 
         self.store:save_session(book_id, {
             legacy_report_context=legacy_context,
+            report_login_session_id=login_snapshot,
             last_attempt=self.last_attempt,
             last_path=value.path,
             last_attempts=attempts_count,
@@ -867,6 +909,7 @@ function Sync:upload(elapsed, callback, options)
         self.failure_notified = false
         local patch={
             local_percent=position.progress,
+            report_login_session_id=login_snapshot,
             pending=nil,
             synckey=response_synckey(response) or legacy_context.synckey or session.synckey,
             last_error=false,
@@ -1015,13 +1058,44 @@ local function acquire_lock_dir(path)
 end
 
 function Sync:_retire_legacy_daemon()
-    -- Stop workers created by earlier service layouts before starting the
-    -- current version. This prevents an OTA reload from leaving an older
-    -- process uploading stale book or position data.
+    -- Stop workers created by earlier service layouts before starting v10.
+    -- Their job files contained authentication snapshots, so overwrite those
+    -- snapshots immediately and remove the remaining files after the worker exits.
     local base = self.store.temp_dir .. "/readtime-service"
-    for _, suffix in ipairs({"", "-v1", "-v2", "-v3", "-v4", "-v5", "-v6", "-v7"}) do
-        U.atomic_write(base .. suffix .. ".stop", "1", true)
+    local retired={}
+    for _, suffix in ipairs({"", "-v1", "-v2", "-v3", "-v4", "-v5", "-v6", "-v7", "-v8", "-v9"}) do
+        local prefix=base..suffix
+        local owner_path=prefix..".owner.json"
+        retired[#retired+1]={
+            job=prefix..".job.json",control=prefix..".control.json",status=prefix..".status.json",
+            context=prefix..".context.json",stop=prefix..".stop",owner=owner_path,lock=prefix..".lock",
+        }
+        local generation=2147483000
+        U.atomic_write(prefix..".job.json",Json.encode({
+            generation=generation,controller_token="retired",book_id="",book={},auth={},interval=30,
+        }),true)
+        U.atomic_write(prefix..".control.json",Json.encode({
+            active=false,generation=generation,controller_token="retired",updated_at=os.time(),
+        }),true)
+        U.atomic_write(prefix..".stop", "1", true)
+        -- Status/context may contain old cookies or report tokens. They are not
+        -- needed once the worker has been retired, so remove them immediately.
+        os.remove(prefix..".status.json")
+        os.remove(prefix..".context.json")
     end
+    local function purge()
+        for _,paths in ipairs(retired) do
+            local owner=read_json_file(paths.owner)
+            if not owner or not process_alive(owner.pid) then
+                os.remove(paths.job); os.remove(paths.control); os.remove(paths.status)
+                os.remove(paths.context); os.remove(paths.stop); os.remove(paths.owner)
+                remove_lock_dir(paths.lock)
+            end
+        end
+    end
+    purge()
+    UIManager:scheduleIn(4,purge)
+    UIManager:scheduleIn(15,purge)
 end
 
 function Sync:_daemon_paths()
@@ -1061,11 +1135,14 @@ function Sync:_attach_existing_daemon(paths, owner)
     local parent_pid = current_pid()
     if tonumber(owner.parent_pid or 0) ~= tonumber(parent_pid or 0) then return false end
     local control = read_json_file(paths.control) or {}
+    local job = read_json_file(paths.job) or {}
     self.daemon = {
         pid=tonumber(owner.pid), paths=paths, active=false,
         generation=tonumber(control.generation or 0) or 0,
         book_id=nil, interval=30, reason="reused", is_child=false,
         service_version=READ_REPORT_SERVICE_VERSION,
+        login_session_id=tostring(job.login_session_id or ""),
+        account_vid=tostring(job.account_vid or ""),
     }
     self.daemon_status_stamp = nil
     self:_schedule_daemon_poll(10)
@@ -1152,10 +1229,15 @@ function Sync:_write_daemon_control(active, immediate, extra)
             and tostring(existing.controller_token or "") ~= ""
             and tostring(existing.controller_token or "") ~= tostring(self.controller_token)
         then return end
+        local auth=self.store:auth()
+        local account=type(auth.account)=="table" and auth.account or {}
         local control = {
             active = active ~= false and d.active == true,
             generation = own_generation,
             controller_token = self.controller_token,
+            login_session_id = tostring(d.login_session_id or auth.login_session_id or ""),
+            account_vid = tostring(d.account_vid or account.vid or ""),
+            book_id = tostring(d.book_id or d.final_book_id or ""),
             progress_ratio = self:local_ratio() or tonumber(existing.progress_ratio) or 0,
             last_activity = tonumber(self.last_activity) or os.time(),
             updated_at = os.time(),
@@ -1189,6 +1271,7 @@ function Sync:_persist_daemon_session(force, explicit_book_id)
     self.daemon_last_persist = now
     self.store:save_session(book_id, {
         legacy_report_context = self.daemon_context,
+        report_login_session_id = tostring(daemon.login_session_id or ""),
         last_attempt = self.last_attempt,
         last_upload = self.last_upload,
         last_path = self.last_path,
@@ -1204,8 +1287,16 @@ function Sync:_load_daemon_context()
     if not daemon then return end
     local context_raw = U.read_file(daemon.paths.context, true)
     if not context_raw then return end
-    local context_ok, context = pcall(Json.decode, context_raw)
-    if context_ok and type(context) == "table" then self.daemon_context = U.copy(context) end
+    local context_ok, envelope = pcall(Json.decode, context_raw)
+    if not context_ok or type(envelope) ~= "table" then return end
+    local auth=self.store:auth()
+    local account=type(auth.account)=="table" and auth.account or {}
+    if tostring(envelope.login_session_id or "")~=tostring(auth.login_session_id or "")
+        or tostring(envelope.account_vid or "")~=tostring(account.vid or "")
+        or tostring(envelope.book_id or "")~=tostring(daemon.book_id or daemon.final_book_id or "") then
+        return
+    end
+    if type(envelope.context)=="table" then self.daemon_context=U.copy(envelope.context) end
 end
 
 function Sync:_import_daemon_status(force)
@@ -1215,9 +1306,25 @@ function Sync:_import_daemon_status(force)
     if not raw then return end
     local ok, status = pcall(Json.decode, raw)
     if not ok or type(status) ~= "table" then return end
+    if self.auth_transitioning then return end
     if tonumber(status.generation or -1) ~= tonumber(daemon.generation or 0) then return end
+    if tostring(status.controller_token or "")~=tostring(self.controller_token or "") then return end
+    local auth=self.store:auth()
+    local account=type(auth.account)=="table" and auth.account or {}
+    local current_session=tostring(auth.login_session_id or "")
+    local current_vid=tostring(account.vid or "")
+    if current_session=="" or current_vid==""
+        or tostring(status.login_session_id or "")~=current_session
+        or tostring(status.account_vid or "")~=current_vid then
+        logger.warn("[MiuRead][ReadReport] stale login status ignored",
+            "status_session=",tostring(status.login_session_id or ""),
+            "current_session=",current_session)
+        return
+    end
 
     local status_book_id = tostring(status.book_id or daemon.book_id or daemon.final_book_id or "")
+    local expected_book_id=tostring(daemon.book_id or daemon.final_book_id or "")
+    if status_book_id~="" and expected_book_id~="" and status_book_id~=expected_book_id then return end
     local final_flush = status.final_flush == true
     local stamp = daemon_stamp(status)
     if final_flush and stamp and self.store:is_read_report_consumed(stamp) then
@@ -1410,6 +1517,13 @@ function Sync:_start_daemon(reason)
     local interval = math.max(10, tonumber(prefs.interval) or 30)
     local session = self.store:session(book_id) or {}
     local auth = self.store:auth()
+    local current_account=type(auth.account)=="table" and auth.account or {}
+    local login_session_id=tostring(auth.login_session_id or "")
+    local account_vid=tostring(current_account.vid or "")
+    if login_session_id=="" or account_vid=="" then
+        self.state="stopped"
+        return false,"当前账号登录会话无效，请重新扫码登录"
+    end
     self.pending_report_elapsed=0
     self.pending_report_status_at=os.time()
     if tonumber(session.pending_report_seconds or 0)~=0 then
@@ -1417,10 +1531,8 @@ function Sync:_start_daemon(reason)
         session.pending_report_seconds=0
     end
     local existing_job=read_json_file(daemon.paths.job) or {}
-    local existing_account=type(existing_job.auth)=="table" and existing_job.auth.account or {}
-    local current_account=type(auth.account)=="table" and auth.account or {}
-    local same_account=tostring(existing_account.vid or "")==tostring(current_account.vid or "")
-        and tonumber(existing_account.logged_at or 0)==tonumber(current_account.logged_at or 0)
+    local same_account=tostring(existing_job.login_session_id or "")==login_session_id
+        and tostring(existing_job.account_vid or "")==account_vid
     local same_document=tostring(existing_job.book_path or "")==tostring(record.path or "")
     if daemon.active and tostring(daemon.book_id or "")==book_id and same_account and same_document
         and process_alive(daemon.pid) then
@@ -1433,8 +1545,9 @@ function Sync:_start_daemon(reason)
             "pid=",tostring(daemon.pid),"book=",book_id,"reason=",tostring(reason or "start"))
         return true
     end
-    local legacy_book = U.copy(self.daemon_context
-        or (type(session.legacy_report_context) == "table" and session.legacy_report_context)
+    local context_matches=tostring(session.report_login_session_id or "")==login_session_id
+    local legacy_book = U.copy((context_matches and self.daemon_context)
+        or (context_matches and type(session.legacy_report_context) == "table" and session.legacy_report_context)
         or {})
     legacy_book.book_id = book_id
     legacy_book.title = record.book.title
@@ -1456,10 +1569,14 @@ function Sync:_start_daemon(reason)
     daemon.final_flush_pending = false
     daemon.interval = interval
     daemon.reason = reason
+    daemon.login_session_id = login_session_id
+    daemon.account_vid = account_vid
 
     local job = {
         generation = daemon.generation,
         controller_token = self.controller_token,
+        login_session_id = login_session_id,
+        account_vid = account_vid,
         book_id = book_id,
         book_title = record.book.title,
         book_path = record.path,
@@ -1470,6 +1587,7 @@ function Sync:_start_daemon(reason)
             api_key = auth.api_key or "",
             wr_ticket = auth.wr_ticket or "",
             wr_wrpa = auth.wr_wrpa or "",
+            login_session_id = login_session_id,
             account = U.copy(auth.account or {}),
         },
         interval = interval,
@@ -1489,6 +1607,36 @@ function Sync:_start_daemon(reason)
         "first_delay=", tostring(math.min(interval, FIRST_REPORT_DELAY)),
         "interval=", tostring(interval), "reason=", tostring(reason or "start"))
     return true
+end
+
+function Sync:_stop_daemon_fast(reason, flush_elapsed)
+    local daemon = self.daemon
+    if self.control_write_task then
+        UIManager:unschedule(self.control_write_task)
+        self.control_write_task = nil
+    end
+    if not daemon then return end
+
+    local extra = {}
+    flush_elapsed = math.floor(tonumber(flush_elapsed) or 0)
+    if daemon.book_id and flush_elapsed >= FINAL_REPORT_MIN_SECONDS then
+        local existing = read_json_file(daemon.paths.control) or {}
+        extra.flush_seq = (tonumber(existing.flush_seq or 0) or 0) + 1
+        extra.flush_elapsed = flush_elapsed
+        extra.flush_reason = tostring(reason or "stop")
+        daemon.final_book_id = daemon.book_id
+        daemon.final_flush_pending = true
+    end
+
+    -- Closing a book or locking the device must not synchronously import the
+    -- worker status and rewrite the full report context. The long-lived worker
+    -- receives one small control-file update and completes the final upload on
+    -- its own. Status/context reconciliation happens after resume or on the
+    -- next normal poll.
+    daemon.active = false
+    self:_write_daemon_control(false, true, extra)
+    self.next_due = 0
+    if not daemon.final_flush_pending then daemon.book_id = nil end
 end
 
 function Sync:_stop_daemon(reason, persist, flush_elapsed)
@@ -1521,9 +1669,9 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
     end
 end
 
-function Sync:_final_elapsed()
+function Sync:_final_elapsed(skip_status_import)
     if not self.store:preferences().sync.time_enabled or not self:record() then return nil end
-    self:_import_daemon_status(true)
+    if skip_status_import ~= true then self:_import_daemon_status(true) end
     local now = os.time()
     local started = tonumber(self.session_started_at or 0) or 0
     if started <= 0 then started = now end
@@ -1596,6 +1744,16 @@ function Sync:stop(reason, flush_elapsed)
     self.progress_hold = false
     self.state = "stopped"
     logger.info("[MiuRead][ReadReport] stopped", "reason=", tostring(reason))
+end
+
+function Sync:stop_fast(reason, flush_elapsed)
+    self.time_enabled = (self.store:preferences().sync or {}).time_enabled==true
+    self:_stop_daemon_fast(reason, flush_elapsed)
+    self.async:cancel(reason)
+    self.busy = false
+    self.progress_hold = false
+    self.state = "stopped"
+    logger.info("[MiuRead][ReadReport] stopped fast", "reason=", tostring(reason))
 end
 
 function Sync:_cancel_record_retry()
@@ -1722,6 +1880,7 @@ function Sync:on_reader_ready()
     self.verified_at = 0
     self.verified_local_percent = nil
     self.verified_remote_percent = nil
+    self.verified_login_session_id = nil
     self:_resolve_reader_record(self.record_generation, 1)
 end
 
@@ -1734,10 +1893,25 @@ function Sync:on_page(page)
     end
 end
 
+function Sync:_defer_session_flush(delay)
+    if self.session_flush_task then
+        UIManager:unschedule(self.session_flush_task)
+        self.session_flush_task = nil
+    end
+    local task
+    task = function()
+        if self.session_flush_task ~= task then return end
+        self.session_flush_task = nil
+        pcall(self.store.flush, self.store)
+    end
+    self.session_flush_task = task
+    UIManager:scheduleIn(math.max(.3, tonumber(delay) or .8), task)
+end
+
 function Sync:on_suspend()
     self.suspended = true
     local r = self.current or self:record()
-    local pending_elapsed=math.max(0,math.floor(tonumber(self:_final_elapsed()) or 0))
+    local pending_elapsed=math.max(0,math.floor(tonumber(self:_final_elapsed(true)) or 0))
     if r then
         local position = self:local_position()
         local now=os.time()
@@ -1751,11 +1925,12 @@ function Sync:on_suspend()
             last_read_at=now,last_read_path=r.path,
             progress_local_percent=position and position.progress or nil,
             pending_report_seconds=0,
-        })
+        }, false)
+        self:_defer_session_flush(.8)
     end
     -- The background worker may submit only the current 10-30 second tail.
     -- Failed time is discarded and is never carried into the next session.
-    self:stop("suspend", pending_elapsed)
+    self:stop_fast("suspend", pending_elapsed)
 end
 
 function Sync:on_resume(_slept)
@@ -1792,29 +1967,96 @@ function Sync:on_close()
                 last_read_at=now,last_read_path=r.path,
                 progress_local_percent=position and position.progress or nil,
                 last_close_path=path,last_close_at=now,
-            })
+            }, false)
+            self:_defer_session_flush(.8)
         end
     end
     -- Even a duplicate close event must stop this plugin instance's service.
     -- It simply must not emit a second final upload.
-    self:stop("close", duplicate and 0 or self:_final_elapsed())
+    self:stop_fast("close", duplicate and 0 or self:_final_elapsed(true))
     self.current = nil
     self.record_checked_path = nil
 end
 
+function Sync:invalidate_login_session(reason)
+    reason=tostring(reason or "auth_transition")
+    self.auth_transitioning=true
+    if self.control_write_task then UIManager:unschedule(self.control_write_task); self.control_write_task=nil end
+    if self.daemon_poll then UIManager:unschedule(self.daemon_poll); self.daemon_poll=nil end
+    if self.async then self.async:cancel(reason) end
+    self.busy=false
+    self.progress_hold=false
+    self.daemon_context=nil
+    self.daemon_status_stamp=nil
+    self.last_error=nil
+    self.consecutive_failures=0
+    self.verified_book_id=nil
+    self.verified_at=0
+    self.verified_local_percent=nil
+    self.verified_remote_percent=nil
+    self.verified_login_session_id=nil
+    local daemon=self.daemon
+    if not daemon then
+        -- A service may survive an OTA reload even when time sync is currently
+        -- disabled and therefore was not attached during Sync:new(). Sanitize it
+        -- as part of the login boundary instead of leaving its old auth snapshot.
+        local paths=self:_daemon_paths()
+        local owner=read_json_file(paths.owner)
+        local parent_pid=current_pid()
+        if type(owner)=="table" and process_alive(owner.pid)
+            and tonumber(owner.service_version or 0)==READ_REPORT_SERVICE_VERSION
+            and tonumber(owner.parent_pid or 0)==tonumber(parent_pid or 0) then
+            daemon={
+                pid=tonumber(owner.pid),paths=paths,active=false,
+                generation=0,book_id=nil,interval=30,reason="auth_reset_attach",
+                is_child=false,service_version=READ_REPORT_SERVICE_VERSION,
+            }
+            self.daemon=daemon
+        end
+    end
+    if daemon and daemon.paths and process_alive(daemon.pid) then
+        local control=read_json_file(daemon.paths.control) or {}
+        local status=read_json_file(daemon.paths.status) or {}
+        local job=read_json_file(daemon.paths.job) or {}
+        local generation=math.max(tonumber(daemon.generation or 0) or 0,
+            tonumber(control.generation or 0) or 0,tonumber(status.generation or 0) or 0,
+            tonumber(job.generation or 0) or 0)+1
+        daemon.generation=generation
+        daemon.active=false
+        daemon.book_id=nil
+        daemon.final_book_id=nil
+        daemon.final_flush_pending=false
+        daemon.login_session_id=""
+        daemon.account_vid=""
+        os.remove(daemon.paths.context)
+        os.remove(daemon.paths.status)
+        U.atomic_write(daemon.paths.job,Json.encode({
+            action="reset_auth",generation=generation,controller_token=self.controller_token,
+            login_session_id="",account_vid="",book_id="",book={},auth={},interval=30,first_delay=10,
+        }),true)
+        U.atomic_write(daemon.paths.control,Json.encode({
+            active=false,generation=generation,controller_token=self.controller_token,
+            login_session_id="",account_vid="",book_id="",updated_at=os.time(),reset_reason=reason,
+        }),true)
+        logger.info("[MiuRead][ReadReport] login session invalidated",
+            "reason=",reason,"generation=",tostring(generation))
+    elseif daemon then
+        self:_cleanup_daemon_files(daemon)
+        self.daemon=nil
+    end
+    self.state="stopped"
+    self.next_due=0
+    return true
+end
+
 function Sync:on_auth_restored()
+    self.auth_transitioning=false
     self.last_error=nil
     self.consecutive_failures=0
     self.failure_notified=false
-    if self.daemon and self.daemon.active then
-        self:_stop_daemon("auth_restored",false,0)
-    end
-    self.async:cancel("auth_restored")
-    self.daemon_context=nil
-    if self.store and self.store.invalidate_report_contexts then
-        self.store:invalidate_report_contexts("auth_restored")
-    end
     self.busy=false
+    self.daemon_context=nil
+    self.store:ensure_login_session_id()
     local record=self:record()
     if not record or self.suspended then return false end
     if self.store:preferences().sync.time_enabled~=true then return false end

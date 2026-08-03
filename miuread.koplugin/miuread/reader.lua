@@ -324,6 +324,9 @@ local function image_attr(attrs, name_pattern)
     local _, value = attrs:match("%s" .. name_pattern .. "%s*=%s*([\"'])(.-)%1")
     if value ~= nil then return value end
     _, value = attrs:match("^" .. name_pattern .. "%s*=%s*([\"'])(.-)%1")
+    if value ~= nil then return value end
+    value = attrs:match("%s" .. name_pattern .. "%s*=%s*([^%s>]+)")
+        or attrs:match("^" .. name_pattern .. "%s*=%s*([^%s>]+)")
     return value
 end
 
@@ -331,6 +334,8 @@ local function image_remove_attr(attrs, name_pattern)
     attrs = tostring(attrs or "")
     attrs = attrs:gsub("%s" .. name_pattern .. "%s*=%s*([\"'])(.-)%1", "")
     attrs = attrs:gsub("^" .. name_pattern .. "%s*=%s*([\"'])(.-)%1%s*", "")
+    attrs = attrs:gsub("%s" .. name_pattern .. "%s*=%s*[^%s>]+", "")
+    attrs = attrs:gsub("^" .. name_pattern .. "%s*=%s*[^%s>]+%s*", "")
     return attrs
 end
 
@@ -340,6 +345,13 @@ local function image_set_local_src(attrs, href)
         attrs = image_remove_attr(attrs, name)
     end
     return ' src="' .. tostring(href or "") .. '"' .. attrs
+end
+
+local function image_set_local_href(attrs, href)
+    for _, name in ipairs({"href", "xlink:href", "data%-src", "data%-original", "srcset"}) do
+        attrs = image_remove_attr(attrs, name)
+    end
+    return ' href="' .. tostring(href or "") .. '"' .. attrs
 end
 
 local OPTIONAL_IMAGE_PLACEHOLDER = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
@@ -403,15 +415,27 @@ local function image_tar_assets(blob)
     return assets, source_map
 end
 
-local function localize_epub_images(reader, xhtml, assets, source_map, state)
+local function localize_epub_images(reader, xhtml, assets, source_map, state, css)
     assets = assets or {}
     source_map = source_map or {}
     local used = image_used_hrefs(assets)
     local remote_cache, remote_failed = {}, {}
     local remote_index = #assets
-    local summary = {tar=#assets, remote=0, localized=0, optional=0, recovered=0, stale=0, missing=0}
+    local summary = {
+        tar=#assets,remote=0,discovered=0,localized=0,optional=0,recovered=0,stale=0,missing=0,
+        required_discovered=0,required_localized=0,required_missing=0,
+        optional_dropped=0,stale_dropped=0,embedded=0,
+    }
     local text_length = readable_text_length(xhtml)
     local used_local_src, pending = {}, {}
+
+    local function normalize_asset_href(value)
+        local href=tostring(value or ""):gsub("\\", "/")
+        while href:sub(1,3)=="../" do href=href:sub(4) end
+        while href:sub(1,2)=="./" do href=href:sub(3) end
+        href=href:gsub("^OEBPS/",""):gsub("^/+","")
+        return href
+    end
 
     local function download_remote(url)
         if remote_cache[url] then return remote_cache[url] end
@@ -421,11 +445,18 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
                 Referer=(state and state.url) or BASE .. "/",
                 Origin=BASE,
                 Accept="image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                ["Cache-Control"]="no-cache",
             },
-            retries=2,
+            retries=1,
             timeout={12, 25},
         })
         if not ok or not data or #data == 0 then
+            if not ok and is_auth_error(data) then
+                -- Preserve the original 401/session error so Reader:chapter can
+                -- renew the Web session and rebuild the chapter with fresh
+                -- signed image addresses instead of retrying a stale URL.
+                error(data)
+            end
             remote_failed[url] = true
             logger.warn("[MiuRead][Reader] remote image failed", "url=", Util.redact_url(url), "error=", ok and "empty" or tostring(data))
             return nil
@@ -440,14 +471,44 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
         local href
         href, remote_index = image_unique_href(used, "remote", remote_index, ext)
         assets[#assets + 1] = {href=href, data=data, mime=mime, source=url}
-        local local_src = "../" .. href
-        remote_cache[url] = local_src
-        image_map_add(source_map, url, local_src)
+        remote_cache[url] = href
+        image_map_add(source_map, url, "../" .. href)
         summary.remote = summary.remote + 1
-        return local_src
+        return href
     end
 
-    xhtml = tostring(xhtml or ""):gsub("<[iI][mM][gG]([^>]*)>", function(attrs)
+    local function resolve_source(source, prefix)
+        local clean=image_trim(source)
+        if clean=="" or clean:sub(1,1)=="#" or clean:lower():match("^data:image/") then return nil,nil end
+        local mapped=image_map_get(source_map,clean)
+        local href=mapped and normalize_asset_href(mapped) or nil
+        local remote_url=image_remote_url(clean)
+        if not href and remote_url then href=download_remote(remote_url) end
+        if href and href~="" then return tostring(prefix or "")..href,href end
+        return nil,nil,remote_url~=nil
+    end
+
+    -- EPUBs often use <picture><source srcset=...><img ...></picture>.
+    -- KOReader only needs the final img, so fold the first source candidate into
+    -- the img before normal localization.
+    xhtml=tostring(xhtml or ""):gsub("<[pP][iI][cC][tT][uU][rR][eE][^>]*>(.-)</[pP][iI][cC][tT][uU][rR][eE]%s*>",function(inner)
+        local attrs=inner:match("<[iI][mM][gG]([^>]*)>")
+        if not attrs then return inner end
+        local existing=image_attr(attrs,"data%-src") or image_attr(attrs,"data%-original")
+            or image_attr(attrs,"data%-lazy%-src") or image_attr(attrs,"data%-actualsrc")
+            or image_attr(attrs,"src") or image_attr(attrs,"srcset")
+        if image_trim(existing)=="" then
+            local source_attrs=inner:match("<[sS][oO][uU][rR][cC][eE]([^>]*)>")
+            local candidate=source_attrs and (image_attr(source_attrs,"srcset") or image_attr(source_attrs,"src")) or nil
+            if candidate then
+                candidate=candidate:match("^%s*([^,%s]+)") or candidate
+                attrs=' data-src="'..Util.xml(candidate)..'"'..attrs
+            end
+        end
+        return "<img"..attrs..">"
+    end)
+
+    xhtml = xhtml:gsub("<[iI][mM][gG]([^>]*)>", function(attrs)
         local srcset = image_attr(attrs, "srcset")
         local source = image_attr(attrs, "data%-src")
             or image_attr(attrs, "data%-original")
@@ -457,21 +518,25 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
             or (srcset and srcset:match("^%s*([^,%s]+)"))
         local clean_source = image_trim(source)
         if clean_source == "" then return "<img" .. attrs .. ">" end
-        if clean_source:lower():match("^data:image/") then return "<img" .. attrs .. ">" end
-
-        local local_src = image_map_get(source_map, clean_source)
-        local remote_url = image_remote_url(clean_source)
-        if not local_src and remote_url then local_src = download_remote(remote_url) end
-        if local_src then
-            used_local_src[local_src] = true
-            summary.localized = summary.localized + 1
-            return "<img" .. image_set_local_src(attrs, local_src) .. ">"
+        if clean_source:lower():match("^data:image/") then
+            summary.embedded=summary.embedded+1
+            return "<img" .. attrs .. ">"
         end
-
         if image_is_optional_reference(attrs, clean_source) then
             summary.optional = summary.optional + 1
+            summary.optional_dropped = summary.optional_dropped + 1
             logger.dbg("[MiuRead][Reader] optional image reference replaced", "src=", tostring(clean_source))
             return "<img" .. image_set_local_src(attrs, OPTIONAL_IMAGE_PLACEHOLDER) .. ">"
+        end
+        summary.discovered=summary.discovered+1
+        summary.required_discovered=summary.required_discovered+1
+
+        local local_src,href,was_remote = resolve_source(clean_source,"../")
+        if local_src then
+            used_local_src[href] = true
+            summary.localized = summary.localized + 1
+            summary.required_localized = summary.required_localized + 1
+            return "<img" .. image_set_local_src(attrs, local_src) .. ">"
         end
 
         local marker = "__MIUREAD_PENDING_IMAGE_" .. tostring(#pending + 1) .. "__"
@@ -479,18 +544,86 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
             marker=marker,
             attrs=attrs,
             source=clean_source,
-            remote=remote_url ~= nil,
+            remote=was_remote==true,
         }
         return marker
     end)
+
+    -- Localize SVG <image href=...> references without flattening the SVG.
+    xhtml=xhtml:gsub("<[iI][mM][aA][gG][eE]([^>]*)>",function(attrs)
+        local source=image_attr(attrs,"xlink:href") or image_attr(attrs,"href")
+            or image_attr(attrs,"data%-src") or image_attr(attrs,"srcset")
+        local clean=image_trim(source)
+        if clean=="" then return "<image"..attrs..">" end
+        if clean:lower():match("^data:image/") then
+            summary.embedded=summary.embedded+1
+            return "<image"..attrs..">"
+        end
+        summary.discovered=summary.discovered+1
+        summary.required_discovered=summary.required_discovered+1
+        local local_src,href,was_remote=resolve_source(clean,"../")
+        if local_src then
+            used_local_src[href]=true
+            summary.localized=summary.localized+1
+            summary.required_localized=summary.required_localized+1
+            return "<image"..image_set_local_href(attrs,local_src)..">"
+        end
+        if was_remote then
+            summary.missing=summary.missing+1
+            summary.required_missing=summary.required_missing+1
+        else
+            summary.stale=summary.stale+1
+            summary.stale_dropped=summary.stale_dropped+1
+        end
+        logger.warn("[MiuRead][Reader] SVG image reference unresolved","src=",tostring(clean))
+        return "<image"..attrs..">"
+    end)
+
+    -- Some illustrated books place images in inline or chapter CSS rather than
+    -- img tags. Resolve url(...) against the same TAR/remote asset map.
+    local function localize_css_urls(value,prefix)
+        return tostring(value or ""):gsub("url%s*%(%s*([\\\"']?)(.-)%1%s*%)",function(_,source)
+            local clean=image_trim(source)
+            if clean=="" or clean:sub(1,1)=="#" then
+                return "url("..tostring(source or "")..")"
+            end
+            if clean:lower():match("^data:") then
+                summary.embedded=summary.embedded+1
+                return "url("..tostring(source or "")..")"
+            end
+            summary.discovered=summary.discovered+1
+            local local_src,href,was_remote=resolve_source(clean,prefix)
+            if local_src then
+                used_local_src[href]=true
+                summary.localized=summary.localized+1
+                summary.required_discovered=summary.required_discovered+1
+                summary.required_localized=summary.required_localized+1
+                return "url('"..local_src.."')"
+            end
+            if was_remote then
+                summary.missing=summary.missing+1
+                summary.required_discovered=summary.required_discovered+1
+                summary.required_missing=summary.required_missing+1
+                logger.warn("[MiuRead][Reader] CSS image reference unresolved","src=",tostring(clean))
+                return "url('"..clean.."')"
+            end
+            summary.stale=summary.stale+1
+            summary.stale_dropped=summary.stale_dropped+1
+            return "url('"..OPTIONAL_IMAGE_PLACEHOLDER.."')"
+        end)
+    end
+    xhtml=xhtml:gsub("([sS][tT][yY][lL][eE]%s*=%s*)([\\\"'])(.-)%2",function(prefix,quote,value)
+        return prefix..quote..localize_css_urls(value,"../")..quote
+    end)
+    local localized_css=localize_css_urls(css or "","")
 
     -- Some books contain valid TAR assets whose internal names no longer match
     -- the HTML paths. When the remaining counts match exactly, map them by order
     -- instead of treating the chapter as incomplete.
     local unused = {}
     for _, asset in ipairs(assets) do
-        local local_src = "../" .. tostring(asset.href or "")
-        if local_src ~= "../" and not used_local_src[local_src] then unused[#unused + 1] = local_src end
+        local href=normalize_asset_href(asset.href)
+        if href~="" and not used_local_src[href] then unused[#unused + 1] = href end
     end
     local local_pending = {}
     for _, item in ipairs(pending) do
@@ -498,11 +631,13 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
     end
     if #local_pending > 0 and #local_pending == #unused then
         for index, item in ipairs(local_pending) do
-            local local_src = unused[index]
+            local href = unused[index]
+            local local_src="../"..href
             xhtml = xhtml:gsub(item.marker, "<img" .. image_set_local_src(item.attrs, local_src) .. ">")
-            used_local_src[local_src] = true
+            used_local_src[href] = true
             item.resolved = true
             summary.localized = summary.localized + 1
+            summary.required_localized = summary.required_localized + 1
             summary.recovered = summary.recovered + 1
             logger.info("[MiuRead][Reader] unmatched image reference recovered from TAR order",
                 "src=", tostring(item.source), "local=", tostring(local_src))
@@ -514,25 +649,23 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
             local replacement
             local archive_failed = state and state.image_archive_expected == true and state.image_archive_ok ~= true
             if not item.remote and not archive_failed then
-                -- A relative path absent from a successfully inspected chapter
-                -- archive has no fetchable source. It is an orphaned source
-                -- reference rather than a failed network resource. Preserve
-                -- meaningful alt text when present.
                 local alt = tostring(image_attr(item.attrs, "alt") or ""):gsub("^%s+", ""):gsub("%s+$", "")
                 replacement = alt ~= "" and ('<span class="miu-image-alt">' .. Util.xml(alt) .. "</span>") or ""
                 summary.stale = summary.stale + 1
+                summary.stale_dropped = summary.stale_dropped + 1
                 logger.warn("[MiuRead][Reader] orphan image reference ignored", "src=", tostring(item.source),
                     "text_length=", tostring(text_length))
             else
                 replacement = "<img" .. item.attrs .. ">"
                 summary.missing = summary.missing + 1
+                summary.required_missing = summary.required_missing + 1
                 logger.warn("[MiuRead][Reader] image reference unresolved", "src=", tostring(item.source))
             end
             xhtml = xhtml:gsub(item.marker, replacement)
         end
     end
 
-    return xhtml, assets, summary
+    return xhtml, assets, summary, localized_css
 end
 
 function Reader:new(http, store)
@@ -550,6 +683,7 @@ function Reader:_recover_login_session()
     self._renewing_session = true
 
     local before = self.store:auth()
+    local before_login_session_id=tostring(before.login_session_id or "")
     local before_vid = tostring((before.account or {}).vid or (before.cookies or {}).wr_vid or "")
     local ok, result = pcall(function()
         local renewed, meta = self:renew()
@@ -569,13 +703,17 @@ function Reader:_recover_login_session()
         end
 
         local after = self.store:auth()
+        if before_login_session_id=="" or tostring(after.login_session_id or "")~=before_login_session_id then
+            error("登录状态已变化，已忽略旧续期结果")
+        end
         local after_vid = tostring((after.account or {}).vid or (after.cookies or {}).wr_vid or "")
         local after_skey = tostring((after.cookies or {}).wr_skey or "")
         if after_vid == "" or after_skey == "" then
             error("续期后仍缺少正文下载所需的登录凭据")
         end
         if before_vid ~= "" and after_vid ~= "" and before_vid ~= after_vid then
-            self.store:save_auth(before)
+            local current=self.store:auth()
+            if tostring(current.login_session_id or "")==before_login_session_id then self.store:save_auth(before) end
             error("续期返回了不同账户，已保留原账户凭据")
         end
         return {meta=meta, verified=true, skills_verified=skills_ok, vid=after_vid}
@@ -748,14 +886,18 @@ function Reader:_epub_once(book, chapter, opt, state)
 .miu-image-only-item img { display: inline-block; max-width: 100%; height: auto; }
 ]]
             state.image_only = true
-            state.image_summary = {tar=#assets, remote=0, localized=#assets, optional=0, recovered=0, stale=0, missing=0}
+            state.image_summary = {
+                tar=#assets,remote=0,discovered=#assets,localized=#assets,optional=0,recovered=0,stale=0,missing=0,
+                required_discovered=#assets,required_localized=#assets,required_missing=0,
+                optional_dropped=0,stale_dropped=0,embedded=0,
+            }
             logger.info("[MiuRead][Reader] empty text chapter preserved as image-only page",
                 "chapter=", tostring(uid), "title=", tostring(chapter.title or ""), "images=", tostring(#assets))
         else
             error("decoded EPUB chapter is empty")
         end
     elseif opt.images ~= false then
-        xhtml, assets, state.image_summary = localize_epub_images(self, xhtml, assets, source_map, state)
+        xhtml, assets, state.image_summary, css = localize_epub_images(self, xhtml, assets, source_map, state, css)
         logger.info("[MiuRead][Reader] chapter images", "chapter=", tostring(uid),
             "tar=", tostring(state.image_summary.tar), "remote=", tostring(state.image_summary.remote),
             "localized=", tostring(state.image_summary.localized), "optional=", tostring(state.image_summary.optional or 0),
@@ -846,7 +988,16 @@ function Reader:chapter(book, chapter, format, opt)
                 break
             end
         end
-        if attempt < 3 then pause(attempt == 1 and 0.8 or 1.8) end
+        if attempt < 3 then
+            -- Kindle may report Wi-Fi as enabled before the network route and
+            -- DNS are usable after resume/restart. Give network failures a
+            -- longer recovery window instead of rapidly exhausting retries.
+            if Http.is_network_error(a) then
+                pause(attempt == 1 and 4.0 or 8.0)
+            else
+                pause(attempt == 1 and 0.8 or 1.8)
+            end
+        end
     end
     error(last or "chapter download failed")
 end
@@ -884,6 +1035,7 @@ end
 -- are retained; browser-session cookies are deliberately discarded.
 function Reader:repair_login_session()
     local auth = self.store:auth()
+    local login_session_id=tostring(auth.login_session_id or "")
     local jar = Util.copy(auth.cookies or {})
     local account = auth.account or {}
     local vid = tostring(jar.wr_vid or account.vid or account.user_vid or "")
@@ -935,6 +1087,10 @@ function Reader:repair_login_session()
         name = tostring(type(user) == "table" and user.name or account.name or ""),
         vid = vid,
     })
+    local current=self.store:auth()
+    if login_session_id=="" or tostring(current.login_session_id or "")~=login_session_id then
+        error("登录状态已变化，已忽略旧修复结果")
+    end
     self.store:save_auth(auth)
     return {repaired=true, cookie_count=(function()
         local n=0; for _ in pairs(jar) do n=n+1 end; return n

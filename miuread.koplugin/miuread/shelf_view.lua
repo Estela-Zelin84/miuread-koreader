@@ -5,6 +5,7 @@ local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
+local GestureBridge = require("miuread.gesture_bridge")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local ImageWidget = require("ui/widget/imagewidget")
@@ -20,21 +21,19 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local U = require("miuread.util")
+local UiScale = require("miuread.ui_scale")
 
 local Screen = Device.screen
 local DIVIDER_COLOR = Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
+local function face(name, nominal, maximum, minimum) return UiScale.face(name, nominal, maximum, minimum) end
 
 local function status_text(book)
     if book.status_text and tostring(book.status_text)~="" then return tostring(book.status_text) end
     if book.download_status and tostring(book.download_status)~="" then return tostring(book.download_status) end
-    local state
-    if book.downloaded then state="已生成"
-    elseif book.local_only then state="已生成书籍"
-    else state="未生成" end
     local progress = tonumber(book.progress or 0) or 0
-    if progress >= 100 then return state .. " · 已读完" end
-    if progress > 0 then return state .. " · " .. tostring(math.floor(progress + .5)) .. "%" end
-    return state
+    if progress >= 100 then return "已读完" end
+    if progress > 0 then return "阅读 " .. tostring(math.floor(progress + .5)) .. "%" end
+    return "未开始"
 end
 
 local function supported_image(path)
@@ -53,16 +52,18 @@ end
 local function placeholder(cover_w,cover_h,title)
     local mark=U.utf8_sub(tostring(title or "书"):gsub("^%s+",""),1,1)
     if mark=="" then mark="书" end
+    local border=Size.border.thin
     return FrameContainer:new{
-        width=cover_w,
-        height=cover_h,
-        bordersize=Size.border.thin,
+        bordersize=border,
         padding=0,
         margin=0,
         background=Blitbuffer.COLOR_WHITE,
         CenterContainer:new{
-            dimen=Geom:new{w=cover_w, h=cover_h},
-            TextWidget:new{text=mark, face=Font:getFace("cfont", math.min(20,Screen:scaleBySize(17)))},
+            dimen=Geom:new{
+                w=math.max(1,cover_w-border*2),
+                h=math.max(1,cover_h-border*2),
+            },
+            TextWidget:new{text=mark, face=face("cfont", 15, 19)},
         },
     }
 end
@@ -75,11 +76,16 @@ local function safe_cover(path,cover_w,cover_h,book_id)
             file=path,
             width=cover_w,
             height=cover_h,
+            scale_factor=0,
             file_do_cache=false,
         }
         image:getSize()
+        image.width=nil
+        image.height=nil
     end)
-    if ok and image then return image end
+    if ok and image then
+        return CenterContainer:new{dimen=Geom:new{w=cover_w,h=cover_h},image}
+    end
     if image and type(image.free)=="function" then pcall(image.free,image) end
     logger.warn("[MiuRead][Cover] render failed","book_id=",tostring(book_id or ""),"path=",tostring(path),"error=",tostring(err))
     return nil,tostring(err or "render failed")
@@ -99,7 +105,7 @@ function ShelfItem:init()
 
     local h = self.dimen.h
     if self.entry and (self.entry._miu_action_row or self.entry._miu_tab_row) then
-        local face=Font:getFace("cfont",math.min(18,Screen:scaleBySize(self.entry._miu_tab_row and 16 or 15)))
+        local row_face=face("cfont", self.entry._miu_tab_row and 13 or 12, self.entry._miu_tab_row and 17 or 16)
         local row=HorizontalGroup:new{align="center"}
         if self.entry._miu_tab_row then
             local tabs=type(self.entry.tabs)=="table" and self.entry.tabs or {}
@@ -111,27 +117,27 @@ function ShelfItem:init()
                 local text=(selected and "●  " or "")..tostring(tab.label or tab.id or index)
                 table.insert(row,CenterContainer:new{
                     dimen=Geom:new{w=width,h=h},
-                    TextWidget:new{text=text,face=face,bold=selected},
+                    TextWidget:new{text=text,face=row_face,bold=selected},
                 })
                 if index<count then table.insert(row,HorizontalSpan:new{width=gap}) end
             end
         else
             local gap=math.max(Size.padding.small,Screen:scaleBySize(8))
             local half_w=math.max(1,math.floor((self.dimen.w-gap)/2))
-            table.insert(row,CenterContainer:new{dimen=Geom:new{w=half_w,h=h},TextWidget:new{text="搜索书架",face=face}})
+            table.insert(row,CenterContainer:new{dimen=Geom:new{w=half_w,h=h},TextWidget:new{text=tostring(self.entry.left_label or "搜索书架"),face=row_face}})
             table.insert(row,HorizontalSpan:new{width=gap})
-            table.insert(row,CenterContainer:new{dimen=Geom:new{w=half_w,h=h},TextWidget:new{text="刷新书架",face=face}})
+            table.insert(row,CenterContainer:new{dimen=Geom:new{w=half_w,h=h},TextWidget:new{text=tostring(self.entry.right_label or "刷新书架"),face=row_face}})
         end
         self._underline=UnderlineContainer:new{
-            dimen=self.dimen:copy(),linesize=Size.line.thin,color=DIVIDER_COLOR,
+            dimen=self.dimen:copy(),linesize=UiScale.line("thin"),color=DIVIDER_COLOR,
             padding=0,vertical_align="center",row,
         }
         self[1]=self._underline
         return
     end
-    local side = math.max(Size.padding.small, Screen:scaleBySize(4))
+    local side = math.max(Size.padding.small, UiScale.dp(3, 3, 7))
     local show_cover = self.entry.show_cover ~= false
-    local cover_h = math.max(Screen:scaleBySize(52), h - side * 2)
+    local cover_h = math.max(UiScale.dp(46, 42, 62), h - side * 2)
     local cover_w = show_cover and math.max(1, math.floor(cover_h * 0.69)) or 0
     local cover
 
@@ -144,10 +150,10 @@ function ShelfItem:init()
     local text_w = math.max(Screen:scaleBySize(96), self.dimen.w - cover_w - gap - side * 2)
     local title = TextBoxWidget:new{
         text=tostring(self.entry.title or "未命名"),
-        face=Font:getFace("cfont", math.min(20, Screen:scaleBySize(17))),
+        face=face("cfont", 14, 18),
         width=text_w,
         height=math.floor(h * .50),
-        height_adjust=true,
+        height_adjust=false,
         height_overflow_show_ellipsis=true,
         alignment="left",
         bold=true,
@@ -158,10 +164,10 @@ function ShelfItem:init()
     details = details .. tostring(self.entry.status or "")
     local info = TextBoxWidget:new{
         text=details,
-        face=Font:getFace("smallinfofont", math.min(16, Screen:scaleBySize(13))),
+        face=face("smallinfofont", 10, 13),
         width=text_w,
         height=math.floor(h * .28),
-        height_adjust=true,
+        height_adjust=false,
         height_overflow_show_ellipsis=true,
         alignment="left",
         fgcolor=Blitbuffer.COLOR_DARK_GRAY,
@@ -170,7 +176,7 @@ function ShelfItem:init()
     local text_group = VerticalGroup:new{
         align="left",
         title,
-        VerticalSpan:new{height=math.max(1, Screen:scaleBySize(2))},
+        VerticalSpan:new{height=UiScale.dp(2, 1, 4)},
         info,
     }
     local row = HorizontalGroup:new{
@@ -186,7 +192,7 @@ function ShelfItem:init()
 
     self._underline = UnderlineContainer:new{
         dimen=self.dimen:copy(),
-        linesize=Size.line.thin,
+        linesize=UiScale.line("thin"),
         color=DIVIDER_COLOR,
         padding=0,
         vertical_align="center",
@@ -226,6 +232,7 @@ function ShelfItem:onUnfocus()
 end
 
 local ShelfMenu = Menu:extend{
+    _miuread_transient = true,
     on_select_callback = nil,
     on_hold_callback = nil,
     on_page_changed = nil,
@@ -234,6 +241,10 @@ local ShelfMenu = Menu:extend{
     _miu_closed = false,
     _suppress_page_callback = false,
 }
+
+function ShelfMenu:handleEvent(event)
+    return GestureBridge.handle(Menu, self, event)
+end
 
 function ShelfMenu:onMenuSelect(entry, pos)
     if entry and (entry._miu_action_row or entry._miu_tab_row) then
@@ -249,11 +260,11 @@ function ShelfMenu:onMenuSelect(entry, pos)
                 end
             end
         elseif pos and tonumber(pos.x) and pos.x >= 0.5 then
-            callback=entry.refresh_callback
+            callback=entry.right_callback or entry.refresh_callback
         elseif pos then
-            callback=entry.search_callback
+            callback=entry.left_callback or entry.search_callback
         else
-            callback=entry.refresh_callback or entry.search_callback
+            callback=entry.right_callback or entry.refresh_callback or entry.left_callback or entry.search_callback
         end
         if callback then callback() end
         return true
@@ -350,10 +361,14 @@ function ShelfView.show(opts)
             tabs=tabs,
         }
     end
-    if opts.show_actions~=false and (opts.on_search or opts.on_refresh) then
+    if opts.show_actions~=false and (opts.on_search or opts.on_refresh or opts.on_left_action or opts.on_right_action) then
         action_count=action_count+1
         items[#items+1]={
             _miu_action_row=true,
+            left_label=opts.left_action_label or "搜索书架",
+            right_label=opts.right_action_label or "刷新书架",
+            left_callback=opts.on_left_action or opts.on_search,
+            right_callback=opts.on_right_action or opts.on_refresh,
             search_callback=opts.on_search,
             refresh_callback=opts.on_refresh,
         }

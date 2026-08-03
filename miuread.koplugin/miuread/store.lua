@@ -6,9 +6,12 @@ local Json=require("miuread.json")
 local U=require("miuread.util")
 local logger=require("logger")
 local Store={}; Store.__index=Store
+local function generate_login_session_id()
+    return tostring(os.time()).."-"..tostring(math.random(100000,999999))
+end
 local defaults={
  schema=Config.SCHEMA,
- auth={api_key="",cookies={},wr_ticket="",wr_wrpa="",ticket_updated_at=0,
+ auth={login_session_id="",api_key="",cookies={},wr_ticket="",wr_wrpa="",ticket_updated_at=0,
      account={name="",vid="",logged_at=0},
      health={state="unknown",last_checked_at=0,last_ok_at=0,last_error_at=0,
          last_error_code="",last_error_message="",last_error_channel="",notice_pending=false,
@@ -19,22 +22,30 @@ local defaults={
              annotations={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_dir="",shelf_section="account",account_shelf_kind="books",memory_mode={enabled=false,previous_known=false,previous_ratio=false},thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",download_dir="",shelf_section="account",account_shelf_kind="books",home_ui={enabled=true,layout_version=23,layout_style="desk",local_root="",local_roots={},local_browse_version=1,local_library_mode="direct",performance_defaults_version=1,auto_scan=false,local_check_on_open=true,page_by_section={},source_order={"account","generated","local","mp"},action_items={refresh=true,search=true,downloads=true,sync=true,frontlight=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false},action_order={"refresh","search","downloads","sync","frontlight","miuread_settings","all_books","history","file_manager","screenshot"},action_layout_version=1,panel_items={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false},panel_order={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","frontlight","sync","miuread_settings","downloads","restart","sleep","full_refresh"},panel_layout_version=1,more_expanded=false,network_metadata=false,background_thought_index=false},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=true,show_status=true,show_recent=true,recent_actions={},quick_layout_version=7,quick_items={toc=true,progress=true,font=true,frontlight=true,sync=true,comment_font=true,page_display=false,typeset=false,current_book=false,downloads=false,full_refresh=false,koreader_menu=false,sleep=false},quick_order={"toc","progress","font","frontlight","sync","comment_font","page_display","typeset","current_book","downloads","full_refresh","koreader_menu","sleep"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,library_scan=true,repair_while_reading=true,mode_switch=true},memory_mode={enabled=false,previous_known=false,previous_ratio=false},thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},repair={auto_check=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
 local function invalidate_report_contexts_table(sessions)
     sessions=type(sessions)=="table" and sessions or {}
     local changed=0
+    local clear_keys={
+        "legacy_report_context","report_context","psvts","pclts","token","reader_url",
+        "context_updated_at","report_login_session_id","verification_login_session_id",
+        "remote","remote_sources","remote_checked_at","remote_web_error","remote_agent_error",
+        "remote_verified","verified_at","verified_reason","verified_local_percent","verified_remote_percent",
+        "progress_sync_state","progress_sync_message","progress_upload_state","progress_upload_error",
+        "progress_upload_verified_at","progress_upload_source","progress_upload_at","progress_upload_percent",
+        "last_response_summary","last_http_code","last_http_length","last_payload_public","last_path",
+        "last_stage","last_error","last_attempts",
+    }
     for _,session in pairs(sessions) do
         if type(session)=="table" then
-            if session.legacy_report_context~=nil then session.legacy_report_context=nil; changed=changed+1 end
-            if session.report_context~=nil then session.report_context=nil; changed=changed+1 end
-            if session.last_error~=nil then session.last_error=nil; changed=changed+1 end
-            if tonumber(session.consecutive_failures or 0)~=0 then session.consecutive_failures=0; changed=changed+1 end
-            for _,key in ipairs({"last_response_summary","last_http_code","last_http_length","last_payload_public","last_path","last_stage"}) do
+            for _,key in ipairs(clear_keys) do
                 if session[key]~=nil then session[key]=nil; changed=changed+1 end
             end
+            if tonumber(session.consecutive_failures or 0)~=0 then session.consecutive_failures=0; changed=changed+1 end
+            if tonumber(session.pending_report_seconds or 0)~=0 then session.pending_report_seconds=0; changed=changed+1 end
         end
     end
     return sessions,changed
@@ -64,10 +75,11 @@ local function settings_file_valid(path)
 end
 
 local function restore_settings_file(path,backup_path)
-    if not path or lfs.attributes(path,"mode")~="file" then return false end
+    if not path then return false end
+    local exists=lfs.attributes(path,"mode")=="file"
     local valid,reason=settings_file_valid(path)
     if valid then return false end
-    local candidates={backup_path,path..".old",path..".previous"}
+    local candidates={path..".previous",backup_path,path..".old"}
     for _,candidate in ipairs(candidates) do
         local backup_ok=settings_file_valid(candidate)
         if backup_ok then
@@ -80,10 +92,14 @@ local function restore_settings_file(path,backup_path)
             logger.warn("[MiuRead][Store] settings restore failed",tostring(restore_error))
         end
     end
-    local corrupt=path..".corrupt-"..tostring(os.time())
-    local moved=os.rename(path,corrupt)
-    logger.warn("[MiuRead][Store] damaged settings isolated",
-        "file=",tostring(moved and corrupt or path),"reason=",tostring(reason))
+    if exists then
+        local corrupt=path..".corrupt-"..tostring(os.time())
+        local moved=os.rename(path,corrupt)
+        logger.warn("[MiuRead][Store] damaged settings isolated",
+            "file=",tostring(moved and corrupt or path),"reason=",tostring(reason))
+    else
+        logger.warn("[MiuRead][Store] settings missing and no valid backup","file=",tostring(path))
+    end
     return true,nil
 end
 
@@ -900,12 +916,311 @@ function Store:migrate()
             -- the reader. Existing annotation caches remain intact and are
             -- upgraded automatically by the idle background worker.
         end
+        if schema<64 then
+            -- 3.1.0-beta.3 promotes the MiuRead bookshelf from an optional
+            -- preview to the default file-manager home. Keep one migration flag
+            -- so a later user choice to disable it is respected.
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.enabled=true
+            p.home_ui.layout_version=2
+            if p.home_ui.auto_scan==nil then p.home_ui.auto_scan=true end
+        end
+        if schema<65 then
+            -- 3.1.0-beta.4 adds the configurable home widget layout and quick center.
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=3
+            if p.home_ui.widgets==nil then p.home_ui.widgets=false end
+            if p.home_ui.preset==nil then p.home_ui.preset="balanced" end
+            if p.home_ui.goal_minutes==nil then p.home_ui.goal_minutes=30 end
+            if p.home_ui.swipe_quick==nil then p.home_ui.swipe_quick=false end
+        end
+        if schema<67 then
+            -- 3.2.0-beta.1 replaces the multi-page widget home with a fixed
+            -- reading desk. Old widget choices are intentionally discarded.
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=7
+            p.home_ui.layout_style="desk"
+            if p.home_ui.auto_scan==nil then p.home_ui.auto_scan=true end
+            p.home_ui.widgets=nil
+            p.home_ui.preset=nil
+            p.home_ui.goal_minutes=nil
+            p.home_ui.swipe_quick=nil
+            p.home_ui.initial_page=nil
+        end
+        if schema<69 then
+            -- 3.2.0-beta.15 moves comments to a lightweight native viewer,
+            -- adds the shared book-repair channel, and removes MiuRead's
+            -- fullscreen swipe interception from the home page.
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=15
+            p.home_ui.layout_style=p.home_ui.layout_style=="compact" and "compact" or "desk"
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            if p.thoughts.display_mode~="native_simple" and p.thoughts.display_mode~="legacy_rich" then
+                p.thoughts.display_mode="native_card"
+            end
+            p.thoughts.height_ratio=math.max(0.52,tonumber(p.thoughts.height_ratio) or 0.70)
+            p.repair=type(p.repair)=="table" and p.repair or {}
+            if p.repair.auto_check==nil then p.repair.auto_check=true end
+        end
+        if schema<70 then
+            -- beta.20 replaces the three comment display modes with one fixed-source,
+            -- paged comment card and exposes its font controls from the reader.
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="unified"
+            p.thoughts.width_ratio=math.max(0.88,math.min(0.94,tonumber(p.thoughts.width_ratio) or 0.92))
+            p.thoughts.height_ratio=math.max(0.58,math.min(0.80,tonumber(p.thoughts.height_ratio) or 0.72))
+        end
+        if schema<71 then
+            -- beta.21 removed beta.20's manual page splitting; beta.22
+            -- migrates this preference again to the native list renderer.
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_list"
+            p.thoughts.comments_per_page=nil
+            p.thoughts.width_ratio=math.max(0.88,math.min(0.94,tonumber(p.thoughts.width_ratio) or 0.92))
+            p.thoughts.height_ratio=math.max(0.56,math.min(0.76,tonumber(p.thoughts.height_ratio) or 0.72))
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=17
+        end
         self.db:saveSetting("preferences",p)
+        if schema<72 then
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_list"
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=17
+            p.home_ui.page_by_section=type(p.home_ui.page_by_section)=="table" and p.home_ui.page_by_section or {}
+            self:save_preferences(p)
+        end
+        if schema<73 then
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_paged"
+            p.thoughts.height_ratio=math.max(0.66,math.min(0.82,tonumber(p.thoughts.height_ratio) or 0.76))
+            self:save_preferences(p)
+        end
+        if schema<74 then
+            -- beta.25 restores the compact v3.0.2 visual hierarchy while
+            -- keeping the safer native renderer. Saved paged-card dimensions
+            -- are intentionally replaced because they produced the oversized
+            -- dialog and visible footer that this migration removes.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_classic"
+            p.thoughts.width_ratio=0.91
+            p.thoughts.height_ratio=0.60
+            p.thoughts.comments_per_page=nil
+            self:save_preferences(p)
+        end
+        if schema<75 then
+            -- beta.27 switches comments to a small-font, click-paged native list,
+            -- adds a configurable quick panel, and limits waiting downloads to one.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_click_paged"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.91
+            p.thoughts.height_ratio=0.66
+            p.download_reader_warning=p.download_reader_warning~=false
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=19
+            self:save_preferences(p)
+            local queue=self.db:readSetting("download_queue",{}) or {}
+            if #queue>1 then self.db:saveSetting("download_queue",{queue[1]}) end
+        end
+        if schema<76 then
+            -- beta.28 replaces beta.27's unsafe comment layout with a guarded
+            -- small-font pager and resets the saved popup dimensions.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_safe_paged"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.91
+            p.thoughts.height_ratio=0.66
+            self:save_preferences(p)
+        end
+        if schema<77 then
+            -- beta.29 uses a borderless adaptive-height comment pager. Text is
+            -- measured before pagination so short and long comments fill pages naturally.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_adaptive_paged"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.92
+            p.thoughts.height_ratio=0.72
+            self:save_preferences(p)
+        end
+        if schema<78 then
+            -- beta.30 keeps one stable opaque rounded frame across comment pages.
+            -- This clears the previous page inside the popup region and avoids
+            -- overlapping text without triggering a full-screen refresh.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_rounded_paged"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.92
+            p.thoughts.height_ratio=0.72
+            self:save_preferences(p)
+        end
+        if schema<79 then
+            -- beta.31 separates the fixed rounded frame from the opaque comment
+            -- page surface. Page turns refresh only the inner content region,
+            -- while short final pages still clear every previous text pixel.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_rounded_layered"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.92
+            p.thoughts.height_ratio=0.72
+            self:save_preferences(p)
+        end
+        if schema<81 then
+            -- beta.33 caps comments at roughly half the screen, fills long
+            -- pages by splitting oversized comments into the remaining space,
+            -- and replaces the boxed shelf badges with lighter status text.
+            local p=self:preferences()
+            p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+            p.thoughts.display_mode="native_compact_rounded"
+            p.thoughts.font="standard"
+            p.thoughts.follow_body_font=false
+            p.thoughts.width_ratio=0.90
+            p.thoughts.height_ratio=0.55
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=20
+            self:save_preferences(p)
+        end
+        if schema<82 then
+            -- beta.37 separates desktop and plugin operation, restores the native
+            -- bottom typesetting panel, adds a configurable reader control panel,
+            -- centralizes notices, and hard-limits downloads to one active job plus
+            -- one waiting job. Existing account, book, annotation and sync data stay.
+            local p=self:preferences()
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=21
+            p.home_ui.quick_items=type(p.home_ui.quick_items)=="table" and p.home_ui.quick_items or {}
+            p.home_ui.quick_items.sync=true
+            p.home_ui.quick_items.downloads=true
+            p.home_ui.quick_items.restart=false
+            p.home_ui.quick_items.quit=false
+            p.reader_ui=type(p.reader_ui)=="table" and p.reader_ui or {}
+            if p.reader_ui.enabled==nil then p.reader_ui.enabled=true end
+            if p.reader_ui.plugin_mode_enabled==nil then p.reader_ui.plugin_mode_enabled=false end
+            if p.reader_ui.show_title==nil then p.reader_ui.show_title=true end
+            if p.reader_ui.show_status==nil then p.reader_ui.show_status=true end
+            p.reader_ui.quick_items=type(p.reader_ui.quick_items)=="table" and p.reader_ui.quick_items or {}
+            local reader_defaults={home=true,toc=true,progress=true,font=true,typeset=true,sync=true,current_book=true,downloads=false,full_refresh=false,koreader_menu=false,sleep=false,more=true}
+            for key,value in pairs(reader_defaults) do
+                if p.reader_ui.quick_items[key]==nil then p.reader_ui.quick_items[key]=value end
+            end
+            if type(p.reader_ui.quick_order)~="table" then
+                p.reader_ui.quick_order={"home","toc","progress","font","typeset","sync","current_book","downloads","full_refresh","koreader_menu","sleep","more"}
+            end
+            p.notices=type(p.notices)=="table" and p.notices or {}
+            for _,key in ipairs({"reader_download","low_battery","low_storage","full_refresh","lockscreen","library_scan","repair_while_reading","mode_switch"}) do
+                if p.notices[key]==nil then p.notices[key]=true end
+            end
+            if p.download_reader_policy~="allow" and p.download_reader_policy~="after_reading" then
+                p.download_reader_policy="ask"
+            end
+            self:save_preferences(p)
+            local queue=self.db:readSetting("download_queue",{}) or {}
+            local kept,seen={},{}
+            for _,job in ipairs(queue) do
+                local book=type(job)=="table" and type(job.book)=="table" and job.book or {}
+                local id=tostring(book.bookId or book.book_id or "")
+                if #kept<1 and (id=="" or not seen[id]) then
+                    kept[#kept+1]=job
+                    if id~="" then seen[id]=true end
+                end
+            end
+            self.db:saveSetting("download_queue",kept)
+        end
+        if schema<84 then
+            -- 3.5 separates the six always-visible homepage actions from the
+            -- pull-down device/KOReader controls. Existing books, downloads,
+            -- comments, reading positions and account data remain unchanged.
+            local p=self:preferences()
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            p.home_ui.layout_version=22
+            p.home_ui.action_items={refresh=true,search=true,downloads=true,sync=true,frontlight=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false}
+            p.home_ui.action_order={"refresh","search","downloads","sync","frontlight","miuread_settings","all_books","history","file_manager","screenshot"}
+            p.home_ui.action_layout_version=1
+            p.home_ui.panel_items={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
+            p.home_ui.panel_order={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","frontlight","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
+            p.home_ui.panel_layout_version=1
+            p.home_ui.more_expanded=false
+            p.home_ui.quick_items=nil
+            p.home_ui.quick_order=nil
+            self:save_preferences(p)
+        end
+        if schema<85 then
+            -- Keep network metadata enrichment opt-in at the feature level but
+            -- enabled by default for the recent-reading card. Results are
+            -- cached and never block the initial home render.
+            local p=self:preferences()
+            p.home_ui=type(p.home_ui)=="table" and p.home_ui or {}
+            if p.home_ui.network_metadata==nil then p.home_ui.network_metadata=true end
+            p.home_ui.more_expanded=false
+            self:save_preferences(p)
+        end
+        if schema<88 then
+            -- beta.9 replaces the reader's default shortcut layout with the
+            -- self-contained MiuRead control center. Existing user-customized
+            -- layouts remain readable and are migrated again in main.lua.
+            local p=self:preferences()
+            p.reader_ui=type(p.reader_ui)=="table" and p.reader_ui or {}
+            if p.reader_ui.show_recent==nil then p.reader_ui.show_recent=true end
+            p.reader_ui.recent_actions=type(p.reader_ui.recent_actions)=="table" and p.reader_ui.recent_actions or {}
+            -- Shortcut migration is completed in main.lua where the plugin can
+            -- distinguish an old recommended layout from a real customization.
+            self:save_preferences(p)
+        end
+        if schema<90 then
+            -- beta.15 separates durable book identity from one QR-login session.
+            -- Old EPUBs, chapter maps, local positions and annotations stay intact;
+            -- only account-bound upload contexts are discarded and rebuilt lazily.
+            local auth=U.merge(defaults.auth,self.db:readSetting("auth",{}) or {})
+            local account=type(auth.account)=="table" and auth.account or {}
+            if tostring(auth.login_session_id or "")==""
+                and tostring(account.vid or "")~=""
+                and tostring(auth.api_key or "")~=""
+                and next(auth.cookies or {})~=nil then
+                auth.login_session_id=generate_login_session_id()
+            end
+            self.db:saveSetting("auth",invalidate_upload_health_table(auth))
+            local sessions=self.db:readSetting("sessions",{}) or {}
+            local cleaned,changed=invalidate_report_contexts_table(sessions)
+            if changed>0 then self.db:saveSetting("sessions",cleaned) end
+        end
+        if schema<93 then
+            -- 4.0.0-beta.10 separates local books into automatic indexing,
+            -- manual indexing and zero-index folder browsing. Preserve an
+            -- existing recursive index by migrating it to manual mode; new
+            -- installs stay in the safest direct browsing mode.
+            local current=self:preferences()
+            current.home_ui=type(current.home_ui)=="table" and current.home_ui or {}
+            local previous_home=type(previous.home_ui)=="table" and previous.home_ui or {}
+            if previous_home.local_library_mode==nil then
+                local legacy=self.db:readSetting("home_local_index",{}) or {}
+                local had_index=type(legacy)=="table" and type(legacy.books)=="table" and #legacy.books>0
+                current.home_ui.local_library_mode=had_index and "manual" or "direct"
+            end
+            local mode=tostring(current.home_ui.local_library_mode or "direct")
+            if mode~="auto" and mode~="manual" and mode~="direct" then mode="direct" end
+            current.home_ui.local_library_mode=mode
+            current.home_ui.auto_scan=mode=="auto"
+            self:save_preferences(current)
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end
 function Store:get(k,d) local v=self.db:readSetting(k,nil); return v==nil and U.copy(d) or v end
 function Store:set(k,v) self.db:saveSetting(k,v); self:flush() end
+function Store:set_deferred(k,v) self.db:saveSetting(k,v) end
 local function sanitized_auth(value)
     local auth=U.merge(defaults.auth,value or {})
     auth.mp_cookie_header=nil
@@ -917,6 +1232,17 @@ local function sanitized_auth(value)
 end
 function Store:auth() return sanitized_auth(self:get("auth",{})) end
 function Store:save_auth(v) self:set("auth",sanitized_auth(v)) end
+function Store:generate_login_session_id() return generate_login_session_id() end
+function Store:ensure_login_session_id()
+    local auth=self:auth()
+    local account=type(auth.account)=="table" and auth.account or {}
+    if tostring(auth.login_session_id or "")=="" and tostring(account.vid or "")~=""
+        and tostring(auth.api_key or "")~="" and next(auth.cookies or {})~=nil then
+        auth.login_session_id=generate_login_session_id()
+        self:save_auth(auth)
+    end
+    return tostring(auth.login_session_id or "")
+end
 function Store:auth_health()
     local auth=self:auth()
     return U.merge(defaults.auth.health,auth.health or {})
@@ -929,8 +1255,14 @@ function Store:update_auth_health(patch)
     return auth.health
 end
 function Store:clear_auth() self:set("auth",U.copy(defaults.auth)) end
+function Store:clear_account_shelf_cache()
+    local cache=self:shelf_cache()
+    cache.books={}; cache.mp={}; cache.updated_at=0
+    self:save_shelf_cache(cache)
+end
 function Store:preferences() return U.merge(defaults.preferences,self:get("preferences",{})) end
 function Store:save_preferences(v) self:set("preferences",U.merge(defaults.preferences,v or {})) end
+function Store:save_preferences_deferred(v) self:set_deferred("preferences",U.merge(defaults.preferences,v or {})) end
 function Store:books_root() local p=self:preferences().download_dir; if p=="" then p=self.default_books_dir end; U.mkdir(p); return p end
 function Store:epub_root() return self:books_root() end
 function Store:book_cache_path(id) return self.cache_books_dir.."/"..U.id_name(id) end
@@ -1060,6 +1392,50 @@ function Store:forget_chapter_all(id,uid)
     self:set("library",all)
 end
 function Store:forget_book(id) local all=self:library(); all[tostring(id)]=nil; self:set("library",all) end
+function Store:forget_book_local_state(id)
+    local key=tostring(id or "")
+    if key=="" then return false end
+    local all=self:library(); all[key]=nil; self:set("library",all)
+    local sessions=self:get("sessions",{}); sessions[key]=nil; self:set("sessions",sessions)
+    local covers=self:get("cover_index",{}); covers[key]=nil; self:set("cover_index",covers)
+
+    local queue_out={}
+    for _,job in ipairs(self:download_queue()) do
+        local job_id=tostring((job.book and (job.book.bookId or job.book.book_id)) or job.book_id or "")
+        if job_id~=key then queue_out[#queue_out+1]=job end
+    end
+    self:save_download_queue(queue_out)
+
+    local pending_out={}
+    for _,row in ipairs(self:pending_installs()) do
+        if tostring(row.book_id or "")~=key then pending_out[#pending_out+1]=row end
+    end
+    self:save_pending_installs(pending_out)
+
+    local repair=self:get("book_repair_state",{}); repair[key]=nil; self:set("book_repair_state",repair)
+    local history_out={}
+    for _,row in ipairs(self:get("book_repair_history",{})) do
+        if tostring(row.book_id or "")~=key then history_out[#history_out+1]=row end
+    end
+    self:set("book_repair_history",history_out)
+
+    local shelf=self:shelf_cache()
+    local shelf_changed=false
+    for _,group in ipairs({shelf.books or {},shelf.mp or {}}) do
+        for _,row in ipairs(group) do
+            if tostring(row.bookId or row.book_id or "")==key and row.cover_path~=nil then
+                row.cover_path=nil; shelf_changed=true
+            end
+        end
+    end
+    if shelf_changed then self:save_shelf_cache(shelf) end
+
+    local state=self:download_state()
+    if tostring(state.book_id or (state.book and (state.book.bookId or state.book.book_id)) or "")==key then
+        self:clear_download_state()
+    end
+    return true
+end
 function Store:forget_all_books() self:set("library",{}) end
 function Store:prune_missing_files()
     local all=self:library(); local changed=false
@@ -1375,15 +1751,20 @@ function Store:mark_last_read(id,path,progress)
     if progress~=nil then patch.progress_local_percent=tonumber(progress) end
     self:save_session(id,patch)
 end
-function Store:invalidate_report_contexts(reason)
+function Store:clear_login_bound_sessions(reason)
     local sessions=self:get("sessions",{})
     local cleaned,changed=invalidate_report_contexts_table(sessions)
     if changed>0 then self:set("sessions",cleaned) end
     self:save_auth(invalidate_upload_health_table(self:get("auth",{})))
+    logger.info("[MiuRead][Store] login-bound sessions cleared",
+        "reason=",tostring(reason or "unknown"),"fields=",tostring(changed))
     return changed,reason
 end
+function Store:invalidate_report_contexts(reason)
+    return self:clear_login_bound_sessions(reason)
+end
 function Store:session(id) return self:get("sessions",{})[tostring(id)] end
-function Store:save_session(id,patch) local a=self:get("sessions",{}); local k=tostring(id); a[k]=U.merge(a[k] or {},patch or {}); self:set("sessions",a); return a[k] end
+function Store:save_session(id,patch,flush_now) local a=self:get("sessions",{}); local k=tostring(id); a[k]=U.merge(a[k] or {},patch or {}); self.db:saveSetting("sessions",a); if flush_now~=false then self:flush() end; return a[k] end
 function Store:clear_session(id) local a=self:get("sessions",{}); a[tostring(id)]=nil; self:set("sessions",a) end
 function Store:shelf_cache() return U.merge(defaults.shelf_cache,self:get("shelf_cache",{})) end
 function Store:save_shelf_cache(v) self:set("shelf_cache",U.merge(defaults.shelf_cache,v or {})) end
@@ -1422,10 +1803,24 @@ function Store:save_download_state(value)
     return U.atomic_write(self.download_state_path,encoded,true)
 end
 function Store:clear_download_state() os.remove(self.download_state_path) end
-function Store:download_queue() return self:get("download_queue",{}) end
-function Store:save_download_queue(queue) self:set("download_queue",type(queue)=="table" and queue or {}) end
+function Store:download_queue()
+    local queue=self:get("download_queue",{})
+    if type(queue)~="table" then return {} end
+    if #queue<=1 then return queue end
+    return {queue[1]}
+end
+function Store:save_download_queue(queue)
+    queue=type(queue)=="table" and queue or {}
+    local kept={}
+    if type(queue[1])=="table" then kept[1]=U.copy(queue[1]) end
+    self:set("download_queue",kept)
+end
 function Store:enqueue_download(job)
-    local queue=self:download_queue(); queue[#queue+1]=U.copy(job or {}); self:save_download_queue(queue); return #queue
+    local queue=self:download_queue()
+    if #queue>=1 then return nil,"full" end
+    queue[1]=U.copy(job or {})
+    self:save_download_queue(queue)
+    return 1
 end
 function Store:dequeue_download()
     local queue=self:download_queue(); if #queue==0 then return nil end
@@ -1490,11 +1885,28 @@ function Store:mark_read_report_consumed(stamp)
     self:set("read_report_consumed",rows)
 end
 function Store:flush()
-    self.db:flush()
+    local previous_path=self.settings_path..".previous"
     if not self.isolated then
         local valid=settings_file_valid(self.settings_path)
-        if valid then U.copy_file(self.settings_path,self.settings_backup_path) end
+        if valid then U.copy_file(self.settings_path,previous_path) end
     end
+    local ok,err=xpcall(function() self.db:flush() end,debug.traceback)
+    if not ok then
+        if not self.isolated then restore_settings_file(self.settings_path,self.settings_backup_path) end
+        error(err)
+    end
+    if not self.isolated then
+        local valid,reason=settings_file_valid(self.settings_path)
+        if valid then
+            U.copy_file(self.settings_path,self.settings_backup_path)
+            os.remove(previous_path)
+        else
+            logger.warn("[MiuRead][Store] settings flush produced invalid file","reason=",tostring(reason))
+            restore_settings_file(self.settings_path,self.settings_backup_path)
+            self.db=LuaSettings:open(self.settings_path)
+        end
+    end
+    return true
 end
 function Store:reload()
     if not self.isolated then restore_settings_file(self.settings_path,self.settings_backup_path) end

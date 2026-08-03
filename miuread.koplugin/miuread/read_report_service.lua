@@ -152,6 +152,27 @@ function Service.run(job)
     local consecutive_failures = 0
     local recovery_probe = false
 
+    local function write_service_status(value, source_job)
+        value=type(value)=="table" and value or {}
+        source_job=type(source_job)=="table" and source_job or current_job or {}
+        if value.generation==nil then value.generation=generation end
+        if value.controller_token==nil then value.controller_token=tostring(source_job.controller_token or "") end
+        if value.login_session_id==nil then value.login_session_id=tostring(source_job.login_session_id or "") end
+        if value.account_vid==nil then value.account_vid=tostring(source_job.account_vid or "") end
+        if value.book_id==nil then value.book_id=tostring(source_job.book_id or "") end
+        return write_status(status_path,value)
+    end
+
+    local function write_context()
+        if not current_job then return end
+        return U.atomic_write(context_path,Json.encode({
+            login_session_id=tostring(current_job.login_session_id or ""),
+            account_vid=tostring(current_job.account_vid or ""),
+            book_id=tostring(current_job.book_id or ""),
+            context=book,
+        }),true)
+    end
+
     local function run_report(control, elapsed, final_flush, reason)
         local interval = math.max(10, tonumber(current_job.interval) or 30)
         -- Keep each request within one normal reporting interval. After a
@@ -183,9 +204,7 @@ function Service.run(job)
         if ok and type(result) == "table" then
             if type(result.legacy_context) == "table" then
                 book = U.copy(result.legacy_context)
-                if result.context_changed then
-                    U.atomic_write(context_path, Json.encode(book), true)
-                end
+                if result.context_changed then write_context() end
             end
             if result.cookies_changed and type(result.cookies) == "table" then auth.cookies = U.copy(result.cookies) end
             if result.wr_ticket_changed then auth.wr_ticket = result.wr_ticket or "" end
@@ -220,7 +239,7 @@ function Service.run(job)
             out.flush_reason = reason
             out.next_due = final_flush and 0 or (completed_at + (delay>0 and delay or interval))
             out.book_id = tostring(current_job.book_id or "")
-            write_status(status_path, out)
+            write_service_status(out)
             return out.next_due
         end
 
@@ -229,7 +248,7 @@ function Service.run(job)
         local kind=classify_error(nil,result)
         local delay=retry_delay(kind,consecutive_failures,interval)
         local due = final_flush and 0 or (completed_at + delay)
-        write_status(status_path, {
+        write_service_status({
             generation = generation,
             seq = sequence,
             state = "error",
@@ -253,7 +272,7 @@ function Service.run(job)
         return due
     end
 
-    write_status(status_path, {
+    write_service_status({
         generation = 0,
         seq = 0,
         state = "service_waiting",
@@ -268,36 +287,52 @@ function Service.run(job)
         if control and tonumber(control.generation or 0) ~= generation then
             local requested = tonumber(control.generation or 0) or 0
             local loaded = read_json(job_path)
-            if loaded and tonumber(loaded.generation or 0) == requested then
+            if loaded and tonumber(loaded.generation or 0) == requested
+                and tostring(control.controller_token or "")==tostring(loaded.controller_token or "")
+                and tostring(control.login_session_id or "")==tostring(loaded.login_session_id or "")
+                and tostring(control.account_vid or "")==tostring(loaded.account_vid or "") then
                 generation = requested
                 current_job = loaded
-                book = U.copy(loaded.book or {})
-                auth = U.copy(loaded.auth or {})
-                local interval = math.max(10, tonumber(loaded.interval) or 30)
-                local first_delay = math.max(5, math.min(interval, tonumber(loaded.first_delay) or interval))
-                local now = os.time()
-                next_due = now + first_delay
-                last_report_at = now
                 last_flush_seq = 0
                 last_control_state = nil
                 consecutive_failures = 0
                 recovery_probe = false
-                U.atomic_write(context_path, Json.encode(book), true)
-                write_status(status_path, {
-                    generation = generation,
-                    seq = sequence,
-                    state = "waiting",
-                    next_due = next_due,
-                    book_id = tostring(loaded.book_id or ""),
-                    first_delay = first_delay,
-                    carry_elapsed = 0,
-                    service_version = tonumber(job.service_version) or 0,
-                })
+                if tostring(loaded.action or "")=="reset_auth" then
+                    book={}
+                    auth={}
+                    next_due=0
+                    last_report_at=os.time()
+                    os.remove(context_path)
+                    write_service_status({
+                        generation=generation,seq=sequence,state="session_reset",next_due=0,
+                        service_version=tonumber(job.service_version) or 0,
+                    })
+                else
+                    book = U.copy(loaded.book or {})
+                    auth = U.copy(loaded.auth or {})
+                    local interval = math.max(10, tonumber(loaded.interval) or 30)
+                    local first_delay = math.max(5, math.min(interval, tonumber(loaded.first_delay) or interval))
+                    local now = os.time()
+                    next_due = now + first_delay
+                    last_report_at = now
+                    write_context()
+                    write_service_status({
+                        generation = generation,
+                        seq = sequence,
+                        state = "waiting",
+                        next_due = next_due,
+                        first_delay = first_delay,
+                        carry_elapsed = 0,
+                        service_version = tonumber(job.service_version) or 0,
+                    })
+                end
             end
         end
 
         if current_job and control and tonumber(control.generation or 0) == generation
             and tostring(control.controller_token or "") == tostring(current_job.controller_token or "")
+            and tostring(control.login_session_id or "") == tostring(current_job.login_session_id or "")
+            and tostring(control.account_vid or "") == tostring(current_job.account_vid or "")
         then
             local active = control.active == true
             local state_key = active and "active" or "inactive"
@@ -309,7 +344,7 @@ function Service.run(job)
                 if not active then
                     next_due = 0
                     if not pending_flush then
-                        write_status(status_path, {
+                        write_service_status({
                             generation = generation,
                             seq = sequence,
                             state = "inactive",
@@ -333,7 +368,7 @@ function Service.run(job)
                     next_due = run_report(control, elapsed, true, tostring(control.flush_reason or "stop"))
                 else
                     next_due = 0
-                    write_status(status_path, {
+                    write_service_status({
                         generation = generation,
                         seq = sequence,
                         state = "inactive",
@@ -366,7 +401,7 @@ function Service.run(job)
         sleep(poll_interval)
     end
 
-    write_status(status_path, {
+    write_service_status({
         generation = generation,
         seq = sequence,
         state = "service_stopped",

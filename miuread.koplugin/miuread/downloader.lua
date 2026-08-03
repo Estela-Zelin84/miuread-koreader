@@ -2,6 +2,7 @@ local Protocol = require("miuread.protocol")
 local Config = require("miuread.config")
 local Codec = require("miuread.codec")
 local Footnotes = require("miuread.footnotes")
+local ResourceRefs = require("miuread.resource_refs")
 local InternalLinks = require("miuread.internal_links")
 local Thoughts = require("miuread.thoughts")
 local Epub = require("miuread.epub")
@@ -23,9 +24,11 @@ Downloader.__index = Downloader
 
 local CACHE_SCHEMA = 9
 local FOOTNOTE_TRANSFORM_VERSION = 2
+local LEGACY_TITLE_TRANSFORM_VERSION = 1
 local TITLE_TRANSFORM_VERSION = 2
+local LEGACY_ANNOTATION_TRANSFORM_VERSION = 1
 local ANNOTATION_TRANSFORM_VERSION = 4
-local ANNOTATION_CACHE_REUSE_SECONDS = 10 * 60
+local IMAGE_TRANSFORM_VERSION = 2
 
 local BASE_CSS = [[
 body { line-height: 1.75; margin: 5%; }
@@ -158,7 +161,31 @@ local function collect_headings(window, limit)
     return headings
 end
 
-local function prepare_chapter_body(html, title)
+local function normalized_title_legacy(value)
+    return plain(value):lower():gsub("[%s%p%c]", "")
+end
+
+local function prepare_chapter_body_legacy(html, title)
+    local fragment = Codec.body(html)
+    title = tostring(title or "")
+    if title == "" then return '<section class="miu-chapter" epub:type="chapter">' .. fragment .. "</section>" end
+    local wanted = normalized_title_legacy(title)
+    local prefix = fragment:sub(1, 1600)
+    local has_title = false
+    for _tag, _attrs, inner in prefix:gmatch("<(h[1-6])([^>]*)>(.-)</%1%s*>") do
+        if normalized_title_legacy(inner) == wanted then has_title = true; break end
+    end
+    if not has_title then
+        local _, first_inner = prefix:match("^%s*<([pd][^>]*)>(.-)</[pd][^>]*>")
+        if first_inner and normalized_title_legacy(first_inner) == wanted then has_title = true end
+    end
+    if not has_title then
+        fragment = '<h1 class="miu-chapter-title">' .. U.xml(title) .. "</h1>\n" .. fragment
+    end
+    return '<section class="miu-chapter" epub:type="chapter" data-miuread-section="1">' .. fragment .. "</section>"
+end
+
+local function prepare_chapter_body_current(html, title)
     local fragment = Codec.body(html)
     title = tostring(title or "")
     if title == "" then
@@ -214,6 +241,13 @@ local function prepare_chapter_body(html, title)
         fragment = '<h1 class="miu-chapter-title">' .. U.xml(title) .. "</h1>\n" .. fragment
     end
     return '<section class="miu-chapter" epub:type="chapter" data-miuread-section="1">' .. fragment .. "</section>"
+end
+
+local function prepare_chapter_body(html, title, transform_version)
+    if tonumber(transform_version) == LEGACY_TITLE_TRANSFORM_VERSION then
+        return prepare_chapter_body_legacy(html, title)
+    end
+    return prepare_chapter_body_current(html, title)
 end
 
 local function preview_information_chapter(book, mode, catalog_count, readable_count, restricted_count, failures)
@@ -284,9 +318,11 @@ local function pattern_escape(value)
     return tostring(value or ""):gsub("([^%w])", "%%%1")
 end
 
-local function namespace_assets(body, assets, uid)
+local function namespace_assets(body, style, assets, uid)
     local out = {}
     local prefix = "ch-" .. U.id_name(uid)
+    body = tostring(body or "")
+    style = tostring(style or "")
     for index, asset in ipairs(assets or {}) do
         local item = U.copy(asset)
         local old = tostring(item.href or "")
@@ -295,11 +331,33 @@ local function namespace_assets(body, assets, uid)
         if old ~= "" and old ~= new then
             body = body:gsub(pattern_escape("../" .. old), "../" .. new)
             body = body:gsub(pattern_escape(old), new)
+            -- Chapter CSS is merged into OEBPS/style.css, where image paths
+            -- are relative to OEBPS rather than OEBPS/text. Keep CSS and XHTML
+            -- references in sync with the per-chapter asset namespace.
+            style = style:gsub(pattern_escape("../" .. old), new)
+            style = style:gsub(pattern_escape(old), new)
         end
         item.href = new
         out[#out + 1] = item
     end
-    return body, out
+    return body, style, out
+end
+
+local function migrate_cached_style_assets(style, assets, uid)
+    style = tostring(style or "")
+    local prefix = "ch-" .. U.id_name(uid)
+    for index, asset in ipairs(assets or {}) do
+        local current = tostring(asset.href or "")
+        local marker = "images/" .. prefix .. "-" .. tostring(index) .. "-"
+        if current:sub(1, #marker) == marker then
+            local old = "images/" .. current:sub(#marker + 1)
+            if old ~= current then
+                style = style:gsub(pattern_escape("../" .. old), current)
+                style = style:gsub(pattern_escape(old), current)
+            end
+        end
+    end
+    return style
 end
 
 local function option_key(opt)
@@ -379,12 +437,22 @@ local function cache_new(store, book, opt, selected, format)
     if not valid then
         U.remove_tree(root)
         U.mkdir(root .. "/chapters")
+        local previous_record=type(opt.existing_download_record)=="table" and opt.existing_download_record or nil
+        local inherited_title_version=previous_record and tonumber(previous_record.title_transform_version) or nil
+        if not inherited_title_version and previous_record then
+            -- 3.2 records contain a task id. Older records do not and should
+            -- retain the 2.3.3 wrapper when their cache has been cleared.
+            inherited_title_version=previous_record.task_id and TITLE_TRANSFORM_VERSION
+                or LEGACY_TITLE_TRANSFORM_VERSION
+        end
         manifest = {
             schema = CACHE_SCHEMA,
             book_id = tostring(book.bookId),
             option_key = option_key(opt),
             signature = signature,
             format = format,
+            title_transform_version = inherited_title_version or TITLE_TRANSFORM_VERSION,
+            image_transform_version = IMAGE_TRANSFORM_VERSION,
             created_at = os.time(),
             updated_at = os.time(),
             chapters = {},
@@ -396,6 +464,22 @@ local function cache_new(store, book, opt, selected, format)
         -- underlying chapter. Preserve checkpoints by UID and refresh the
         -- current catalog fingerprint instead of discarding the whole cache.
         manifest.signature = signature
+        if tonumber(manifest.title_transform_version or 0) <= 0 then
+            local detected
+            for _, cached_entry in pairs(manifest.chapters or {}) do
+                local version = tonumber(cached_entry.title_transform_version or 0)
+                if version > 0 then detected = version; break end
+            end
+            -- Caches created before 3.2 used the 2.3.3 chapter wrapper. Lock
+            -- them to that layout instead of silently rebuilding the whole book.
+            manifest.title_transform_version = detected or LEGACY_TITLE_TRANSFORM_VERSION
+        end
+        if tonumber(manifest.image_transform_version or 0)<=0 then
+            -- Existing beta.15 and older checkpoints were produced before the
+            -- picture/SVG/CSS resource scanner. Keep their generation marked
+            -- as legacy so individual chapters can be refreshed safely.
+            manifest.image_transform_version=1
+        end
         manifest.updated_at = os.time()
         write_json(path, manifest)
     end
@@ -466,6 +550,9 @@ local function cache_save_base(cache, chapter, body, style, assets, state)
     entry.structural = state and state.structural == true or false
     entry.image_only = state and state.image_only == true or false
     entry.image_summary = state and state.image_summary or nil
+    entry.image_transform_version = IMAGE_TRANSFORM_VERSION
+    entry.title_transform_version = tonumber(entry.title_transform_version
+        or cache.manifest.title_transform_version) or TITLE_TRANSFORM_VERSION
     entry.error = nil
     cache.manifest.chapters[uid] = entry
     if state and (state.psvts or state.pclts or state.token or state.url) then
@@ -503,8 +590,10 @@ local function cache_save_final(cache, chapter, body, annotation, style, footnot
     entry.thoughts = annotation and (annotation.thought_count or 0) or 0
     entry.thought_entries = annotation and (annotation.thought_entry_count or 0) or 0
     entry.footnote_transform_version = FOOTNOTE_TRANSFORM_VERSION
-    entry.title_transform_version = TITLE_TRANSFORM_VERSION
-    entry.annotation_transform_version = ANNOTATION_TRANSFORM_VERSION
+    entry.title_transform_version = tonumber(entry.title_transform_version
+        or cache.manifest.title_transform_version) or TITLE_TRANSFORM_VERSION
+    entry.annotation_transform_version = annotation and ANNOTATION_TRANSFORM_VERSION
+        or tonumber(entry.annotation_transform_version or 0)
     entry.footnote_candidates = footnote_stats and tonumber(footnote_stats.candidates or footnote_stats.refs or 0) or 0
     entry.footnote_refs = footnote_stats and tonumber(footnote_stats.refs or 0) or 0
     entry.footnotes_converted = footnote_stats and tonumber(footnote_stats.converted or 0) or 0
@@ -698,6 +787,14 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     end
     local filename=U.safe_name(book.title,"book")..preview_name..range_name..chapter_name.." ["..suffix.."].epub"
     local path=self.store:epub_path(filename)
+    -- Keep the exact path of an existing variant. KOReader sidecar notes are
+    -- associated with the document path, so a title or filename change must not
+    -- silently create a second EPUB and leave the old .sdr behind.
+    local recorded_path=type(existing_record)=="table" and tostring(existing_record.file or "") or ""
+    if recorded_path~="" then
+        path=recorded_path
+        filename=recorded_path:match("([^/]+)$") or filename
+    end
     if U.file_exists(path) then
         local identity=type(self.store.epub_identity)=="function" and self.store:epub_identity(path) or nil
         local same_identity=type(identity)=="table"
@@ -707,7 +804,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         if not same_identity and type(existing_record)=="table" and tostring(existing_record.file or "")==tostring(path) then
             same_identity=true
         end
-        if not same_identity then
+        if not same_identity and recorded_path=="" then
             local collision_id=standalone and (tostring(book.bookId).."-"..tostring(opt.chapter_uid)) or tostring(book.bookId)
             local stem=filename:gsub("%.epub$","")
             filename=stem.." ["..U.id_name(collision_id):sub(-12).."].epub"
@@ -748,6 +845,41 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
 
     local link_stats=repair_internal_links(chapters)
     ensure_not_cancelled()
+
+    -- Final XHTML and CSS are the source of truth. Footnote conversion and
+    -- annotation injection may intentionally remove an earlier image marker,
+    -- so prune no-longer-referenced candidates instead of treating them as a
+    -- corrupt book or listing them in the OPF manifest.
+    local final_assets,resource_stats,resource_error=ResourceRefs.prune(chapters,css,assets)
+    if not final_assets then
+        logger.warn("[MiuRead][Download] final resource scan failed",tostring(resource_error))
+        error("书籍内容整理失败，未覆盖原文件。 [MiuReadResourceScan]")
+    end
+    logger.info("[MiuRead][Download] final image references",
+        "references=",tostring(resource_stats.references or 0),
+        "kept=",tostring(resource_stats.kept or 0),
+        "pruned=",tostring(resource_stats.pruned or 0),
+        "embedded=",tostring(resource_stats.embedded or 0),
+        "missing=",tostring(resource_stats.missing or 0),
+        "external=",tostring(resource_stats.external or 0))
+    if tonumber(resource_stats.missing or 0)>0 then
+        logger.warn("[MiuRead][Download] final image references missing",
+            table.concat(resource_stats.missing_samples or {},","))
+        error("书籍正文图片未完整获取，未覆盖原文件。 [MiuReadImageMissing]")
+    end
+    if tonumber(resource_stats.external or 0)>0 then
+        logger.warn("[MiuRead][Download] final image references remain external",
+            table.concat(resource_stats.external_samples or {},","))
+        error("书籍正文图片尚未完成本地化，未覆盖原文件。 [MiuReadImageExternal]")
+    end
+    assets=final_assets
+    opt.image_summary=type(opt.image_summary)=="table" and opt.image_summary or {}
+    opt.image_summary.final_referenced=tonumber(resource_stats.references or 0) or 0
+    opt.image_summary.orphan_pruned=tonumber(resource_stats.pruned or 0) or 0
+    opt.image_summary.embedded=math.max(tonumber(opt.image_summary.embedded or 0) or 0,
+        tonumber(resource_stats.embedded or 0) or 0)
+    opt.image_summary.assets=#assets
+
     local stamp=tostring(opt.download_run_id or os.time()):gsub("[^%w%-]","-")
     local temp_path=path:gsub("%.epub$","")..".miuread-new-"..stamp..".epub"
     os.remove(temp_path)
@@ -764,6 +896,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         range_end_title=opt.range_end_title,content_type="book",
         sync_enabled=not partial_range,read_report_enabled=not partial_range,
         chapters=map,generated_at=now,complete=true,task_id=opt.download_run_id,
+        title_transform_version=tonumber(opt.title_transform_version) or TITLE_TRANSFORM_VERSION,
         access_scope=access_scope,catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
         readable_count=tonumber(opt.readable_chapter_count) or #chapters,
         restricted_count=tonumber(opt.restricted_chapter_count) or 0,
@@ -774,14 +907,21 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         annotation_pending=opt.annotation_pending==true or nil,
         annotation_fallback=opt.annotation_fallback==true or nil,
         annotation_error_kind=opt.annotation_error_kind,
+        images=U.copy(opt.image_summary or {}),
+        image_transform_version=IMAGE_TRANSFORM_VERSION,
         internal_links={links=link_stats.links or 0,rewritten=link_stats.rewritten or 0,
             unresolved=link_stats.unresolved or 0,critical=link_stats.unresolved_critical or 0},
     })
     if not built then os.remove(temp_path); error(build_error) end
     ensure_not_cancelled()
-    local validation_options={book_id=book.bookId,variant=storage_kind,chapters=map,previous_chapters=previous_chapters}
+    local validation_options={book_id=book.bookId,variant=storage_kind,chapters=map,previous_chapters=previous_chapters,
+        image_summary=U.copy(opt.image_summary or {})}
     local valid,validation_error=EpubInstaller.validate(temp_path,validation_options)
-    if not valid then os.remove(temp_path); error("EPUB 完整性验证失败："..tostring(validation_error)) end
+    if not valid then
+        logger.warn("[MiuRead][Download] EPUB validation failed",tostring(validation_error))
+        os.remove(temp_path)
+        error("书籍内容验证未通过，未覆盖原文件。 [MiuReadEpubValidation]")
+    end
     logger.info("[MiuRead][Download] low-memory EPUB package completed",
         "bytes=",tostring(U.file_size(temp_path) or 0),
         "memory_kb=",tostring(math.floor(collectgarbage("count"))))
@@ -824,6 +964,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         file_size=defer_install and U.file_size(pending_path) or U.file_size(path),
         previous_chapter_map=defer_install and U.copy(previous_chapters or {}) or nil,
         task_id=opt.download_run_id,
+        title_transform_version=tonumber(opt.title_transform_version) or TITLE_TRANSFORM_VERSION,
         pending_install=defer_install or nil,
         pending_file=pending_path,
         annotation_requested=opt.annotation_requested==true or opt.annotations==true,
@@ -832,6 +973,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         annotation_error_kind=opt.annotation_error_kind,
         annotation_errors=U.copy(opt.annotation_errors or {}),
         annotation_account_key=opt.annotations and annotation_account_key or nil,
+        image_count=#assets,image_summary=U.copy(opt.image_summary or {}),
+        image_transform_version=IMAGE_TRANSFORM_VERSION,
     }
     if standalone then
         record.chapter_uid = tostring(opt.chapter_uid)
@@ -856,6 +999,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
 end
 
 local function append_entry(chapters, assets, css_list, css_seen, entry, body_source, style, chapter_assets, index)
+    style = migrate_cached_style_assets(style, chapter_assets, entry and entry.uid)
     css_add(css_list, css_seen, style)
     for _, asset in ipairs(chapter_assets or {}) do assets[#assets + 1] = asset end
     local chapter = {
@@ -875,6 +1019,39 @@ end
 function Downloader:book(input, opt, progress)
     opt = opt or {}
     progress = progress or function() end
+    local function respect_reader_priority(stage)
+        local pause_path=tostring(opt.pause_path or "")
+        local pause_logged=false
+        -- The parent writes this marker before suspend and page transitions.
+        -- Waiting here preserves the child and its checkpoints without starting
+        -- another chapter, request or annotation batch.
+        while pause_path~="" and U.file_exists(pause_path) do
+            if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
+            if not pause_logged then
+                pause_logged=true
+                logger.info("[MiuRead][Download] worker paused",tostring(stage or "work"))
+            end
+            pause(.25)
+        end
+        if pause_logged then logger.info("[MiuRead][Download] worker resumed",tostring(stage or "work")) end
+
+        local active_path=tostring(opt.reader_active_path or "")
+        if active_path=="" or not U.file_exists(active_path) then return end
+        local busy_until=tonumber(U.read_file(tostring(opt.reader_busy_path or ""),true) or 0) or 0
+        local waited=0
+        while busy_until>os.time() and waited<30 do
+            if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
+            if pause_path~="" and U.file_exists(pause_path) then
+                return respect_reader_priority(stage)
+            end
+            pause(.25)
+            waited=waited+.25
+            busy_until=tonumber(U.read_file(tostring(opt.reader_busy_path or ""),true) or 0) or 0
+        end
+        -- Even while the reader is merely open, leave short gaps between heavy
+        -- batches so page turns and comment scrolling remain responsive.
+        pause(stage=="chapter" and .12 or .05)
+    end
     local book = normalized_book(input)
     if book.bookId == "" then error("bookId missing") end
 
@@ -888,6 +1065,7 @@ function Downloader:book(input, opt, progress)
         error("公众号文章请在公众号文章列表中单篇打开")
     end
 
+    respect_reader_priority("catalog")
     progress("catalog", 0, 1, book.title)
     local catalog, all = self:catalog(book.bookId)
     local full_catalog_map={}
@@ -904,6 +1082,15 @@ function Downloader:book(input, opt, progress)
     local requested_kind=opt.annotations==true and "notes" or "clean"
     local existing_range=(opt.range_start_index and opt.range_end_index)
         and self.store:variant(book.bookId,"range_"..requested_kind) or nil
+    local existing_download_record
+    if opt.chapter_uid then
+        existing_download_record=self.store:chapter_variant(book.bookId,opt.chapter_uid,requested_kind)
+    elseif existing_range then
+        existing_download_record=existing_range
+    else
+        existing_download_record=self.store:variant(book.bookId,requested_kind)
+    end
+    opt.existing_download_record=existing_download_record
     local selected=DownloadPlan.select(all,opt,existing_range)
     if type(opt.missing_previous_chapter_uids)=="table" and #opt.missing_previous_chapter_uids>0 then
         error("微信读书目录已经变化，无法安全覆盖已有章节版。原文件已保留；请删除旧章节版后重新生成。")
@@ -912,6 +1099,7 @@ function Downloader:book(input, opt, progress)
     expected = #selected
     local format = catalog.format == "txt" and "txt" or "epub"
     local cache = cache_new(self.store, book, opt, selected, format)
+    opt.title_transform_version=tonumber(cache.manifest.title_transform_version) or TITLE_TRANSFORM_VERSION
     session = cache.manifest.session
     local failure_map, restricted_map = {}, {}
     local requested_annotations=opt.annotations==true
@@ -945,23 +1133,25 @@ function Downloader:book(input, opt, progress)
             return cached
         end
 
-        local previous_saved_at=tonumber(previous and previous.saved_at or 0) or 0
-        local force_refresh=previous and previous.complete==true
-            and (previous_saved_at<=0 or os.time()-previous_saved_at>ANNOTATION_CACHE_REUSE_SECONDS)
         local function persist_checkpoint(snapshot)
             local merged=self.annotations:merge(previous,snapshot)
             merged.saved_at=os.time()
             local saved,save_error=AnnotationCache.save(cache.root,uid,annotation_account_key,self.annotations,merged)
             if not saved then error("无法保存批注断点："..tostring(save_error)) end
             previous=AnnotationCache.load(cache.root,uid,annotation_account_key,self.annotations) or merged
+            -- Keep the compact per-download checkpoint after every successful
+            -- batch, but update the shared popup cache only once when the
+            -- chapter finishes. This avoids dozens of redundant Kindle writes.
             return previous
         end
+
         local function fetch_once()
             return self.annotations:fetch_chapter(book.bookId,chapter.chapterUid or chapter.uid,
                 function(stage,current_index,total)
+                    respect_reader_priority("annotation_batch")
                     if report_progress then report_progress(stage,current_index,total) end
                 end,
-                {previous=previous,checkpoint=persist_checkpoint,force_refresh=force_refresh})
+                {previous=previous,checkpoint=persist_checkpoint})
         end
 
         local ok,current=pcall(fetch_once)
@@ -1066,6 +1256,7 @@ function Downloader:book(input, opt, progress)
     end
 
     local function finalize_chapter(chapter,index,entry,body,style,annotation,detail_message)
+        respect_reader_priority("transform")
         local uid=tostring(chapter.chapterUid or chapter.uid)
         if detail_message then
             progress("resume",index,expected,chapter.title,{message=detail_message})
@@ -1124,12 +1315,17 @@ function Downloader:book(input, opt, progress)
         end
         progress("images", index, expected, chapter.title)
         local fallback_title = "第 " .. tostring(index) .. " 节"
-        body = prepare_chapter_body(body, chapter.title and chapter.title ~= "" and chapter.title or fallback_title)
+        local title_transform_version = entry and tonumber(entry.title_transform_version)
+            or tonumber(cache.manifest.title_transform_version) or TITLE_TRANSFORM_VERSION
+        body = prepare_chapter_body(body,
+            chapter.title and chapter.title ~= "" and chapter.title or fallback_title,
+            title_transform_version)
         return cache_save_final(cache, chapter, body, annotation, style, foot_stats)
     end
 
     local function process_one(chapter, index, retry_round)
         if opt.cancelled and opt.cancelled() then error("download cancelled") end
+        respect_reader_priority("chapter")
         local uid = tostring(chapter.chapterUid or chapter.uid)
         local entry = cache.manifest.chapters[uid]
         local body, style, new_assets
@@ -1144,10 +1340,10 @@ function Downloader:book(input, opt, progress)
                 cache_reset_entry(cache, uid)
                 entry = nil
             elseif current_title ~= "" and current_title ~= tostring(entry.title or "") then
-                -- The base body is still reusable; only rebuild the final
-                -- chapter wrapper so the latest title is reflected.
+                -- Update the catalog/TOC title without rewriting completed XHTML.
+                -- Replacing a heading inside the chapter can invalidate KOReader
+                -- local-note positions even though the正文 itself did not change.
                 entry.title = current_title
-                entry.complete = false
                 entry.error = nil
                 cache_save(cache)
             end
@@ -1159,49 +1355,46 @@ function Downloader:book(input, opt, progress)
             })
         end
 
-        if entry and entry.complete
-            and tonumber(entry.footnote_transform_version or 0) ~= FOOTNOTE_TRANSFORM_VERSION then
-            -- Rebuild only the derived chapter file. The downloaded body and
-            -- image checkpoints remain intact, so upgrading never redownloads
-            -- chapters merely because the footnote transformer changed.
-            entry.complete = false
-            entry.error = nil
-            cache_save(cache)
-            logger.info("[MiuRead][Download] rebuilding cached chapter for footnote transformer",
-                "chapter=",uid,"from=",tostring(entry.footnote_transform_version or 0),
-                "to=",tostring(FOOTNOTE_TRANSFORM_VERSION))
+        if entry and opt.images~=false
+            and tonumber(entry.image_transform_version or cache.manifest.image_transform_version or 1)<IMAGE_TRANSFORM_VERSION then
+            logger.info("[MiuRead][Download] refreshing legacy image checkpoint",
+                "chapter=",uid,"old_version=",tostring(entry.image_transform_version or cache.manifest.image_transform_version or 1))
+            cache_reset_entry(cache,uid)
+            entry=nil
         end
 
-        if entry and entry.complete
-            and tonumber(entry.title_transform_version or 0) ~= TITLE_TRANSFORM_VERSION then
-            -- Rebuild only the derived chapter wrapper. Existing body, image and
-            -- annotation checkpoints remain reusable.
-            entry.complete = false
-            entry.error = nil
-            cache_save(cache)
-            logger.info("[MiuRead][Download] rebuilding cached chapter for title transformer",
-                "chapter=",uid,"from=",tostring(entry.title_transform_version or 0),
-                "to=",tostring(TITLE_TRANSFORM_VERSION))
+        -- Transformer version changes no longer force completed chapters to be
+        -- regenerated. The current transformers apply to new or genuinely changed
+        -- chapters, while existing XHTML remains stable for KOReader local notes.
+
+        if entry and entry.complete then
+            local migrated=false
+            if tonumber(entry.title_transform_version or 0)<=0 then
+                entry.title_transform_version=tonumber(cache.manifest.title_transform_version)
+                    or LEGACY_TITLE_TRANSFORM_VERSION
+                migrated=true
+            end
+            if requested_annotations and tonumber(entry.annotation_transform_version or 0)<=0 then
+                entry.annotation_transform_version=LEGACY_ANNOTATION_TRANSFORM_VERSION
+                migrated=true
+            end
+            if requested_annotations and tostring(entry.annotation_account_key or "")=="" then
+                -- Older caches did not record the account. Preserve their final
+                -- XHTML and bind it to the current account instead of rebuilding
+                -- every chapter during the upgrade.
+                entry.annotation_account_key=annotation_account_key
+                migrated=true
+            end
+            if migrated then cache_save(cache) end
         end
 
-        if entry and entry.complete and requested_annotations
-            and tonumber(entry.annotation_transform_version or 0) ~= ANNOTATION_TRANSFORM_VERSION then
-            -- Rebuild from the pristine chapter body so newly added annotation
-            -- fallbacks are applied without redownloading正文 or images.
-            entry.complete = false
-            entry.error = nil
-            cache_save(cache)
-            logger.info("[MiuRead][Download] rebuilding cached chapter for annotation transformer",
-                "chapter=",uid,"from=",tostring(entry.annotation_transform_version or 0),
-                "to=",tostring(ANNOTATION_TRANSFORM_VERSION))
-        end
-
-        local annotation_saved_at=tonumber(entry and entry.annotation_saved_at or 0) or 0
-        local annotation_cache_fresh=annotation_saved_at>0
-            and os.time()-annotation_saved_at<=ANNOTATION_CACHE_REUSE_SECONDS
+        -- A completed chapter is stable across download runs. Re-fetching and
+        -- re-injecting every annotation on every update changes EPUB text nodes
+        -- and invalidates KOReader local-note positions. Only pending, changed,
+        -- new, or account-mismatched chapters are rebuilt.
         local annotation_current=not requested_annotations or (
-            tostring(entry and entry.annotation_account_key or "")==tostring(annotation_account_key)
-            and entry.annotation_pending~=true and annotation_cache_fresh)
+            entry and entry.annotation_pending~=true
+            and tostring(entry.annotation_account_key or "")==tostring(annotation_account_key))
         if entry and entry.complete and annotation_current then
             local cached_path, cached_style = cache_load_final_source(cache, entry)
             if cached_path then
@@ -1245,8 +1438,7 @@ function Downloader:book(input, opt, progress)
                 session = state
             end
             body = Codec.body(downloaded)
-            body, new_assets = namespace_assets(body, downloaded_assets, uid)
-            style = downloaded_style
+            body, style, new_assets = namespace_assets(body, downloaded_style, downloaded_assets, uid)
             entry = cache_save_base(cache, chapter, body, style, new_assets, state)
         end
 
@@ -1262,7 +1454,6 @@ function Downloader:book(input, opt, progress)
             entry.annotation_error_kind=pending and (annotation.error_kind or "incomplete") or nil
             entry.annotation_error=pending and table.concat(annotation.errors or {},"; ") or nil
             entry.annotation_account_key=annotation_account_key
-            entry.annotation_saved_at=tonumber(annotation.saved_at or 0)>0 and tonumber(annotation.saved_at) or os.time()
             entry.annotation_run_id=opt.download_run_id
             if pending then
                 record_annotation_error(chapter,annotation)
@@ -1314,6 +1505,11 @@ function Downloader:book(input, opt, progress)
     css_list, css_seen = {}, {}
     css_add(css_list, css_seen, BASE_CSS)
     annotation_summary = {underlines=0, thoughts=0, fallbacks=0, chapters_ok=0, chapters_failed=0, errors={}}
+    local image_summary={
+        discovered=0,localized=0,optional=0,recovered=0,stale=0,missing=0,chapters=0,
+        required_discovered=0,required_localized=0,required_missing=0,
+        optional_dropped=0,stale_dropped=0,embedded=0,
+    }
     for index, chapter in ipairs(selected) do
         local uid = tostring(chapter.chapterUid or chapter.uid)
         local entry = cache.manifest.chapters[uid]
@@ -1323,6 +1519,15 @@ function Downloader:book(input, opt, progress)
             -- not download failures and must not create empty chapters.
         elseif final_path then
             append_entry(chapters, assets, css_list, css_seen, entry, {path=final_path}, final_style, final_assets, index)
+            local chapter_images=type(entry.image_summary)=="table" and entry.image_summary or {}
+            image_summary.chapters=image_summary.chapters+1
+            for _,key in ipairs({
+                "discovered","localized","optional","recovered","stale","missing",
+                "required_discovered","required_localized","required_missing",
+                "optional_dropped","stale_dropped","embedded",
+            }) do
+                image_summary[key]=image_summary[key]+(tonumber(chapter_images[key]) or 0)
+            end
             if opt.annotations then
                 annotation_summary.chapters_ok = annotation_summary.chapters_ok + 1
                 annotation_summary.underlines = annotation_summary.underlines + (tonumber(entry.underlines) or 0)
@@ -1353,6 +1558,8 @@ function Downloader:book(input, opt, progress)
     opt.annotation_fallback=tonumber(annotation_summary.fallbacks or 0)>0
     opt.annotation_error_kind=annotation_error_kind
     opt.annotation_errors=U.copy(annotation_errors)
+    image_summary.assets=#assets
+    opt.image_summary=image_summary
 
     local restricted_count=0
     for _ in pairs(restricted_map) do restricted_count=restricted_count+1 end
@@ -1410,6 +1617,8 @@ function Downloader:book(input, opt, progress)
 end
 
 Downloader._prepare_chapter_body = prepare_chapter_body
+Downloader._prepare_chapter_body_legacy = prepare_chapter_body_legacy
+Downloader._prepare_chapter_body_current = prepare_chapter_body_current
 Downloader._namespace_assets = namespace_assets
 Downloader._catalog_signature = catalog_signature
 Downloader._option_key = option_key

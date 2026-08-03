@@ -1,8 +1,19 @@
 local Device=require("device")
 local logger=require("logger")
-local QRMessage=require("ui/widget/qrmessage")
-local ButtonDialog=require("ui/widget/buttondialog")
-local InputDialog=require("ui/widget/inputdialog")
+local RawQRMessage=require("ui/widget/qrmessage")
+local RawButtonDialog=require("ui/widget/buttondialog")
+local RawInputDialog=require("ui/widget/inputdialog")
+local GestureBridge=require("miuread.gesture_bridge")
+local function gesture_aware_class(base)
+    local class=base:extend{_miuread_transient=true}
+    function class:handleEvent(event)
+        return GestureBridge.handle(base,self,event)
+    end
+    return class
+end
+local QRMessage=gesture_aware_class(RawQRMessage)
+local ButtonDialog=gesture_aware_class(RawButtonDialog)
+local InputDialog=gesture_aware_class(RawInputDialog)
 local UIManager=require("ui/uimanager")
 local Cookies=require("miuread.cookies")
 local Protocol=require("miuread.protocol")
@@ -132,7 +143,8 @@ function Auth:_finish(data)
     local ok_channel={state="ok",checked_at=now,error="",code=""}
     local pending_channel={state="unknown",checked_at=now,error="",code=""}
     local web_ready=renewal_ok and renewal_succ
-    self.store:save_auth({
+    local new_auth={
+        login_session_id=self.store:generate_login_session_id(),
         api_key=api_key,cookies=jar,wr_ticket=wr_ticket,wr_wrpa=wr_wrpa,
         ticket_updated_at=(wr_ticket~="" or wr_wrpa~="") and now or 0,
         account={name=account_name,vid=vid,logged_at=now},
@@ -146,7 +158,13 @@ function Auth:_finish(data)
                 read_report=Util.copy(web_ready and ok_channel or pending_channel),
             },
         },
-    })
+    }
+    local old_auth=self.store:auth()
+    if self.host.on_auth_replacing then
+        local replaced,replace_error=pcall(self.host.on_auth_replacing,self.host,old_auth,new_auth)
+        if not replaced then logger.warn("[MiuRead][Auth] pre-commit reset failed",tostring(replace_error)) end
+    end
+    self.store:save_auth(new_auth)
     logger.info("[MiuRead][Auth] QR session finalized",
         "session_cookies=",tostring(cookie_count(session)),
         "persistent_cookies=",tostring(#Cookies.names(jar)),

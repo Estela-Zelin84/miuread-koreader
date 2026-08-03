@@ -133,12 +133,11 @@ local function validate_delete_path(path, policy)
     end
 
     if mode == "book_delete" then
-        if direct_child(path, books_root) and path:lower():match("%.epub$") then return true end
-        local allowed = type(policy.allowed_book_cache) == "table" and policy.allowed_book_cache or {}
-        for _, root in ipairs(allowed) do
-            if path == normalize_path(root) then return true end
+        local allowed = type(policy.allowed_paths) == "table" and policy.allowed_paths or {}
+        for _, exact_path in ipairs(allowed) do
+            if path == normalize_path(exact_path) then return true end
         end
-        return false, "只允许删除当前书籍的 EPUB 与专属数据目录"
+        return false, "不在当前书籍完整删除白名单中"
     end
 
     return false, "清理策略缺失"

@@ -203,8 +203,13 @@ function Http:_jar()
     return jar
 end
 
-function Http:_save_jar(jar)
+function Http:_save_jar(jar, expected_login_session_id)
     local auth = self.store:auth()
+    if tostring(expected_login_session_id or "")~=""
+        and tostring(auth.login_session_id or "")~=tostring(expected_login_session_id or "") then
+        logger.warn("[MiuRead][HTTP] stale cookie response ignored")
+        return false
+    end
     local cleaned = Cookies.sanitize(jar or {})
     if not Cookies.same(auth.cookies or {}, cleaned) then
         auth.cookies = cleaned
@@ -212,11 +217,16 @@ function Http:_save_jar(jar)
     end
 end
 
-function Http:_save_response_auth_headers(headers)
+function Http:_save_response_auth_headers(headers, expected_login_session_id)
     local ticket = hget(headers, "x-wr-ticket")
     local wrpa = hget(headers, "x-wrpa-0")
     if (ticket == nil or tostring(ticket) == "") and (wrpa == nil or tostring(wrpa) == "") then return false end
     local auth = self.store:auth()
+    if tostring(expected_login_session_id or "")~=""
+        and tostring(auth.login_session_id or "")~=tostring(expected_login_session_id or "") then
+        logger.warn("[MiuRead][HTTP] stale credential response ignored")
+        return false
+    end
     local changed = false
     if ticket ~= nil and tostring(ticket) ~= "" and tostring(auth.wr_ticket or "") ~= tostring(ticket) then
         auth.wr_ticket = tostring(ticket)
@@ -241,6 +251,8 @@ function Http:_request_once(opt)
     local current = assert(opt.url, "url required")
     local method = opt.method or (opt.body and "POST" or "GET")
     local body = opt.body
+    local auth_snapshot=self.store:auth()
+    local request_login_session_id=tostring(auth_snapshot.login_session_id or "")
     local jar = self:_jar()
     local headers = {}
     for k, v in pairs(opt.headers or {}) do headers[k] = v end
@@ -286,11 +298,11 @@ function Http:_request_once(opt)
         if set_cookie and opt.auth ~= false then
             local before = Cookies.sanitize(jar)
             jar = Cookies.absorb(jar, set_cookie, {protect_core=true})
-            if not Cookies.same(before, jar) then self:_save_jar(jar) end
+            if not Cookies.same(before, jar) then self:_save_jar(jar,request_login_session_id) end
             headers["Cookie"] = Cookies.header(jar)
         end
         if opt.auth ~= false and is_weread_url(current) then
-            self:_save_response_auth_headers(resp_headers)
+            self:_save_response_auth_headers(resp_headers,request_login_session_id)
         end
 
         local location = hget(resp_headers, "location")
