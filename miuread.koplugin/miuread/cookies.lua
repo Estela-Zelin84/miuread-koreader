@@ -22,34 +22,9 @@ local protected_core = {
     wr_rt=true,
 }
 
-local function segments(line)
-    local out = {}
-    for part in tostring(line or ""):gmatch("[^;]+") do
-        table.insert(out, Util.trim(part))
-    end
-    return out
-end
-
 function Cookies.is_persistent_name(name)
     name = tostring(name or "")
     return name:match("^wr_") ~= nil or stable[name] == true
-end
-
-function Cookies.parse_header(text)
-    local jar = {}
-    for _, part in ipairs(segments(text)) do
-        local k, v = part:match("^([^=]+)=(.*)$")
-        if k then
-            local name = Util.trim(k)
-            local value = Util.trim(v)
-            if not reserved[name:lower()]
-                and Cookies.is_persistent_name(name)
-                and value ~= "" then
-                jar[name] = value
-            end
-        end
-    end
-    return jar
 end
 
 function Cookies.header(jar)

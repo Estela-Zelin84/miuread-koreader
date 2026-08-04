@@ -1,7 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
-local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -13,7 +12,6 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
-local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
@@ -28,6 +26,7 @@ local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
 local live_widget
+local home_generation = 0
 
 local function face(name, nominal, maximum, minimum)
     return UiScale.face(name, nominal, maximum, minimum)
@@ -391,7 +390,42 @@ local function welcome_card(width, height, callback)
     return tappable(width, height, layers, callback)
 end
 
+local function shelf_folder_card(folder, width, height, callback)
+    local inner_w = math.max(1, width - UiScale.dp(8, 6, 12))
+    local icon_h = math.max(UiScale.dp(52, 44, 72), math.floor(height * .48))
+    local title_h = math.max(UiScale.dp(30, 26, 42), math.floor(height * .24))
+    local detail_h = math.max(UiScale.dp(20, 17, 28), height - icon_h - title_h - UiScale.dp(10, 8, 15))
+    local icon_key = folder.local_parent==true and "back" or "folder"
+    local body = VerticalGroup:new{
+        align = "center",
+        Ui.icon(icon_key, inner_w, icon_h, UiScale.dp(34, 29, 48), {
+            face = UiScale.iconFace("cfont", 24, 34),
+        }),
+        TextBoxWidget:new{
+            text = tostring(folder.title or "文件夹"), face = face("cfont", 11.8, 16.5), bold = true,
+            width = inner_w, height = title_h, height_adjust = false,
+            height_overflow_show_ellipsis = true, alignment = "center",
+        },
+        TextBoxWidget:new{
+            text = tostring(folder.status_text or "文件夹"), face = face("smallinfofont", 8.7, 12),
+            width = inner_w, height = detail_h, height_adjust = false,
+            height_overflow_show_ellipsis = true, alignment = "center", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        },
+    }
+    local card = fixed_frame(width, height, {
+        bordersize = UiScale.line("thin"), padding = UiScale.dp(4, 3, 7),
+        radius = UiScale.radius(8, 6, 13), background = Blitbuffer.COLOR_WHITE,
+        color = Blitbuffer.COLOR_GRAY,
+    }, body)
+    return tappable(width, height, card, function(anchor)
+        if callback then callback(folder, anchor) end
+    end)
+end
+
 local function shelf_book_card(book, width, height, callback, hold_callback)
+    if book and (book.local_folder==true or book.kind=="folder") then
+        return shelf_folder_card(book,width,height,callback)
+    end
     local pad = math.max(UiScale.dp(1, 0, 2), math.floor(width * .004))
     local inner_w = math.max(1, width - pad * 2)
     local progress = math.max(0, math.min(100, tonumber(book.progress) or 0))
@@ -603,6 +637,10 @@ function HomeWidget:_notify_resume_interaction(kind)
 end
 
 function HomeWidget:handleEvent(event)
+    -- ReaderUI may keep the already-built home underneath the document during
+    -- page transitions. A parked home must be completely inert so its gesture
+    -- ranges and child TapBoxes can never compete with the reader.
+    if self._miu_input_suspended==true then return true end
     if event and event.handler=="onGesture" then
         self:_notify_resume_interaction("gesture")
         local ges=event.args and event.args[1]
@@ -775,15 +813,20 @@ function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_ope
     if #books == 0 then return 0 end
     local columns, rows, col_gap, row_gap, card_w, card_h = self:_grid_geometry(m, width, height, #books, force_rows)
     local capacity = columns * rows
-    local shown = math.min(#books, capacity)
-    for index = 1, shown do
-        local row = math.floor((index - 1) / columns)
-        local col = (index - 1) % columns
-        local start_x = x
+    local slot = 0
+    for _,book in ipairs(books) do
+        local folder=book and (book.local_folder==true or book.kind=="folder")
+        local weight=folder and 2 or 1
+        if folder and slot%columns==columns-1 then slot=slot+1 end
+        if slot+weight>capacity then break end
+        local row = math.floor(slot / columns)
+        local col = slot % columns
+        local item_w = folder and (card_w * 2 + col_gap) or card_w
         self:_add(children,
-            start_x + col * (card_w + col_gap),
+            x + col * (card_w + col_gap),
             y + row * (card_h + row_gap),
-            shelf_book_card(books[index], card_w, card_h, on_open, on_hold))
+            shelf_book_card(book, item_w, card_h, on_open, on_hold))
+        slot = slot + weight
     end
     return rows * card_h + math.max(0, rows - 1) * row_gap
 end
@@ -955,6 +998,7 @@ function HomeWidget:_rebuild()
     UiScale.setDisplayMode(self.opts and self.opts.display_size or "standard")
     local m = self:_metrics()
     self._last_screen_w, self._last_screen_h = m.sw, m.sh
+    self._last_rotation = Screen.getRotationMode and Screen:getRotationMode() or nil
     self._metrics_cache = m
     self.dimen = Geom:new{x = 0, y = 0, w = m.sw, h = m.sh}
     self.header_dimen = Geom:new{x = 0, y = 0, w = m.sw, h = math.min(m.sh, m.body_y)}
@@ -968,7 +1012,6 @@ function HomeWidget:_rebuild()
     local static_body_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     self:_build_sections(static_body_layer, m, compact, "static")
     children[#children + 1] = static_body_layer
-    self._static_body_layer = static_body_layer
     local section_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     self:_build_sections(section_layer, m, compact, "section")
     children[#children + 1] = section_layer
@@ -1054,7 +1097,6 @@ function HomeWidget:updateSection(opts)
         self._section_cache_clock=(tonumber(self._section_cache_clock) or 0)+1
         cached.used=self._section_cache_clock
     end
-    local old = root[self._section_layer_index]
     root[self._section_layer_index] = section_layer
     self._section_layer = section_layer
     -- Old layers stay alive in the bounded cache. They are freed on eviction,
@@ -1101,6 +1143,13 @@ function HomeWidget:onMenu()
 end
 function HomeWidget:onBack()
     self:_notify_resume_interaction("back")
+    if self.opts and self.opts.on_back then
+        local ok,handled=pcall(self.opts.on_back)
+        if ok and handled==true then
+            logger.info("[MiuRead][Home] back handled by current section")
+            return true
+        end
+    end
     -- The MiuRead home is the root page. Back must not leak to FileManager.
     logger.info("[MiuRead][Home] back consumed at root")
     return true
@@ -1112,11 +1161,7 @@ function HomeWidget:onHome()
 end
 
 function HomeWidget:onSetDimensions()
-    self:_close_rotation_transients()
-    self:_clear_inactive_section_cache()
-    self:_rebuild()
-    UIManager:setDirty("all", "full")
-    return true
+    return self:_schedule_dimension_refresh()
 end
 function HomeWidget:_close_rotation_transients()
     local stack = UIManager._window_stack or {}
@@ -1133,25 +1178,32 @@ end
 function HomeWidget:_schedule_dimension_refresh()
     self._dimension_refresh_generation = (tonumber(self._dimension_refresh_generation) or 0) + 1
     local generation = self._dimension_refresh_generation
+    if self._dimension_refresh_task then UIManager:unschedule(self._dimension_refresh_task) end
     self:_close_rotation_transients()
-    self:_clear_inactive_section_cache()
     local last_w, last_h, stable, attempts = nil, nil, 0, 0
-    -- A rotation event and the final framebuffer size do not arrive together
-    -- on every device. Rebuild once, only after two consecutive samples agree.
-    local function settle()
-        if self._miu_closed or generation ~= self._dimension_refresh_generation then return end
+    -- Rotation and the final framebuffer size may arrive as separate events.
+    -- Keep only the newest settle task and rebuild once after the size is stable.
+    local task
+    task=function()
+        if self._miu_closed or self._dimension_refresh_task~=task
+            or generation ~= self._dimension_refresh_generation then return end
         attempts = attempts + 1
         local sw, sh = Screen:getWidth(), Screen:getHeight()
+        local rotation=Screen.getRotationMode and Screen:getRotationMode() or nil
         if sw == last_w and sh == last_h then stable = stable + 1
         else last_w, last_h, stable = sw, sh, 0 end
         if stable >= 1 or attempts >= 8 then
-            self:onSetDimensions()
-            UIManager:setDirty("all", "full")
+            self._dimension_refresh_task=nil
+            if sw == self._last_screen_w and sh == self._last_screen_h and rotation==self._last_rotation then return end
+            self:_clear_inactive_section_cache()
+            self:_rebuild()
+            UIManager:setDirty(self, "full")
             return
         end
-        UIManager:scheduleIn(.08, settle)
+        UIManager:scheduleIn(.08, task)
     end
-    UIManager:scheduleIn(.06, settle)
+    self._dimension_refresh_task=task
+    UIManager:scheduleIn(.06, task)
     return true
 end
 function HomeWidget:onScreenResize() return self:_schedule_dimension_refresh() end
@@ -1159,20 +1211,69 @@ function HomeWidget:onRotation() return self:_schedule_dimension_refresh() end
 
 function HomeWidget:onCloseWidget()
     self._miu_closed = true
+    self._dimension_refresh_generation=(tonumber(self._dimension_refresh_generation) or 0)+1
+    if self._dimension_refresh_task then UIManager:unschedule(self._dimension_refresh_task); self._dimension_refresh_task=nil end
     self:_clear_inactive_section_cache()
     if live_widget == self then live_widget = nil end
     if self.opts and self.opts.on_close then pcall(self.opts.on_close, self) end
 end
 
 local HomeView = {}
+local function stacked_home_widgets()
+    local rows = {}
+    for _, window in ipairs(UIManager._window_stack or {}) do
+        local widget = window and window.widget or nil
+        if widget and widget.name == "miuread_home" and not widget._miu_closed then rows[#rows + 1] = widget end
+    end
+    return rows
+end
+function HomeView.prune_duplicates()
+    local rows = stacked_home_widgets()
+    if #rows == 0 then
+        if live_widget and (live_widget._miu_closed or not UIManager:isWidgetShown(live_widget)) then live_widget = nil end
+        return 0
+    end
+    local keep = nil
+    if live_widget and not live_widget._miu_closed and UIManager:isWidgetShown(live_widget) then keep = live_widget end
+    if not keep then keep = rows[#rows]; live_widget = keep end
+    local closed = 0
+    for _, widget in ipairs(rows) do
+        if widget ~= keep then
+            widget._miu_superseded = true
+            widget._miu_suppress_restore = true
+            pcall(UIManager.close, UIManager, widget)
+            closed = closed + 1
+        end
+    end
+    if closed > 0 then logger.warn("[MiuRead][Home] duplicate roots removed", tostring(closed)) end
+    return closed
+end
 function HomeView.current() return live_widget end
 function HomeView.is_shown()
+    HomeView.prune_duplicates()
     return live_widget and not live_widget._miu_closed and UIManager:isWidgetShown(live_widget)
+end
+-- Keep the rendered home in UIManager's stack while ReaderUI owns the screen.
+-- This avoids briefly exposing FileManager during open/close, while disabling
+-- all home input prevents the stale gesture-zone issue seen in older builds.
+function HomeView.park()
+    if not HomeView.is_shown() then return false end
+    live_widget._miu_input_suspended=true
+    live_widget._miu_resume_interaction_callback=nil
+    live_widget._miu_resume_waiting_interaction=false
+    return true
+end
+function HomeView.unpark(skip_dirty)
+    if not HomeView.is_shown() then return false end
+    live_widget._miu_input_suspended=false
+    if skip_dirty~=true then UIManager:setDirty(live_widget,"ui") end
+    return true
 end
 -- FileManager is recreated after ReaderUI closes so KOReader's docless
 -- plugins (including Gesture Manager) remain alive beneath MiuRead. Move the
 -- already-built home above that native base without closing/rebuilding it.
 function HomeView.raise(skip_dirty)
+    HomeView.prune_duplicates()
     if not HomeView.is_shown() then return false end
     local stack = UIManager._window_stack or {}
     local window, index
@@ -1203,6 +1304,7 @@ end
 function HomeView.resume(opts)
     if not HomeView.is_shown() then return false end
     opts=opts or {}
+    live_widget._miu_input_suspended=false
     live_widget._miu_resume_interaction_callback=opts.on_interaction
     live_widget._miu_resume_waiting_interaction=true
     live_widget._miu_last_interaction_at=0
@@ -1214,6 +1316,7 @@ function HomeView.resume(opts)
     return true
 end
 function HomeView.close(full_refresh)
+    HomeView.prune_duplicates()
     if live_widget and not live_widget._miu_closed then UIManager:close(live_widget) end
     live_widget = nil
     if full_refresh == true then
@@ -1236,19 +1339,27 @@ function HomeView.update_section(opts)
 end
 function HomeView.show(opts, refresh_kind)
     opts = opts or {}
+    HomeView.prune_duplicates()
     if HomeView.is_shown() then
         local ok, err = pcall(live_widget.update, live_widget, opts, refresh_kind)
         if ok then return live_widget end
         logger.warn("[MiuRead][Home] in-place update failed", tostring(err))
     end
-    if live_widget and not live_widget._miu_closed then UIManager:close(live_widget) end
+    if live_widget and not live_widget._miu_closed then
+        live_widget._miu_superseded = true
+        live_widget._miu_suppress_restore = true
+        UIManager:close(live_widget)
+    end
     local ok, widget = pcall(HomeWidget.new, HomeWidget, {opts = opts})
     if not ok or not widget then
         logger.err("[MiuRead][Home] build failed", tostring(widget))
         return nil, tostring(widget)
     end
+    home_generation = home_generation + 1
+    widget._miu_home_generation = home_generation
     live_widget = widget
     UIManager:show(widget, "ui", widget.dimen)
+    HomeView.prune_duplicates()
     return widget
 end
 return HomeView

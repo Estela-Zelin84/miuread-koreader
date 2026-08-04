@@ -1,20 +1,30 @@
-# 觅阅 · 微信读书助手
+# MiuRead · WeRead Assistant
 
-KOReader 的微信读书插件，支持 Kindle、Kobo 与 Android 等 KOReader 设备。
+A WeRead plugin for KOReader, supporting Kindle, Kobo, Android, and other KOReader devices.
 
-## 当前版本
+## Current Release
 
-当前源码为 `4.0.0-beta.7` 内测版，应提交到 `beta` 分支。
+This repository contains the beta `4.1.0-beta.1` source and is intended for the `beta` branch.
 
-详细变更见 `CHANGELOG-4.0.0-beta.7.txt`。
+See `CHANGELOG-4.1.0-beta.1.txt` for the release notes.
 
-## 分支与发布
+## Branches and Releases
 
-- `main`：正式版源码，使用 `.github/workflows/release.yml` 发布并更新 `update.json`。
-- `beta`：内测版源码，使用 `.github/workflows/release-beta.yml` 发布并更新 `update-beta.json`。
+- `main`: stable source, released through `.github/workflows/release.yml`; publishes `update.json`.
+- `beta`: beta source, released through `.github/workflows/release-beta.yml`; publishes `update-beta.json`.
 
-两个 workflow 都保留在默认分支，GitHub Actions 才会同时显示正式版与内测版入口。
+Both workflows should remain on the default branch so that the stable and beta release actions remain available in GitHub Actions.
 
-## 安装
+## Installation
 
-将完整安装包中的 `miuread.koplugin` 文件夹放入 KOReader 的 `plugins` 目录，然后完整重启 KOReader。
+Copy the complete `miuread.koplugin` directory from the release package into KOReader's `plugins` directory, then fully restart KOReader.
+
+## Origin and License
+
+MiuRead originated as a modified version of `finlater/weread.koplugin` v0.1.1 and has since undergone substantial restructuring, modification, and extension.
+
+Copyright in code originating from the upstream project remains with its original copyright holders. Copyright in later additions and modifications belongs to the respective MiuRead contributors.
+
+This project is distributed under the GNU Affero General Public License version 3 only (`AGPL-3.0-only`). Anyone who modifies, combines, or redistributes this project must preserve the applicable copyright, attribution, modification, and license notices and provide the corresponding source code as required by the license.
+
+See `LICENSE` and `NOTICE` for details.

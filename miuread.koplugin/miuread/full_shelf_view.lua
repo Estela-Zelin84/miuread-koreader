@@ -8,7 +8,6 @@ local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local ImageWidget = require("ui/widget/imagewidget")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local TextBoxWidget = require("ui/widget/textboxwidget")
@@ -263,6 +262,8 @@ end
 function GridShelfWidget:_build()
     local m, margin, header_h, footer_h, gap, rows = self:_metrics()
     local sw, sh = m.sw, m.sh
+    self._last_screen_w, self._last_screen_h = sw, sh
+    self._last_rotation = Screen.getRotationMode and Screen:getRotationMode() or nil
     local columns = 4
     self.perpage = columns * rows
     self.pages = math.max(1, math.ceil(#(self.opts.books or {}) / self.perpage))
@@ -389,6 +390,8 @@ function GridShelfWidget:onShow()
 end
 function GridShelfWidget:onCloseWidget()
     self._miu_closed = true
+    self._dimension_generation=(tonumber(self._dimension_generation) or 0)+1
+    if self._dimension_task then UIManager:unschedule(self._dimension_task); self._dimension_task=nil end
     if self.opts and self.opts.on_close then
         local callback = self.opts.on_close
         self.opts.on_close = nil
@@ -396,28 +399,31 @@ function GridShelfWidget:onCloseWidget()
     end
 end
 function GridShelfWidget:onSetDimensions()
-    self:_build()
-    UIManager:setDirty(self, "full")
-    return true
+    return self:_schedule_dimension_refresh()
 end
 function GridShelfWidget:_schedule_dimension_refresh()
     self._dimension_generation = (tonumber(self._dimension_generation) or 0) + 1
     local generation = self._dimension_generation
+    if self._dimension_task then UIManager:unschedule(self._dimension_task) end
     local last_w, last_h, stable, attempts = nil, nil, 0, 0
-    local function settle()
-        if self._miu_closed or generation ~= self._dimension_generation then return end
-        attempts = attempts + 1
-        local sw, sh = Screen:getWidth(), Screen:getHeight()
-        if sw == last_w and sh == last_h then stable = stable + 1
-        else last_w, last_h, stable = sw, sh, 0 end
-        if stable >= 1 or attempts >= 8 then
-            self:onSetDimensions()
-            UIManager:setDirty("all", "full")
+    local task
+    task=function()
+        if self._miu_closed or self._dimension_task~=task or generation~=self._dimension_generation then return end
+        attempts=attempts+1
+        local sw,sh=Screen:getWidth(),Screen:getHeight()
+        local rotation=Screen.getRotationMode and Screen:getRotationMode() or nil
+        if sw==last_w and sh==last_h then stable=stable+1 else last_w,last_h,stable=sw,sh,0 end
+        if stable>=1 or attempts>=8 then
+            self._dimension_task=nil
+            if sw==self._last_screen_w and sh==self._last_screen_h and rotation==self._last_rotation then return end
+            self:_build()
+            UIManager:setDirty(self,"full")
             return
         end
-        UIManager:scheduleIn(.08, settle)
+        UIManager:scheduleIn(.08,task)
     end
-    UIManager:scheduleIn(.06, settle)
+    self._dimension_task=task
+    UIManager:scheduleIn(.06,task)
     return true
 end
 function GridShelfWidget:onScreenResize() return self:_schedule_dimension_refresh() end

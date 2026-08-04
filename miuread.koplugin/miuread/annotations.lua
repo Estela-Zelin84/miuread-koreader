@@ -1,7 +1,6 @@
 local logger = require("logger")
 local Thoughts = require("miuread.thoughts")
 local Http = require("miuread.http")
-local U = require("miuread.util")
 local ok_socket, socket = pcall(require, "socket")
 
 local Annotations = {}
@@ -90,11 +89,12 @@ local function parse_range(value)
     return a, b
 end
 
-local function review_texts(group)
+local function review_texts(group,yield_check)
     local rows, seen, invalid = {}, {}, 0
     local pages, skipped = table_entries(array_from(group, {"pageReviews", "reviews", "updated"}))
     invalid = invalid + skipped
-    for _, page in ipairs(pages) do
+    for page_index, page in ipairs(pages) do
+        if yield_check and page_index%64==0 then yield_check() end
         -- Review payloads occasionally contain placeholders, functions or tables
         -- with surprising metatables. Keep each entry isolated so one malformed
         -- review can never abort the whole book download.
@@ -128,27 +128,6 @@ local function review_texts(group)
         end
     end
     return rows, invalid
-end
-
-local function normalize_reviews(data)
-    local map, groups, group_count, entry_count, invalid_count = {}, {}, 0, 0, 0
-    local source, skipped = table_entries(array_from(data, {"reviews", "updated"}))
-    invalid_count = invalid_count + skipped
-    for _, group in ipairs(source) do
-        local key = range_key(group)
-        if key ~= "" then
-            local texts, invalid = review_texts(group)
-            invalid_count = invalid_count + invalid
-            if #texts > 0 then
-                if not map[key] then group_count = group_count + 1; map[key] = {} end
-                for _, item in ipairs(texts) do map[key][#map[key] + 1] = item end
-                entry_count = entry_count + #texts
-            end
-        end
-    end
-    for key, texts in pairs(map) do groups[#groups + 1] = {range = key, texts = texts} end
-    table.sort(groups, function(a, b) return tostring(a.range) < tostring(b.range) end)
-    return map, groups, group_count, entry_count, invalid_count
 end
 
 function Annotations:new(api) return setmetatable({api = api}, self) end
@@ -232,23 +211,48 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         return result
     end
 
-    local groups={}
     local batches=self.api:review_batches(target_ranges,5)
     local completed,pending={},{}
+    local review_map={}
+    local group_count,entry_count,invalid_review_count=0,0,0
     for _,key in ipairs(target_ranges) do pending[tostring(key)]=true end
 
-    local function mark_batch(batch,target,value)
+    local function mark_batch_completed(batch)
         for _,item in ipairs(batch or {}) do
             local key=range_key(item)
-            if key~="" then
-                target[key]=value==nil and true or value
-            end
+            if key~="" then pending[key]=nil; completed[key]=true end
         end
     end
+    local active_batch_index=0
+    local function merge_review_rows(rows)
+        local new_invalid=0
+        for group_index,group in ipairs(rows or {}) do
+            if group_index%8==0 then progress("thoughts",active_batch_index,#batches,"整理想法") end
+            local key=range_key(group)
+            if key~="" then
+                local texts,invalid=review_texts(group,function()
+                    progress("thoughts",active_batch_index,#batches,"整理想法")
+                end)
+                new_invalid=new_invalid+invalid
+                if #texts>0 then
+                    if not review_map[key] then review_map[key]={}; group_count=group_count+1 end
+                    for _,item in ipairs(texts) do review_map[key][#review_map[key]+1]=item end
+                    entry_count=entry_count+#texts
+                end
+            else
+                new_invalid=new_invalid+1
+            end
+        end
+        invalid_review_count=invalid_review_count+new_invalid
+        return new_invalid
+    end
     local function rebuild_state()
-        local invalid_reviews
-        result.review_map,result.review_groups,result.thought_count,result.thought_entry_count,invalid_reviews=
-            normalize_reviews({reviews=groups})
+        result.review_map=review_map
+        result.review_groups={}
+        for key,texts in pairs(review_map) do result.review_groups[#result.review_groups+1]={range=key,texts=texts} end
+        table.sort(result.review_groups,function(a,b) return tostring(a.range)<tostring(b.range) end)
+        result.thought_count=group_count
+        result.thought_entry_count=entry_count
         result.completed_ranges={}
         result.pending_ranges={}
         for key in pairs(completed) do result.completed_ranges[#result.completed_ranges+1]=key end
@@ -257,10 +261,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         table.sort(result.pending_ranges)
         result.review_complete=#result.pending_ranges==0
         result.complete=result.underline_request_ok and result.underlines_partial~=true and result.review_complete
-        if invalid_reviews>0 then
-            logger.warn("[MiuRead][Annotations] ignored invalid review entries",
-                "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid_reviews))
-        end
+        result.invalid_review_count=invalid_review_count
     end
     local function save_checkpoint()
         rebuild_state()
@@ -271,24 +272,24 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     end
 
     for index,batch in ipairs(batches) do
+        active_batch_index=index
         progress("thoughts",index,#batches,"")
         local good,response,batch_network,batch_kind=call_with_retry("thoughts batch "..tostring(index),function()
             return self.api:readreviews(book_id,uid,batch)
         end)
         if good then
             local rows,invalid=table_entries(array_from(response,{"reviews","updated"}))
-            for _,item in ipairs(rows) do groups[#groups+1]=item end
-            if invalid>0 then
+            local entry_invalid=merge_review_rows(rows)
+            local skipped=invalid+entry_invalid
+            if skipped>0 then
                 result.error_kind=result.error_kind or "data"
-                result.errors[#result.errors+1]="batch "..tostring(index).." contained invalid review groups"
-                logger.warn("[MiuRead][Annotations] ignored invalid review groups","book=",result.book_id,
-                    "chapter=",result.chapter_uid,"batch=",tostring(index),"count=",tostring(invalid))
-            else
-                for _,item in ipairs(batch or {}) do
-                    local key=range_key(item)
-                    if key~="" then pending[key]=nil; completed[key]=true end
-                end
+                result.errors[#result.errors+1]="batch "..tostring(index).." skipped malformed review entries"
+                invalid_review_count=invalid_review_count+invalid
             end
+            -- A successful response is complete even when a malformed optional
+            -- review entry was skipped. Keeping the whole range pending caused
+            -- the same data to be fetched and normalized indefinitely.
+            mark_batch_completed(batch)
             save_checkpoint()
         elseif is_data_specific_failure(response) then
             logger.warn("[MiuRead][Annotations] thoughts batch failed; isolating ranges",
@@ -303,16 +304,14 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
                 local key=range_key(item)
                 if single_ok then
                     local rows,invalid=table_entries(array_from(single_response,{"reviews","updated"}))
-                    for _,row in ipairs(rows) do groups[#groups+1]=row end
-                    if invalid>0 then
+                    local entry_invalid=merge_review_rows(rows)
+                    local skipped=invalid+entry_invalid
+                    if skipped>0 then
                         result.error_kind=result.error_kind or "data"
-                        result.errors[#result.errors+1]="review range contained invalid entries"
-                        logger.warn("[MiuRead][Annotations] ignored invalid review groups",
-                            "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid))
-                    elseif key~="" then
-                        pending[key]=nil
-                        completed[key]=true
+                        result.errors[#result.errors+1]="review range skipped malformed entries"
+                        invalid_review_count=invalid_review_count+invalid
                     end
+                    if key~="" then pending[key]=nil; completed[key]=true end
                     save_checkpoint()
                 else
                     result.errors[#result.errors+1]=str(single_response)
@@ -343,6 +342,10 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     end
 
     rebuild_state()
+    if invalid_review_count>0 then
+        logger.warn("[MiuRead][Annotations] malformed review entries skipped",
+            "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid_review_count))
+    end
     logger.info("[MiuRead][Annotations] chapter fetched","book=",result.book_id,"chapter=",result.chapter_uid,
         "underlines=",result.underline_count,"thought_groups=",result.thought_count,
         "thought_entries=",result.thought_entry_count,"pending_ranges=",#result.pending_ranges)

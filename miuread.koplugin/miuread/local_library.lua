@@ -137,7 +137,7 @@ function LocalLibrary.scan(root, options)
                         format=extension(full):upper(),
                         size=tonumber(attr.size) or 0,
                         modified_at=tonumber(attr.modification) or 0,
-                        cover_path=cover_path(full),
+                        cover_path=options.include_cover==true and cover_path(full) or nil,
                     }
                     if #rows>=limit then stopped=true; break end
                     end
@@ -153,6 +153,136 @@ function LocalLibrary.scan(root, options)
         return tostring(a.title or ""):lower()<tostring(b.title or ""):lower()
     end)
     return {root=root,scanned_at=os.time(),books=rows,truncated=stopped==true}
+end
+
+
+function LocalLibrary.normalize(path)
+    path=tostring(path or ""):gsub("\\","/"):gsub("/+","/")
+    if #path>1 then path=path:gsub("/$","") end
+    return path
+end
+
+function LocalLibrary.basename(path) return basename(LocalLibrary.normalize(path)) end
+-- Fast folder browsing: inspect only the selected directory itself. This never
+-- descends into child folders and never opens book containers. The scanner can
+-- run to completion in a subprocess or advance in small UI-thread batches on
+-- devices where subprocess workers are unavailable.
+local DirectoryScan={}
+DirectoryScan.__index=DirectoryScan
+
+function DirectoryScan:_close()
+    if self._closed then return end
+    self._closed=true
+    pcall(function()
+        if self.state and self.state.close then self.state:close() end
+    end)
+end
+
+function DirectoryScan:cancel()
+    self.cancelled=true
+    self.done=true
+    self:_close()
+end
+
+function DirectoryScan:_accept(name)
+    if name=="." or name==".." then return end
+    local full=(self.path=="/" and "/"..name or self.path.."/"..name)
+    local attr=lfs.attributes(full)
+    if attr and attr.mode=="directory" then
+        if not should_skip_dir(name,full,self.path) then
+            self.folders[#self.folders+1]={
+                kind="folder",local_folder=true,title=name,
+                path=full,folder_path=full,modified_at=tonumber(attr.modification) or 0,
+            }
+            self.seen=self.seen+1
+        end
+    elseif attr and attr.mode=="file" and LocalLibrary.is_supported(full) then
+        local title=title_from_path(full)
+        if self.options.include_dictionaries==true or not LocalLibrary.is_likely_dictionary(full,title) then
+            self.books[#self.books+1]={
+                file=full,title=title,author="",format=extension(full):upper(),
+                size=tonumber(attr.size) or 0,modified_at=tonumber(attr.modification) or 0,
+                cover_path=self.include_cover and cover_path(full) or nil,
+                local_file=true,source="local",
+            }
+            self.seen=self.seen+1
+        end
+    end
+    if self.seen>=self.limit then
+        self.truncated=true
+        self.done=true
+        self:_close()
+    end
+end
+
+function DirectoryScan:step(batch_size)
+    if self.done or self.cancelled then return true end
+    batch_size=math.max(1,tonumber(batch_size) or 32)
+    local processed=0
+    while processed<batch_size and not self.done do
+        local ok,name=pcall(self.iter,self.state,self.var)
+        if not ok then
+            self.error=tostring(name or "无法读取目录")
+            self.done=true
+            self:_close()
+            break
+        end
+        self.var=name
+        if not name then
+            self.done=true
+            self:_close()
+            break
+        end
+        processed=processed+1
+        self:_accept(name)
+    end
+    return self.done
+end
+
+function DirectoryScan:snapshot()
+    if not self._sorted then
+        table.sort(self.folders,function(a,b)
+            return tostring(a.title or ""):lower()<tostring(b.title or ""):lower()
+        end)
+        table.sort(self.books,function(a,b)
+            local am,bm=tonumber(a.modified_at) or 0,tonumber(b.modified_at) or 0
+            if self.options.sort=="name" then
+                return tostring(a.title or ""):lower()<tostring(b.title or ""):lower()
+            end
+            if am~=bm then return am>bm end
+            return tostring(a.title or ""):lower()<tostring(b.title or ""):lower()
+        end)
+        self._sorted=true
+    end
+    return {
+        path=self.path,scanned_at=os.time(),folders=self.folders,books=self.books,
+        truncated=self.truncated==true,direct_count=#self.folders+#self.books,
+        error=self.error,
+    }
+end
+
+function LocalLibrary.new_directory_scan(path, options)
+    options=options or {}
+    path=LocalLibrary.normalize(path)
+    local scanner=setmetatable({
+        path=path,options=options,limit=math.max(20,tonumber(options.limit) or 1600),
+        include_cover=options.include_cover==true,folders={},books={},seen=0,
+        truncated=false,done=false,cancelled=false,
+    },DirectoryScan)
+    local ok,iter,state,var=pcall(lfs.dir,path)
+    if not ok or not iter then
+        scanner.done=true
+        scanner.error=tostring(iter or state or "无法读取目录")
+        return scanner
+    end
+    scanner.iter,scanner.state,scanner.var=iter,state,var
+    return scanner
+end
+
+function LocalLibrary.list_directory(path, options)
+    local scanner=LocalLibrary.new_directory_scan(path,options)
+    while not scanner:step(256) do end
+    return scanner:snapshot()
 end
 
 return LocalLibrary

@@ -190,6 +190,4 @@ function NetworkMetadata.fetch(http, book)
     return nil
 end
 
-NetworkMetadata.normalize_isbn = normalize_isbn
-NetworkMetadata.first_isbn = first_isbn
 return NetworkMetadata

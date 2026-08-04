@@ -293,12 +293,6 @@ local function local_progress(session,row)
     return tonumber(pending.percent or session.progress_local_percent or session.verified_local_percent or row.progress or 0) or 0
 end
 
-function Library:is_downloaded(id, library_snapshot)
-    local source=library_snapshot or self.store:library()
-    local b=source and source[tostring(id)]
-    return b and record_state(b).downloaded or false
-end
-
 function Library:local_books(library_snapshot,sessions_snapshot)
     local source=library_snapshot or self.store:library()
     local sessions=sessions_snapshot or self.store:get("sessions",{})
@@ -422,26 +416,6 @@ end
 
 -- Kept for older call sites and saved data. New shelf pages use account_rows and
 -- generated_rows so cloud-only and generated files are never silently mixed.
-function Library:merge_books(remote_rows,local_rows)
-    local out=self:account_rows(remote_rows,local_rows)
-    local seen={}
-    for _,row in ipairs(out) do seen[tostring(row.bookId)]=true end
-    for _,local_book in ipairs(local_rows or {}) do
-        local id=tostring(local_book.bookId or "")
-        if id~="" and not seen[id] then
-            local copy=U.copy(local_book)
-            copy.cloudOrder=copy.cloudOrder or (1000000+#out+1)
-            out[#out+1]=copy
-        end
-    end
-    return out
-end
-
-function Library:combined(remote_books,remote_mp,library_snapshot,sessions_snapshot)
-    local local_books,local_mp=self:local_books(library_snapshot,sessions_snapshot)
-    return self:merge_books(remote_books,local_books),self:merge_books(remote_mp,local_mp)
-end
-
 local function shelf_rows_fingerprint(rows,section)
     local parts={tostring(section or ""), tostring(#(rows or {}))}
     for index,row in ipairs(rows or {}) do
@@ -604,12 +578,5 @@ function Library:cache_cover(b,options)
     if persist_index then self.store:set("cover_index",index) end
     logger.info("[MiuRead][Cover] cached","book_id=",tostring(b.bookId),"bytes=",tostring(#data),"type=",tostring(mime))
     return path
-end
-function Library:clear_covers() U.remove_tree(self.store.covers_dir); U.mkdir(self.store.covers_dir); self.store:set("cover_index",{}) end
-function Library:reader_link(url)
-    local id=tostring(url or ""):match("/web/reader/([^/?#]+)") or tostring(url or ""):match("bookId=([^&#]+)")
-    if not id then return nil end
-    if id:match("^%d+$") or Protocol.is_mp_account(id) then return id end
-    return nil
 end
 return Library

@@ -1,5 +1,4 @@
 local Thoughts = require("miuread.thoughts")
-local U = require("miuread.util")
 local lfs = require("libs/libkoreader-lfs")
 
 local Repair = {}

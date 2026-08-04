@@ -6,28 +6,19 @@ local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
-local TextBoxWidget = require("ui/widget/textboxwidget")
-local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
-local ok_socket, socket = pcall(require, "socket")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
 local live_toolbar
-
-local function now()
-    if ok_socket and socket and type(socket.gettime) == "function" then return socket.gettime() end
-    return os.time()
-end
 
 local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
 function OffsetContainer:getSize() return self[1]:getSize() end
@@ -179,7 +170,6 @@ local Toolbar = InputContainer:extend{
     opts = nil,
     closed = false,
     pending_action = nil,
-    opened_at = 0,
     action_locked = false,
 }
 
@@ -189,14 +179,27 @@ end
 
 function Toolbar:_activate(action, label)
     if self.closed or self.action_locked then return true end
-    local elapsed = now() - (tonumber(self.opened_at) or 0)
-    if elapsed >= 0 and elapsed < .22 then
-        logger.info("[MiuRead][ReaderToolbar] opening tap ignored", tostring(label or "unknown"))
-        return true
-    end
+    -- The native ReaderUI menu handler already consumes the gesture that opens
+    -- this toolbar. Do not block a later, valid tap with a fixed time window.
     self.action_locked = true
     logger.info("[MiuRead][ReaderToolbar] tapped", tostring(label or "unknown"))
     return self:_close(action)
+end
+
+function Toolbar:_activate_immediate(action, label)
+    if self.closed or self.action_locked then return true end
+    self.action_locked = true
+    self.pending_action = nil
+    logger.info("[MiuRead][ReaderToolbar] tapped", tostring(label or "unknown"))
+    -- Navigation and device-lifecycle actions must start before this transient
+    -- widget closes. Waiting for onCloseWidget can silently lose the action when
+    -- another surface changes the window stack at the same time.
+    local ok, err = xpcall(function()
+        if type(action) == "function" then action() end
+    end, debug.traceback)
+    if not ok then logger.warn("[MiuRead][ReaderToolbar] action failed", tostring(err)) end
+    if not self.closed then self:_close(nil, true) end
+    return true
 end
 
 function Toolbar:_close(action, cancel_pending)
@@ -213,7 +216,6 @@ end
 
 function Toolbar:init()
     self.opts = self.opts or {}
-    self.opened_at = now()
     self.action_locked = false
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     local portrait = sw < sh
@@ -273,7 +275,7 @@ function Toolbar:init()
     local home_tap = TapBox:new{
         dimen = Geom:new{w = side_w, h = title_h},
         enabled = type(home_action) == "function",
-        callback = function() self:_activate(home_action, "返回主页") end,
+        callback = function() self:_activate_immediate(home_action, "返回主页") end,
     }
     home_tap[1] = Ui.icon("home", side_w, title_h, Skin.dp(28, 24, 36), {
         face = Skin.face("cfont", 19.2, 25.2, 16.2),

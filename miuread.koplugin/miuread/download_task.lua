@@ -52,8 +52,10 @@ function DownloadTask:new(store)
         standby_held = false,
         keep_awake_enabled = true,
         backgrounded = false,
+        pause_reasons = {},
         foreground_poll_interval = 0.40,
         background_poll_interval = 1.50,
+        paused_poll_interval = 2.00,
         owner_path = store.temp_dir .. "/download-task-owner.json",
         owner_token = tostring(os.time()) .. "-" .. tostring(math.random(100000,999999)),
     }, self)
@@ -61,6 +63,127 @@ end
 
 function DownloadTask:set_backgrounded(value)
     self.backgrounded = value == true
+    -- A background task must never keep Kindle awake indefinitely. Foreground
+    -- progress pages may hold the lock, but background work releases it at once.
+    if self.backgrounded then
+        self:_release_awake()
+    elseif self.job and not self:is_paused() then
+        self:_hold_awake()
+    end
+end
+
+function DownloadTask:_control_descriptor()
+    if self.job then return self.job end
+    -- FileManager and ReaderUI own different plugin instances. Read the active
+    -- task descriptor from the persisted download state so either instance can
+    -- pause or stop the same child process during a foreground recovery.
+    local ok,state=pcall(self.store.download_state,self.store)
+    local task=ok and type(state)=="table" and state.task or nil
+    return type(task)=="table" and task or nil
+end
+
+function DownloadTask:_control_pause_path()
+    local task=self:_control_descriptor()
+    local path=type(task)=="table" and tostring(task.pause_path or "") or ""
+    return path~="" and path or nil
+end
+
+function DownloadTask:_marker_reasons(path)
+    local reasons={}
+    path=path or self:_control_pause_path()
+    if not path then return reasons end
+    local raw=U.read_file(path,true)
+    if not raw then return reasons end
+    local ok,value=pcall(Json.decode,raw)
+    if not ok or type(value)~="table" then return reasons end
+    for _,reason in ipairs(type(value.reasons)=="table" and value.reasons or {}) do
+        reason=tostring(reason or "")
+        if reason~="" then reasons[reason]=true end
+    end
+    return reasons
+end
+
+function DownloadTask:_merged_pause_reasons(path)
+    path=path or self:_control_pause_path()
+    -- While a task descriptor exists, the marker is the single source of
+    -- truth shared by FileManager and ReaderUI. Never merge stale per-instance
+    -- reasons back into it after another instance has resumed the worker.
+    if path then return self:_marker_reasons(path) end
+    local reasons={}
+    for reason,value in pairs(self.pause_reasons or {}) do
+        if value==true then reasons[reason]=true end
+    end
+    return reasons
+end
+
+function DownloadTask:is_paused()
+    return next(self:_merged_pause_reasons())~=nil
+end
+
+function DownloadTask:_write_pause_marker(path,reasons)
+    path=path or self:_control_pause_path()
+    if not path then return false end
+    reasons=reasons or self:_merged_pause_reasons(path)
+    self.pause_reasons=reasons
+    if next(reasons)==nil then
+        os.remove(path)
+        return true
+    end
+    local ordered={}
+    for reason in pairs(reasons) do ordered[#ordered+1]=reason end
+    table.sort(ordered)
+    return U.atomic_write(path,Json.encode({
+        paused=true,reasons=ordered,updated_at=os.time(),
+    }),true)==true
+end
+
+function DownloadTask:pause(reason)
+    reason=tostring(reason or "manual")
+    local path=self:_control_pause_path()
+    local reasons=self:_merged_pause_reasons(path)
+    reasons[reason]=true
+    local wrote=self:_write_pause_marker(path,reasons)
+    self:_release_awake()
+    logger.info("[MiuRead][DownloadTask] paused","reason=",reason,
+        "marker=",tostring(wrote),"shared=",tostring(self.job==nil))
+    if self.job then self:_schedule() end
+    return wrote
+end
+
+function DownloadTask:resume(reason)
+    local path=self:_control_pause_path()
+    local reasons=self:_merged_pause_reasons(path)
+    if reason==nil then
+        reasons={}
+    else
+        reasons[tostring(reason)]=nil
+    end
+    local still_paused=next(reasons)~=nil
+    self:_write_pause_marker(path,reasons)
+    if not still_paused and self.job and not self.backgrounded then self:_hold_awake() end
+    logger.info("[MiuRead][DownloadTask] resume requested",
+        "reason=",tostring(reason or "all"),"still_paused=",tostring(still_paused),
+        "shared=",tostring(self.job==nil))
+    if self.job then self:_schedule() end
+    return not still_paused
+end
+
+function DownloadTask:on_suspend() return self:pause("suspend") end
+function DownloadTask:on_resume() return self:resume("suspend") end
+
+function DownloadTask:stop_for_foreground(reason)
+    reason=tostring(reason or "foreground_recovery")
+    local task=self:_control_descriptor()
+    if type(task)~="table" then return false end
+    self:pause(reason)
+    local cancel_path=tostring(task.cancel_path or "")
+    if cancel_path=="" then return false end
+    local wrote=U.atomic_write(cancel_path,"1",true)==true
+    if self.job then self.job.cancel_requested_at=os.time() end
+    logger.warn("[MiuRead][DownloadTask] stopped for foreground recovery",
+        "reason=",reason,"pid=",tostring(task.pid or ""),"marker=",tostring(wrote))
+    if self.job then self:_schedule() end
+    return wrote
 end
 
 function DownloadTask:last_state()
@@ -154,7 +277,7 @@ function DownloadTask:descriptor()
     return {
         pid=job.pid,progress_path=job.progress_path,result_path=job.result_path,
         recovery_path=job.recovery_path,diagnostic_path=job.diagnostic_path,
-        cancel_path=job.cancel_path,worker_settings_path=job.worker_settings_path,
+        cancel_path=job.cancel_path,pause_path=job.pause_path,worker_settings_path=job.worker_settings_path,
         started_at=job.started_at,owner_token=self.owner_token,task_token=job.task_token,
         restart_count=tonumber(job.restart_count) or 0,
     }
@@ -208,7 +331,8 @@ function DownloadTask:_schedule()
         self:_poll()
     end
     self.poll_task = task
-    local interval = self.backgrounded and self.background_poll_interval or self.foreground_poll_interval
+    local interval = self:is_paused() and self.paused_poll_interval
+        or (self.backgrounded and self.background_poll_interval or self.foreground_poll_interval)
     UIManager:scheduleIn(interval, task)
 end
 
@@ -226,7 +350,8 @@ function DownloadTask:_read_progress(job)
         job.last_progress_state = state
         job.last_progress_at = tonumber(state.updated_at) or file_mtime(job.progress_path) or os.time()
         job.waiting_notified = false
-        if self.keep_awake_enabled and not self.standby_held then self:_hold_awake() end
+        if self.keep_awake_enabled and not self.backgrounded and not self:is_paused()
+            and not self.standby_held then self:_hold_awake() end
         if job.on_progress then job.on_progress(state) end
         return true
     end
@@ -322,6 +447,7 @@ function DownloadTask:_finish(job, forced_error)
     os.remove(job.result_path)
     if job.recovery_path then os.remove(job.recovery_path) end
     os.remove(job.cancel_path)
+    if job.pause_path then os.remove(job.pause_path) end
     if job.worker_settings_path then os.remove(job.worker_settings_path) end
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job = nil
@@ -360,6 +486,7 @@ function DownloadTask:_restart_interrupted(job)
     os.remove(job.result_path)
     if job.recovery_path then os.remove(job.recovery_path) end
     os.remove(job.cancel_path)
+    if job.pause_path then os.remove(job.pause_path) end
     if job.worker_settings_path then os.remove(job.worker_settings_path) end
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job=nil
@@ -396,7 +523,8 @@ function DownloadTask:_poll()
     if read_json(job.result_path) then self:_finish(job); return end
 
     local now=os.time()
-    if not job.last_keepalive or now-job.last_keepalive>=5 then
+    if not self.backgrounded and not self:is_paused()
+        and (not job.last_keepalive or now-job.last_keepalive>=5) then
         job.last_keepalive=now
         local reset=self:_reset_device_timeout()
         if reset then logger.dbg("[MiuRead][DownloadTask] Kindle T1 timer reset") end
@@ -422,6 +550,12 @@ function DownloadTask:_poll()
 
     if running then
         job.dead_seen_at=nil
+        if self:is_paused() then
+            job.waiting_notified=false
+            self:_release_awake()
+            self:_schedule()
+            return
+        end
         job.unknown_seen_at=nil
         job.rechecking_notified=false
         if job.cancel_requested_at and now-job.cancel_requested_at>=8 then
@@ -506,6 +640,8 @@ function DownloadTask:cancel()
     local job = self.job
     if not job or job.cancel_requested_at or not self:_owns_job() then return end
     job.cancel_requested_at = os.time()
+    self.pause_reasons={}
+    if job.pause_path then os.remove(job.pause_path) end
     U.atomic_write(job.cancel_path, "1", true)
 end
 
@@ -516,6 +652,13 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
     local pid=descriptor and tonumber(descriptor.pid)
     if not pid or not descriptor.progress_path or not descriptor.result_path
         or not descriptor.cancel_path then return false,"下载任务记录不完整" end
+    if not descriptor.pause_path or tostring(descriptor.pause_path)=="" then
+        -- A pre-beta.10 worker cannot obey suspend barriers. Stop it cleanly
+        -- instead of reattaching an unsafe process; its chapter checkpoint is
+        -- retained and the user can continue the same download afterwards.
+        U.atomic_write(descriptor.cancel_path,"1",true)
+        return false,"旧版后台任务已安全停止；断点已保留，请继续下载"
+    end
     self.keep_awake_enabled=self.store:preferences().download_keep_awake~=false
     local recovery_path=descriptor.recovery_path
         or tostring(descriptor.result_path):gsub("download%-result%-","download-recovery-")
@@ -524,7 +667,7 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
     self.job={
         pid=pid,progress_path=descriptor.progress_path,result_path=descriptor.result_path,
         recovery_path=recovery_path,diagnostic_path=diagnostic_path,
-        cancel_path=descriptor.cancel_path,worker_settings_path=descriptor.worker_settings_path,
+        cancel_path=descriptor.cancel_path,pause_path=descriptor.pause_path,worker_settings_path=descriptor.worker_settings_path,
         on_progress=on_progress,on_done=on_done,last_progress_raw=nil,last_progress_state=nil,
         last_progress_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,
         unknown_seen_at=nil,waiting_notified=false,rechecking_notified=false,
@@ -534,6 +677,7 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
         restart_options=serializable_copy(restart_options),
     }
     self.backgrounded=true
+    self.pause_reasons=self:_marker_reasons(self.job.pause_path)
     self:_read_progress(self.job)
     if self.job.token_mismatch then
         self.job=nil
@@ -560,7 +704,7 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
             "pid=",tostring(pid),"error=",tostring(done))
     end
     self:_claim(pid)
-    self:_hold_awake()
+    self:_release_awake()
     logger.info("[MiuRead][DownloadTask] attached","pid=",tostring(pid),
         "done=",tostring(done_ok and done or "unknown"),"alive=",tostring(alive))
     if result_ready or usable_recovery_result(recovery_ready) or completed_snapshot then
@@ -585,6 +729,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     local recovery_path = self.store.temp_dir .. "/download-recovery-" .. stamp .. ".json"
     local diagnostic_path = self.store.temp_dir .. "/download-diagnostic-" .. stamp .. ".txt"
     local cancel_path = self.store.temp_dir .. "/download-cancel-" .. stamp
+    local pause_path = self.store.temp_dir .. "/download-pause-" .. stamp .. ".json"
     local worker_settings_path = self.store.temp_dir .. "/download-settings-" .. stamp .. ".lua"
     self.store:flush()
     local copied, copy_error = U.copy_file(self.store.settings_path, worker_settings_path)
@@ -596,6 +741,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     clean_options.download_run_id=tostring(clean_options.download_run_id or task_token)
     clean_options.reader_active_path="/tmp/miuread-reader-active.flag"
     clean_options.reader_busy_path="/tmp/miuread-reader-busy.until"
+    clean_options.pause_path=pause_path
     local start_auth=self.store:auth()
     local start_account=type(start_auth.account)=="table" and start_auth.account or {}
     local auth_snapshot={
@@ -693,6 +839,9 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
             raw=tostring(raw or "未知下载错误")
             local display=raw:match("^(.-)\nstack traceback:") or raw
             display=display:gsub("^.-%.lua:%d+:%s*", "")
+            if raw:lower():find("download cancelled",1,true) then
+                return "下载已暂停，可稍后继续"
+            end
             if raw:lower():find("not enough memory", 1, true) then
                 return "设备内存不足，未生成新的 EPUB。原有完整书未被覆盖，已完成章节仍保存在断点缓存；再次下载时会继续。"
             end
@@ -828,9 +977,11 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         end
     end
 
+    os.remove(pause_path)
     local ok, pid, err = pcall(FFIUtil.runInSubProcess, child, false, false)
     if not ok or not pid then
         os.remove(worker_settings_path)
+        os.remove(pause_path)
         return false, tostring(err or pid or "无法启动下载子进程")
     end
 
@@ -841,6 +992,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         recovery_path = recovery_path,
         diagnostic_path = diagnostic_path,
         cancel_path = cancel_path,
+        pause_path = pause_path,
         worker_settings_path = worker_settings_path,
         on_progress = on_progress,
         on_done = on_done,
@@ -859,6 +1011,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         started_at = os.time(),
     }
     self:_claim(pid)
+    self.pause_reasons={}
     self.backgrounded = false
     self:_hold_awake()
     logger.info("[MiuRead][DownloadTask] started", "pid=", tostring(pid))

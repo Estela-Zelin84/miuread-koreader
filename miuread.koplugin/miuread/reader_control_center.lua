@@ -6,11 +6,8 @@ local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
-local TextBoxWidget = require("ui/widget/textboxwidget")
-local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -385,13 +382,14 @@ end
 
 function Center:onTapDismiss(_, ges)
     local pos = ges and ges.pos
-    if pos and (pos.y > self.panel_dimen.y + self.panel_dimen.h or pos.x < self.panel_dimen.x or pos.x > self.panel_dimen.x + self.panel_dimen.w) then
-        return self:_close(self.opts and self.opts.on_back or nil)
+    if pos and (pos.y < self.panel_dimen.y or pos.y > self.panel_dimen.y + self.panel_dimen.h
+        or pos.x < self.panel_dimen.x or pos.x > self.panel_dimen.x + self.panel_dimen.w) then
+        return self:_close(nil, true)
     end
     return false
 end
 function Center:onSwipeDismiss(_, ges)
-    if ges and ges.direction == "north" then return self:_close(self.opts and self.opts.on_back or nil) end
+    if ges and ges.direction == "north" then return self:_close(nil, true) end
     return false
 end
 function Center:onClose()

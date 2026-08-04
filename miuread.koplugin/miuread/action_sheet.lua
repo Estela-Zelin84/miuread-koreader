@@ -1,7 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
-local Device = require("device")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -9,6 +8,7 @@ local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
+local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
@@ -20,7 +20,6 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local UiScale = require("miuread.ui_scale")
 
-local Screen = Device.screen
 local live_sheet
 local MAX_PRIMARY_ACTIONS = 6
 
@@ -240,6 +239,42 @@ function SheetWidget:_card(action, width, height, seed)
     end)
 end
 
+function SheetWidget:_footer(action, width, height)
+    if type(action) ~= "table" then return nil end
+    local enabled = action.enabled ~= false
+    local layers = OverlapGroup:new{
+        dimen = Geom:new{w = width, h = height},
+        allow_mirroring = false,
+    }
+    layers[#layers + 1] = OffsetContainer:new{
+        x_off = 0,
+        y_off = 0,
+        LineWidget:new{
+            background = Blitbuffer.COLOR_GRAY,
+            dimen = Geom:new{w = width, h = math.max(1, UiScale.line("thin"))},
+        },
+    }
+    layers[#layers + 1] = TextBoxWidget:new{
+        text = tostring(action.label or action.text or "更多操作  ›"),
+        face = UiScale.face("cfont", 9.8, 13.8, 8.4),
+        bold = true,
+        width = width,
+        height = height,
+        height_adjust = false,
+        height_overflow_show_ellipsis = true,
+        alignment = "center",
+        fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+    }
+    local tap = TapBox:new{
+        dimen = Geom:new{w = width, h = height},
+        callback = function()
+            if enabled then self:_close(action.callback) end
+        end,
+    }
+    tap[1] = layers
+    return tap
+end
+
 local function normalized_anchor(anchor)
     if type(anchor) ~= "table" then return nil end
     local x, y = tonumber(anchor.x), tonumber(anchor.y)
@@ -287,6 +322,8 @@ function SheetWidget:_build()
     local title_h = has_title and UiScale.dp(has_subtitle and 32 or 29, has_subtitle and 29 or 26, has_subtitle and 44 or 39) or 0
     local subtitle_h = has_subtitle and UiScale.dp(21, 19, 29) or 0
     local card_h = UiScale.dp(58, 53, 79)
+    local footer_action = type(self.opts.footer_action) == "table" and self.opts.footer_action or nil
+    local footer_h = footer_action and UiScale.dp(39, 35, 52) or 0
     local show_close = self.opts.show_close == true
     if show_close and count < MAX_PRIMARY_ACTIONS then
         actions[#actions + 1] = {icon = "×", label = tostring(self.opts.close_label or "关闭"), close_only = true}
@@ -298,6 +335,7 @@ function SheetWidget:_build()
     local header_h = title_h + subtitle_h
     local content_h = header_h + (header_h > 0 and count > 0 and gap or 0)
         + rows * card_h + math.max(0, rows - 1) * gap
+        + (footer_h > 0 and (gap + footer_h) or 0)
     local panel_h = pad * 2 + content_h
     local max_h = math.floor(sh * (metrics.portrait and .66 or .82))
     panel_h = math.min(max_h, panel_h)
@@ -345,6 +383,10 @@ function SheetWidget:_build()
         end
         list[#list + 1] = row_group
         if row < rows then list[#list + 1] = VerticalSpan:new{height = gap} end
+    end
+    if footer_h > 0 then
+        list[#list + 1] = VerticalSpan:new{height = gap}
+        list[#list + 1] = self:_footer(footer_action, inner_w, footer_h)
     end
 
     local panel = fixed_frame(panel_w, panel_h, {
@@ -474,6 +516,22 @@ local function show_fallback(opts, reason)
                     UIManager:scheduleIn(.04, function()
                         local ok, err = pcall(action.callback)
                         if not ok then logger.warn("[MiuRead][ActionSheet] fallback action failed", tostring(err)) end
+                    end)
+                end
+            end,
+        }}
+    end
+    local footer = type(opts.footer_action) == "table" and opts.footer_action or nil
+    if footer then
+        buttons[#buttons + 1] = {{
+            text = tostring(footer.label or footer.text or "更多操作"),
+            enabled = footer.enabled ~= false,
+            callback = function()
+                UIManager:close(dialog)
+                if footer.enabled ~= false and footer.callback then
+                    UIManager:scheduleIn(.04, function()
+                        local ok, err = pcall(footer.callback)
+                        if not ok then logger.warn("[MiuRead][ActionSheet] fallback footer failed", tostring(err)) end
                     end)
                 end
             end,

@@ -446,10 +446,6 @@ function Footnotes.collect_footnote_refs(html)
 end
 
 -- Backward-compatible name used by older callers/tests.
-function Footnotes.collect_cross_file_refs(html)
-    return Footnotes.collect_footnote_refs(html)
-end
-
 function Footnotes.fetch_missing_anchors(meta, missing_refs, ref_files)
     if type(missing_refs) ~= "table" or #missing_refs == 0 or type(meta) ~= "table" then return {} end
     local refs={}
@@ -593,10 +589,6 @@ local function convert_anchor_refs(html, anchor_texts, fn_offset)
         )
     end)
     return result, notes
-end
-
-function Footnotes.convert_cross_file_footnotes(html, anchor_texts, fn_offset)
-    return convert_anchor_refs(html, anchor_texts or {}, fn_offset or 0)
 end
 
 local function build_footnote_section(img_notes, anchor_notes)
@@ -745,9 +737,4 @@ function Footnotes.validate(html)
     return true
 end
 
-Footnotes._sanitize_note_html=sanitize_note_html
-Footnotes._note_content=note_content
-Footnotes._normalize_ref_path=normalize_ref_path
-Footnotes._ref_key=ref_key
-Footnotes._collect_anchor_presence=collect_anchor_presence
 return Footnotes

@@ -120,24 +120,6 @@ local function is_structure_chapter(chapter)
         or kind:find("season", 1, true) ~= nil
 end
 
-local function is_cover_chapter(chapter)
-    chapter = type(chapter) == "table" and chapter or {}
-    if truthy(chapter.isCover) or truthy(chapter.cover) then return true end
-    local kind = tostring(chapter.chapterType or chapter.chapter_type or chapter.typeName or chapter.nodeType or ""):lower()
-    if kind == "cover" or kind:find("cover_page", 1, true) then return true end
-    return tostring(chapter.title or ""):gsub("%s+", "") == "封面"
-end
-
-local function is_unavailable_chapter(chapter)
-    chapter = type(chapter) == "table" and chapter or {}
-    if truthy(chapter.isDeleted) or truthy(chapter.deleted) or truthy(chapter.isRemoved)
-        or truthy(chapter.isHidden) or truthy(chapter.unavailable) then
-        return true
-    end
-    local status = tostring(chapter.status or chapter.chapterStatus or chapter.state or ""):lower()
-    return status == "deleted" or status == "removed" or status == "hidden" or status == "unavailable"
-end
-
 local function has_content_markup(html)
     local value = tostring(html or ""):lower()
     return value:find("<img", 1, true) ~= nil
@@ -196,31 +178,6 @@ end
 -- Only explicit service-side permission messages are treated as preview or
 -- entitlement limits. Network, login and decoding failures must never be
 -- downgraded into a preview book.
-local function is_access_denied_error(value)
-    if is_auth_error(value) then return false end
-    local text=tostring(value or "")
-    local lower=text:lower()
-    local markers={
-        "permission denied", "access denied", "not authorized", "not authorised",
-        "not entitled", "purchase required", "preview only", "trial only",
-        "subscription required", "membership required", "not available for reading",
-    }
-    for _,marker in ipairs(markers) do
-        if lower:find(marker,1,true) then return true end
-    end
-    local zh={
-        "无阅读权限", "没有阅读权限", "暂无阅读权限", "无权阅读",
-        "仅支持试读", "仅可试读", "只能试读", "试读结束",
-        "需要购买", "请购买后阅读", "购买后可读",
-        "会员已过期", "会员到期", "需要会员", "开通会员后阅读",
-        "不在可读范围", "本章暂不可读", "该章节暂不可读",
-    }
-    for _,marker in ipairs(zh) do
-        if text:find(marker,1,true) then return true end
-    end
-    return false
-end
-
 local function login_page_error(html, final_url)
     local url = tostring(final_url or ""):lower()
     if url:find("/web/login", 1, true) or url:find("/web/confirm", 1, true)
@@ -730,12 +687,6 @@ function Reader:_recover_login_session()
     return false, result
 end
 
-function Reader:check_login_session()
-    local ok, result = self:_recover_login_session()
-    if not ok then error(result) end
-    return result
-end
-
 local function load_reader_context(self,book_id,chapter_uid,require_psvts)
     local url=Protocol.is_mp(book_id) and Protocol.mp_reader_url(book_id) or Protocol.reader_url(book_id,chapter_uid)
     local html,_,final_url=self.http:download(url,{headers={Accept="text/html,application/xhtml+xml"},retries=2})
@@ -767,10 +718,6 @@ end
 
 function Reader:state(book_id,chapter_uid)
     return load_reader_context(self,book_id,chapter_uid,true)
-end
-
-function Reader:access_state(book_id)
-    return load_reader_context(self,book_id,nil,false)
 end
 
 function Reader:catalog(book_id)
@@ -1116,18 +1063,5 @@ function Reader:report(book_id, chapter_uid, opt)
     return self:report_payload(payload, session.reader_url or Protocol.reader_url(book_id), 0)
 end
 
-Reader._visible_text = visible_text
-Reader._is_structure_chapter = is_structure_chapter
-Reader._is_cover_chapter = is_cover_chapter
-Reader._is_unavailable_chapter = is_unavailable_chapter
-Reader._has_readable_content = has_readable_content
-Reader.is_access_denied_error = is_access_denied_error
-Reader._is_empty_error = is_empty_error
-Reader._is_auth_error = is_auth_error
-Reader._image_source_keys = image_source_keys
-Reader._image_is_optional_reference = image_is_optional_reference
-Reader._image_tar_assets = image_tar_assets
-Reader._localize_epub_images = localize_epub_images
-Reader.PART_CSS = PART_CSS
 
 return Reader

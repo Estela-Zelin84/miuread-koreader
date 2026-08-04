@@ -605,11 +605,5 @@ function MP:clear_account(book_id)
     return U.remove_tree(self:_account_dir(book_id))
 end
 
-MP.ARTICLE_CSS = ARTICLE_CSS
-MP.parse_articles = parse_articles
-MP.extract_mp_body = extract_mp_body
-MP.strip_mp_images = strip_mp_images
-MP.strip_mp_reader_font_styles = strip_mp_reader_font_styles
-MP.strip_blank_mp_blocks = strip_blank_mp_blocks
 
 return MP

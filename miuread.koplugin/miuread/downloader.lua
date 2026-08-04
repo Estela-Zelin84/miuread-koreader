@@ -1,5 +1,4 @@
 local Protocol = require("miuread.protocol")
-local Config = require("miuread.config")
 local Codec = require("miuread.codec")
 local Footnotes = require("miuread.footnotes")
 local ResourceRefs = require("miuread.resource_refs")
@@ -277,25 +276,6 @@ local function preview_information_chapter(book, mode, catalog_count, readable_c
     end
     lines[#lines + 1] = '<p>生成时间：' .. U.xml(os.date("%Y-%m-%d %H:%M:%S")) .. '</p></section>'
     return table.concat(lines, "\n"), title
-end
-
-local function localize(http, html, assets, enabled)
-    if not enabled then return html end
-    local cache = {}
-    local function replace(prefix, quote, url)
-        local clean = tostring(url):gsub("&amp;", "&")
-        if cache[clean] then return prefix .. quote .. cache[clean] .. quote end
-        local ok, data = pcall(http.download, http, clean, {auth=false, retries=3})
-        if not ok or not data or #data == 0 then return prefix .. quote .. url .. quote end
-        local ext, mime = Codec.media(data)
-        local href = "images/remote-" .. tostring(#assets + 1) .. ext
-        assets[#assets + 1] = {href=href, data=data, mime=mime}
-        cache[clean] = "../" .. href
-        return prefix .. quote .. cache[clean] .. quote
-    end
-    html = html:gsub("(data%-src=)([\"'])(https?://[^\"']+)%2", replace)
-    html = html:gsub("(src=)([\"'])(https?://[^\"']+)%2", replace)
-    return html
 end
 
 local function failure_message(failures, expected, actual, checkpointed)
@@ -1020,12 +1000,30 @@ function Downloader:book(input, opt, progress)
     opt = opt or {}
     progress = progress or function() end
     local function respect_reader_priority(stage)
+        local pause_path=tostring(opt.pause_path or "")
+        local pause_logged=false
+        -- The parent writes this marker before suspend and page transitions.
+        -- Waiting here preserves the child and its checkpoints without starting
+        -- another chapter, request or annotation batch.
+        while pause_path~="" and U.file_exists(pause_path) do
+            if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
+            if not pause_logged then
+                pause_logged=true
+                logger.info("[MiuRead][Download] worker paused",tostring(stage or "work"))
+            end
+            pause(.25)
+        end
+        if pause_logged then logger.info("[MiuRead][Download] worker resumed",tostring(stage or "work")) end
+
         local active_path=tostring(opt.reader_active_path or "")
         if active_path=="" or not U.file_exists(active_path) then return end
         local busy_until=tonumber(U.read_file(tostring(opt.reader_busy_path or ""),true) or 0) or 0
         local waited=0
         while busy_until>os.time() and waited<30 do
-            if type(opt.cancelled)=="function" and opt.cancelled() then return end
+            if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
+            if pause_path~="" and U.file_exists(pause_path) then
+                return respect_reader_priority(stage)
+            end
             pause(.25)
             waited=waited+.25
             busy_until=tonumber(U.read_file(tostring(opt.reader_busy_path or ""),true) or 0) or 0
@@ -1596,22 +1594,6 @@ function Downloader:book(input, opt, progress)
         U.remove_tree(cache.root)
     end
     return record
-end
-
-Downloader._prepare_chapter_body = prepare_chapter_body
-Downloader._prepare_chapter_body_legacy = prepare_chapter_body_legacy
-Downloader._prepare_chapter_body_current = prepare_chapter_body_current
-Downloader._namespace_assets = namespace_assets
-Downloader._catalog_signature = catalog_signature
-Downloader._option_key = option_key
-Downloader._validate_epub = function(path,expected)
-    if type(expected)=="number" then
-        local meta,err=EpubInstaller.inspect(path)
-        if not meta then return nil,err end
-        if tonumber(meta._chapter_count)~=tonumber(expected) then return nil,"EPUB 章节数量不一致" end
-        return true,meta
-    end
-    return EpubInstaller.validate(path,expected)
 end
 
 return Downloader

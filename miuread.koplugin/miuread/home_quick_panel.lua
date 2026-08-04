@@ -1,6 +1,5 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
-local Device = require("device")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -11,8 +10,6 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
-local TextBoxWidget = require("ui/widget/textboxwidget")
-local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
@@ -22,7 +19,6 @@ local logger = require("logger")
 local UiScale = require("miuread.ui_scale")
 local Ui = require("miuread.ui_components")
 
-local Screen = Device.screen
 local live_panel
 
 local function face(name, nominal, maximum, minimum)
@@ -359,11 +355,7 @@ function QuickPanelWidget:onCloseWidget()
     self.pending_action = nil
     self._closed = true
     if live_panel == self then live_panel = nil end
-    if self._rotation_close then
-        UIManager:scheduleIn(.05, function()
-            if UIManager._exit_code == nil then UIManager:setDirty("all", "full") end
-        end)
-    elseif region then
+    if not self._rotation_close and region then
         UIManager:setDirty(nil, function() return "ui", region end)
     end
     if action then

@@ -1,14 +1,11 @@
 local Blitbuffer = require("ffi/blitbuffer")
-local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
-local TextBoxWidget = require("ui/widget/textboxwidget")
 local UIManager = require("ui/uimanager")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -266,13 +263,14 @@ end
 
 function Dialog:onTapDismiss(_, ges)
     local pos = ges and ges.pos
-    if pos and (pos.y > self.frame_dimen.y + self.frame_dimen.h or pos.x < self.frame_dimen.x or pos.x > self.frame_dimen.x + self.frame_dimen.w) then
-        return self:_close(self.on_back)
+    if pos and (pos.y < self.frame_dimen.y or pos.y > self.frame_dimen.y + self.frame_dimen.h
+        or pos.x < self.frame_dimen.x or pos.x > self.frame_dimen.x + self.frame_dimen.w) then
+        return self:_close(nil, true)
     end
     return false
 end
 function Dialog:onSwipeDismiss(_, ges)
-    if ges and ges.direction == "north" then return self:_close(self.on_back) end
+    if ges and ges.direction == "north" then return self:_close(nil, true) end
     return false
 end
 function Dialog:onClose() return self:_close(self.on_back) end

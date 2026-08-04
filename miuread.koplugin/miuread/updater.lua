@@ -47,10 +47,6 @@ function Updater:manifest_urls()
     return out
 end
 
-function Updater:manifest_url()
-    return self:manifest_urls()[1]
-end
-
 local function collect_table_urls(value,out,seen)
     if type(value)~="table" then return end
     for _,url in ipairs(value) do with_github_mirrors(url,out,seen) end
@@ -74,6 +70,53 @@ local function file_bytes(path)
     local data=U.read_file(path,true)
     if type(data)~="string" then return nil end
     return data
+end
+
+local function update_artifact_kind(path)
+    local name=tostring(path or ""):match("([^/]+)$") or ""
+    if name:match("^stage%-") then return "stage" end
+    if name:match("^backup%-") then return "backup" end
+    if name:match("^miuread%-.+%.zip$") then return "package" end
+    return nil
+end
+
+local function path_inside(root,path)
+    root=tostring(root or ""):gsub("/+$","")
+    path=tostring(path or "")
+    return root~="" and path:sub(1,#root+1)==root.."/"
+end
+
+function Updater:_remove_download(path)
+    if not path_inside(self.store.updates_dir,path) or update_artifact_kind(path)~="package" then return false end
+    local removed,err=U.remove_tree(path)
+    if not removed then
+        logger.warn("[MiuRead][Updater] unable to remove update package",tostring(path),tostring(err))
+        return false
+    end
+    return true
+end
+
+function Updater:_cleanup_update_artifacts(protected)
+    protected=type(protected)=="table" and protected or {}
+    local removed={stage=0,backup=0,package=0}
+    for _,path in ipairs(U.list(self.store.updates_dir)) do
+        local kind=update_artifact_kind(path)
+        if kind and not protected[path] then
+            local ok,err=U.remove_tree(path)
+            if ok then
+                removed[kind]=removed[kind]+1
+            else
+                logger.warn("[MiuRead][Updater] artifact cleanup failed",tostring(path),tostring(err))
+            end
+        end
+    end
+    if removed.stage+removed.backup+removed.package>0 then
+        logger.info("[MiuRead][Updater] artifacts cleaned",
+            "stage=",tostring(removed.stage),
+            "backup=",tostring(removed.backup),
+            "package=",tostring(removed.package))
+    end
+    return removed
 end
 
 local function clean_notes(value)
@@ -141,7 +184,7 @@ function Updater:check()
                 local cleaned,text_error=clean_manifest_text(m)
                 if not cleaned then
                     fallback=fallback or U.copy(m)
-                    fallback.notes="更新说明显示异常 可继续下载安装"
+                    fallback.notes="更新说明读取异常\n可继续下载并安装新版本"
                     fallback.summary=fallback.notes
                     fallback.name=tostring(m.name or "")
                     errors[#errors+1]=text_error
@@ -199,6 +242,9 @@ local function download_one(self,url,path)
 end
 
 function Updater:download(m)
+    local pending=self.store:update_state()
+    if pending.pending then error("上次更新尚未确认，请完整重启 KOReader 后再更新") end
+    self:_cleanup_update_artifacts()
     local urls=package_urls(m)
     if #urls==0 then error("更新包地址无效") end
     local p=self.store.updates_dir.."/miuread-"..U.id_name(m.version)..".zip"
@@ -239,42 +285,60 @@ local function safe_relative(rel)
 end
 
 function Updater:install(path,manifest)
+    local pending=self.store:update_state()
+    if pending.pending then
+        self:_remove_download(path)
+        return nil,"上次更新尚未确认，请完整重启 KOReader 后再更新"
+    end
+    self:_cleanup_update_artifacts({[path]=true})
+
     local stamp=tostring(os.time()).."-"..tostring(math.random(1000,9999))
     local stage=self.store.updates_dir.."/stage-"..stamp
     local unpacked=stage.."/unpacked"
     local backup=self.store.updates_dir.."/backup-"..stamp
     U.remove_tree(stage); U.remove_tree(backup); U.mkdir(unpacked)
 
+    local function fail(message)
+        U.remove_tree(stage)
+        U.remove_tree(backup)
+        self:_remove_download(path)
+        return nil,message
+    end
+
     -- 全量包必须只包含一个 miuread.koplugin 根目录。
     local rc=os.execute("unzip -q "..U.shell_quote(path).." -d "..U.shell_quote(unpacked).." 2>/dev/null")
-    if not command_ok(rc) then U.remove_tree(stage); return nil,"解压更新包失败" end
+    if not command_ok(rc) then return fail("解压更新包失败") end
 
     local incoming=unpacked.."/miuread.koplugin"
     if not U.file_exists(incoming.."/main.lua") or not U.file_exists(incoming.."/_meta.lua") then
-        U.remove_tree(stage); return nil,"更新包缺少 miuread.koplugin 或插件文件不完整"
+        return fail("更新包缺少 miuread.koplugin 或插件文件不完整")
     end
     local incoming_config=U.read_file(incoming.."/miuread/config.lua",true) or ""
     local incoming_version=incoming_config:match('VERSION%s*=%s*["\']([^"\']+)["\']')
     local incoming_channel=incoming_config:match('UPDATE_CHANNEL%s*=%s*["\']([^"\']+)["\']') or "stable"
     if tostring(incoming_version or "")~=tostring(manifest.version or "") then
-        U.remove_tree(stage); return nil,"更新包版本与清单不一致"
+        return fail("更新包版本与清单不一致")
     end
     if tostring(incoming_channel)~=tostring(Config.UPDATE_CHANNEL or "stable") then
-        U.remove_tree(stage); return nil,"更新包通道不匹配，已拒绝安装"
+        return fail("更新包通道不匹配，已拒绝安装")
     end
     local roots=U.list(unpacked)
     if #roots~=1 or roots[1]~=incoming then
-        U.remove_tree(stage); return nil,"更新包根目录必须只包含 miuread.koplugin"
+        return fail("更新包根目录必须只包含 miuread.koplugin")
     end
 
     local ok,e=U.copy_tree(self.plugin_root,backup)
-    if not ok then U.remove_tree(stage); return nil,"备份当前插件失败："..tostring(e) end
+    if not ok then return fail("备份当前插件失败："..tostring(e)) end
 
     local function rollback(message)
         U.remove_tree(self.plugin_root)
         local restored,re=U.copy_tree(backup,self.plugin_root)
         U.remove_tree(stage)
-        if not restored then return nil,tostring(message).."；回滚也失败："..tostring(re) end
+        self:_remove_download(path)
+        if not restored then
+            return nil,tostring(message).."；回滚也失败："..tostring(re).."；备份已保留在 "..tostring(backup)
+        end
+        U.remove_tree(backup)
         return nil,tostring(message).."；已恢复旧版本"
     end
 
@@ -300,19 +364,44 @@ function Updater:install(path,manifest)
     end
 
     U.remove_tree(stage)
-    self.store:save_update_state({pending=true,expected=manifest.version,backup=backup,installed_at=os.time()})
-    logger.info("[MiuRead][Updater] update installed","version=",tostring(manifest.version),"backup=",tostring(backup))
+    self.store:save_update_state({
+        pending=true,
+        expected=manifest.version,
+        backup=backup,
+        package=path,
+        installed_at=os.time(),
+    })
+    logger.info("[MiuRead][Updater] update installed",
+        "version=",tostring(manifest.version),
+        "backup=",tostring(backup),
+        "package=",tostring(path))
     return true
 end
 
 function Updater:startup()
     local s=self.store:update_state()
-    if not s.pending then return nil end
+    if not s.pending then
+        self:_cleanup_update_artifacts()
+        return nil
+    end
+
     if tostring(s.expected)==tostring(self.version) then
         if s.backup then U.remove_tree(s.backup) end
+        if s.package then self:_remove_download(s.package) end
         self.store:save_update_state({})
+        self:_cleanup_update_artifacts()
+        logger.info("[MiuRead][Updater] update confirmed; rollback files removed",
+            "version=",tostring(self.version))
         return "updated"
     end
+
+    local protected={}
+    if type(s.backup)=="string" and s.backup~="" then protected[s.backup]=true end
+    if type(s.package)=="string" and s.package~="" then protected[s.package]=true end
+    self:_cleanup_update_artifacts(protected)
+    logger.warn("[MiuRead][Updater] update still pending",
+        "expected=",tostring(s.expected),
+        "running=",tostring(self.version))
     return "mismatch"
 end
 
