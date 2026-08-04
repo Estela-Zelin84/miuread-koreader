@@ -34,6 +34,16 @@ jobs:
           test -f miuread.koplugin/main.lua
           test -f miuread.koplugin/_meta.lua
           test -f miuread.koplugin/miuread/config.lua
+          test -s LICENSE
+          test -s NOTICE
+          test -s NON_COMMERCIAL_NOTICE.txt
+          test -s THIRD_PARTY_NOTICES
+          test -s miuread.koplugin/LICENSE
+          test -s miuread.koplugin/NOTICE
+          test -s miuread.koplugin/NON_COMMERCIAL_NOTICE.txt
+          test -s miuread.koplugin/THIRD_PARTY_NOTICES
+          grep -Fq 'must not be sold or commercially monetized' LICENSE
+          grep -Fq '无论如何修改，均不得用于售卖。' miuread.koplugin/main.lua
 
           python3 - <<'PY'
           from pathlib import Path
@@ -232,6 +242,10 @@ jobs:
               "miuread.koplugin/_meta.lua",
               "miuread.koplugin/main.lua",
               "miuread.koplugin/miuread/config.lua",
+              "miuread.koplugin/LICENSE",
+              "miuread.koplugin/NOTICE",
+              "miuread.koplugin/NON_COMMERCIAL_NOTICE.txt",
+              "miuread.koplugin/THIRD_PARTY_NOTICES",
           }
           forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
           forbidden_suffixes = {".md", ".epub", ".log"}

@@ -6023,10 +6023,7 @@ end
 function Plugin:_home_frontlight()
     local ok_fl,has_fl=pcall(Device.hasFrontlight,Device)
     if not ok_fl or not has_fl then self:info("当前设备不支持前光"); return false end
-    local ok,widget=pcall(function() return require("ui/widget/frontlightwidget"):new{} end)
-    if not ok or not widget then self:info("前光设置暂时无法打开"); return false end
-    UIManager:show(widget)
-    return true
+    return self:_show_frontlight_panel{placement="center"}
 end
 
 function Plugin:_home_toggle_night()
@@ -6715,13 +6712,17 @@ function Plugin:_reader_record_recent_action(key)
     return true
 end
 
-function Plugin:_reader_night_label()
+function Plugin:_reader_night_enabled()
     local enabled=false
     if G_reader_settings and type(G_reader_settings.readSetting)=="function" then
         local ok,value=pcall(G_reader_settings.readSetting,G_reader_settings,"night_mode")
         if ok then enabled=value==true end
     end
-    return enabled and "已开启" or "已关闭"
+    return enabled
+end
+
+function Plugin:_reader_night_label()
+    return self:_reader_night_enabled() and "已开启" or "已关闭"
 end
 
 function Plugin:_reader_rotation_label()
@@ -6949,6 +6950,11 @@ function Plugin:_reader_frontlight_bounds()
     return minimum,maximum
 end
 
+function Plugin:_reader_frontlight_enabled()
+    local minimum=self:_reader_frontlight_bounds()
+    return (self:_reader_frontlight_value() or minimum)>minimum
+end
+
 function Plugin:_reader_set_frontlight(value)
     local powerd=self:_reader_power_device()
     if not powerd then self:info("当前设备没有可调前光"); return false end
@@ -6958,6 +6964,7 @@ function Plugin:_reader_set_frontlight(value)
     local ok=false
     if target<=minimum then
         if current>minimum then
+            self._miuread_last_frontlight=current
             if type(powerd.turnOffFrontlight)=="function" then ok=pcall(powerd.turnOffFrontlight,powerd)
             elseif type(powerd.toggleFrontlight)=="function" then ok=pcall(powerd.toggleFrontlight,powerd)
             elseif type(powerd.setIntensity)=="function" then ok=pcall(powerd.setIntensity,powerd,minimum) end
@@ -6970,11 +6977,29 @@ function Plugin:_reader_set_frontlight(value)
         ok=pcall(powerd.turnOnFrontlight,powerd)
     end
     if type(powerd.updateResumeFrontlightState)=="function" then pcall(powerd.updateResumeFrontlightState,powerd) end
-    if ok and UIManager and type(UIManager.broadcastEvent)=="function" then
-        pcall(UIManager.broadcastEvent,UIManager,Event:new("FrontlightStateChanged"))
+    if ok then
+        local actual=self:_reader_frontlight_value() or target
+        if actual>minimum then self._miuread_last_frontlight=actual end
+        if UIManager and type(UIManager.broadcastEvent)=="function" then
+            pcall(UIManager.broadcastEvent,UIManager,Event:new("FrontlightStateChanged"))
+        end
+    else
+        self:info("当前设备暂时无法直接调整前光")
     end
-    if not ok then self:info("当前设备暂时无法直接调整前光") end
     return ok
+end
+
+function Plugin:_reader_toggle_frontlight()
+    local minimum,maximum=self:_reader_frontlight_bounds()
+    local current=self:_reader_frontlight_value() or minimum
+    if current>minimum then
+        self._miuread_last_frontlight=current
+        return self:_reader_set_frontlight(minimum)
+    end
+    local fallback=math.min(maximum,minimum+math.max(1,math.ceil((maximum-minimum)/10)))
+    local target=tonumber(self._miuread_last_frontlight) or fallback
+    target=math.max(minimum+1,math.min(maximum,target))
+    return self:_reader_set_frontlight(target)
 end
 
 function Plugin:_reader_adjust_frontlight(delta)
@@ -7028,12 +7053,23 @@ function Plugin:_reader_adjust_warmth(delta)
     return self:_reader_set_warmth(state.value+(tonumber(delta) or 0)*stride)
 end
 
-function Plugin:_show_reader_frontlight_panel(back_callback)
+function Plugin:_show_frontlight_panel(options)
+    options=type(options)=="table" and options or {}
     if not Device:hasFrontlight() then self:info("当前设备没有前光"); return false end
     local minimum,maximum=self:_reader_frontlight_bounds()
     local warmth=self:_reader_warmth_state()
     local dialog,err=ReaderFrontlightDialog.show{
         title="前光",
+        placement=options.placement or "top",
+        toggle=function()
+            local enabled=self:_reader_frontlight_enabled()
+            return {
+                label="前光",
+                value=enabled and "开" or "关",
+                selected=enabled,
+                callback=function() self:_reader_toggle_frontlight() end,
+            }
+        end,
         brightness=function()
             return {
                 label="亮度",
@@ -7042,6 +7078,10 @@ function Plugin:_show_reader_frontlight_panel(back_callback)
                 value=self:_reader_frontlight_value() or minimum,
                 on_decrease=function() self:_reader_adjust_frontlight(-1) end,
                 on_increase=function() self:_reader_adjust_frontlight(1) end,
+                on_set=function(value)
+                    if not self:_reader_set_frontlight(value) then return false end
+                    return self:_reader_frontlight_value() or value
+                end,
             }
         end,
         warmth=warmth and function()
@@ -7053,21 +7093,36 @@ function Plugin:_show_reader_frontlight_panel(back_callback)
                 value=current.value,
                 on_decrease=function() self:_reader_adjust_warmth(-1) end,
                 on_increase=function() self:_reader_adjust_warmth(1) end,
+                on_set=function(value)
+                    if not self:_reader_set_warmth(value) then return false end
+                    local state=self:_reader_warmth_state()
+                    return state and state.value or value
+                end,
             }
         end or nil,
         actions={
-            {label="关闭前光",callback=function() self:_reader_set_frontlight(minimum) end},
             {label="最低",callback=function() self:_reader_set_frontlight(math.min(maximum,minimum+1)) end},
+            {
+                label=function() return "夜间模式 · "..(self:_reader_night_enabled() and "开" or "关") end,
+                selected=function() return self:_reader_night_enabled() end,
+                callback=function() self:_home_toggle_night() end,
+            },
             {label="最高",callback=function() self:_reader_set_frontlight(maximum) end},
         },
-        on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_back=options.on_back,
     }
     if not dialog then
         logger.warn("[MiuRead][ReaderFrontlight] custom dialog unavailable",tostring(err or "unknown"))
         return false
     end
     return true
+end
+
+function Plugin:_show_reader_frontlight_panel(back_callback)
+    return self:_show_frontlight_panel{
+        placement="top",
+        on_back=back_callback or function() self:show_reader_quick_panel() end,
+    }
 end
 
 function Plugin:_reader_footer()
@@ -12231,6 +12286,7 @@ function Plugin:update_settings_menu()
         {text="检查"..tostring(Config.UPDATE_CHANNEL_LABEL).."更新",callback=self:safe("update",function() self:check_update(false) end)},
         {text="当前运行版本 · "..tostring(self.version),enabled=false},
         {text="更新通道 · "..tostring(Config.UPDATE_CHANNEL_LABEL),enabled=false},
+        {text="官方更新永久免费 · 原版及任何修改版均不得售卖",enabled=false},
     }
 end
 function Plugin:_restart_koreader(source)
@@ -12403,6 +12459,10 @@ function Plugin:show_about()
         memory_note="\n\n检测到外部或遗留的低内存设置，可在“下载与存储”中检查并恢复。"
     end
     self:info(Config.NAME.." "..self.version
+        .."\n\n觅阅永久免费，仅限非商业使用。"
+        .."\n禁止出售插件、源码、安装包及任何修改、改名、移植或重新打包版本。"
+        .."\n禁止收费下载、安装、更新、激活、定制、捆绑或以其他方式获利。"
+        .."\n无论如何修改，均不得用于售卖。"
         .."\n\n微信读书内容下载、书架管理与阅读同步。"
         .."\n\n已下载书籍作为本地 EPUB 直接打开，不进行联网权限验证或锁定。"
         ..memory_note
@@ -12552,10 +12612,18 @@ function Plugin:_teardown_thought_tap()
     self._thought_tap_setup=nil
 end
 function Plugin:_thought_font_size(level)
-    -- Keep the four choices visibly distinct after KOReader/Kindle scaling.
-    local nominal={small=12,standard=15,large=18,xlarge=21}
-    local value=nominal[tostring(level or "standard")] or nominal.standard
-    return math.max(12,math.min(26,Device.screen:scaleBySize(value)))
+    -- Scale once and keep proportional gaps. The former fixed 26 px ceiling
+    -- collapsed every choice to the same size on high-DPI Kindle screens.
+    local standard=math.max(15,Device.screen:scaleBySize(15))
+    local sizes={
+        small=math.max(12,math.floor(standard*.78+.5)),
+        standard=standard,
+        large=math.floor(standard*1.24+.5),
+        xlarge=math.floor(standard*1.50+.5),
+    }
+    sizes.large=math.max(sizes.standard+3,sizes.large)
+    sizes.xlarge=math.max(sizes.large+3,sizes.xlarge)
+    return sizes[tostring(level or "standard")] or sizes.standard
 end
 local function usable_font_name(value)
     if type(value)~="string" then return nil end

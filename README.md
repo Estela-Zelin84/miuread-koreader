@@ -1,20 +1,38 @@
-# 觅阅 · 微信读书助手
+# MiuRead · WeRead Assistant
 
-KOReader 的微信读书插件，支持 Kindle、Kobo 与 Android 等 KOReader 设备。
+A WeRead plugin for KOReader, supporting Kindle, Kobo, Android, and other
+KOReader devices.
 
-## 当前版本
+> **MiuRead is free and not for sale.** Selling, paid distribution, paid
+> installation, paid updates, commercial bundling, or monetization of MiuRead
+> or any modified, renamed, ported, or repackaged version is prohibited.
 
-当前源码为 `4.0.0` 正式版，应提交到 `main` 分支。
+## Current Release
 
-详细变更见 `CHANGELOG-4.0.0.txt`。
+This repository contains the stable source `4.1.0` and is intended
+for the `main` branch.
 
-## 分支与发布
+See `CHANGELOG-4.1.0.txt` for the release notes.
 
-- `main`：正式版源码，使用 `.github/workflows/release.yml` 发布并更新 `update.json`。
-- `beta`：内测版源码，使用 `.github/workflows/release-beta.yml` 发布并更新 `update-beta.json`。
+## Branches and Releases
 
-两个 workflow 都保留在默认分支，GitHub Actions 才会同时显示正式版与内测版入口。
+- `main`: stable source, released through `.github/workflows/release.yml`; publishes `update.json`.
+- `beta`: beta source, released through `.github/workflows/release-beta.yml`; publishes `update-beta.json`.
 
-## 安装
+Both workflows should remain on the default branch so that the stable and beta
+release actions remain available in GitHub Actions.
 
-将完整安装包中的 `miuread.koplugin` 文件夹放入 KOReader 的 `plugins` 目录，然后完整重启 KOReader。
+## Installation
+
+Copy the complete `miuread.koplugin` directory from the release package into
+KOReader's `plugins` directory, then fully restart KOReader.
+
+## License and No-Sale Rule
+
+MiuRead-owned code is distributed under the MiuRead Non-Commercial No-Sale
+License 1.0. The original version and every modified, renamed, ported,
+translated, merged, recompiled, or repackaged version must remain free and must
+not be sold or commercially monetized.
+
+Third-party material remains under its own license terms. See `LICENSE`,
+`NOTICE`, `NON_COMMERCIAL_NOTICE.txt`, and `THIRD_PARTY_NOTICES`.

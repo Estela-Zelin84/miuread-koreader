@@ -1,0 +1,91 @@
+MiuRead Non-Commercial No-Sale License 1.0
+Version 1.0, 4 August 2026
+
+Copyright (C) 2026 MiuRead contributors
+
+This license applies to the MiuRead-owned portions of the software and related
+materials distributed with this notice (the "Software"). Third-party material
+remains subject to its own license terms as identified in THIRD_PARTY_NOTICES.
+
+1. Permission
+
+Subject to every condition below, you may use, inspect, copy, modify, translate,
+port, and redistribute the Software only for free and only for non-commercial
+purposes.
+
+2. Absolute prohibition on sale and monetization
+
+The Software, its source code, installation packages, updates, and every
+modified, renamed, translated, ported, merged, adapted, recompiled, repackaged,
+or derivative version must not be sold or commercially monetized.
+
+Prohibited conduct includes, without limitation:
+
+- selling, renting, leasing, licensing, sublicensing, or exchanging the Software
+  for money or other consideration;
+- charging for download access, installation, activation, updates, maintenance,
+  customization, modification, migration, technical support, or continued use;
+- making access conditional on a payment, membership fee, paid group, purchase,
+  subscription, donation, sponsorship, tip, or other financial contribution;
+- bundling or preinstalling the Software in paid hardware, software, services,
+  courses, packages, or commercial offerings;
+- using the Software or a modified version to advertise, promote, or support a
+  paid offering;
+- removing, hiding, weakening, or bypassing the no-sale notice.
+
+A genuinely voluntary donation that is not required for access, download,
+installation, updates, source code, support, or any feature is not a sale.
+
+3. Modified versions
+
+Every modified, renamed, translated, ported, merged, adapted, recompiled,
+repackaged, or derivative version must:
+
+- remain free of charge;
+- remain non-commercial;
+- include this complete license without modification;
+- preserve the copyright, attribution, modification, and no-sale notices; and
+- provide its corresponding source code at no charge when distributed.
+
+Changing the name, icon, package structure, code organization, implementation,
+or distribution method does not remove these obligations.
+
+4. Redistribution
+
+Free redistribution is permitted only when the complete license, NOTICE,
+NON_COMMERCIAL_NOTICE.txt, and THIRD_PARTY_NOTICES are included. A distributor
+must not imply official endorsement or authorization.
+
+5. Name and marks
+
+This license does not grant permission to use the names "MiuRead" or "觅阅",
+project logos, icons, or other identifying marks to imply an official,
+authorized, or endorsed release. Descriptive attribution is allowed.
+
+6. Third-party material
+
+This license cannot replace or restrict rights granted by third-party copyright
+holders. Third-party code and assets remain governed by their applicable
+licenses. When third-party terms conflict with this license, those terms govern
+only the affected third-party material.
+
+7. Termination
+
+Your permission under this license terminates automatically if you violate any
+condition. After termination, you must stop using and distributing the
+MiuRead-owned portions of the Software and remove all copies under your control,
+except where applicable law requires otherwise.
+
+8. No warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, TITLE, AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED BY LAW,
+THE COPYRIGHT HOLDERS ARE NOT LIABLE FOR ANY CLAIM, DAMAGE, OR OTHER LIABILITY
+ARISING FROM THE SOFTWARE OR ITS USE.
+
+9. Acceptance
+
+Using, modifying, or redistributing the Software indicates acceptance of this
+license. If you do not accept every condition, you have no permission under
+this license.

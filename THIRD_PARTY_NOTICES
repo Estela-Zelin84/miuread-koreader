@@ -1,0 +1,17 @@
+Third-Party Notices
+
+MiuRead contains or may contain code and assets originating from third-party
+projects. Those portions remain governed by their respective copyright notices
+and license terms.
+
+Legacy upstream reference:
+- Project: finlater/weread.koplugin
+- Referenced historical version: v0.1.1
+- Rights in upstream-originating code remain with the original copyright
+  holders and contributors.
+
+KOReader APIs, names, and related project materials remain subject to KOReader's
+applicable licenses and policies.
+
+The MiuRead Non-Commercial No-Sale License applies only to copyrightable material
+owned by MiuRead contributors and does not replace third-party license terms.
