@@ -1,5 +1,0 @@
-dist/
-release.env
-*.zip
-*.sha256
-.DS_Store
