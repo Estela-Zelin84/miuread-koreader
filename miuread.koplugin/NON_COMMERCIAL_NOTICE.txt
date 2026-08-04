@@ -1,0 +1,12 @@
+MIUREAD IS FREE AND NOT FOR SALE
+
+MiuRead, its source code, installation packages, updates, and every modified,
+renamed, ported, translated, merged, recompiled, or repackaged version must not
+be sold or commercially monetized.
+
+Do not pay for downloads, installation, activation, updates, customization,
+support, membership access, bundled packages, or preinstalled copies.
+
+Modification does not remove this restriction.
+
+See LICENSE for the complete terms.
