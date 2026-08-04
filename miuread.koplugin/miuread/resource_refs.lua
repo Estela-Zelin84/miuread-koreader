@@ -222,5 +222,7 @@ function R.prune(chapters, css, assets)
     return kept, stats
 end
 
+R._normalize_path = normalize_path
+R._asset_href = asset_href
 
 return R

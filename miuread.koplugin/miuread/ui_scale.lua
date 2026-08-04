@@ -27,6 +27,10 @@ function UiScale.setDisplayMode(mode)
     display_mode = mode
 end
 
+function UiScale.getDisplayMode()
+    return display_mode
+end
+
 function UiScale.metrics()
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     local short = math.max(1, math.min(sw, sh))

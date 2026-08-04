@@ -5,6 +5,7 @@ local FFIUtil = require("ffi/util")
 local Json = require("miuread.json")
 local Config = require("miuread.config")
 local ReadReportService = require("miuread.read_report_service")
+local Protocol = require("miuread.protocol")
 local Http = require("miuread.http")
 local ReadReportWorker = require("miuread.legacy_adapter_worker")
 local U = require("miuread.util")
@@ -13,6 +14,7 @@ local Sync = {}
 Sync.__index = Sync
 local legacy_daemon_retired = false
 
+local CONTEXT_MAX_AGE = 15 * 60
 local READ_REPORT_SERVICE_VERSION = 10
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
@@ -174,6 +176,20 @@ local function choose_remote_progress(web,agent,threshold)
     return selected
 end
 
+local function context_from(state, fallback)
+    fallback = fallback or {}
+    if type(state) ~= "table" then state = {} end
+    return {
+        psvts = Protocol.optional(state.psvts) or Protocol.optional(fallback.psvts),
+        pclts = Protocol.optional(state.pclts) or Protocol.optional(fallback.pclts),
+        token = Protocol.optional(state.token) or Protocol.optional(fallback.token),
+        reader_url = state.url or fallback.reader_url,
+        app_id = fallback.app_id or Protocol.app_id(Protocol.USER_AGENT),
+        chapters = fallback.chapters,
+        context_updated_at = tonumber(fallback.context_updated_at or 0) or 0,
+    }
+end
+
 local function map_position(chapters, ratio, fallback)
     chapters = type(chapters) == "table" and chapters or {}
     ratio = U.clamp(tonumber(ratio) or 0, 0, 1)
@@ -301,7 +317,7 @@ function Sync:new(reader, api, store, host, async, identity_async)
         busy=false, progress_hold=false, session_uploads=0, last_upload=0, last_attempt=0,
         last_error=nil, last_path=nil, last_stage=nil, last_response_summary=nil,
         last_response_path=nil, last_http_code=nil, last_http_length=nil,
-        state="stopped", tick_count=0, next_due=0,
+        state="stopped", tick_count=0, last_report_clock=0, next_due=0,
         consecutive_failures=0, first_success_notified=false, failure_notified=false,
         verified_book_id=nil, verified_at=0, verified_local_percent=nil,
         verified_remote_percent=nil, verified_login_session_id=nil, verification_ttl=4 * 60 * 60,
@@ -532,6 +548,7 @@ end
 function Sync:end_progress_sync(reason)
     self.progress_hold = false
     self.last_stage = reason or "阅读进度检查完成"
+    self.last_report_clock = os.time()
     if self:is_current_verified() then
         self.state = self.store:preferences().sync.time_enabled and "waiting" or "stopped"
         if self.store:preferences().sync.time_enabled and not self.suspended then
@@ -698,6 +715,29 @@ function Sync:_recover_auth_once(channel,error,on_done)
         if on_done then on_done(success,detail) end
     end)
     return true
+end
+
+function Sync:_prepare_context(record, ratio, session, force)
+    local book_id = record.book.book_id
+    local saved = type(session.report_context) == "table" and session.report_context or session
+    local ctx = context_from(nil, saved)
+    local base_map = (record.record and record.record.chapter_map) or record.book.catalog or saved.chapters or {}
+    ctx.chapters = (#(saved.chapters or {}) > 0 and saved.chapters) or base_map
+    local position = map_position(ctx.chapters, ratio, {
+        chapter_uid = record.record and record.record.chapter_uid or 0,
+        summary = record.book.title,
+    })
+    local now = os.time()
+    local stale = now - (tonumber(ctx.context_updated_at) or 0) >= CONTEXT_MAX_AGE
+    if force or stale or not Protocol.optional(ctx.psvts) then
+        local ok_base, state = pcall(self.reader.state, self.reader, book_id, nil)
+        if not ok_base then state = self.reader:state(book_id, position.chapter_uid) end
+        ctx = context_from(state, ctx)
+        ctx.chapters = ctx.chapters or base_map
+        ctx.reader_url = state.url or Protocol.reader_url(book_id)
+        ctx.context_updated_at = now
+    end
+    return ctx, position
 end
 
 function Sync:upload(elapsed, callback, options)
@@ -1306,6 +1346,8 @@ function Sync:_import_daemon_status(force)
     if status.context_changed or force then self:_load_daemon_context() end
     self.next_due = tonumber(status.next_due) or self.next_due or 0
     if status_book_id~="" then
+        self.pending_report_elapsed=0
+        self.pending_report_status_at=tonumber(status.completed_at) or os.time()
         local saved=self.store:session(status_book_id) or {}
         if tonumber(saved.pending_report_seconds or 0)~=0 then
             self.store:save_session(status_book_id,{pending_report_seconds=0})
@@ -1345,6 +1387,8 @@ function Sync:_import_daemon_status(force)
     end
 
     if status.accepted then
+        self.pending_report_elapsed=0
+        self.pending_report_status_at=tonumber(status.completed_at) or os.time()
         self.state = daemon.active and "waiting" or "stopped"
         self.session_uploads = self.session_uploads + 1
         self.last_upload = tonumber(status.completed_at) or os.time()
@@ -1480,6 +1524,8 @@ function Sync:_start_daemon(reason)
         self.state="stopped"
         return false,"当前账号登录会话无效，请重新扫码登录"
     end
+    self.pending_report_elapsed=0
+    self.pending_report_status_at=os.time()
     if tonumber(session.pending_report_seconds or 0)~=0 then
         self.store:save_session(book_id,{pending_report_seconds=0})
         session.pending_report_seconds=0
@@ -1640,6 +1686,16 @@ end
 
 -- Kept for compatibility with older callers. Automatic reporting now uses one
 -- long-lived subprocess instead of forking a fresh worker every 30 seconds.
+function Sync:_schedule(_delay)
+    if self.store:preferences().sync.time_enabled and not self.suspended then
+        self:_start_daemon("schedule_compat")
+    end
+end
+
+function Sync:_tick()
+    self:_write_daemon_control(true)
+end
+
 function Sync:start(reason)
     self.last_activity = os.time()
     if reason == "reader_ready" or reason == "resume" or reason == "enabled"
@@ -2056,9 +2112,15 @@ function Sync:status()
         service_version=self.daemon and self.daemon.service_version or READ_REPORT_SERVICE_VERSION,
         final_flush_pending=self.daemon and self.daemon.final_flush_pending==true or false,
         last_elapsed=session and session.last_elapsed,
+        pending_report_elapsed=0,
         last_report_reason=session and session.last_report_reason,
     }
 end
 
+Sync._accepted = accepted
+Sync._response_summary = response_summary
+Sync._response_synckey = response_synckey
+Sync._response_progress = response_progress
+Sync._catalog_progress_from_remote = catalog_progress_from_remote
 
 return Sync

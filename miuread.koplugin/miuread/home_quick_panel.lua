@@ -1,5 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
+local Device = require("device")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -10,6 +11,8 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
+local TextBoxWidget = require("ui/widget/textboxwidget")
+local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
@@ -19,6 +22,7 @@ local logger = require("logger")
 local UiScale = require("miuread.ui_scale")
 local Ui = require("miuread.ui_components")
 
+local Screen = Device.screen
 local live_panel
 
 local function face(name, nominal, maximum, minimum)

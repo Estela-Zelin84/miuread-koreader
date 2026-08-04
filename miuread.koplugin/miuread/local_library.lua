@@ -163,6 +163,9 @@ function LocalLibrary.normalize(path)
 end
 
 function LocalLibrary.basename(path) return basename(LocalLibrary.normalize(path)) end
+function LocalLibrary.dirname(path) return dirname(LocalLibrary.normalize(path)) end
+function LocalLibrary.title_from_path(path) return title_from_path(path) end
+
 -- Fast folder browsing: inspect only the selected directory itself. This never
 -- descends into child folders and never opens book containers. The scanner can
 -- run to completion in a subprocess or advance in small UI-thread batches on

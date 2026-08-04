@@ -47,6 +47,10 @@ function Updater:manifest_urls()
     return out
 end
 
+function Updater:manifest_url()
+    return self:manifest_urls()[1]
+end
+
 local function collect_table_urls(value,out,seen)
     if type(value)~="table" then return end
     for _,url in ipairs(value) do with_github_mirrors(url,out,seen) end
@@ -184,7 +188,7 @@ function Updater:check()
                 local cleaned,text_error=clean_manifest_text(m)
                 if not cleaned then
                     fallback=fallback or U.copy(m)
-                    fallback.notes="更新说明读取异常\n可继续下载并安装新版本"
+                    fallback.notes="更新说明显示异常 可继续下载安装"
                     fallback.summary=fallback.notes
                     fallback.name=tostring(m.name or "")
                     errors[#errors+1]=text_error

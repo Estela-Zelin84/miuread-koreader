@@ -23,8 +23,6 @@ local Size = require("ui/size")
 
 local Screen = Device.screen
 local live_popup
-local POPUP_WIDTH_RATIO = 0.90
-local POPUP_HEIGHT_RATIO = 0.55
 
 local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
 function OffsetContainer:getSize()
@@ -120,6 +118,8 @@ local NativePopup = InputContainer:extend{
     comments = nil,
     font_size = nil,
     font_name = nil,
+    width_ratio = 0.92,
+    height_ratio = 0.55,
     on_close_callback = nil,
     on_interact_callback = nil,
     on_error_callback = nil,
@@ -477,9 +477,10 @@ function NativePopup:_build(reset_pages, anchor_comment)
     local close_size = math.max(28, math.min(40, math.floor(metrics.body_size * 1.55)))
     local close_inset = math.max(2, Screen:scaleBySize(2))
 
-    -- Keep dense pages near half-screen while short pages use their natural height.
-    local width_ratio = POPUP_WIDTH_RATIO
-    local height_ratio = POPUP_HEIGHT_RATIO
+    local width_ratio = clamp(self.width_ratio, 0.88, 0.94)
+    -- Preserve the reading context: dense pages stay around half-screen and
+    -- short pages keep their natural height.
+    local height_ratio = clamp(self.height_ratio, 0.42, 0.56)
     local side_margin = math.max(14, math.floor(sw * 0.02))
     local vertical_margin = math.max(18, math.floor(sh * 0.03))
     local width = math.min(math.floor(sw * width_ratio), sw - side_margin * 2)
@@ -497,7 +498,7 @@ function NativePopup:_build(reset_pages, anchor_comment)
     )
 
     if reset_pages or not self.pages then
-        self.pages = self:_paginate_comments(comment_w, maximum_comments_h, metrics)
+        self.pages, self.page_heights = self:_paginate_comments(comment_w, maximum_comments_h, metrics)
         self.page_index = clamp(self.page_index, 1, #self.pages)
         if tonumber(anchor_comment) then
             for page_index, page in ipairs(self.pages or {}) do
@@ -558,6 +559,7 @@ function NativePopup:_build(reset_pages, anchor_comment)
         w = close_size,
         h = close_size,
     }
+    self.frame_style = {bordersize = border, radius = radius}
 
     local close = CloseButton:new{
         dimen = Geom:new{w = close_size, h = close_size},
@@ -598,6 +600,7 @@ function NativePopup:_build(reset_pages, anchor_comment)
     self.content_group = content_group
     self.surface = surface
     self.popup_group = popup_group
+    self.close_button = close
 
     if previous_root and previous_root ~= self[1] and type(previous_root.free) == "function" then
         pcall(previous_root.free, previous_root)
@@ -776,6 +779,8 @@ function M.show(opts)
         comments = opts.comments,
         font_size = opts.font_size,
         font_name = opts.font_name,
+        width_ratio = opts.width_ratio,
+        height_ratio = opts.height_ratio,
         on_close_callback = opts.on_close,
         on_interact_callback = opts.on_interact,
         on_error_callback = opts.on_error,

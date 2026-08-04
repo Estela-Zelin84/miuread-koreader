@@ -298,5 +298,7 @@ function E.build(path, book, chapters, css, assets, cover, meta)
     return path
 end
 
+E._stream_zip = stream_zip
+E._source_stats = source_stats
 
 return E

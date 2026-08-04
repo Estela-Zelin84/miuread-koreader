@@ -65,6 +65,13 @@ function Codec.body(html)
     local s=tostring(html or "")
     local b=s:match("<body[^>]*>([%s%S]*)</body>"); return b or s
 end
+function Codec.mp_body(html)
+    local s=tostring(html or ""):gsub("<script[%s%S]-</script>",""):gsub("<style[%s%S]-</style>","")
+    local start=s:find('id="js_content"',1,true) or s:find("class=\"rich_media_content",1,true)
+    if not start then return Codec.body(s) end
+    start=s:find(">",start,true); if not start then return Codec.body(s) end
+    local tail=s:sub(start+1); local stop=tail:find("</div>",1,true); return stop and tail:sub(1,stop-1) or tail
+end
 local function tar_text(value)
     return tostring(value or ""):match("^[^%z]*") or ""
 end

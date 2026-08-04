@@ -1,6 +1,7 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
+local Device = require("device")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -20,6 +21,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local UiScale = require("miuread.ui_scale")
 
+local Screen = Device.screen
 local live_sheet
 local MAX_PRIMARY_ACTIONS = 6
 

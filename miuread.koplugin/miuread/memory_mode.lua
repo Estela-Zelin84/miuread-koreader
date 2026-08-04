@@ -181,5 +181,8 @@ function MemoryMode:restore_detected()
     return true,{changed=true,enabled=false,detected=true,used_default=state.previous_known~=true}
 end
 
+MemoryMode.SETTING_KEY = SETTING_KEY
+MemoryMode.TARGET_RATIO = TARGET_RATIO
+MemoryMode._same_ratio = same_ratio
 
 return MemoryMode

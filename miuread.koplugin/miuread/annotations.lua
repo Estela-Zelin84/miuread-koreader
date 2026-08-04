@@ -1,6 +1,7 @@
 local logger = require("logger")
 local Thoughts = require("miuread.thoughts")
 local Http = require("miuread.http")
+local U = require("miuread.util")
 local ok_socket, socket = pcall(require, "socket")
 
 local Annotations = {}

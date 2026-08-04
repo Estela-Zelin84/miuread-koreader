@@ -179,6 +179,13 @@ function CacheCleanupTask:_finish(job, forced_error)
         local ok, decoded = pcall(Json.decode, raw)
         result = ok and decoded or {ok = false, error = "后台任务结果无法解析", removed = 0, missing = 0, freed_bytes = 0}
     end
+    if job.kind == "cleanup" then
+        pcall(function()
+            result.finished_at = result.finished_at or os.time()
+            result.operation = result.operation or tostring(job.operation or "后台清理")
+            self.store:save_cleanup_result(result)
+        end)
+    end
     os.remove(job.result_path)
     self.job = nil
     if job.on_done then

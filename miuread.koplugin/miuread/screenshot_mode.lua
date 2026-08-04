@@ -88,4 +88,8 @@ function ScreenshotMode.cancel()
     armed = false
 end
 
+function ScreenshotMode.isArmed()
+    return armed == true
+end
+
 return ScreenshotMode

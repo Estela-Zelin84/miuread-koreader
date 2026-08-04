@@ -335,6 +335,65 @@ local function resolve_link(current_path, href, attrs, inner, index)
     return href, canonical and "valid" or "missing-file", critical
 end
 
+local function rewrite_href_values(html, callback)
+    local changed = false
+    local function replace_double(prefix, value)
+        local new_value = callback(value)
+        if new_value ~= value then changed = true end
+        return prefix .. '"' .. encode_href(new_value) .. '"'
+    end
+    local function replace_single(prefix, value)
+        local new_value = callback(value)
+        if new_value ~= value then changed = true end
+        return prefix .. "'" .. tostring(new_value or ""):gsub("&", "&amp;"):gsub("'", "&apos;") .. "'"
+    end
+    html = tostring(html or ""):gsub('(<[aA][^>]-[hH][rR][eE][fF]%s*=%s*)"([^"]*)"', replace_double)
+    html = html:gsub("(<[aA][^>]-[hH][rR][eE][fF]%s*=%s*)'([^']*)'", replace_single)
+    return html, changed
+end
+
+function M.rewrite_documents(documents, options)
+    options = options or {}
+    local files, files_lower, anchors, anchors_lower, aliases, aliases_lower, alias_stats = build_index(documents)
+    local index = {
+        files = files, files_lower = files_lower, anchors = anchors, anchors_lower = anchors_lower,
+        aliases = aliases, aliases_lower = aliases_lower,
+    }
+    local stats = {
+        links = 0, rewritten = 0, valid = 0, ignored = 0, files_changed = 0,
+        unresolved = 0, unresolved_critical = 0, unresolved_other = 0, dropped = 0,
+        samples = {}, reasons = {}, aliases = alias_stats or {resolved = 0, ambiguous = 0, missing = 0},
+    }
+
+    for _, doc in ipairs(documents or {}) do
+        local current_path = doc.path
+        local raw = tostring(doc.html or "")
+        local rewritten, changed = rewrite_href_values(raw, function(href)
+            stats.links = stats.links + 1
+            local new_href, reason, critical = resolve_link(current_path, decode_entities(href), "", "", index)
+            stats.reasons[reason] = (stats.reasons[reason] or 0) + 1
+            if reason == "ignored" or reason == "custom" then
+                stats.ignored = stats.ignored + 1
+            elseif reason == "missing-anchor" or reason == "missing-file"
+                or reason == "ambiguous" or reason == "ambiguous-case" then
+                stats.unresolved = stats.unresolved + 1
+                if critical then stats.unresolved_critical = stats.unresolved_critical + 1
+                else stats.unresolved_other = stats.unresolved_other + 1 end
+                if #stats.samples < (tonumber(options.sample_limit) or 20) then
+                    stats.samples[#stats.samples + 1] = current_path .. " -> " .. tostring(href) .. "（" .. reason .. "）"
+                end
+            else
+                stats.valid = stats.valid + 1
+                if new_href ~= decode_entities(href) then stats.rewritten = stats.rewritten + 1 end
+            end
+            return new_href
+        end)
+        doc.html = rewritten
+        doc.changed = changed
+    end
+    return stats
+end
+
 -- Opening-tag aware variant used when numeric link text/class information is
 -- needed to decide whether an unresolved link is fatal.
 function M.rewrite_documents_strict(documents, options)
@@ -596,5 +655,11 @@ function M.validate_documents(documents, options)
     return true, nil, stats
 end
 
+M.normalize_path = normalize_path
+M.relative_path = relative_path
+M.collect_ids = collect_ids
+M.is_custom_fragment = is_custom_fragment
+M.collect_target_hints = collect_target_hints
+M.infer_aliases = infer_aliases
 
 return M

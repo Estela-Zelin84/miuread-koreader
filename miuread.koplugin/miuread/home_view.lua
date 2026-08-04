@@ -1,6 +1,7 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
+local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -12,6 +13,7 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
+local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
@@ -1012,6 +1014,7 @@ function HomeWidget:_rebuild()
     local static_body_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     self:_build_sections(static_body_layer, m, compact, "static")
     children[#children + 1] = static_body_layer
+    self._static_body_layer = static_body_layer
     local section_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     self:_build_sections(section_layer, m, compact, "section")
     children[#children + 1] = section_layer
@@ -1097,6 +1100,7 @@ function HomeWidget:updateSection(opts)
         self._section_cache_clock=(tonumber(self._section_cache_clock) or 0)+1
         cached.used=self._section_cache_clock
     end
+    local old = root[self._section_layer_index]
     root[self._section_layer_index] = section_layer
     self._section_layer = section_layer
     -- Old layers stay alive in the bounded cache. They are freed on eviction,
@@ -1252,6 +1256,9 @@ function HomeView.current() return live_widget end
 function HomeView.is_shown()
     HomeView.prune_duplicates()
     return live_widget and not live_widget._miu_closed and UIManager:isWidgetShown(live_widget)
+end
+function HomeView.is_parked()
+    return HomeView.is_shown() and live_widget._miu_input_suspended==true
 end
 -- Keep the rendered home in UIManager's stack while ReaderUI owns the screen.
 -- This avoids briefly exposing FileManager during open/close, while disabling
