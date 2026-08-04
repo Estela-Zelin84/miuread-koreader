@@ -7,17 +7,16 @@ KOReader devices.
 > installation, paid updates, commercial bundling, or monetization of MiuRead
 > or any modified, renamed, ported, or repackaged version is prohibited.
 
-## Current Release
+## Release Channels
 
-This repository contains the beta source `4.1.0-beta.1` and is intended
-for the `beta` branch.
-
-See `CHANGELOG-4.1.0-beta.1.txt` for the release notes.
-
-## Branches and Releases
+This repository supports both stable and beta releases.
 
 - `main`: stable source, released through `.github/workflows/release.yml`; publishes `update.json`.
 - `beta`: beta source, released through `.github/workflows/release-beta.yml`; publishes `update-beta.json`.
+
+The active version is declared in `miuread.koplugin/_meta.lua` and
+`miuread.koplugin/miuread/config.lua`. Version-specific release notes are stored
+in the matching `CHANGELOG-*.txt` file and published with GitHub Releases.
 
 Both workflows should remain on the default branch so that the stable and beta
 release actions remain available in GitHub Actions.
