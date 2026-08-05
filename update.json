@@ -1,0 +1,16 @@
+{
+  "version": "4.1.1",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.1.1",
+  "channel": "stable",
+  "package_type": "full",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v4.1.1/miuread-v4.1.1-full.zip",
+  "package_urls": [
+    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v4.1.1/miuread-v4.1.1-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v4.1.1/miuread-v4.1.1-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v4.1.1/miuread-v4.1.1-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v4.1.1/miuread-v4.1.1-full.zip"
+  ],
+  "size": 477728,
+  "sha256": "400a1f481f5b1843665caffc2e0dcdbb93e0786f3e6969a85fb9f638773d8622",
+  "notes": "\u4e0e 4.1.0 \u76f8\u6bd4:\n- \u4fee\u6b63\u9879\u76ee\u6388\u6743\u8bf4\u660e\uff0c\u7edf\u4e00\u6062\u590d\u4e3a AGPL-3.0-only\n- \u672c\u6b21\u4e0d\u5305\u542b\u529f\u80fd\u53d8\u5316"
+}
