@@ -3,6 +3,7 @@ local socketutil = require("socketutil")
 local ok_http, http = pcall(require, "socket.http")
 local ok_https, https = pcall(require, "ssl.https")
 local ok_socket, socket = pcall(require, "socket")
+local ok_lfs, lfs = pcall(require, "lfs")
 local Json = require("miuread.json")
 local Cookies = require("miuread.cookies")
 local Protocol = require("miuread.protocol")
@@ -95,10 +96,82 @@ function Http:new(store)
         store = store,
         user_agent = Protocol.USER_AGENT,
         last_weread_request_at = 0,
+        last_weread_request_at_by_scope = {},
         rate_limit_until = 0,
         min_weread_interval = 0.35,
         shared_rate_limit_path = base~="" and (base.."/weread-rate-limit.json") or nil,
+        shared_pacing_path = base~="" and (base.."/weread-pacing.json") or nil,
     }, self)
+end
+
+function Http:_pacing_path(scope)
+    local path=tostring(self.shared_pacing_path or "")
+    if path=="" then return "" end
+    scope=tostring(scope or "global"):gsub("[^%w%-_]","-")
+    if scope=="" or scope=="global" then return path end
+    return path:gsub("%.json$","").."-"..scope..".json"
+end
+
+local function release_pacing_lock(path)
+    if ok_lfs and lfs and type(lfs.rmdir)=="function" then pcall(lfs.rmdir,path) end
+end
+
+local function pacing_lock_stale(path)
+    if not (ok_lfs and lfs and type(lfs.attributes)=="function") then return false end
+    local ok,modified=pcall(lfs.attributes,path,"modification")
+    return ok and tonumber(modified) and os.time()-tonumber(modified)>10
+end
+
+local function acquire_pacing_lock(path)
+    if not (ok_lfs and lfs and type(lfs.mkdir)=="function") then return false end
+    local deadline=clock_now()+2.0
+    while clock_now()<deadline do
+        if lfs.mkdir(path)==true then return true end
+        if pacing_lock_stale(path) then release_pacing_lock(path) end
+        pause(0.04)
+    end
+    return false
+end
+
+function Http:_reserve_shared_pacing(scope,interval,jitter)
+    local path=self:_pacing_path(scope)
+    interval=math.max(0,tonumber(interval) or 0)
+    jitter=math.max(0,tonumber(jitter) or 0)
+    if path=="" or interval<=0 then return 0 end
+
+    local lock_path=path..".lock"
+    local locked=acquire_pacing_lock(lock_path)
+    if not locked then return 0 end
+
+    local ok,result=pcall(function()
+        local now=clock_now()
+        local next_at=0
+        local raw=Util.read_file(path,true)
+        if raw then
+            local decoded_ok,state=pcall(Json.decode,raw)
+            if decoded_ok and type(state)=="table" then next_at=tonumber(state.next_at or 0) or 0 end
+        end
+        -- A stale or corrupted reservation must never block requests for minutes.
+        if next_at<now-interval or next_at>now+120 then next_at=now end
+        local scheduled=math.max(now,next_at)
+        local extra=jitter>0 and (math.random()*jitter) or 0
+        local wrote,err=Util.atomic_write(path,Json.encode({
+            next_at=scheduled+interval+extra,
+            scope=tostring(scope or "global"),
+            updated_at=os.time(),
+        }),true)
+        if not wrote then
+            logger.warn("[MiuRead][HTTP] shared pacing state write failed",tostring(err))
+            return 0
+        end
+        return math.max(0,scheduled-now)
+    end)
+    release_pacing_lock(lock_path)
+    if not ok then
+        logger.warn("[MiuRead][HTTP] shared pacing reservation failed",tostring(result))
+        return 0
+    end
+    return tonumber(result) or 0
 end
 
 function Http:_rate_limit_path(scope)
@@ -182,12 +255,24 @@ function Http:_pace(url, opt)
     if not is_weread_api_url(url) or opt.pacing == false then return end
     if self:_cancelled() then error("download cancelled") end
     local now = clock_now()
+    local scope=tostring(opt.pacing_scope or opt.rate_limit_scope or "global")
+    local scoped_last=tonumber((self.last_weread_request_at_by_scope or {})[scope]) or 0
     local wait = math.max(0, (tonumber(self.rate_limit_until) or 0) - now)
     local interval = tonumber(opt.min_interval) or tonumber(self.min_weread_interval) or 0
-    wait = math.max(wait, interval - (now - (tonumber(self.last_weread_request_at) or 0)))
+    wait = math.max(wait, interval - (now - scoped_last))
     if wait > 0 then pause(wait) end
     if self:_cancelled() then error("download cancelled") end
-    self.last_weread_request_at = clock_now()
+    if opt.shared_pacing==true then
+        local shared_wait=self:_reserve_shared_pacing(scope,interval,opt.pacing_jitter)
+        if shared_wait>0 then pause(shared_wait) end
+    elseif tonumber(opt.pacing_jitter or 0)>0 then
+        pause(math.random()*tonumber(opt.pacing_jitter))
+    end
+    if self:_cancelled() then error("download cancelled") end
+    local requested_at=clock_now()
+    self.last_weread_request_at=requested_at
+    self.last_weread_request_at_by_scope=self.last_weread_request_at_by_scope or {}
+    self.last_weread_request_at_by_scope[scope]=requested_at
 end
 
 function Http:_jar()
