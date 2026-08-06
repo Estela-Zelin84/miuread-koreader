@@ -1,12 +1,12 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.1.1",
-    SCHEMA = 94,
+    VERSION = "4.1.2",
+    SCHEMA = 95,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
-    -- 更新清单固定保存在对应发布分支的仓库根目录；清单中的下载地址
-    -- 指向 GitHub Release 全量包。安装另一通道的全量包可切换更新通道。
+    -- 正式版更新清单固定保存在正式仓库根目录；清单中的下载地址
+    -- 指向 GitHub Release 全量包。
     UPDATE_CHANNEL = "stable",
     UPDATE_CHANNEL_LABEL = "正式通道",
     UPDATE_MANIFEST = "https://raw.githubusercontent.com/miumiupy98-art/miuread-koreader/main/update.json",
