@@ -212,7 +212,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         return result
     end
 
-    local batches=self.api:review_batches(target_ranges,5)
+    local batches=self.api:review_batches(target_ranges,30)
     local completed,pending={},{}
     local review_map={}
     local group_count,entry_count,invalid_review_count=0,0,0
@@ -272,74 +272,77 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         end
     end
 
-    for index,batch in ipairs(batches) do
-        active_batch_index=index
-        progress("thoughts",index,#batches,"")
-        local good,response,batch_network,batch_kind=call_with_retry("thoughts batch "..tostring(index),function()
+    local function accept_response(batch,response,label)
+        local rows,invalid=table_entries(array_from(response,{"reviews","updated"}))
+        local entry_invalid=merge_review_rows(rows)
+        local skipped=invalid+entry_invalid
+        if skipped>0 then
+            result.error_kind=result.error_kind or "data"
+            result.errors[#result.errors+1]=tostring(label).." skipped malformed review entries"
+            invalid_review_count=invalid_review_count+invalid
+        end
+        -- A successful response is complete even when a malformed optional
+        -- review entry was skipped. Keeping the whole range pending caused
+        -- the same data to be fetched and normalized indefinitely.
+        mark_batch_completed(batch)
+        save_checkpoint()
+    end
+
+    local function split_batch(batch)
+        local middle=math.floor(#batch/2)
+        local left,right={},{}
+        for index,item in ipairs(batch) do
+            if index<=middle then left[#left+1]=item else right[#right+1]=item end
+        end
+        return left,right
+    end
+
+    local function fetch_adaptive(batch,label,depth)
+        depth=tonumber(depth) or 0
+        progress("thoughts",active_batch_index,#batches,
+            depth>0 and ("缩小想法批次至 "..tostring(#batch)) or "")
+        local good,response,network_down,error_kind=call_with_retry(label,function()
             return self.api:readreviews(book_id,uid,batch)
         end)
         if good then
-            local rows,invalid=table_entries(array_from(response,{"reviews","updated"}))
-            local entry_invalid=merge_review_rows(rows)
-            local skipped=invalid+entry_invalid
-            if skipped>0 then
-                result.error_kind=result.error_kind or "data"
-                result.errors[#result.errors+1]="batch "..tostring(index).." skipped malformed review entries"
-                invalid_review_count=invalid_review_count+invalid
-            end
-            -- A successful response is complete even when a malformed optional
-            -- review entry was skipped. Keeping the whole range pending caused
-            -- the same data to be fetched and normalized indefinitely.
-            mark_batch_completed(batch)
-            save_checkpoint()
-        elseif is_data_specific_failure(response) then
-            logger.warn("[MiuRead][Annotations] thoughts batch failed; isolating ranges",
-                "book=",result.book_id,"chapter=",result.chapter_uid,"batch=",index,"/",#batches)
-            local stop=false
-            for item_index,item in ipairs(batch) do
-                progress("thoughts",index,#batches,"获取想法 "..tostring(item_index).."/"..tostring(#batch))
-                local single_ok,single_response,single_network,single_kind=call_with_retry(
-                    "thought range "..tostring(index).."."..tostring(item_index),function()
-                        return self.api:readreviews(book_id,uid,{item})
-                    end)
-                local key=range_key(item)
-                if single_ok then
-                    local rows,invalid=table_entries(array_from(single_response,{"reviews","updated"}))
-                    local entry_invalid=merge_review_rows(rows)
-                    local skipped=invalid+entry_invalid
-                    if skipped>0 then
-                        result.error_kind=result.error_kind or "data"
-                        result.errors[#result.errors+1]="review range skipped malformed entries"
-                        invalid_review_count=invalid_review_count+invalid
-                    end
-                    if key~="" then pending[key]=nil; completed[key]=true end
-                    save_checkpoint()
-                else
-                    result.errors[#result.errors+1]=str(single_response)
-                    result.error_kind=single_kind or (single_network and "network") or "server"
-                    result.auth_required=single_kind=="authentication"
-                    result.forbidden=single_kind=="forbidden"
-                    result.rate_limited=single_kind=="rate_limit"
-                    save_checkpoint()
-                    if result.auth_required or result.forbidden or result.rate_limited or single_network then
-                        stop=true
-                        break
-                    end
-                end
-            end
-            if stop then break end
-        else
-            result.errors[#result.errors+1]="batch "..tostring(index)..": "..str(response)
-            result.error_kind=batch_kind or (batch_network and "network") or "server"
-            result.auth_required=batch_kind=="authentication"
-            result.forbidden=batch_kind=="forbidden"
-            result.rate_limited=batch_kind=="rate_limit"
-            logger.warn("[MiuRead][Annotations] thoughts batch deferred","book=",result.book_id,
-                "chapter=",result.chapter_uid,"batch=",tostring(index),"/",tostring(#batches),
-                "kind=",tostring(result.error_kind))
-            save_checkpoint()
-            break
+            accept_response(batch,response,label)
+            return true,false
         end
+
+        if is_data_specific_failure(response) and #batch>1 then
+            local left,right=split_batch(batch)
+            logger.warn("[MiuRead][Annotations] thoughts batch rejected; reducing size",
+                "book=",result.book_id,"chapter=",result.chapter_uid,
+                "from=",tostring(#batch),"left=",tostring(#left),"right=",tostring(#right))
+            local left_ok,left_stop=fetch_adaptive(left,label..".1",depth+1)
+            if left_stop then return false,true end
+            local right_ok,right_stop=fetch_adaptive(right,label..".2",depth+1)
+            return left_ok and right_ok,right_stop
+        end
+
+        result.errors[#result.errors+1]=tostring(label)..": "..str(response)
+        if is_data_specific_failure(response) then
+            result.error_kind=result.error_kind or "data"
+            save_checkpoint()
+            return false,false
+        end
+
+        result.error_kind=error_kind or (network_down and "network") or "server"
+        result.auth_required=error_kind=="authentication"
+        result.forbidden=error_kind=="forbidden"
+        result.rate_limited=error_kind=="rate_limit"
+        logger.warn("[MiuRead][Annotations] thoughts batch deferred","book=",result.book_id,
+            "chapter=",result.chapter_uid,"batch=",tostring(active_batch_index),"/",tostring(#batches),
+            "ranges=",tostring(#batch),"kind=",tostring(result.error_kind))
+        save_checkpoint()
+        return false,true
+    end
+
+    for index,batch in ipairs(batches) do
+        active_batch_index=index
+        progress("thoughts",index,#batches,"")
+        local _,stop=fetch_adaptive(batch,"thoughts batch "..tostring(index),0)
+        if stop then break end
     end
 
     rebuild_state()
