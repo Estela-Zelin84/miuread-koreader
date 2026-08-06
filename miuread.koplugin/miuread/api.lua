@@ -180,23 +180,91 @@ function Api:_chapter_call(name, id, chapter_uid, extra, request_options)
     error(last or (name .. ": params error(node)"))
 end
 
-local ANNOTATION_REQUEST_OPTIONS={
+local WEB_ANNOTATION_REQUEST_OPTIONS={
+    auth=true,
+    retries=1,
+    rate_limit_retries=0,
+    rate_limit_fail_fast=true,
+    rate_limit_cooldown=300,
+    rate_limit_scope="annotations-web",
+    pacing_scope="annotations-web",
+    shared_pacing=true,
+    min_interval=0.45,
+    pacing_jitter=0.10,
+    timeout={10,18},
+}
+
+local AGENT_ANNOTATION_REQUEST_OPTIONS={
     retries=0,
     rate_limit_retries=0,
     rate_limit_fail_fast=true,
     rate_limit_cooldown=900,
-    rate_limit_scope="annotations",
-    min_interval=0.9,
+    rate_limit_scope="annotations-agent",
+    pacing_scope="annotations-agent",
+    shared_pacing=true,
+    -- The Skill Gateway has a much tighter request budget than the web API.
+    -- Keeping a little over four seconds between shared requests leaves room
+    -- below the observed 30 requests / 100 seconds ceiling.
+    min_interval=4.25,
+    pacing_jitter=0.35,
     timeout={10,18},
 }
 
+local function annotation_headers(id,chapter_uid)
+    return {
+        Accept="application/json, text/plain, */*",
+        Origin="https://weread.qq.com",
+        Referer=Protocol.reader_url(id,chapter_uid),
+        ["Cache-Control"]="no-cache, no-store, max-age=0",
+        Pragma="no-cache",
+    }
+end
+
+local function annotation_batch_error(value)
+    local text=tostring(value or ""):lower()
+    return text:find("params error",1,true)~=nil
+        or text:find("invalid range",1,true)~=nil
+        or text:find("invalid parameter",1,true)~=nil
+        or text:find("range error",1,true)~=nil
+end
+
+function Api:_web_underlines(id,chapter_uid)
+    local last
+    local candidates=unique_candidates(chapter_uid)
+    if #candidates==0 then error("/web/book/underlines: invalid chapterUid") end
+    for _,uid in ipairs(candidates) do
+        local url="https://weread.qq.com/web/book/underlines?bookId="
+            ..Protocol.escape(tostring(id or "")).."&chapterUid="..Protocol.escape(uid)
+        local options=U.copy(WEB_ANNOTATION_REQUEST_OPTIONS)
+        options.headers=annotation_headers(id,uid)
+        local ok,value=pcall(self.http.get_json,self.http,url,options)
+        if ok and type(value)=="table" then
+            value._annotation_source="web"
+            return value
+        end
+        last=ok and "web underlines returned invalid data" or value
+    end
+    error(last or "web underlines failed")
+end
+
+function Api:_agent_underlines(id,chapter_uid)
+    local value=self:_chapter_call("/book/underlines",id,chapter_uid,nil,AGENT_ANNOTATION_REQUEST_OPTIONS)
+    if type(value)=="table" then value._annotation_source="agent" end
+    return value
+end
+
 function Api:underlines(id, chapter_uid)
-    return self:_chapter_call("/book/underlines", id, chapter_uid, nil, ANNOTATION_REQUEST_OPTIONS)
+    local ok,value=pcall(self._web_underlines,self,id,chapter_uid)
+    if ok then return value end
+    logger.warn("[MiuRead][API] web underlines unavailable; using Skill Gateway",
+        "book=",tostring(id),"chapter=",tostring(chapter_uid),"error=",tostring(value))
+    return self:_agent_underlines(id,chapter_uid)
 end
 
 function Api:review_batches(ranges, batch_size)
     local out = {}
-    batch_size = tonumber(batch_size) or 5
+    batch_size = tonumber(batch_size) or 30
+    batch_size = math.max(1,math.min(30,math.floor(batch_size)))
     for first = 1, #(ranges or {}), batch_size do
         local batch = {}
         for i = first, math.min(first + batch_size - 1, #ranges) do
@@ -208,9 +276,47 @@ function Api:review_batches(ranges, batch_size)
     return out
 end
 
+function Api:_web_readreviews(id,chapter_uid,batch)
+    local last
+    local candidates=unique_candidates(chapter_uid)
+    if #candidates==0 then error("/web/book/readReviews: invalid chapterUid") end
+    for _,uid in ipairs(candidates) do
+        local options=U.copy(WEB_ANNOTATION_REQUEST_OPTIONS)
+        options.headers=annotation_headers(id,uid)
+        local payload={
+            bookId=tostring(id or ""),
+            chapterUid=uid,
+            reviews=sanitize(batch or {}),
+        }
+        local ok,value=pcall(self.http.post_json,self.http,
+            "https://weread.qq.com/web/book/readReviews",payload,options)
+        if ok and type(value)=="table" then
+            value._annotation_source="web"
+            return value
+        end
+        last=ok and "web readReviews returned invalid data" or value
+    end
+    error(last or "web readReviews failed")
+end
+
+function Api:_agent_readreviews(id,chapter_uid,batch)
+    local value=self:_chapter_call("/book/readreviews",id,chapter_uid,
+        {reviews=sanitize(batch or {})},AGENT_ANNOTATION_REQUEST_OPTIONS)
+    if type(value)=="table" then value._annotation_source="agent" end
+    return value
+end
+
 function Api:readreviews(id, chapter_uid, batch)
-    return self:_chapter_call("/book/readreviews", id, chapter_uid,
-        {reviews=sanitize(batch or {})}, ANNOTATION_REQUEST_OPTIONS)
+    local ok,value=pcall(self._web_readreviews,self,id,chapter_uid,batch)
+    if ok then return value end
+    -- Batch-shape failures must go back to the adaptive splitter. Falling
+    -- through to the Skill Gateway would repeat the same rejected payload and
+    -- spend the tighter Agent request budget without improving the result.
+    if annotation_batch_error(value) then error(value) end
+    logger.warn("[MiuRead][API] web readReviews unavailable; using Skill Gateway",
+        "book=",tostring(id),"chapter=",tostring(chapter_uid),
+        "ranges=",tostring(#(batch or {})),"error=",tostring(value))
+    return self:_agent_readreviews(id,chapter_uid,batch)
 end
 
 Api._scalar = scalar
