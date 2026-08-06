@@ -2,6 +2,7 @@ local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local Font = require("ui/font")
+local ThoughtFaceFactory = require("miuread.thought_face_factory")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -22,7 +23,47 @@ local U = require("miuread.util")
 local Size = require("ui/size")
 
 local Screen = Device.screen
+local MUTED_TEXT_COLOR = Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
+local INACTIVE_TEXT_COLOR = Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
+local SEPARATOR_COLOR = Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
 local live_popup
+local pooled_popup
+
+local LAYOUT_CACHE_LIMIT = 3
+local GHOSTING_REFRESH_INTERVAL = 6
+local layout_cache = {}
+local layout_cache_order = {}
+
+local function layout_cache_touch(key)
+    for index = #layout_cache_order, 1, -1 do
+        if layout_cache_order[index] == key then
+            table.remove(layout_cache_order, index)
+            break
+        end
+    end
+    layout_cache_order[#layout_cache_order + 1] = key
+end
+
+local function layout_cache_get(key)
+    local cached = key and layout_cache[key] or nil
+    if cached then layout_cache_touch(key) end
+    return cached
+end
+
+local function layout_cache_put(key, value)
+    if not key or key == "" or type(value) ~= "table" then return end
+    layout_cache[key] = value
+    layout_cache_touch(key)
+    while #layout_cache_order > LAYOUT_CACHE_LIMIT do
+        local expired = table.remove(layout_cache_order, 1)
+        layout_cache[expired] = nil
+    end
+end
+
+local function clear_layout_cache()
+    layout_cache = {}
+    layout_cache_order = {}
+end
 
 local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
 function OffsetContainer:getSize()
@@ -30,6 +71,43 @@ function OffsetContainer:getSize()
 end
 function OffsetContainer:paintTo(bb, x, y)
     self[1]:paintTo(bb, x + self.x_off, y + self.y_off)
+end
+
+local Separator = Widget:extend{
+    dimen = nil,
+    dashed = false,
+    inset = 0,
+    top_padding = 0,
+    line_size = 1,
+    dash_width = 8,
+    dash_gap = 6,
+    color = SEPARATOR_COLOR,
+}
+function Separator:getSize()
+    return self.dimen or Geom:new{w = 1, h = 1}
+end
+function Separator:paintTo(bb, x, y)
+    local dimen = self:getSize()
+    self.dimen.x, self.dimen.y = x, y
+    local inset = math.max(0, math.floor(tonumber(self.inset) or 0))
+    local line_size = math.max(1, math.floor(tonumber(self.line_size) or 1))
+    local line_width = math.max(1, math.floor(dimen.w - inset * 2))
+    local line_x = x + inset
+    local line_y = y + math.max(0, math.floor(tonumber(self.top_padding) or 0))
+    local color = self.color or SEPARATOR_COLOR
+    if not self.dashed then
+        bb:paintRect(line_x, line_y, line_width, line_size, color)
+        return
+    end
+
+    local dash_width = math.max(1, math.floor(tonumber(self.dash_width) or 1))
+    local dash_gap = math.max(1, math.floor(tonumber(self.dash_gap) or 1))
+    local offset = 0
+    while offset < line_width do
+        local width = math.min(dash_width, line_width - offset)
+        bb:paintRect(line_x + offset, line_y, width, line_size, color)
+        offset = offset + dash_width + dash_gap
+    end
 end
 
 local CloseButton = InputContainer:extend{dimen = nil, callback = nil}
@@ -58,14 +136,80 @@ local function clamp(value, minimum, maximum)
     return value
 end
 
-local function clean(value)
-    local text = U.clean_utf8 and U.clean_utf8(value) or tostring(value or "")
-    return tostring(text or "")
-        :gsub("\239\191\189", "")
-        :gsub("[%c]+", " ")
-        :gsub("%s+", " ")
-        :match("^%s*(.-)%s*$") or ""
+local function is_edge_blank_at(text, index, length)
+    local byte = text:byte(index)
+    if not byte then return false, 0 end
+    if byte == 0x09 or byte == 0x0A or byte == 0x0B or byte == 0x0C
+        or byte == 0x0D or byte == 0x20 then
+        return true, 1
+    end
+    if byte == 0xC2 and index + 1 <= length and text:byte(index + 1) == 0xA0 then
+        return true, 2
+    end
+    if byte == 0xE2 and index + 2 <= length and text:byte(index + 1) == 0x80 then
+        local third = text:byte(index + 2)
+        if third == 0x8B or third == 0x8C then return true, 3 end
+    end
+    if byte == 0xE3 and index + 2 <= length
+        and text:byte(index + 1) == 0x80 and text:byte(index + 2) == 0x80 then
+        return true, 3
+    end
+    if byte == 0xEF and index + 2 <= length
+        and text:byte(index + 1) == 0xBB and text:byte(index + 2) == 0xBF then
+        return true, 3
+    end
+    return false, 0
 end
+
+local function trim_edge_blanks(text)
+    text = tostring(text or "")
+    local length = #text
+    if length == 0 then return text end
+    local first = 1
+    while first <= length do
+        local blank, bytes = is_edge_blank_at(text, first, length)
+        if not blank then break end
+        first = first + bytes
+    end
+    local last = length
+    while last >= first do
+        local start = last
+        while start > first do
+            local byte = text:byte(start)
+            if not byte or byte < 0x80 or byte >= 0xC0 then break end
+            start = start - 1
+        end
+        local blank, bytes = is_edge_blank_at(text, start, length)
+        if not blank or start + bytes - 1 ~= last then break end
+        last = start - 1
+    end
+    if first > last then return "" end
+    if first == 1 and last == length then return text end
+    return text:sub(first, last)
+end
+
+local function clean_body(value)
+    local text = U.clean_utf8 and U.clean_utf8(value) or tostring(value or "")
+    text = tostring(text or "")
+        :gsub("\239\191\189", "")
+        :gsub("\r\n", "\n")
+        :gsub("\r", "\n")
+        :gsub("[%z\1-\8\11\12\14-\31]", " ")
+        :gsub("[ \t]+\n", "\n")
+        :gsub("\n[ \t]+", "\n")
+    return trim_edge_blanks(text)
+end
+
+local function clean_inline(value)
+    return trim_edge_blanks(clean_body(value)
+        :gsub("\194\160", " ")
+        :gsub("\226\128[\139\140]", " ")
+        :gsub("\227\128\128", " ")
+        :gsub("[%c]+", " ")
+        :gsub("%s+", " "))
+end
+
+local clean = clean_inline
 
 local function display_units(value)
     value = clean(value)
@@ -98,8 +242,10 @@ end
 
 local function make_face(name, size, fallback)
     local requested = clean(name)
-    local ok, value
-    if requested ~= "" then
+    if requested == "" then requested = nil end
+    local ok, value = pcall(ThoughtFaceFactory.getFace, ThoughtFaceFactory, requested, size, fallback or "cfont")
+    if ok and value then return value end
+    if requested then
         ok, value = pcall(function() return Font:getFace(requested, size) end)
         if ok and value then return value end
     end
@@ -116,6 +262,7 @@ local NativePopup = InputContainer:extend{
     stop_events_propagation = true,
     source_text = "",
     comments = nil,
+    cache_key = nil,
     font_size = nil,
     font_name = nil,
     width_ratio = 0.92,
@@ -129,7 +276,10 @@ local NativePopup = InputContainer:extend{
     page_changing = false,
     paint_failed = false,
     comments_dimen = nil,
+    page_indicator_dimen = nil,
+    content_refresh_dimen = nil,
     page_refresh_count = 0,
+    _measurement_cache = nil,
 }
 
 function NativePopup:handleEvent(event)
@@ -190,12 +340,67 @@ function NativePopup:_text_box(text, face, width, opts)
     return box
 end
 
+function NativePopup:_content_identity()
+    local parts = {tostring(self.cache_key or ""), clean(self.source_text)}
+    if parts[1] == "" then
+        for _, item in ipairs(type(self.comments) == "table" and self.comments or {}) do
+            parts[#parts + 1] = table.concat({
+                clean(item.author),
+                tostring(tonumber(item.likes or 0) or 0),
+                clean_body(item.content),
+                tostring(item.review_id or ""),
+            }, "\31")
+        end
+    end
+    return table.concat(parts, "\30")
+end
+
+function NativePopup:_layout_cache_key(width, maximum_height, metrics)
+    return table.concat({
+        self:_content_identity(),
+        tostring(Screen:getWidth()),
+        tostring(Screen:getHeight()),
+        tostring(width),
+        tostring(maximum_height),
+        tostring(metrics.body_size),
+        tostring(metrics.meta_size),
+        tostring(metrics.source_size),
+        clean(self.font_name),
+        ThoughtFaceFactory:signature(),
+    }, "|")
+end
+
+function NativePopup:_measure_piece(piece, width, metrics)
+    self._measurement_cache = self._measurement_cache or {}
+    local key = table.concat({
+        clean(piece.author),
+        tostring(tonumber(piece.likes or 0) or 0),
+        piece.continuation and "1" or "0",
+        clean_body(piece.content),
+        tostring(width),
+        tostring(metrics.body_size),
+        tostring(metrics.meta_size),
+    }, "\31")
+    local cached = self._measurement_cache[key]
+    if cached then return cached end
+    local widget, measured = self:_piece_widget(piece, width, metrics)
+    measured = math.max(1, tonumber(measured) or 1)
+    self._measurement_cache[key] = measured
+    if widget and type(widget.free) == "function" then pcall(widget.free, widget) end
+    return measured
+end
+
 function NativePopup:_layout_metrics(base_size)
     -- font_size already contains KOReader's device scaling. Preserve the four
     -- user-visible levels instead of squeezing every device into 16–22 px.
     local body_size = math.max(12, math.floor((tonumber(base_size) or 15) + .5))
     local meta_size = math.max(10, math.floor(body_size * .72 + .5))
     local source_size = math.max(11, math.floor(body_size * .82 + .5))
+    local separator_line_size = math.max(1, Screen:scaleBySize(1))
+    local source_separator_top = math.max(6, math.floor(body_size * .40))
+    local source_separator_bottom = math.max(8, math.floor(body_size * .52))
+    local comment_separator_top = math.max(6, math.floor(body_size * .40))
+    local comment_separator_bottom = comment_separator_top
     return {
         body_size = body_size,
         meta_size = meta_size,
@@ -204,10 +409,46 @@ function NativePopup:_layout_metrics(base_size)
         meta_face = make_face(self.font_name, meta_size, "smallinfofont"),
         source_face = make_face(self.font_name, source_size, "smallinfofont"),
         meta_body_gap = math.max(5, math.floor(body_size * .22)),
-        entry_gap = math.max(11, math.floor(body_size * .42)),
         body_line_height = 0.20,
         frame_guard = math.max(6, math.floor(body_size * .22)),
+        separator_side_inset = math.max(10, math.floor(body_size * .65)),
+        separator_line_size = separator_line_size,
+        separator_dash_width = math.max(8, math.floor(body_size * .58)),
+        separator_dash_gap = math.max(6, math.floor(body_size * .42)),
+        source_separator_top = source_separator_top,
+        source_separator_bottom = source_separator_bottom,
+        source_separator_height = source_separator_top + separator_line_size + source_separator_bottom,
+        comment_separator_top = comment_separator_top,
+        comment_separator_bottom = comment_separator_bottom,
+        comment_separator_height = comment_separator_top + separator_line_size + comment_separator_bottom,
     }
+end
+
+function NativePopup:_separator_widget(width, metrics, dashed, source_separator, extra_inset)
+    local top_padding = source_separator and metrics.source_separator_top or metrics.comment_separator_top
+    local bottom_padding = source_separator and metrics.source_separator_bottom or metrics.comment_separator_bottom
+    local line_size = metrics.separator_line_size
+    return Separator:new{
+        dimen = Geom:new{
+            w = math.max(1, width),
+            h = math.max(1, top_padding + line_size + bottom_padding),
+        },
+        dashed = dashed == true,
+        inset = math.max(0, (tonumber(extra_inset) or 0) + metrics.separator_side_inset),
+        top_padding = top_padding,
+        line_size = line_size,
+        dash_width = metrics.separator_dash_width,
+        dash_gap = metrics.separator_dash_gap,
+        color = SEPARATOR_COLOR,
+    }
+end
+
+local function needs_comment_separator(previous_piece, current_piece)
+    if not previous_piece or not current_piece then return false end
+    local previous_index = tonumber(previous_piece.comment_index)
+    local current_index = tonumber(current_piece.comment_index)
+    if previous_index and current_index then return previous_index ~= current_index end
+    return not current_piece.continuation
 end
 
 function NativePopup:_piece_widget(piece, width, metrics)
@@ -223,16 +464,16 @@ function NativePopup:_piece_widget(piece, width, metrics)
     else
         meta = author
     end
-    local content = clean(piece.content)
+    local content = clean_body(piece.content)
     if content == "" then content = " " end
 
     -- Let KOReader measure the author row with the same face it will paint.
     -- A forced height clipped or completely hid author names on later pages on
-    -- some Kindle font metrics. Keep it natural and dark enough to remain
-    -- visible on e-ink.
+    -- some Kindle font metrics. Keep the row muted so the comment body remains
+    -- the primary reading focus.
     group[#group + 1] = self:_text_box(meta, metrics.meta_face, width, {
         line_height = 0.10,
-        fgcolor = Blitbuffer.COLOR_BLACK,
+        fgcolor = MUTED_TEXT_COLOR,
     })
     group[#group + 1] = VerticalSpan:new{height = metrics.meta_body_gap}
     group[#group + 1] = self:_text_box(content, metrics.body_face, width, {
@@ -248,7 +489,7 @@ function NativePopup:_fit_prefix(item, content, maximum_height, width, metrics, 
     while low <= high do
         local middle = math.floor((low + high) / 2)
         local prefix = U.utf8_sub(content, 1, middle)
-        local _, measured = self:_piece_widget({
+        local measured = self:_measure_piece({
             author = item.author,
             likes = item.likes,
             content = prefix,
@@ -264,7 +505,7 @@ function NativePopup:_fit_prefix(item, content, maximum_height, width, metrics, 
     end
     if best < 1 then
         best = 1
-        local _, measured = self:_piece_widget({
+        local measured = self:_measure_piece({
             author = item.author,
             likes = item.likes,
             content = U.utf8_sub(content, 1, 1),
@@ -279,16 +520,22 @@ function NativePopup:_fit_prefix(item, content, maximum_height, width, metrics, 
 end
 
 function NativePopup:_paginate_comments(width, maximum_height, metrics)
+    self._measurement_cache = {}
     local comments = type(self.comments) == "table" and self.comments or {}
-    if #comments == 0 then return {{}}, {0} end
+    if #comments == 0 then
+        self._measurement_cache = nil
+        return {{}}, {0}
+    end
 
     local pages, heights = {}, {}
     local page, used = {}, 0
     local function page_height(items)
         local total = 0
         for index, piece in ipairs(items or {}) do
-            if index > 1 then total = total + metrics.entry_gap end
-            local _, measured = self:_piece_widget(piece, width, metrics)
+            if index > 1 and needs_comment_separator(items[index - 1], piece) then
+                total = total + metrics.comment_separator_height
+            end
+            local measured = self:_measure_piece(piece, width, metrics)
             total = total + measured
         end
         return total
@@ -301,7 +548,8 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
         end
     end
     local function add(piece, height)
-        local gap = #page > 0 and metrics.entry_gap or 0
+        local gap = #page > 0 and needs_comment_separator(page[#page], piece)
+            and metrics.comment_separator_height or 0
         page[#page + 1] = piece
         used = used + gap + height
     end
@@ -310,7 +558,7 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
         local item = {
             author = clean(raw.author),
             likes = tonumber(raw.likes or 0) or 0,
-            content = clean(raw.content),
+            content = clean_body(raw.content),
             comment_index = comment_index,
         }
         if item.author == "" then item.author = "微信读书用户" end
@@ -318,16 +566,18 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
             local remaining_content = item.content
             local continuation = false
             while remaining_content ~= "" do
-                local gap = #page > 0 and metrics.entry_gap or 0
-                local available = math.max(1, maximum_height - used - gap)
-                local whole_piece = {
+                local probe_piece = {
                     author = item.author,
                     likes = item.likes,
                     content = remaining_content,
                     continuation = continuation,
                     comment_index = item.comment_index,
                 }
-                local _, whole_height = self:_piece_widget(whole_piece, width, metrics)
+                local gap = #page > 0 and needs_comment_separator(page[#page], probe_piece)
+                    and metrics.comment_separator_height or 0
+                local available = math.max(1, maximum_height - used - gap)
+                local whole_piece = probe_piece
+                local whole_height = self:_measure_piece(whole_piece, width, metrics)
 
                 if whole_height <= available then
                     add(whole_piece, whole_height)
@@ -376,7 +626,10 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
         end
     end
     flush()
-    if #pages == 0 then return {{}}, {0} end
+    if #pages == 0 then
+        self._measurement_cache = nil
+        return {{}}, {0}
+    end
 
     -- Balance the last two pages when the final page would otherwise contain
     -- only a tiny amount of text. Moving complete trailing pieces preserves
@@ -403,6 +656,7 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
         heights[#heights - 1] = previous_h
         heights[#heights] = last_h
     end
+    self._measurement_cache = nil
     return pages, heights
 end
 
@@ -436,7 +690,7 @@ function NativePopup:_build_source(width, metrics, close_size)
     return group, total_h
 end
 
-function NativePopup:_build_comment_page(width, metrics)
+function NativePopup:_build_comment_page(width, metrics, target_height)
     local page = (self.pages and self.pages[self.page_index]) or {}
     local group = VerticalGroup:new{align = "left"}
     if #page == 0 then
@@ -450,19 +704,77 @@ function NativePopup:_build_comment_page(width, metrics)
         })
     else
         for index, piece in ipairs(page) do
-            if index > 1 then
-                group[#group + 1] = VerticalSpan:new{height = metrics.entry_gap}
+            if index > 1 and needs_comment_separator(page[index - 1], piece) then
+                group[#group + 1] = self:_separator_widget(width, metrics, true, false)
             end
             local widget = self:_piece_widget(piece, width, metrics)
             group[#group + 1] = widget
         end
     end
 
-    -- The page border must follow the completed KOReader layout, not the
-    -- separate measurements used while deciding pagination.
     if group.resetLayout then group:resetLayout() end
-    local final_h = math.max(1, group:getSize().h)
-    return group, final_h
+    local natural_h = math.max(1, group:getSize().h)
+    local final_h = natural_h
+    target_height = tonumber(target_height)
+    if target_height and target_height > natural_h then
+        group[#group + 1] = VerticalSpan:new{height = target_height - natural_h}
+        if group.resetLayout then group:resetLayout() end
+        final_h = target_height
+    end
+    return group, math.max(1, final_h), natural_h
+end
+
+function NativePopup:_page_indicator_text()
+    local count = #(self.pages or {})
+    if count <= 1 then return "" end
+    return tostring(clamp(self.page_index, 1, count)) .. " / " .. tostring(count)
+end
+
+function NativePopup:_build_page_indicator(width, metrics, height)
+    local text = self:_page_indicator_text()
+    if text == "" then return nil, 0, nil end
+
+    local count = #(self.pages or {})
+    local current = clamp(self.page_index, 1, count)
+    local face = make_face(
+        self.font_name, math.max(10, math.floor(metrics.meta_size * .92 + .5)), "smallinfofont"
+    )
+    local label = TextWidget:new{
+        text = text,
+        face = face,
+        fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+    }
+    local left = TextWidget:new{
+        text = "‹",
+        face = face,
+        fgcolor = current > 1 and Blitbuffer.COLOR_DARK_GRAY or INACTIVE_TEXT_COLOR,
+    }
+    local right = TextWidget:new{
+        text = "›",
+        face = face,
+        fgcolor = current < count and Blitbuffer.COLOR_DARK_GRAY or INACTIVE_TEXT_COLOR,
+    }
+
+    local label_size = label:getSize()
+    local left_size = left:getSize()
+    local right_size = right:getSize()
+    local indicator_h = math.max(
+        tonumber(height) or 0,
+        label_size.h, left_size.h, right_size.h
+    ) + math.max(2, Screen:scaleBySize(1))
+    local side_w = math.max(
+        left_size.w, right_size.w,
+        math.floor(math.max(1, width) * .16)
+    )
+    side_w = math.min(side_w, math.max(1, math.floor((width - label_size.w) / 2)))
+    local center_w = math.max(1, width - side_w * 2)
+
+    local container = HorizontalGroup:new{
+        CenterContainer:new{dimen = Geom:new{w = side_w, h = indicator_h}, left},
+        CenterContainer:new{dimen = Geom:new{w = center_w, h = indicator_h}, label},
+        CenterContainer:new{dimen = Geom:new{w = side_w, h = indicator_h}, right},
+    }
+    return container, indicator_h, label
 end
 
 function NativePopup:_build(reset_pages, anchor_comment)
@@ -478,8 +790,6 @@ function NativePopup:_build(reset_pages, anchor_comment)
     local close_inset = math.max(2, Screen:scaleBySize(2))
 
     local width_ratio = clamp(self.width_ratio, 0.88, 0.94)
-    -- Preserve the reading context: dense pages stay around half-screen and
-    -- short pages keep their natural height.
     local height_ratio = clamp(self.height_ratio, 0.42, 0.56)
     local side_margin = math.max(14, math.floor(sw * 0.02))
     local vertical_margin = math.max(18, math.floor(sh * 0.03))
@@ -490,15 +800,30 @@ function NativePopup:_build(reset_pages, anchor_comment)
     local comment_w = math.max(1, inner_w - frame_guard * 2)
 
     local source_group, source_h = self:_build_source(inner_w, metrics, close_size)
-    local source_gap = clean(self.source_text) ~= "" and math.max(10, Screen:scaleBySize(7)) or 0
+    local has_source = clean(self.source_text) ~= ""
+    local source_separator_h = has_source and metrics.source_separator_height or 0
     local bottom_padding = math.max(4, Screen:scaleBySize(3))
+    local indicator_gap = math.max(4, Screen:scaleBySize(3))
+    local indicator_height = math.max(metrics.meta_size + math.max(4, Screen:scaleBySize(2)), Screen:scaleBySize(14))
+    local indicator_reserve = indicator_gap + indicator_height
     local maximum_comments_h = math.max(
         metrics.body_size * 3,
-        maximum_height - inset * 2 - source_h - source_gap - bottom_padding
+        maximum_height - inset * 2 - source_h - source_separator_h - bottom_padding - indicator_reserve
     )
 
     if reset_pages or not self.pages then
-        self.pages, self.page_heights = self:_paginate_comments(comment_w, maximum_comments_h, metrics)
+        local cache_key = self:_layout_cache_key(comment_w, maximum_comments_h, metrics)
+        local cached = layout_cache_get(cache_key)
+        if cached then
+            self.pages = cached.pages
+            self.page_heights = cached.page_heights
+            self._layout_cache_hit = true
+        else
+            self.pages, self.page_heights = self:_paginate_comments(comment_w, maximum_comments_h, metrics)
+            layout_cache_put(cache_key, {pages = self.pages, page_heights = self.page_heights})
+            self._layout_cache_hit = false
+        end
+        self._layout_cache_key_value = cache_key
         self.page_index = clamp(self.page_index, 1, #self.pages)
         if tonumber(anchor_comment) then
             for page_index, page in ipairs(self.pages or {}) do
@@ -515,17 +840,30 @@ function NativePopup:_build(reset_pages, anchor_comment)
         end
     end
 
-    local comment_group, comments_h = self:_build_comment_page(comment_w, metrics)
+    local fixed_comments_h = #(self.pages or {}) > 1 and maximum_comments_h or nil
+    local comment_group, comments_h = self:_build_comment_page(comment_w, metrics, fixed_comments_h)
     local guarded_comments = HorizontalGroup:new{
         HorizontalSpan:new{width = frame_guard},
         comment_group,
         HorizontalSpan:new{width = frame_guard},
     }
+    local indicator_container, indicator_h, indicator_label =
+        self:_build_page_indicator(inner_w, metrics, indicator_height)
 
     local content_group = VerticalGroup:new{align = "left"}
     content_group[#content_group + 1] = source_group
-    if source_gap > 0 then content_group[#content_group + 1] = VerticalSpan:new{height = source_gap} end
+    if has_source then
+        content_group[#content_group + 1] = self:_separator_widget(
+            inner_w, metrics, false, true, frame_guard
+        )
+    end
     content_group[#content_group + 1] = guarded_comments
+    local indicator_index
+    if indicator_container then
+        content_group[#content_group + 1] = VerticalSpan:new{height = indicator_gap}
+        indicator_index = #content_group + 1
+        content_group[indicator_index] = indicator_container
+    end
     content_group[#content_group + 1] = VerticalSpan:new{height = bottom_padding}
     if content_group.resetLayout then content_group:resetLayout() end
 
@@ -549,9 +887,28 @@ function NativePopup:_build(reset_pages, anchor_comment)
     self.popup_dimen = Geom:new{x = popup_x, y = popup_y, w = width, h = height}
     self.comments_dimen = Geom:new{
         x = popup_x + inset + frame_guard,
-        y = popup_y + inset + source_h + source_gap,
+        y = popup_y + inset + source_h + source_separator_h,
         w = comment_w,
         h = math.max(1, comments_h),
+    }
+    if indicator_container then
+        self.page_indicator_dimen = Geom:new{
+            x = popup_x + inset,
+            y = self.comments_dimen.y + comments_h + indicator_gap,
+            w = inner_w,
+            h = indicator_h,
+        }
+    else
+        self.page_indicator_dimen = nil
+    end
+    local refresh_bottom = self.page_indicator_dimen
+        and (self.page_indicator_dimen.y + self.page_indicator_dimen.h)
+        or (self.comments_dimen.y + self.comments_dimen.h)
+    self.content_refresh_dimen = Geom:new{
+        x = popup_x + inset,
+        y = self.comments_dimen.y,
+        w = inner_w,
+        h = math.max(1, refresh_bottom - self.comments_dimen.y),
     }
     self.close_dimen = Geom:new{
         x = popup_x + close_x,
@@ -592,8 +949,13 @@ function NativePopup:_build(reset_pages, anchor_comment)
         inset = inset,
         close_size = close_size,
         width = width,
+        inner_w = inner_w,
         comment_w = comment_w,
         metrics = metrics,
+        fixed_comments_h = fixed_comments_h,
+        indicator_gap = indicator_gap,
+        indicator_height = indicator_height,
+        indicator_index = indicator_index,
     }
     self.comment_group = comment_group
     self.guarded_comments = guarded_comments
@@ -601,6 +963,8 @@ function NativePopup:_build(reset_pages, anchor_comment)
     self.surface = surface
     self.popup_group = popup_group
     self.close_button = close
+    self.page_indicator_container = indicator_container
+    self.page_indicator_widget = indicator_label
 
     if previous_root and previous_root ~= self[1] and type(previous_root.free) == "function" then
         pcall(previous_root.free, previous_root)
@@ -619,10 +983,21 @@ function NativePopup:_replace_comment_page()
 
     local previous_popup = self.popup_dimen and self.popup_dimen:copy() or nil
     local previous_group = self.comment_group
-    local comment_group, comments_h = self:_build_comment_page(layout.comment_w, layout.metrics)
+    local previous_indicator = self.page_indicator_container
+    local comment_group, comments_h = self:_build_comment_page(
+        layout.comment_w, layout.metrics, layout.fixed_comments_h
+    )
+    local indicator_container, indicator_h, indicator_label = self:_build_page_indicator(
+        layout.inner_w, layout.metrics, layout.indicator_height
+    )
 
     self.guarded_comments[2] = comment_group
     self.comment_group = comment_group
+    if layout.indicator_index and indicator_container then
+        self.content_group[layout.indicator_index] = indicator_container
+        self.page_indicator_container = indicator_container
+        self.page_indicator_widget = indicator_label
+    end
     if self.guarded_comments.resetLayout then self.guarded_comments:resetLayout() end
     if self.content_group.resetLayout then self.content_group:resetLayout() end
 
@@ -631,6 +1006,10 @@ function NativePopup:_replace_comment_page()
     self.height = height
     self.popup_dimen.h = height
     self.comments_dimen.h = math.max(1, comments_h)
+    if self.page_indicator_dimen and indicator_container then
+        self.page_indicator_dimen.y = self.comments_dimen.y + comments_h + layout.indicator_gap
+        self.page_indicator_dimen.h = indicator_h
+    end
 
     if self.surface.dimen then
         self.surface.dimen.w = natural_size.w
@@ -647,6 +1026,10 @@ function NativePopup:_replace_comment_page()
     if previous_group and previous_group ~= comment_group and type(previous_group.free) == "function" then
         pcall(previous_group.free, previous_group)
     end
+    if previous_indicator and previous_indicator ~= indicator_container
+        and type(previous_indicator.free) == "function" then
+        pcall(previous_indicator.free, previous_indicator)
+    end
     return previous_popup, self.popup_dimen:copy()
 end
 
@@ -662,25 +1045,24 @@ function NativePopup:_change_page(delta)
         self.page_index = target
         local previous_popup, current_popup = self:_replace_comment_page()
         self.page_refresh_count = (tonumber(self.page_refresh_count) or 0) + 1
+        local eink = type(Device.hasEinkScreen) == "function" and Device:hasEinkScreen()
+        local flash_refresh = eink and self.page_refresh_count >= GHOSTING_REFRESH_INTERVAL
+        if flash_refresh then self.page_refresh_count = 0 end
+        local refresh_mode = flash_refresh and "flashui" or "ui"
 
-        local dirty=current_popup or previous_popup
-        if previous_popup and current_popup then
-            local left=math.min(previous_popup.x,current_popup.x)
-            local top=math.min(previous_popup.y,current_popup.y)
-            local right=math.max(previous_popup.x+previous_popup.w,current_popup.x+current_popup.w)
-            local bottom=math.max(previous_popup.y+previous_popup.h,current_popup.y+current_popup.h)
-            dirty=Geom:new{x=left,y=top,w=right-left,h=bottom-top}
-        end
-        if previous_popup and current_popup
-            and (previous_popup.x~=current_popup.x or previous_popup.y~=current_popup.y
-                or previous_popup.w~=current_popup.w or previous_popup.h~=current_popup.h) then
-            -- A size change exposes or covers ReaderUI pixels. Repaint the
-            -- complete old/new union from bottom to top, then draw the new
-            -- popup once. This preserves MiuRead's dynamic height without
-            -- leaving the previous page below it.
-            UIManager:setDirty("all",function() return "ui",dirty end)
+        local dimensions_changed = previous_popup and current_popup
+            and (previous_popup.x ~= current_popup.x or previous_popup.y ~= current_popup.y
+                or previous_popup.w ~= current_popup.w or previous_popup.h ~= current_popup.h)
+        if dimensions_changed then
+            local left = math.min(previous_popup.x, current_popup.x)
+            local top = math.min(previous_popup.y, current_popup.y)
+            local right = math.max(previous_popup.x + previous_popup.w, current_popup.x + current_popup.w)
+            local bottom = math.max(previous_popup.y + previous_popup.h, current_popup.y + current_popup.h)
+            local dirty = Geom:new{x = left, y = top, w = right - left, h = bottom - top}
+            UIManager:setDirty("all", function() return refresh_mode, dirty end)
         else
-            UIManager:setDirty(self,function() return "ui",dirty end)
+            local dirty = self.content_refresh_dimen or current_popup or previous_popup
+            UIManager:setDirty(flash_refresh and "all" or self, function() return refresh_mode, dirty end)
         end
     end, debug.traceback)
     if not ok then
@@ -725,6 +1107,7 @@ function NativePopup:init()
     if Device:isTouchDevice() then
         self.ges_events = {
             TapPage = {GestureRange:new{ges = "tap", range = self.dimen}},
+            SwipePage = {GestureRange:new{ges = "swipe", range = self.dimen}},
         }
     end
     if Device:hasKeys() and Device.input and Device.input.group then
@@ -754,6 +1137,26 @@ function NativePopup:onTapPage(_, ges)
     return self:_change_page(1)
 end
 
+function NativePopup:onSwipePage(_, ges)
+    local pos = ges and ges.pos
+    if pos and self.popup_dimen and pos:notIntersectWith(self.popup_dimen) then
+        return true
+    end
+    local direction = ges and tostring(ges.direction or "") or ""
+    local relative = ges and ges.relative
+    if relative then
+        local dx = math.abs(tonumber(relative.x) or 0)
+        local dy = math.abs(tonumber(relative.y) or 0)
+        local minimum = math.max(18, Screen:scaleBySize(14))
+        if dy < minimum or dy <= dx * 1.15 then return true end
+    end
+    if direction == "north" then return self:_change_page(1) end
+    if direction == "south" then return self:_change_page(-1) end
+    -- Horizontal and diagonal swipes are consumed by the popup so they can
+    -- never turn the book page underneath it.
+    return true
+end
+
 function NativePopup:onPrevious() return self:_change_page(-1) end
 function NativePopup:onNext() return self:_change_page(1) end
 function NativePopup:onClose() return self:_close() end
@@ -771,28 +1174,94 @@ function NativePopup:onCloseWidget()
     if region then UIManager:setDirty("all", function() return "partial", region end) end
 end
 
+function NativePopup:_reopen(opts)
+    opts = opts or {}
+    self.source_text = opts.source_text
+    self.comments = opts.comments
+    self.cache_key = opts.cache_key
+    self.font_size = opts.font_size
+    self.font_name = opts.font_name
+    self.width_ratio = opts.width_ratio
+    self.height_ratio = opts.height_ratio
+    self.on_close_callback = opts.on_close
+    self.on_interact_callback = opts.on_interact
+    self.on_error_callback = opts.on_error
+    self.closing = false
+    self.paint_failed = false
+    self.page_changing = false
+    self.page_index = 1
+    self.pages = nil
+    self.page_heights = nil
+    self.page_refresh_count = 0
+    self._measurement_cache = nil
+    self:init()
+end
+
 local M = {}
 function M.show(opts)
     opts = opts or {}
-    local popup = NativePopup:new{
-        source_text = opts.source_text,
-        comments = opts.comments,
-        font_size = opts.font_size,
-        font_name = opts.font_name,
-        width_ratio = opts.width_ratio,
-        height_ratio = opts.height_ratio,
-        on_close_callback = opts.on_close,
-        on_interact_callback = opts.on_interact,
-        on_error_callback = opts.on_error,
-    }
+    local popup = pooled_popup
+    if popup then
+        popup:_reopen(opts)
+    else
+        popup = NativePopup:new{
+            source_text = opts.source_text,
+            comments = opts.comments,
+            cache_key = opts.cache_key,
+            font_size = opts.font_size,
+            font_name = opts.font_name,
+            width_ratio = opts.width_ratio,
+            height_ratio = opts.height_ratio,
+            on_close_callback = opts.on_close,
+            on_interact_callback = opts.on_interact,
+            on_error_callback = opts.on_error,
+        }
+        pooled_popup = popup
+    end
     live_popup = popup
     UIManager:show(popup, "partial", popup.popup_dimen)
     return popup
 end
 
+function M.close_visible()
+    if not live_popup or live_popup.closing then return false end
+    live_popup:_close()
+    return true
+end
+
 function M.refresh_font(font_size, font_name)
     if not live_popup or live_popup.closing then return false end
     return live_popup:updateFont(font_size, font_name)
+end
+
+function M.clear_cache()
+    clear_layout_cache()
+    ThoughtFaceFactory:clearCache()
+end
+
+function M.cleanup()
+    local popup = pooled_popup
+    if live_popup and not live_popup.closing then
+        pcall(live_popup._close, live_popup)
+    end
+    live_popup = nil
+    pooled_popup = nil
+    clear_layout_cache()
+    ThoughtFaceFactory:clearCache()
+    if popup then
+        popup.on_close_callback = nil
+        popup.on_interact_callback = nil
+        popup.on_error_callback = nil
+        if popup[1] and type(popup[1].free) == "function" then
+            pcall(popup[1].free, popup[1])
+        end
+        popup[1] = nil
+        popup.pages = nil
+        popup.page_heights = nil
+        popup.comments = nil
+        popup.source_text = nil
+    end
+    collectgarbage("step", 48)
 end
 
 return M
