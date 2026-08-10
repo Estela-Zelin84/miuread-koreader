@@ -1,6 +1,7 @@
 local Protocol = require("miuread.protocol")
 local U = require("miuread.util")
 local Http = require("miuread.http")
+local Codec = require("miuread.codec")
 local logger = require("logger")
 
 local Api = {}
@@ -245,6 +246,105 @@ function Api:_web_underlines(id,chapter_uid)
         last=ok and "web underlines returned invalid data" or value
     end
     error(last or "web underlines failed")
+end
+
+local function annotation_write_headers(id, chapter_uid)
+    if tostring(id or "") ~= "" and tostring(chapter_uid or "") ~= "" then
+        return annotation_headers(id, chapter_uid)
+    end
+    return {
+        Accept="application/json, text/plain, */*",
+        Origin="https://weread.qq.com",
+        Referer="https://weread.qq.com/",
+        ["Cache-Control"]="no-cache, no-store, max-age=0",
+        Pragma="no-cache",
+    }
+end
+
+function Api:_web_annotation_write(path, payload, book_id, chapter_uid)
+    payload = sanitize(U.copy(payload or {}))
+    path = tostring(path or "")
+    if path == "" then error("annotation write path missing") end
+
+    local function request_once()
+        return self.http:post_json("https://weread.qq.com" .. path, payload, {
+            headers=annotation_write_headers(book_id, chapter_uid),
+            -- Write requests are never transport-retried blindly. A lost response
+            -- may mean the server already committed the mutation.
+            retries=0,
+            rate_limit_retries=0,
+            timeout={10,18},
+            pacing_scope="annotation-write",
+            shared_pacing=true,
+            min_interval=0.65,
+        })
+    end
+
+    local ok, data = pcall(request_once)
+    local auth_code = not ok and tonumber(Http.auth_error_code(data)) or nil
+    if not ok and (auth_code == -2011 or auth_code == -2012) and self.reader
+        and type(self.reader._recover_login_session) == "function" then
+        local recovered, recover_error = self.reader:_recover_login_session()
+        logger.warn("[MiuRead][API] annotation write auth renewal",
+            "path=", path, "code=", tostring(auth_code),
+            "ok=", tostring(recovered),
+            "error=", recovered and "" or tostring(recover_error))
+        -- Only the confirmed web-session timeout codes are automatically retried,
+        -- and even then only once. Other write failures are left unresolved so a
+        -- caller can reconcile with the cloud before deciding to resend.
+        if recovered then ok, data = pcall(request_once) end
+    end
+    if not ok then error(path .. ": " .. tostring(data)) end
+    return unwrap(data)
+end
+
+function Api:add_bookmark(payload)
+    payload = type(payload) == "table" and payload or {}
+    -- ADD_BOOKMARK receives plain text inside the Web reader, but the
+    -- /web/book/addBookmark wire contract encodes markText as Base64 UTF-8.
+    -- Keep the synchronization layer and local database in plain text and
+    -- perform the transport encoding only at this API boundary.
+    local wire = U.copy(payload)
+    local plain = tostring(wire.markText or "")
+    wire.markText = Codec.b64encode(plain)
+    logger.info("[MiuRead][API] addBookmark wire",
+        "type=", tostring(wire.type),
+        "chapterIdx=", tostring(wire.chapterIdx),
+        "bookVersion=", tostring(wire.bookVersion),
+        "markText=base64",
+        "plain_chars=", tostring(U.utf8_len(plain)),
+        "plain_bytes=", tostring(#plain),
+        "wire_bytes=", tostring(#wire.markText))
+    return self:_web_annotation_write("/web/book/addBookmark", wire,
+        wire.bookId or wire.bookid, wire.chapterUid or wire.chapteruid)
+end
+
+function Api:remove_bookmark(bookmark_id, context)
+    context = type(context) == "table" and context or {}
+    local id = tostring(bookmark_id or "")
+    if id == "" then error("bookmarkId missing") end
+    return self:_web_annotation_write("/web/book/removeBookmark", {bookmarkId=id},
+        context.bookId or context.bookid, context.chapterUid or context.chapteruid)
+end
+
+function Api:add_review(payload)
+    payload = type(payload) == "table" and payload or {}
+    return self:_web_annotation_write("/web/review/add", payload,
+        payload.bookId or payload.bookid, payload.chapterUid or payload.chapteruid)
+end
+
+function Api:remove_review(payload)
+    payload = type(payload) == "table" and payload or {}
+    local review_id = tostring(payload.reviewId or payload.review_id or "")
+    if review_id == "" then error("reviewId missing") end
+    payload.reviewId = review_id
+    -- The legacy web bundle exposes this mutation as FETCH_BOOK_REVIEW_DELETE.
+    -- Its concrete path is not emitted in clear text in the obfuscated bundle;
+    -- `/web/review/delete` follows the companion add/list/single endpoint family.
+    -- Keep it on the no-transport-retry write path so a device-side rejection is
+    -- harmless: the local tombstone stays pending and no blind second delete runs.
+    return self:_web_annotation_write("/web/review/delete", payload,
+        payload.bookId or payload.bookid, payload.chapterUid or payload.chapteruid)
 end
 
 function Api:_agent_underlines(id,chapter_uid)

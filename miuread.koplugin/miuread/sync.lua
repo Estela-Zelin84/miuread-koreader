@@ -8,6 +8,7 @@ local ReadReportService = require("miuread.read_report_service")
 local Protocol = require("miuread.protocol")
 local Http = require("miuread.http")
 local ReadReportWorker = require("miuread.legacy_adapter_worker")
+local BookIntegrity = require("miuread.book_integrity")
 local U = require("miuread.util")
 
 local Sync = {}
@@ -15,7 +16,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 10
+local READ_REPORT_SERVICE_VERSION = 14
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
 
@@ -176,6 +177,36 @@ local function choose_remote_progress(web,agent,threshold)
     return selected
 end
 
+local function positions_match(submitted,remote,threshold)
+    submitted=type(submitted)=="table" and submitted or {}
+    remote=type(remote)=="table" and remote or {}
+    if remote.conflict then return false,"remote_source_conflict" end
+    threshold=math.max(0,tonumber(threshold) or 2)
+    local submitted_uid=tostring(submitted.chapter_uid or submitted.chapterUid or "")
+    local remote_uid=tostring(remote.chapter_uid or remote.chapterUid or "")
+    if submitted_uid~="" and remote_uid~="" and submitted_uid~=remote_uid then
+        return false,"chapter_uid_mismatch"
+    end
+    local submitted_percent=tonumber(submitted.progress)
+    local remote_percent=tonumber(remote.percent)
+    if submitted_percent~=nil and remote_percent~=nil
+        and math.abs(submitted_percent-remote_percent)>threshold then
+        return false,"progress_mismatch"
+    end
+    if submitted_uid~="" and remote_uid~="" then
+        local a,b=tonumber(submitted.offset or submitted.chapter_offset),tonumber(remote.offset or remote.chapter_offset)
+        local chapter_words=tonumber(submitted.chapter_word_count) or 0
+        if a~=nil and b~=nil then
+            local tolerance=math.max(256,math.floor(chapter_words*0.04))
+            if math.abs(a-b)>tolerance and submitted_percent~=nil and remote_percent~=nil
+                and math.abs(submitted_percent-remote_percent)>math.max(0.5,threshold/2) then
+                return false,"chapter_offset_mismatch"
+            end
+        end
+    end
+    return true
+end
+
 local function context_from(state, fallback)
     fallback = fallback or {}
     if type(state) ~= "table" then state = {} end
@@ -318,13 +349,13 @@ function Sync:new(reader, api, store, host, async, identity_async)
         last_error=nil, last_path=nil, last_stage=nil, last_response_summary=nil,
         last_response_path=nil, last_http_code=nil, last_http_length=nil,
         state="stopped", tick_count=0, last_report_clock=0, next_due=0,
-        consecutive_failures=0, first_success_notified=false, failure_notified=false,
+        consecutive_failures=0, first_success_notified=false, failure_notified=false, last_error_kind=nil,
         verified_book_id=nil, verified_at=0, verified_local_percent=nil,
         verified_remote_percent=nil, verified_login_session_id=nil, verification_ttl=4 * 60 * 60,
         daemon=nil, daemon_poll=nil, daemon_status_stamp=nil,
         daemon_context=nil, daemon_last_persist=0, daemon_generation=0,
         daemon_restart_count=0, auth_recovery_busy=false, auth_recovery_at=0,
-        daemon_auth_retry_at=0, auth_transitioning=false,
+        auto_repair_busy=false, daemon_auth_retry_at=0, auth_transitioning=false,
         control_write_task=nil, session_started_at=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
         time_enabled=(store:preferences().sync or {}).time_enabled==true,
@@ -388,17 +419,41 @@ function Sync:local_ratio()
     end
 end
 
+function Sync:_core_map_hash(record)
+    record=record or self:record()
+    if not record then return "" end
+    return BookIntegrity.record_hash(record.book,record.record)
+end
+
 function Sync:position(record, ratio, chapters)
     ratio = ratio or self:local_ratio() or 0
-    local map = chapters or (record.record and record.record.chapter_map) or record.book.catalog or {}
-    return map_position(map, ratio, {
+    local local_map = chapters or (record.record and record.record.chapter_map) or {}
+    local full_map = (record.book and record.book.catalog) or local_map
+    local mapped,map_error=BookIntegrity.position_from_maps(local_map,full_map,ratio,{
         chapter_uid = record.record and record.record.chapter_uid or 0,
         summary = record.book.title,
     })
+    if mapped then return mapped end
+    local fallback=map_position(local_map,ratio,{
+        chapter_uid=record.record and record.record.chapter_uid or 0,
+        summary=record.book.title,
+    })
+    fallback.safe=BookIntegrity.maps_equivalent(local_map,full_map)
+    fallback.mapping_error=map_error
+    fallback.source=fallback.safe and "equivalent_local_map" or "unsafe_local_ratio"
+    return fallback
 end
 
 function Sync:_decorate_legacy_context(context, record)
     context = context or {}
+    local core_hash=self:_core_map_hash(record)
+    context.book_id=tostring(record and record.book and record.book.book_id or context.book_id or "")
+    context.core_map_hash=core_hash
+    local full_catalog=record and record.book and record.book.catalog
+    if type(full_catalog)=="table" and #full_catalog>0 then
+        context.chapters=U.copy(full_catalog)
+        context.catalog_complete=true
+    end
     local standalone_uid = record and record.record and record.record.chapter_uid
     if standalone_uid ~= nil and tostring(standalone_uid) ~= "" then
         local local_map = record.record.chapter_map or {}
@@ -447,9 +502,10 @@ function Sync:local_position(ratio)
         }
     end
     local position = self:position(record, ratio)
-    position.safe = true
+    position.safe = position.safe~=false and position.progress~=nil and tostring(position.chapter_uid or "")~=""
     position.standalone = false
-    position.chapter_percent = math.floor(U.clamp(ratio, 0, 1) * 100 + .5)
+    position.epub_percent = math.floor(U.clamp(ratio, 0, 1) * 100 + .5)
+    position.chapter_percent = tonumber(position.chapter_percent) or position.epub_percent
     return position
 end
 
@@ -562,7 +618,7 @@ end
 function Sync:_remote_catalog(book_id)
     local record=self:record()
     if not record or tostring(record.book.book_id or "")~=tostring(book_id or "") then return {} end
-    local map=(record.record and record.record.chapter_map) or record.book.catalog or {}
+    local map=(record.book and record.book.catalog) or (record.record and record.record.chapter_map) or {}
     local standalone_uid=record.record and record.record.chapter_uid
     if standalone_uid~=nil and tostring(standalone_uid)~="" then
         local session=self.store:session(record.book.book_id) or {}
@@ -587,6 +643,9 @@ end
 
 function Sync:remote(book_id, callback, options)
     options=options or {}
+    local generation_snapshot=tonumber(self.record_generation or 0) or 0
+    local current_record=self:record()
+    local path_snapshot=current_record and tostring(current_record.path or "") or ""
     self.state = "fetching_remote"
     self.last_stage = "读取云端进度"
     local threshold=tonumber(self.store:preferences().sync.threshold) or 2
@@ -602,6 +661,15 @@ function Sync:remote(book_id, callback, options)
         if web_ok then out.web=web else out.web_error=tostring(web) end
         return out
     end, function(result)
+        local now_record=self:record()
+        if generation_snapshot~=tonumber(self.record_generation or 0)
+            or not now_record or tostring(now_record.book.book_id or "")~=tostring(book_id or "")
+            or tostring(now_record.path or "")~=path_snapshot then
+            logger.warn("[MiuRead][Sync] stale remote progress ignored after book switch",
+                "book=",tostring(book_id))
+            callback(nil,"书籍已切换")
+            return
+        end
         self.store:reload()
         local current_auth=self.store:auth()
         local current_account=type(current_auth.account)=="table" and current_auth.account or {}
@@ -674,6 +742,7 @@ function Sync:mark_verified(book_id, reason, local_percent, remote_percent)
         verified_local_percent=self.verified_local_percent,
         verified_remote_percent=self.verified_remote_percent,
         verification_login_session_id=self.verified_login_session_id,
+        report_core_map_hash=self:_core_map_hash(),
         progress_local_percent=self.verified_local_percent, pending=false,
     })
     self.store:update_cached_progress(book_id, self.verified_local_percent)
@@ -691,9 +760,9 @@ function Sync:_save_local_snapshot(book_id,position)
     self.store:save_session(book_id,{local_position_snapshot=snapshot})
 end
 
-function Sync:_recover_auth_once(channel,error,on_done)
+function Sync:_recover_auth_once(channel,error,on_done,force)
     local now=os.time()
-    if self.auth_recovery_busy or now-(tonumber(self.auth_recovery_at) or 0)<60 then
+    if self.auth_recovery_busy or (not force and now-(tonumber(self.auth_recovery_at) or 0)<60) then
         if on_done then on_done(false,"登录恢复正在进行或刚刚尝试过") end
         return false
     end
@@ -710,7 +779,9 @@ function Sync:_recover_auth_once(channel,error,on_done)
             local reason=called and detail or renewed
             logger.warn("[MiuRead][Sync] parent login recovery failed","channel=",tostring(channel),
                 "error=",U.first_line(reason or error,180))
-            if self.host.on_auth_required then pcall(self.host.on_auth_required,self.host,channel,reason or error) end
+            if not force and self.host.on_auth_required then
+                pcall(self.host.on_auth_required,self.host,channel,reason or error)
+            end
         end
         if on_done then on_done(success,detail) end
     end)
@@ -740,6 +811,334 @@ function Sync:_prepare_context(record, ratio, session, force)
     return ctx, position
 end
 
+function Sync:_normalize_report_error_kind(kind, err)
+    kind=tostring(kind or "")
+    if kind=="unconfirmed" then return "unconfirmed" end
+    if kind=="position" then return "context" end
+    if kind=="authentication" or kind=="context" or kind=="transport" or kind=="server" then return kind end
+    err=tostring(err or "")
+    if Http.is_auth_error(err) then return "authentication" end
+    if Http.is_network_error and Http.is_network_error(err) then return "transport" end
+    local lower=err:lower()
+    if lower:find("chapter",1,true) or lower:find("context",1,true) or err:find("章节",1,true) then
+        return "context"
+    end
+    return "server"
+end
+
+function Sync:_clear_noncontext_repair_flag(book_id, session, reason)
+    session=type(session)=="table" and session or self.store:session(book_id) or {}
+    if session.sync_repair_required~=true then return false end
+    local kind=self:_normalize_report_error_kind(session.sync_repair_kind,session.sync_repair_error)
+    if kind=="context" then return false end
+    self.store:save_session(book_id,{
+        sync_repair_required=false,
+        sync_repair_kind=nil,
+        sync_repair_error=nil,
+        sync_repair_at=nil,
+        repair_flag_cleared_at=os.time(),
+        repair_flag_cleared_reason=tostring(reason or "transient_failure_reclassified"),
+    })
+    logger.info("[MiuRead][Sync] cleared legacy transient repair flag",
+        "book=",tostring(book_id),"kind=",kind)
+    return true
+end
+
+function Sync:_record_report_issue(book_id, kind, err, options)
+    options=type(options)=="table" and options or {}
+    book_id=tostring(book_id or "")
+    if book_id=="" then return false end
+    kind=self:_normalize_report_error_kind(kind,err)
+    err=tostring(err or "阅读同步暂时未完成")
+    local session=self.store:session(book_id) or {}
+    local failures=(tonumber(session.consecutive_failures) or 0)+1
+    local context_failures=tonumber(session.report_context_failures) or 0
+
+    if kind=="unconfirmed" then
+        self.last_error=nil
+        self.last_error_kind=nil
+        self.consecutive_failures=0
+        self.state=self.progress_hold and "verification_required" or "waiting"
+        self.last_stage="微信读书未明确确认本次请求，后续继续同步"
+        self.store:save_session(book_id,{
+            last_unconfirmed=err,
+            last_unconfirmed_at=os.time(),
+            last_error=false,
+            consecutive_failures=0,
+            report_state="unconfirmed",
+            pending_report_seconds=0,
+        })
+        self:_clear_noncontext_repair_flag(book_id,session,"unconfirmed_response")
+        return false
+    end
+
+    self.last_error=err
+    self.last_error_kind=kind
+    self.consecutive_failures=failures
+    local patch={
+        last_error=err,
+        last_error_kind=kind,
+        last_error_at=os.time(),
+        consecutive_failures=failures,
+        report_state=kind,
+        pending_report_seconds=0,
+    }
+    if kind=="context" then
+        context_failures=context_failures+1
+        patch.report_context_failures=context_failures
+    else
+        patch.report_context_failures=0
+    end
+    self.store:save_session(book_id,patch)
+
+    if kind=="authentication" then
+        self.state="waiting"
+        self.last_stage="登录状态需要重新验证"
+        self:_clear_noncontext_repair_flag(book_id,session,"authentication_failure")
+        if self.host.on_auth_required then pcall(self.host.on_auth_required,self.host,"read_report",err) end
+        return false
+    end
+    if kind=="transport" or kind=="server" then
+        self.state="waiting"
+        self.last_stage=kind=="transport" and "网络暂不可用，稍后自动继续" or "微信读书暂未确认，稍后自动继续"
+        self:_clear_noncontext_repair_flag(book_id,session,"transient_failure")
+        return false
+    end
+
+    -- A real context/position failure is book-specific. Give the automatic
+    -- recovery path one chance; only a repeated context failure is allowed to
+    -- become a user-facing Repair Sync state.
+    if options.force_repair_required==true or context_failures>=2 then
+        self:_mark_repair_required(book_id,"context",err,options.suppress_prompt==true)
+        return true
+    end
+    self.state="waiting"
+    self.last_stage="当前书籍同步信息异常，等待自动重建"
+    return false
+end
+
+function Sync:_mark_repair_required(book_id, kind, err, suppress_prompt)
+    book_id=tostring(book_id or "")
+    if book_id=="" then return false end
+    kind=self:_normalize_report_error_kind(kind,err)
+    err=tostring(err or "阅读同步失败")
+    -- Repair Sync is reserved for book-specific chapter/context corruption.
+    -- Network, server and login problems have their own recovery paths.
+    if kind~="context" then
+        self.store:save_session(book_id,{
+            sync_repair_required=false,
+            last_error=err,
+            last_error_kind=kind,
+            last_error_at=os.time(),
+            pending_report_seconds=0,
+        })
+        self.state="waiting"
+        return false
+    end
+    self.last_error=err
+    self.last_error_kind=kind
+    self.consecutive_failures=math.max(1,tonumber(self.consecutive_failures) or 0)
+    self.store:save_session(book_id,{
+        sync_repair_required=true,
+        sync_repair_kind=kind,
+        sync_repair_error=err,
+        sync_repair_at=os.time(),
+        pending_report_seconds=0,
+        last_error=err,
+        consecutive_failures=self.consecutive_failures,
+    })
+    local daemon=self.daemon
+    if daemon and tostring(daemon.book_id or "")==book_id and daemon.active then
+        daemon.active=false
+        self:_write_daemon_control(false,true)
+        self.next_due=0
+    end
+    self.state="repair_required"
+    if not suppress_prompt and not self.failure_notified then
+        self.failure_notified=true
+        if self.host.on_read_report_failure then
+            pcall(self.host.on_read_report_failure,self.host,err,kind,book_id)
+        end
+    end
+    return true
+end
+
+function Sync:repair_current(callback)
+    local record=self:record()
+    if not record then if callback then callback(false,"未识别当前觅阅书籍") end; return false end
+    local book_id=tostring(record.book.book_id or "")
+    if book_id=="" then if callback then callback(false,"当前书籍 ID 无效") end; return false end
+    local core_hash=self:_core_map_hash(record)
+    if core_hash=="" then if callback then callback(false,"当前书籍章节映射不完整") end; return false end
+
+    local daemon=self.daemon
+    if daemon and daemon.active then
+        daemon.active=false
+        self:_write_daemon_control(false,true)
+        self.next_due=0
+    end
+
+    local session=self.store:session(book_id) or {}
+    local prior_kind=tostring(session.sync_repair_kind or self.last_error_kind or "")
+    local prior_error=tostring(session.sync_repair_error or session.last_error or self.last_error or "")
+    self.store:save_session(book_id,{
+        last_stage="正在检查登录与当前书籍同步状态",
+        pending_report_seconds=0,
+        book_core_map_hash=core_hash,
+    })
+    self.state="repairing"
+    self.failure_notified=false
+
+    local finished=false
+    local function fail(result,value)
+        if finished then return end
+        finished=true
+        local err=tostring(result or "阅读同步修复失败")
+        local kind=(value and value.error_kind) or nil
+        if Http.is_auth_error(err) then kind="authentication" end
+        kind=self:_normalize_report_error_kind(kind or (err:lower():find("chapter",1,true) and "context" or "server"),err)
+        local repair_required=self:_mark_repair_required(book_id,kind,err,true)==true
+        self.state=repair_required and "repair_required" or "waiting"
+        if callback then callback(false,err,nil,value) end
+    end
+
+    local function commit(result,position,value,remote)
+        if finished then return end
+        local auth=self.store:auth()
+        local login=tostring(auth.login_session_id or "")
+        local candidate=value and value.legacy_context
+        if type(candidate)~="table" or tostring(candidate.book_id or candidate.bookId or "")~=book_id then
+            fail("修复结果缺少当前书籍的有效同步上下文",{error_kind="context"})
+            return
+        end
+        candidate.core_map_hash=core_hash
+        finished=true
+        self.store:save_session(book_id,{
+            legacy_report_context=U.copy(candidate),
+            report_login_session_id=login,
+            report_core_map_hash=core_hash,
+            book_core_map_hash=core_hash,
+            sync_repair_required=false,
+            sync_repair_kind=nil,
+            sync_repair_error=nil,
+            sync_repair_at=nil,
+            consecutive_failures=0,
+            report_context_failures=0,
+            report_state="ok",
+            last_error=false,
+            sync_repaired_at=os.time(),
+            last_stage="阅读同步已修复并通过云端回读确认",
+            pending_report_seconds=0,
+            progress_upload_state="verified",
+            progress_upload_verified_at=os.time(),
+        })
+        self.last_error=nil
+        self.last_error_kind=nil
+        self.consecutive_failures=0
+        self.failure_notified=false
+        self:mark_verified(book_id,"repair_cloud_verified",position and position.progress,remote and remote.percent)
+        self.state="waiting"
+        if self.store:preferences().sync.time_enabled==true and not self.suspended then
+            UIManager:scheduleIn(1,function() self:start("manual_repair_success") end)
+        end
+        logger.info("[MiuRead][SyncRepair] cloud verification accepted",
+            "book=",book_id,
+            "chapter=",tostring(position and position.chapter_uid or "-"),
+            "progress=",tostring(position and position.progress or "-"))
+        if callback then callback(true,result,position,value) end
+    end
+
+    local function verify(result,position,value,attempt)
+        attempt=tonumber(attempt) or 1
+        self.store:save_session(book_id,{last_stage="正在回读微信读书云端位置确认修复结果"})
+        UIManager:scheduleIn(attempt==1 and 1.4 or 2.4,function()
+            if finished then return end
+            local current=self:record()
+            if not current or tostring(current.book.book_id or "")~=book_id then
+                fail("书籍已切换，已取消旧书同步修复",{error_kind="context"})
+                return
+            end
+            self:remote(book_id,function(remote,remote_error)
+                if finished then return end
+                local matched,reason=positions_match(position,remote,self.store:preferences().sync.threshold)
+                if matched then
+                    commit(result,position,value,remote)
+                elseif attempt<2 and remote then
+                    logger.info("[MiuRead][SyncRepair] cloud verification pending",
+                        "book=",book_id,"reason=",tostring(reason))
+                    verify(result,position,value,attempt+1)
+                else
+                    local detail=remote_error or reason or "云端位置未更新"
+                    logger.warn("[MiuRead][SyncRepair] cloud verification failed",
+                        "book=",book_id,"reason=",tostring(detail),
+                        "submitted_uid=",tostring(position and position.chapter_uid or "-"),
+                        "remote_uid=",tostring(remote and remote.chapter_uid or "-"),
+                        "submitted_progress=",tostring(position and position.progress or "-"),
+                        "remote_progress=",tostring(remote and remote.percent or "-"))
+                    fail("微信读书已接收请求，但云端位置未与当前书籍一致",{error_kind="context"})
+                end
+            end,{force=true})
+        end)
+    end
+
+    local function run_upload(force_context,label)
+        logger.info("[MiuRead][SyncRepair] "..tostring(label or "testing context"),
+            "book=",book_id,"core=",core_hash:sub(1,12))
+        self.store:save_session(book_id,{last_stage=force_context and "正在重新建立当前书籍章节同步信息" or "正在验证原有章节同步信息"})
+        if force_context then
+            self.daemon_context=nil
+            if daemon and daemon.paths and daemon.paths.context then os.remove(daemon.paths.context) end
+        end
+        local started=self:upload(0,function(ok,result,position,value)
+            if ok then
+                verify(result,position,value,1)
+                return
+            end
+            local err=tostring(result or "")
+            local kind=tostring((value and value.error_kind) or "")
+            if not force_context and kind~="authentication" and not Http.is_auth_error(err) then
+                run_upload(true,"rebuilding current book context")
+            else
+                fail(result,value)
+            end
+        end,{silent=true,progress_only=true,force_context=force_context,repair=true,transactional_context=true})
+        if not started then fail("暂时无法启动阅读同步修复",{error_kind="context"}) end
+        return started
+    end
+
+    local saved_context=type(session.legacy_report_context)=="table" and session.legacy_report_context or nil
+    local auth=self.store:auth()
+    local can_preserve=type(saved_context)=="table"
+        and tostring(saved_context.book_id or saved_context.bookId or "")==book_id
+        and tostring(session.report_login_session_id or "")==tostring(auth.login_session_id or "")
+        and tostring(session.report_core_map_hash or "")~=""
+        and tostring(session.report_core_map_hash or "")==core_hash
+
+    local function after_auth()
+        if can_preserve then
+            run_upload(false,"testing preserved context")
+        else
+            run_upload(true,"rebuilding current book context")
+        end
+    end
+
+    local needs_auth_check=prior_kind=="authentication" or prior_kind=="context" or Http.is_auth_error(prior_error)
+    if needs_auth_check then
+        logger.info("[MiuRead][SyncRepair] explicit login renewal requested","book=",book_id,
+            "previous_kind=",prior_kind~="" and prior_kind or "unknown")
+        self.store:save_session(book_id,{last_stage="正在验证微信读书登录状态"})
+        local started=self:_recover_auth_once("read_report",prior_error,function(recovered,detail)
+            if recovered then after_auth()
+            else fail(tostring(detail or "微信读书登录验证失败"),{error_kind="authentication"}) end
+        end,true)
+        if not started then fail("登录状态正在处理 请稍后再试",{error_kind="authentication"}) end
+        return started
+    end
+
+    after_auth()
+    return true
+end
+
 function Sync:upload(elapsed, callback, options)
     options = options or {}
     local record = self:record()
@@ -751,7 +1150,22 @@ function Sync:upload(elapsed, callback, options)
     if self.busy then if callback then callback(false, "同步任务忙") end; return false end
 
     local book_id = tostring(record.book.book_id)
+    local generation_snapshot=tonumber(self.record_generation or 0) or 0
+    local path_snapshot=tostring(record.path or "")
+    local core_hash=self:_core_map_hash(record)
     local session = self.store:session(book_id) or {}
+    if session.sync_repair_required==true and options.repair~=true then
+        local repair_kind=self:_normalize_report_error_kind(session.sync_repair_kind,session.sync_repair_error)
+        if repair_kind~="context" then
+            self:_clear_noncontext_repair_flag(book_id,session,"upload_reclassified")
+            session=self.store:session(book_id) or session
+        else
+            self.last_error=tostring(session.sync_repair_error or "当前书籍需要修复同步")
+            self.last_error_kind="context"
+            if callback then callback(false,self.last_error) end
+            return false
+        end
+    end
     local auth = self.store:auth()
     local account=type(auth.account)=="table" and auth.account or {}
     local login_snapshot=tostring(auth.login_session_id or "")
@@ -766,14 +1180,37 @@ function Sync:upload(elapsed, callback, options)
     -- Keep the old worker's own field names and cached context isolated from
     -- MiuRead's newer protocol model. On first use it refreshes the reader page,
     -- catalog and reporting context through the isolated compatibility worker.
+    local saved_context=type(session.legacy_report_context)=="table" and session.legacy_report_context or nil
     local context_matches=tostring(session.report_login_session_id or "")==login_snapshot
-    local legacy_book = U.copy(context_matches and type(session.legacy_report_context) == "table"
-        and session.legacy_report_context or {})
+        and tostring(session.report_core_map_hash or "")~=""
+        and tostring(session.report_core_map_hash or "")==tostring(core_hash or "")
+        and type(saved_context)=="table"
+        and tostring(saved_context.book_id or saved_context.bookId or "")==book_id
+        and (tostring(saved_context.core_map_hash or "")==""
+            or tostring(saved_context.core_map_hash or "")==tostring(core_hash or ""))
+    local legacy_book = U.copy(context_matches and saved_context or {})
     legacy_book.book_id = book_id
     legacy_book.title = record.book.title
     self:_decorate_legacy_context(legacy_book, record)
     local position_snapshot=self:local_position(ratio)
     self:_save_local_snapshot(book_id,position_snapshot)
+    if type(position_snapshot)~="table" or position_snapshot.safe~=true or position_snapshot.progress==nil
+        or tostring(position_snapshot.chapter_uid or "")=="" then
+        local mapping_error=type(position_snapshot)=="table" and position_snapshot.mapping_error or "position_unavailable"
+        local message="当前书籍无法可靠换算微信读书整书进度"
+            ..(mapping_error and ("（"..tostring(mapping_error).."）") or "")
+        self.last_error=message
+        self.last_error_kind="context"
+        if callback then callback(false,message,position_snapshot,{error_kind="context"}) end
+        return false
+    end
+    legacy_book.local_chapter_uid=position_snapshot.chapter_uid
+    legacy_book.local_chapter_idx=position_snapshot.chapter_index or position_snapshot.chapter_idx
+    legacy_book.local_chapter_offset=position_snapshot.offset or position_snapshot.chapter_offset
+    legacy_book.local_chapter_word_count=position_snapshot.chapter_word_count
+    legacy_book.progress=position_snapshot.progress
+    legacy_book.core_map_hash=core_hash
+    local report_ratio=U.clamp((tonumber(position_snapshot.progress) or 0)/100,0,1)
 
     self.busy, self.state, self.last_attempt = true, options.progress_only and "progress_uploading" or "uploading", os.time()
     self.last_stage = options.progress_only and "主动提交阅读进度" or "调用兼容阅读时间上传链路"
@@ -782,17 +1219,28 @@ function Sync:upload(elapsed, callback, options)
             book_id = book_id,
             book_title = record.book.title,
             book = legacy_book,
-            progress_ratio = ratio,
+            core_map_hash = core_hash,
+            progress_ratio = report_ratio,
             elapsed_seconds = elapsed or 0,
             cookies = auth.cookies or {},
             api_key = auth.api_key or "",
             wr_ticket = auth.wr_ticket or "",
             wr_wrpa = auth.wr_wrpa or "",
             allow_renewal = false,
+            force_context = options.force_context == true,
         }
     end, function(result)
         self.busy = false
         self.state = self.progress_hold and "verification_required" or "waiting"
+        local current_record=self:record()
+        if generation_snapshot~=tonumber(self.record_generation or 0)
+            or not current_record or tostring(current_record.book.book_id or "")~=book_id
+            or tostring(current_record.path or "")~=path_snapshot then
+            logger.warn("[MiuRead][ReadReport] stale book worker result ignored",
+                "book=",book_id,"generation=",tostring(generation_snapshot))
+            if callback then callback(false,"书籍已切换，本次旧同步结果已忽略") end
+            return
+        end
         self.store:reload()
         local current_auth=self.store:auth()
         local current_account=type(current_auth.account)=="table" and current_auth.account or {}
@@ -803,26 +1251,15 @@ function Sync:upload(elapsed, callback, options)
             return
         end
         if not result.ok or type(result.value) ~= "table" then
-            self.last_error = result.error or "阅读时间工作器无结果"
-            self.last_stage = "工作器失败"
+            self.last_error = result.error or "阅读同步工作器无结果"
+            self.last_stage = "同步工作器失败"
+            local kind=Http.is_auth_error(self.last_error) and "authentication"
+                or ((Http.is_network_error and Http.is_network_error(self.last_error)) and "transport" or "context")
             logger.warn("[MiuRead][ReadReport] worker failed", tostring(self.last_error))
-            if Http.is_auth_error(self.last_error) and options.auth_retried~=true then
-                local retry_options=U.copy(options); retry_options.auth_retried=true
-                self:_recover_auth_once(auth_channel,self.last_error,function(recovered)
-                    if recovered then self:upload(elapsed,callback,retry_options)
-                    else
-                        self.consecutive_failures=self.consecutive_failures+1
-                        self:_notify_failure()
-                        if callback then callback(false,self.last_error) end
-                    end
-                end)
-                return
-            end
-            self.consecutive_failures = self.consecutive_failures + 1
-            if Http.is_auth_error(self.last_error) and self.host.on_auth_required then
-                pcall(self.host.on_auth_required,self.host,auth_channel,self.last_error)
-            end
-            self:_notify_failure()
+            self:_record_report_issue(book_id,kind,self.last_error,{
+                force_repair_required=options.repair==true,
+                suppress_prompt=options.repair==true,
+            })
             if callback then callback(false, self.last_error) end
             return
         end
@@ -847,9 +1284,7 @@ function Sync:upload(elapsed, callback, options)
             or (tostring(value.path or ""):find("context", 1, true) and "兼容上传上下文失败"
             or "兼容上传链路被服务端拒绝")
 
-        self.store:save_session(book_id, {
-            legacy_report_context=legacy_context,
-            report_login_session_id=login_snapshot,
+        local diagnostic_patch={
             last_attempt=self.last_attempt,
             last_path=value.path,
             last_attempts=attempts_count,
@@ -858,31 +1293,47 @@ function Sync:upload(elapsed, callback, options)
             last_http_code=self.last_http_code,
             last_http_length=self.last_http_length,
             last_payload_public=public,
-        })
+        }
+        if options.transactional_context~=true and value.accepted==true then
+            diagnostic_patch.legacy_report_context=legacy_context
+            diagnostic_patch.report_login_session_id=login_snapshot
+            diagnostic_patch.report_core_map_hash=core_hash
+        end
+        self.store:save_session(book_id,diagnostic_patch)
+
+        if value.uncertain==true or tostring(value.error_kind or "")=="unconfirmed" then
+            local target_label=options.progress_only and "阅读进度" or "阅读时长"
+            local message="微信读书未明确确认本次"..target_label.."（"..tostring(value.error or "无明确回执").."）"
+            self.last_response_summary=value.response_summary or value.error
+            self:_record_report_issue(book_id,"unconfirmed",message)
+            self.store:save_session(book_id,{
+                last_response_summary=self.last_response_summary,
+                last_http_code=self.last_http_code,
+                last_http_length=self.last_http_length,
+                last_payload_public=public,
+                progress_upload_state=options.progress_only and "unconfirmed" or nil,
+            })
+            logger.warn("[MiuRead][ReadReport] unconfirmed",
+                "book=",book_id,"target=",target_label,
+                "ci=",tostring(public.ci or "-"),"co=",tostring(public.co or "-"),
+                "pr=",tostring(public.pr or "-"),"summary=",tostring(self.last_response_summary or "-"))
+            -- A progress-only request can be safely checked by reading cloud
+            -- position. A reading-time interval must not be replayed because it
+            -- may already have been accepted server-side.
+            if callback then
+                if options.progress_only then callback(true,value.response or {},position,value)
+                else callback(false,message,position,value) end
+            end
+            return
+        end
 
         if not value.accepted then
             local rejected_auth=tostring(value.error_kind or "")=="authentication" or Http.is_auth_error(value.error)
             local target_label=options.progress_only and "阅读进度" or "阅读时长"
             self.last_error = "微信读书未确认接收"..target_label.."（" .. tostring(value.error or "unknown") .. "）"
-            if rejected_auth and options.auth_retried~=true then
-                local retry_options=U.copy(options); retry_options.auth_retried=true
-                self:_recover_auth_once(auth_channel,value.error or self.last_error,function(recovered)
-                    if recovered then self:upload(elapsed,callback,retry_options)
-                    else
-                        self.consecutive_failures=self.consecutive_failures+1
-                        self:_notify_failure()
-                        if callback then callback(false,self.last_error,position,value) end
-                    end
-                end)
-                return
-            end
-            self.consecutive_failures = self.consecutive_failures + 1
-            if rejected_auth and self.host.on_auth_required then
-                pcall(self.host.on_auth_required,self.host,auth_channel,value.error or self.last_error)
-            end
+            self.last_error_kind=rejected_auth and "authentication" or self:_normalize_report_error_kind(value.error_kind,value.error)
             self.store:save_session(book_id, {
                 last_error=self.last_error,
-                consecutive_failures=self.consecutive_failures,
                 last_response_summary=self.last_response_summary,
                 last_http_code=self.last_http_code,
                 last_http_length=self.last_http_length,
@@ -895,8 +1346,18 @@ function Sync:upload(elapsed, callback, options)
                 "pr=", tostring(public.pr or "-"),
                 "token_source=", tostring(public.token_source or "-"),
                 "pc_source=", tostring(public.pc_source or "-"),
-                "fields_complete=", tostring(public.payload_fields_complete == true))
-            self:_notify_failure()
+                "fields_complete=", tostring(public.payload_fields_complete == true),
+                "position_source=", tostring(public.position_source or "-"),
+                "report_uid=", tostring(public.report_chapter_uid or "-"),
+                "report_idx=", tostring(public.report_chapter_idx or "-"),
+                "local_uid=", tostring(public.local_chapter_uid or "-"),
+                "local_idx=", tostring(public.local_chapter_idx or "-"),
+                "remote_uid=", tostring(public.remote_chapter_uid or "-"),
+                "remote_idx=", tostring(public.remote_chapter_idx or "-"))
+            self:_record_report_issue(book_id,self.last_error_kind,self.last_error,{
+                force_repair_required=options.repair==true,
+                suppress_prompt=options.repair==true,
+            })
             if callback then callback(false, self.last_error, position, value) end
             return
         end
@@ -909,7 +1370,6 @@ function Sync:upload(elapsed, callback, options)
         self.failure_notified = false
         local patch={
             local_percent=position.progress,
-            report_login_session_id=login_snapshot,
             pending=nil,
             synckey=response_synckey(response) or legacy_context.synckey or session.synckey,
             last_error=false,
@@ -920,7 +1380,19 @@ function Sync:upload(elapsed, callback, options)
             last_http_code=self.last_http_code,
             last_http_length=self.last_http_length,
             last_payload_public=public,
+            book_core_map_hash=core_hash,
         }
+        if options.transactional_context~=true then
+            patch.legacy_report_context=legacy_context
+            patch.report_login_session_id=login_snapshot
+            patch.report_core_map_hash=core_hash
+            patch.sync_repair_required=false
+            patch.sync_repair_kind=nil
+            patch.sync_repair_error=nil
+            patch.sync_repair_at=nil
+            patch.report_context_failures=0
+            patch.report_state="ok"
+        end
         if options.progress_only then
             patch.progress_upload_at=completed_at
             patch.progress_upload_percent=position.progress
@@ -960,10 +1432,9 @@ function Sync:upload_progress(callback)
 end
 
 function Sync:_notify_failure()
-    if self.consecutive_failures >= 2 and not self.failure_notified then
-        self.failure_notified = true
-        if self.host.on_read_report_failure then pcall(self.host.on_read_report_failure, self.host, self.last_error) end
-    end
+    local record=self:record()
+    local book_id=record and record.book and record.book.book_id
+    if book_id then self:_mark_repair_required(book_id,self.last_error_kind or "server",self.last_error) end
 end
 
 function Sync:test_upload(callback)
@@ -1072,7 +1543,7 @@ function Sync:_retire_legacy_daemon()
         }
         local generation=2147483000
         U.atomic_write(prefix..".job.json",Json.encode({
-            generation=generation,controller_token="retired",book_id="",book={},auth={},interval=30,
+            generation=generation,controller_token="retired",book_id="",book={},auth={},interval=Config.READ_INTERVAL,
         }),true)
         U.atomic_write(prefix..".control.json",Json.encode({
             active=false,generation=generation,controller_token="retired",updated_at=os.time(),
@@ -1139,7 +1610,7 @@ function Sync:_attach_existing_daemon(paths, owner)
     self.daemon = {
         pid=tonumber(owner.pid), paths=paths, active=false,
         generation=tonumber(control.generation or 0) or 0,
-        book_id=nil, interval=30, reason="reused", is_child=false,
+        book_id=nil, interval=Config.READ_INTERVAL, reason="reused", is_child=false,
         service_version=READ_REPORT_SERVICE_VERSION,
         login_session_id=tostring(job.login_session_id or ""),
         account_vid=tostring(job.account_vid or ""),
@@ -1185,6 +1656,7 @@ function Sync:_ensure_daemon()
         stop_path = paths.stop,
         owner_path = paths.owner,
         lock_path = paths.lock,
+        reader_busy_path = "/tmp/miuread-reader-busy.until",
     }
     local child = function() return ReadReportService.run(service_job) end
     local ok, pid, err = pcall(FFIUtil.runInSubProcess, child, false, false)
@@ -1200,7 +1672,7 @@ function Sync:_ensure_daemon()
     }), true)
     self.daemon = {
         pid=pid, paths=paths, active=false, generation=0,
-        book_id=nil, interval=30, reason="prestarted", is_child=true,
+        book_id=nil, interval=Config.READ_INTERVAL, reason="prestarted", is_child=true,
         service_version=READ_REPORT_SERVICE_VERSION,
     }
     self.daemon_status_stamp = nil
@@ -1231,18 +1703,43 @@ function Sync:_write_daemon_control(active, immediate, extra)
         then return end
         local auth=self.store:auth()
         local account=type(auth.account)=="table" and auth.account or {}
+        local book_id=tostring(d.book_id or d.final_book_id or "")
+        local position=nil
+        local record=self:record()
+        if record and book_id~="" and tostring(record.book.book_id or "")==book_id then
+            position=self:local_position()
+            if type(position)=="table" and position.safe==true then
+                self:_save_local_snapshot(book_id,position)
+            else
+                position=nil
+            end
+        end
         local control = {
             active = active ~= false and d.active == true,
             generation = own_generation,
             controller_token = self.controller_token,
             login_session_id = tostring(d.login_session_id or auth.login_session_id or ""),
             account_vid = tostring(d.account_vid or account.vid or ""),
-            book_id = tostring(d.book_id or d.final_book_id or ""),
-            progress_ratio = self:local_ratio() or tonumber(existing.progress_ratio) or 0,
+            book_id = book_id,
+            core_map_hash = tostring(d.core_map_hash or existing.core_map_hash or ""),
+            record_generation = tonumber(d.record_generation or existing.record_generation or 0) or 0,
+            progress_ratio = position and (tonumber(position.progress or 0)/100)
+                or tonumber(existing.progress_ratio) or 0,
+            local_chapter_uid = position and position.chapter_uid or existing.local_chapter_uid,
+            local_chapter_idx = position and position.chapter_index or existing.local_chapter_idx,
+            local_chapter_offset = position and (position.chapter_offset or position.offset) or existing.local_chapter_offset,
+            local_chapter_word_count = position and position.chapter_word_count or existing.local_chapter_word_count,
+            position_source = position and position.source or existing.position_source,
+            position_safe = position and true or existing.position_safe==true,
             last_activity = tonumber(self.last_activity) or os.time(),
             updated_at = os.time(),
         }
         for key, value in pairs(extra) do control[key] = value end
+        -- Never activate a reporting interval without a current, safe position.
+        if control.active and (not position or tostring(control.local_chapter_uid or "")=="") then
+            control.active=false
+            control.position_safe=false
+        end
         U.atomic_write(d.paths.control, Json.encode(control), true)
     end
 
@@ -1258,20 +1755,18 @@ function Sync:_write_daemon_control(active, immediate, extra)
         write_now()
     end
     self.control_write_task = task
-    UIManager:scheduleIn(tonumber(Config.CONTROL_WRITE_DELAY) or 30, task)
+    UIManager:scheduleIn(tonumber(Config.CONTROL_WRITE_DELAY) or 60, task)
     return true
 end
 
 function Sync:_persist_daemon_session(force, explicit_book_id)
     local daemon = self.daemon
     local book_id = explicit_book_id or (daemon and (daemon.book_id or daemon.final_book_id))
-    if not book_id then return end
+    if not book_id or not daemon then return end
     local now = os.time()
     if not force and now - (tonumber(self.daemon_last_persist) or 0) < 300 then return end
     self.daemon_last_persist = now
-    self.store:save_session(book_id, {
-        legacy_report_context = self.daemon_context,
-        report_login_session_id = tostring(daemon.login_session_id or ""),
+    local patch={
         last_attempt = self.last_attempt,
         last_upload = self.last_upload,
         last_path = self.last_path,
@@ -1279,7 +1774,17 @@ function Sync:_persist_daemon_session(force, explicit_book_id)
         last_response_summary = self.last_response_summary,
         last_error = self.last_error or false,
         consecutive_failures = self.consecutive_failures,
-    })
+        book_core_map_hash=tostring(daemon.core_map_hash or ""),
+    }
+    local context=self.daemon_context
+    if type(context)=="table"
+        and tostring(context.book_id or context.bookId or "")==tostring(book_id)
+        and tostring(context.core_map_hash or "")==tostring(daemon.core_map_hash or "") then
+        patch.legacy_report_context=context
+        patch.report_login_session_id=tostring(daemon.login_session_id or "")
+        patch.report_core_map_hash=tostring(daemon.core_map_hash or "")
+    end
+    self.store:save_session(book_id,patch)
 end
 
 function Sync:_load_daemon_context()
@@ -1291,12 +1796,21 @@ function Sync:_load_daemon_context()
     if not context_ok or type(envelope) ~= "table" then return end
     local auth=self.store:auth()
     local account=type(auth.account)=="table" and auth.account or {}
-    if tostring(envelope.login_session_id or "")~=tostring(auth.login_session_id or "")
+    if tonumber(envelope.generation or -1)~=tonumber(daemon.generation or 0)
+        or tostring(envelope.controller_token or "")~=tostring(self.controller_token or "")
+        or tostring(envelope.login_session_id or "")~=tostring(auth.login_session_id or "")
         or tostring(envelope.account_vid or "")~=tostring(account.vid or "")
-        or tostring(envelope.book_id or "")~=tostring(daemon.book_id or daemon.final_book_id or "") then
+        or tostring(envelope.book_id or "")~=tostring(daemon.book_id or daemon.final_book_id or "")
+        or tostring(envelope.core_map_hash or "")~=tostring(daemon.core_map_hash or "") then
+        logger.warn("[MiuRead][ReadReport] stale daemon context ignored",
+            "book=",tostring(envelope.book_id or "-"),"core=",tostring(envelope.core_map_hash or "-"):sub(1,12))
         return
     end
-    if type(envelope.context)=="table" then self.daemon_context=U.copy(envelope.context) end
+    if type(envelope.context)=="table"
+        and tostring(envelope.context.book_id or envelope.context.bookId or "")==tostring(envelope.book_id or "")
+        and tostring(envelope.context.core_map_hash or "")==tostring(envelope.core_map_hash or "") then
+        self.daemon_context=U.copy(envelope.context)
+    end
 end
 
 function Sync:_import_daemon_status(force)
@@ -1325,6 +1839,12 @@ function Sync:_import_daemon_status(force)
     local status_book_id = tostring(status.book_id or daemon.book_id or daemon.final_book_id or "")
     local expected_book_id=tostring(daemon.book_id or daemon.final_book_id or "")
     if status_book_id~="" and expected_book_id~="" and status_book_id~=expected_book_id then return end
+    if tostring(status.core_map_hash or "")~=tostring(daemon.core_map_hash or "") then
+        logger.warn("[MiuRead][ReadReport] stale core-map status ignored",
+            "book=",status_book_id,"status_core=",tostring(status.core_map_hash or "-"):sub(1,12),
+            "current_core=",tostring(daemon.core_map_hash or "-"):sub(1,12))
+        return
+    end
     local final_flush = status.final_flush == true
     local stamp = daemon_stamp(status)
     if final_flush and stamp and self.store:is_read_report_consumed(stamp) then
@@ -1393,13 +1913,17 @@ function Sync:_import_daemon_status(force)
         self.session_uploads = self.session_uploads + 1
         self.last_upload = tonumber(status.completed_at) or os.time()
         self.last_error = nil
+        self.last_error_kind = nil
         self.consecutive_failures = 0
         self.failure_notified = false
         if self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,"read_report") end
-        if status_book_id ~= "" and (not self.first_success_notified or final_flush) then
+        if status_book_id ~= "" then
             self.store:save_session(status_book_id, {
                 last_error=false,
+                last_error_kind=false,
                 consecutive_failures=0,
+                report_context_failures=0,
+                report_state="ok",
                 last_upload=self.last_upload,
                 last_elapsed=tonumber(status.elapsed_seconds),
                 last_report_reason=final_flush and tostring(status.flush_reason or "stop") or "interval",
@@ -1426,43 +1950,86 @@ function Sync:_import_daemon_status(force)
         end
         self:_persist_daemon_session(force or final_flush, status_book_id ~= "" and status_book_id or nil)
         if final_flush and stamp then self.store:mark_read_report_consumed(stamp) end
-    elseif status.error then
-        local error_kind=tostring(status.error_kind or "server")
+    elseif status.uncertain==true or status.state=="unconfirmed" then
         self.state = daemon.active and "waiting" or "stopped"
-        self.consecutive_failures = math.max(self.consecutive_failures + 1,tonumber(status.consecutive_failures) or 0)
-        self.last_error = tostring(status.error)
-        self.last_stage=error_kind=="authentication" and "登录验证失败，本次时间不补传，将稍后重新计时"
-            or (error_kind=="context" and "阅读上下文暂时无效，等待自动刷新" or "后台上传失败，本次时间不补传，将稍后重试")
-        if error_kind=="authentication" then
-            local retry_now=os.time()
-            if retry_now-(tonumber(self.daemon_auth_retry_at) or 0)>=60 then
-                self.daemon_auth_retry_at=retry_now
-                self:_recover_auth_once("read_report",self.last_error,function(recovered)
-                    if recovered and not self.suspended and self.store:preferences().sync.time_enabled then
-                        self:_stop_daemon("auth_recovered",true)
-                        UIManager:scheduleIn(1,function() self:start("auth_recovered") end)
-                    end
-                end)
-            elseif self.consecutive_failures>=2 and self.host.on_auth_required then
-                pcall(self.host.on_auth_required,self.host,"read_report",self.last_error)
-            end
+        self.consecutive_failures=0
+        self.last_error=nil
+        self.last_error_kind=nil
+        self.last_stage=final_flush and "关闭前阅读时间未获明确回执" or "本次阅读时间未获明确回执，后续继续"
+        if status_book_id~="" then
+            local saved=self.store:session(status_book_id) or {}
+            self.store:save_session(status_book_id,{
+                last_unconfirmed=tostring(status.error or status.response_summary or "微信读书未明确确认"),
+                last_unconfirmed_at=tonumber(status.completed_at) or os.time(),
+                last_error=false,
+                consecutive_failures=0,
+                report_state="unconfirmed",
+                pending_report_seconds=0,
+            })
+            self:_clear_noncontext_repair_flag(status_book_id,saved,"daemon_unconfirmed")
         end
+        if final_flush then
+            logger.info("[MiuRead][ReadReport] final upload unconfirmed",
+                "book=",status_book_id,"elapsed=",tostring(status.elapsed_seconds or "-"),
+                "reason=",tostring(status.flush_reason or "stop"))
+            daemon.final_flush_pending=false
+            if not daemon.active then daemon.book_id=nil end
+        else
+            logger.info("[MiuRead][ReadReport] service response unconfirmed; continuing",
+                "book=",status_book_id,"next_due=",tostring(status.next_due or "-"))
+        end
+        self:_persist_daemon_session(force or final_flush,status_book_id~="" and status_book_id or nil)
+        if final_flush and stamp then self.store:mark_read_report_consumed(stamp) end
+    elseif status.error then
+        local error_kind=self:_normalize_report_error_kind(status.error_kind,status.error)
+        self.state = daemon.active and "waiting" or "stopped"
+        self.last_error = tostring(status.error)
+        self.last_error_kind=error_kind
+        local repair_required=false
+        if status_book_id~="" then
+            repair_required=self:_record_report_issue(status_book_id,error_kind,self.last_error,{suppress_prompt=false})
+        end
+        self.consecutive_failures=math.max(tonumber(self.consecutive_failures) or 0,
+            tonumber(status.consecutive_failures) or 0)
         if final_flush then
             logger.warn("[MiuRead][ReadReport] final upload failed",
                 "book=", status_book_id, "elapsed=", tostring(status.elapsed_seconds or "-"),
                 "reason=", tostring(status.flush_reason or "stop"),
-                "error=", self.last_error)
+                "kind=",error_kind,"error=", self.last_error)
             daemon.final_flush_pending = false
             if not daemon.active then daemon.book_id = nil end
         else
             logger.warn("[MiuRead][ReadReport] service rejected",
                 "kind=",error_kind,"retry_delay=",tostring(status.retry_delay or 0),
-                "failures=",tostring(self.consecutive_failures),"error=",self.last_error)
-            self:_notify_failure()
+                "failures=",tostring(self.consecutive_failures),"repair=",tostring(repair_required),
+                "error=",self.last_error)
+            if error_kind=="authentication" and not repair_required then
+                self:_recover_auth_once("read_report",self.last_error,function(ok_recover)
+                    if ok_recover and not self.suspended and self:record() then self:start("auth_recovered") end
+                end,false)
+            elseif error_kind=="context" and not repair_required and not self.auto_repair_busy then
+                self.auto_repair_busy=true
+                UIManager:scheduleIn(.35,function()
+                    local current=self:record()
+                    if not current or tostring(current.book.book_id or "")~=status_book_id then
+                        self.auto_repair_busy=false
+                        return
+                    end
+                    logger.info("[MiuRead][SyncRepair] automatic context rebuild requested","book=",status_book_id)
+                    self:repair_current(function(ok_repair,detail)
+                        self.auto_repair_busy=false
+                        if not ok_repair then
+                            local current_session=self.store:session(status_book_id) or {}
+                            if current_session.sync_repair_required==true and self.host.on_read_report_failure then
+                                pcall(self.host.on_read_report_failure,self.host,
+                                    tostring(detail or "自动恢复当前书籍同步信息失败"),"context",status_book_id)
+                            end
+                        end
+                    end)
+                end)
+            end
         end
-        if force or final_flush or self.consecutive_failures >= 2 then
-            self:_persist_daemon_session(true, status_book_id ~= "" and status_book_id or nil)
-        end
+        self:_persist_daemon_session(true, status_book_id ~= "" and status_book_id or nil)
         if final_flush and stamp then self.store:mark_read_report_consumed(stamp) end
     end
 end
@@ -1508,14 +2075,33 @@ function Sync:_start_daemon(reason)
         self.state = "stopped"
         return false, "未识别到 MiuRead 书籍"
     end
+    local book_id = tostring(record.book.book_id or "")
+    local core_hash=self:_core_map_hash(record)
+    local position_snapshot=self:local_position()
+    if core_hash=="" or type(position_snapshot)~="table" or position_snapshot.safe~=true
+        or tostring(position_snapshot.chapter_uid or "")=="" or position_snapshot.progress==nil then
+        self.state="verification_required"
+        return false,"当前书籍无法可靠换算微信读书整书进度"
+    end
     local ok, err = self:_ensure_daemon()
     if not ok then self.state="stopped"; return false, err end
 
     local daemon = self.daemon
-    local book_id = tostring(record.book.book_id)
     local prefs = self.store:preferences().sync
-    local interval = math.max(10, tonumber(prefs.interval) or 30)
+    local interval = math.max(10, tonumber(prefs.interval) or tonumber(Config.READ_INTERVAL) or 60)
     local session = self.store:session(book_id) or {}
+    if session.sync_repair_required==true then
+        local repair_kind=self:_normalize_report_error_kind(session.sync_repair_kind,session.sync_repair_error)
+        if repair_kind~="context" then
+            self:_clear_noncontext_repair_flag(book_id,session,"daemon_start_reclassified")
+            session=self.store:session(book_id) or session
+        else
+            self.state="repair_required"
+            self.last_error=tostring(session.sync_repair_error or "当前书籍需要修复同步")
+            self.last_error_kind="context"
+            return false,"当前书籍需要修复同步"
+        end
+    end
     local auth = self.store:auth()
     local current_account=type(auth.account)=="table" and auth.account or {}
     local login_session_id=tostring(auth.login_session_id or "")
@@ -1534,11 +2120,15 @@ function Sync:_start_daemon(reason)
     local same_account=tostring(existing_job.login_session_id or "")==login_session_id
         and tostring(existing_job.account_vid or "")==account_vid
     local same_document=tostring(existing_job.book_path or "")==tostring(record.path or "")
-    if daemon.active and tostring(daemon.book_id or "")==book_id and same_account and same_document
+    local same_core=tostring(existing_job.core_map_hash or "")==core_hash
+    if daemon.active and tostring(daemon.book_id or "")==book_id and same_account and same_document and same_core
         and process_alive(daemon.pid) then
         daemon.reason=reason
+        daemon.core_map_hash=core_hash
+        daemon.record_generation=tonumber(self.record_generation or 0) or 0
         self.state="waiting"
         self.last_stage="轻量后台服务运行中"
+        self:_save_local_snapshot(book_id,position_snapshot)
         self:_write_daemon_control(true,true)
         self:_schedule_daemon_poll(5)
         logger.info("[MiuRead][ReadReport] duplicate activation ignored",
@@ -1546,13 +2136,19 @@ function Sync:_start_daemon(reason)
         return true
     end
     local context_matches=tostring(session.report_login_session_id or "")==login_session_id
+        and tostring(session.report_core_map_hash or "")==core_hash
     local legacy_book = U.copy((context_matches and self.daemon_context)
         or (context_matches and type(session.legacy_report_context) == "table" and session.legacy_report_context)
         or {})
     legacy_book.book_id = book_id
     legacy_book.title = record.book.title
     self:_decorate_legacy_context(legacy_book, record)
-    local position_snapshot=self:local_position()
+    legacy_book.local_chapter_uid=position_snapshot.chapter_uid
+    legacy_book.local_chapter_idx=position_snapshot.chapter_index
+    legacy_book.local_chapter_offset=position_snapshot.chapter_offset or position_snapshot.offset
+    legacy_book.local_chapter_word_count=position_snapshot.chapter_word_count
+    legacy_book.progress=position_snapshot.progress
+    legacy_book.core_map_hash=core_hash
     self:_save_local_snapshot(book_id,position_snapshot)
 
     local existing_control = read_json_file(daemon.paths.control) or {}
@@ -1571,6 +2167,9 @@ function Sync:_start_daemon(reason)
     daemon.reason = reason
     daemon.login_session_id = login_session_id
     daemon.account_vid = account_vid
+    daemon.core_map_hash=core_hash
+    daemon.record_generation=tonumber(self.record_generation or 0) or 0
+    self.daemon_context=U.copy(legacy_book)
 
     local job = {
         generation = daemon.generation,
@@ -1578,6 +2177,8 @@ function Sync:_start_daemon(reason)
         login_session_id = login_session_id,
         account_vid = account_vid,
         book_id = book_id,
+        core_map_hash = core_hash,
+        record_generation = daemon.record_generation,
         book_title = record.book.title,
         book_path = record.path,
         book = legacy_book,
@@ -1604,7 +2205,7 @@ function Sync:_start_daemon(reason)
     self:_schedule_daemon_poll(5)
     logger.info("[MiuRead][ReadReport] service activated",
         "pid=", tostring(daemon.pid), "book=", book_id,
-        "first_delay=", tostring(math.min(interval, FIRST_REPORT_DELAY)),
+        "core=",core_hash:sub(1,12),"first_delay=", tostring(math.min(interval, FIRST_REPORT_DELAY)),
         "interval=", tostring(interval), "reason=", tostring(reason or "start"))
     return true
 end
@@ -1678,14 +2279,14 @@ function Sync:_final_elapsed(skip_status_import)
     local uploaded = tonumber(self.last_upload or 0) or 0
     local base = math.max(started, uploaded)
     local elapsed = math.max(0, now - base)
-    local maximum = math.max(FINAL_REPORT_MIN_SECONDS, tonumber(Config.READ_INTERVAL) or 30)
+    local maximum = math.max(FINAL_REPORT_MIN_SECONDS, tonumber(Config.READ_INTERVAL) or 60)
     elapsed = math.min(elapsed, maximum)
     if elapsed < FINAL_REPORT_MIN_SECONDS then return nil end
     return elapsed
 end
 
 -- Kept for compatibility with older callers. Automatic reporting now uses one
--- long-lived subprocess instead of forking a fresh worker every 30 seconds.
+-- long-lived subprocess instead of forking a fresh worker every 60 seconds.
 function Sync:_schedule(_delay)
     if self.store:preferences().sync.time_enabled and not self.suspended then
         self:_start_daemon("schedule_compat")
@@ -1928,7 +2529,7 @@ function Sync:on_suspend()
         }, false)
         self:_defer_session_flush(.8)
     end
-    -- The background worker may submit only the current 10-30 second tail.
+    -- The background worker may submit only the current 10-60 second tail.
     -- Failed time is discarded and is never carried into the next session.
     self:stop_fast("suspend", pending_elapsed)
 end
@@ -2008,7 +2609,7 @@ function Sync:invalidate_login_session(reason)
             and tonumber(owner.parent_pid or 0)==tonumber(parent_pid or 0) then
             daemon={
                 pid=tonumber(owner.pid),paths=paths,active=false,
-                generation=0,book_id=nil,interval=30,reason="auth_reset_attach",
+                generation=0,book_id=nil,interval=Config.READ_INTERVAL,reason="auth_reset_attach",
                 is_child=false,service_version=READ_REPORT_SERVICE_VERSION,
             }
             self.daemon=daemon
@@ -2032,7 +2633,7 @@ function Sync:invalidate_login_session(reason)
         os.remove(daemon.paths.status)
         U.atomic_write(daemon.paths.job,Json.encode({
             action="reset_auth",generation=generation,controller_token=self.controller_token,
-            login_session_id="",account_vid="",book_id="",book={},auth={},interval=30,first_delay=10,
+            login_session_id="",account_vid="",book_id="",book={},auth={},interval=Config.READ_INTERVAL,first_delay=10,
         }),true)
         U.atomic_write(daemon.paths.control,Json.encode({
             active=false,generation=generation,controller_token=self.controller_token,
@@ -2069,7 +2670,7 @@ function Sync:status_label()
     if not self.store:preferences().sync.time_enabled then return "已关闭" end
     local labels = {
         stopped="未运行", waiting="运行中", uploading="正在上传", progress_uploading="上传阅读进度", fetching_remote="读取云进度",
-        progress_sync="检查云端位置", verification_required="等待位置选择", paused="已暂停", idle="空闲暂停",
+        progress_sync="检查云端位置", verification_required="等待位置选择", repair_required="需要修复同步", paused="已暂停", idle="空闲暂停",
     }
     if self.last_error then return "上传失败" end
     if self.busy or self.state == "uploading" then return "正在上传" end
@@ -2096,6 +2697,7 @@ function Sync:status()
         session_uploads=self.session_uploads,last_upload=self.last_upload or (session and session.last_upload) or 0,
         last_attempt=self.last_attempt or (session and session.last_attempt) or 0,
         last_error=(self.last_error~=nil and self.last_error or (session and session.last_error)),
+        last_error_kind=self.last_error_kind or (session and session.last_error_kind),
         last_path=self.last_path or (session and session.last_path),
         last_stage=self.last_stage or (session and session.last_stage),
         last_response_summary=self.last_response_summary or (session and session.last_response_summary),

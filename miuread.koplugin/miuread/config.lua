@@ -1,17 +1,18 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.1.2",
-    SCHEMA = 95,
+    VERSION = "4.3.0",
+    SCHEMA = 111,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
-    -- 正式版更新清单固定保存在正式仓库根目录；清单中的下载地址
-    -- 指向 GitHub Release 全量包。
+    -- 正式版更新清单由 tag 发布流程生成，并作为固定 stable-channel Release
+    -- 资源提供。main/update.json 仅用于把 4.1.2 等旧正式版桥接到 4.3.0；
+    -- 4.3.0 起插件自身只读取 stable-channel，避免旧桥接清单参与后续判断。
     UPDATE_CHANNEL = "stable",
     UPDATE_CHANNEL_LABEL = "正式通道",
-    UPDATE_MANIFEST = "https://raw.githubusercontent.com/miumiupy98-art/miuread-koreader/main/update.json",
+    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
     UPDATE_MANIFESTS = {
-        "https://raw.githubusercontent.com/miumiupy98-art/miuread-koreader/main/update.json",
+        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
     },
 
     -- 仅作为 GitHub 官方资源访问失败时的回退入口。
@@ -25,19 +26,34 @@ local C = {
     AUTO_UPDATE_INTERVAL = 24 * 60 * 60,
     AUTO_UPDATE_RETRY_INTERVAL = 6 * 60 * 60,
 
-    READ_INTERVAL = 30,
+    READ_INTERVAL = 60,
     IDLE_TIMEOUT = 600,
     REMOTE_THRESHOLD = 2,
 
     -- Coalesce page-turn control snapshots. Reading position stays in memory
     -- and is written at most once per window; suspend/close still flushes now.
-    CONTROL_WRITE_DELAY = 30,
+    CONTROL_WRITE_DELAY = 60,
 
     LOW_MEMORY_SETTING = "DGLOBAL_CACHE_FREE_PROPORTION",
     LOW_MEMORY_RATIO = 0.15,
 
+    -- Runtime performance protection is based on measured UI latency, not on
+    -- device model or age. The lightweight flag is shared with the download
+    -- subprocess so an already-running job can adapt immediately.
+    LIGHTWEIGHT_MODE_FLAG = "/tmp/miuread-lightweight-mode.flag",
+    PERFORMANCE_SLOW_MS = 1200,
+    PERFORMANCE_EXTREME_MS = 2500,
+    PERFORMANCE_WINDOW_SECONDS = 10 * 60,
+    PERFORMANCE_REPEAT_COUNT = 2,
+    PERFORMANCE_PROMPT_COOLDOWN = 7 * 24 * 60 * 60,
+
     -- Online features are verified by their real request. Renewal is recovery,
     -- never a prerequisite. Diagnostics never include account secrets.
+    -- beta.11 restores explicit/manual cloud annotation writes after moving the
+    -- coordinate basis to complete decrypted XHTML. Diagnostic export remains
+    -- available separately and never performs cloud writes.
+    ANNOTATION_COORD_DIAGNOSTIC_ONLY = false,
+
     AUTH_NOTICE_FAILURE_THRESHOLD = 2,
     DOWNLOAD_AUTO_RESTARTS = 2,
     DOWNLOAD_DIAGNOSTIC_KEEP = 3,

@@ -3,6 +3,7 @@ local Protocol = require("miuread.protocol")
 local Cookies = require("miuread.cookies")
 local Http = require("miuread.http")
 local Codec = require("miuread.codec")
+local AnnotationCoord = require("miuread.annotation_coord")
 local Util = require("miuread.util")
 local logger = require("logger")
 local ok_socket, socket = pcall(require, "socket")
@@ -77,6 +78,44 @@ local function regex_context(html)
         token = optional_value(html:match('"token"%s*:%s*"([^"]+)"')),
         book = {},
     }
+end
+
+local function positive_number(value)
+    local n = tonumber(value)
+    if n and n > 0 then return n end
+end
+
+-- Locate the version belonging to the requested book, not an unrelated
+-- `version` field elsewhere in the reader bootstrap payload.
+local function find_book_version(value, book_id, depth, seen)
+    if type(value) ~= "table" or (depth or 0) > 8 then return nil end
+    seen = seen or {}
+    if seen[value] then return nil end
+    seen[value] = true
+
+    local id = tostring(value.bookId or value.book_id or "")
+    if id ~= "" and id == tostring(book_id or "") then
+        local version = positive_number(value.bookVersion or value.book_version or value.version)
+        if version then return version end
+    end
+
+    for _, key in ipairs({"bookInfo", "book"}) do
+        local child = value[key]
+        if type(child) == "table" then
+            local child_id = tostring(child.bookId or child.book_id or book_id or "")
+            if child_id == tostring(book_id or "") then
+                local version = positive_number(child.bookVersion or child.book_version or child.version)
+                if version then return version end
+            end
+        end
+    end
+
+    for _, child in pairs(value) do
+        if type(child) == "table" then
+            local version = find_book_version(child, book_id, (depth or 0) + 1, seen)
+            if version then return version end
+        end
+    end
 end
 
 local function catalog_records(data)
@@ -757,6 +796,9 @@ local function load_reader_context(self,book_id,chapter_uid,require_psvts)
             end
         end
     end
+    context.book_version = positive_number(context.book and
+        (context.book.bookVersion or context.book.book_version or context.book.version))
+        or find_book_version(context.source, book_id)
     if html:find("可永久阅读",1,true) then context.ownership_hint="可永久阅读" end
     if html:find("书币购买或活动领取",1,true) then context.ownership_hint="书币购买或活动领取" end
     if html:find("个人上传",1,true) or html:find("用户上传",1,true) then context.ownership_hint="个人上传" end
@@ -767,10 +809,6 @@ end
 
 function Reader:state(book_id,chapter_uid)
     return load_reader_context(self,book_id,chapter_uid,true)
-end
-
-function Reader:access_state(book_id)
-    return load_reader_context(self,book_id,nil,false)
 end
 
 function Reader:catalog(book_id)
@@ -824,6 +862,10 @@ function Reader:_txt_once(book, chapter, opt, state)
     if not ok_b then b = "" end
     local xhtml = Codec.text_xhtml(Codec.decode_parts({a, b}))
     if not has_readable_content(xhtml, false) then error("decoded TXT chapter is empty") end
+    -- Keep the complete decrypted chapter before any coordinate/body trimming.
+    -- beta.10 exports this only for local coordinate diagnostics.
+    state.raw_xhtml = xhtml
+    state.coord_html = AnnotationCoord.fromDownloadedXhtml(xhtml)
     state.content_format = "txt"
     return xhtml, "body{line-height:1.75;margin:5%;}", {}, state
 end
@@ -841,6 +883,13 @@ function Reader:_epub_once(book, chapter, opt, state)
     local b = self:shard("/web/book/chapter/e_1", id, uid, state.psvts, false)
     local c = self:shard("/web/book/chapter/e_3", id, uid, state.psvts, false)
     local xhtml = Codec.decode_parts({a, b, c})
+    -- Keep the exact decrypted XHTML before image localization, body extraction
+    -- or any MiuRead rewrite. This is the missing reference required to compare
+    -- local coordinates with real WeRead ranges.
+    state.raw_xhtml = xhtml
+    -- Preserve the current MiuRead coordinate candidate separately so raw.xhtml
+    -- and coord.xhtml can be compared byte-for-byte.
+    state.coord_html = AnnotationCoord.fromDownloadedXhtml(xhtml)
 
     local css = "body{line-height:1.7;margin:5%;}img{max-width:100%;height:auto;}"
     local ok_style, style_raw = pcall(self.shard, self, "/web/book/chapter/e_2", id, uid, state.psvts, true)

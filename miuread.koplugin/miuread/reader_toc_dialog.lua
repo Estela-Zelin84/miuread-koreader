@@ -14,6 +14,7 @@ local UIManager = require("ui/uimanager")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local TransientGuard = require("miuread.transient_guard")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
@@ -47,6 +48,7 @@ end
 local Dialog = InputContainer:extend{
     name = "miuread_reader_toc_dialog",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
     covers_fullscreen = true,
     stop_events_propagation = true,
     opts = nil,
@@ -155,6 +157,17 @@ function Dialog:_build_content()
     local max_rows = math.max(5, math.floor((max_h - pad * 2 - header_h - footer_h - handle_h - gap * 2) / row_h))
     max_rows = math.min(10, max_rows)
     local items = self:_items()
+    -- Follow the current reading chapter once whenever the directory is opened.
+    -- After that, manual directory paging is respected until the dialog closes.
+    if self.opts and self.opts.auto_follow ~= false and not self._auto_follow_applied then
+        for index, item in ipairs(items) do
+            if item.current == true then
+                self.page = math.max(1, math.ceil(index / max_rows))
+                break
+            end
+        end
+        self._auto_follow_applied = true
+    end
     local total_pages = math.max(1, math.ceil(math.max(1, #items) / max_rows))
     self.page = math.max(1, math.min(total_pages, tonumber(self.page) or 1))
     local first = (self.page - 1) * max_rows + 1
@@ -325,6 +338,7 @@ function M.close()
     live_dialog = nil
 end
 function M.show(opts)
+    TransientGuard.close_all()
     M.close()
     local ok, dialog = pcall(Dialog.new, Dialog, {opts = opts or {}})
     if not ok or not dialog then

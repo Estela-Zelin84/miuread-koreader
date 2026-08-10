@@ -23,7 +23,7 @@ local defaults={
              annotations={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",download_dir="",shelf_section="account",account_shelf_kind="books",home_ui={enabled=true,layout_version=23,layout_style="desk",local_root="",local_roots={},local_browse_version=1,local_library_mode="direct",performance_defaults_version=1,auto_scan=false,local_check_on_open=true,page_by_section={},source_order={"account","generated","local","mp"},action_items={refresh=true,search=true,downloads=true,sync=true,frontlight=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false},action_order={"refresh","search","downloads","sync","frontlight","miuread_settings","all_books","history","file_manager","screenshot"},action_layout_version=1,panel_items={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false},panel_order={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","frontlight","sync","miuread_settings","downloads","restart","sleep","full_refresh"},panel_layout_version=1,more_expanded=false,network_metadata=false,background_thought_index=false},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=true,show_status=true,show_recent=true,recent_actions={},quick_layout_version=7,quick_items={toc=true,progress=true,font=true,frontlight=true,sync=true,comment_font=true,page_display=false,typeset=false,current_book=false,downloads=false,full_refresh=false,koreader_menu=false,sleep=false},quick_order={"toc","progress","font","frontlight","sync","comment_font","page_display","typeset","current_book","downloads","full_refresh","koreader_menu","sleep"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,library_scan=true,repair_while_reading=true,mode_switch=true},memory_mode={enabled=false,previous_known=false,previous_ratio=false},thoughts={font="standard",font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},repair={auto_check=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",download_dir="",shelf_section="account",account_shelf_kind="books",home_ui={enabled=true,layout_version=23,layout_style="desk",display_size="standard",ui_font_mode="default",ui_font_face="",local_root="",local_roots={},local_browse_version=2,local_library_mode="auto",local_auto_update=true,performance_defaults_version=1,auto_scan=true,local_check_on_open=true,page_by_section={},source_order={"account","generated","local","mp"},action_items={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false},action_order={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot"},action_layout_version=3,panel_items={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false},panel_order={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep","full_refresh"},panel_layout_version=2,more_expanded=false,network_metadata_defaults_version=1,network_metadata=true},reader_ui={enabled=true,show_title=true,show_status=true,show_recent=false,recent_actions={},quick_layout_version=10,quick_items={toc=true,progress=true,font=true,page=true,comments=true,search=true,bookmark=true,back=true,rotation=true,screenshot=true},quick_order={"toc","progress","font","page","comments","search","bookmark","back","rotation","screenshot"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,library_scan=true,repair_while_reading=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="desktop",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,font="standard",font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0},repair={auto_check=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
@@ -913,11 +913,6 @@ function Store:migrate()
             end
             self.db:saveSetting("auth",U.merge(defaults.auth,auth))
         end
-        if schema<62 then
-            -- 3.0.0-beta.3 generates compact per-chapter thought indexes outside
-            -- the reader. Existing annotation caches remain intact and are
-            -- upgraded automatically by the idle background worker.
-        end
         if schema<64 then
             -- 3.1.0-beta.3 promotes the MiuRead bookshelf from an optional
             -- preview to the default file-manager home. Keep one migration flag
@@ -1217,6 +1212,137 @@ function Store:migrate()
             current.home_ui.auto_scan=mode=="auto"
             self:save_preferences(current)
         end
+        if schema<97 then
+            -- 4.2.0-beta.6 keeps memory protection separate from lightweight
+            -- performance protection. Existing installs stay in standard mode;
+            -- latency detection is enabled without changing device behavior.
+            local current=self:preferences()
+            current.performance_mode=type(current.performance_mode)=="table" and current.performance_mode or {}
+            if current.performance_mode.enabled==nil then current.performance_mode.enabled=false end
+            if current.performance_mode.auto_detect==nil then current.performance_mode.auto_detect=true end
+            current.performance_mode.last_prompt_at=tonumber(current.performance_mode.last_prompt_at or 0) or 0
+            current.performance_mode.reminders_disabled=current.performance_mode.reminders_disabled==true
+            self:save_preferences(current)
+        end
+        if schema<98 then
+            -- 4.2.0-beta.8 makes plugin mode a true non-desktop mode. Legacy
+            -- reader-panel overrides are disabled and mode-environment advice
+            -- starts with a clean acknowledgement set.
+            local current=self:preferences()
+            current.reader_ui=type(current.reader_ui)=="table" and current.reader_ui or {}
+            current.reader_ui.plugin_mode_enabled=false
+            current.notices=type(current.notices)=="table" and current.notices or {}
+            if current.notices.mode_environment==nil then current.notices.mode_environment=true end
+            current.mode_guard=type(current.mode_guard)=="table" and current.mode_guard or {}
+            current.mode_guard.acknowledged={}
+            self:save_preferences(current)
+        end
+        if schema<99 then
+            -- 4.2.0-beta.9 fixes the desktop reader surface to a stable six-item
+            -- layout and adds a persistent switch for comment interaction.
+            local current=self:preferences()
+            current.reader_ui=type(current.reader_ui)=="table" and current.reader_ui or {}
+            current.reader_ui.show_recent=false
+            current.reader_ui.recent_actions={}
+            current.reader_ui.quick_layout_version=8
+            current.reader_ui.quick_items={home=true,toc=true,progress=true,font=true,comments=true,more=true}
+            current.reader_ui.quick_order={"home","toc","progress","font","comments","more"}
+            current.thoughts=type(current.thoughts)=="table" and current.thoughts or {}
+            if current.thoughts.enabled==nil then current.thoughts.enabled=true end
+            self:save_preferences(current)
+        end
+        if schema<100 then
+            -- 4.2.0-beta.10 replaces the bottom six-item reader surface with a
+            -- transient top control center. The hidden reading state remains
+            -- completely clean and the primary row is fixed to five reader tools.
+            local current=self:preferences()
+            current.reader_ui=type(current.reader_ui)=="table" and current.reader_ui or {}
+            current.reader_ui.show_title=false
+            current.reader_ui.show_status=false
+            current.reader_ui.show_recent=false
+            current.reader_ui.recent_actions={}
+            current.reader_ui.quick_layout_version=9
+            current.reader_ui.quick_items={toc=true,progress=true,font=true,comments=true,search=true}
+            current.reader_ui.quick_order={"toc","progress","font","comments","search"}
+            self:save_preferences(current)
+        end
+        if schema<101 then
+            -- 4.3.0-beta.1 separates the runtime mode from the configured next
+            -- mode and replaces automatic third-party UI scanning with a
+            -- one-time explanation whenever the user really enters a mode.
+            local current=self:preferences()
+            current.mode_intro={pending_mode="",pending_reason="",last_confirmed_mode="",confirmed_at=0}
+            current.notices=type(current.notices)=="table" and current.notices or {}
+            current.notices.mode_environment=true
+            current.mode_guard=nil
+            self:save_preferences(current)
+        end
+        if schema<104 then
+            -- 4.3.0-beta.4 no longer treats an update or schema migration as
+            -- entering a new runtime mode. Existing users keep their selected
+            -- mode silently; only a future explicit switch arms a prompt.
+            local current=self:preferences()
+            current.mode_intro=type(current.mode_intro)=="table" and current.mode_intro or {}
+            current.mode_intro.pending_mode=""
+            current.mode_intro.pending_reason=""
+            current.mode_intro.last_confirmed_mode=tostring(current.mode_intro.last_confirmed_mode or "")
+            current.mode_intro.confirmed_at=tonumber(current.mode_intro.confirmed_at or 0) or 0
+            self:save_preferences(current)
+        end
+        if schema<106 then
+            -- 4.3.0-beta.13 follows WeRead Web's default underline style.
+            -- Earlier MiuRead builds persisted style 0 only because it was the
+            -- plugin default; there was no UI that let a user explicitly pick 0.
+            local current=self:preferences()
+            current.annotation_sync=type(current.annotation_sync)=="table" and current.annotation_sync or {}
+            if tonumber(current.annotation_sync.highlight_style or 0)==0 then
+                current.annotation_sync.highlight_style=1
+            end
+            current.annotation_sync.highlight_color=tonumber(current.annotation_sync.highlight_color) or 0
+            self:save_preferences(current)
+        end
+        if schema<109 then
+            -- 4.3.0-beta.18 halves routine read-report/control writes. Existing
+            -- installs that still carry the old 30-second default move to 60s;
+            -- an explicitly longer interval remains untouched.
+            local current=self:preferences()
+            current.sync=type(current.sync)=="table" and current.sync or {}
+            local interval=tonumber(current.sync.interval)
+            if interval==nil or interval<=30 then current.sync.interval=Config.READ_INTERVAL end
+            self:save_preferences(current)
+        end
+        if schema<111 then
+            -- 4.3.0-beta.21 repairs the beta.20 homepage row. Frontlight is no
+            -- longer selectable there; removing it lets MiuRead Settings return
+            -- to the visible sixth slot without resetting other custom choices.
+            local current=self:preferences()
+            current.home_ui=type(current.home_ui)=="table" and current.home_ui or {}
+            local home=current.home_ui
+            home.action_items=type(home.action_items)=="table" and home.action_items or {}
+            home.action_order=type(home.action_order)=="table" and home.action_order or {}
+            home.action_items.frontlight=nil
+            if home.action_items.sleep==nil then home.action_items.sleep=true end
+            if home.action_items.miuread_settings==nil then home.action_items.miuread_settings=true end
+            local seen,order={},{}
+            for _,key in ipairs(home.action_order) do
+                if key~="frontlight" and not seen[key] then seen[key]=true; order[#order+1]=key end
+            end
+            local function ensure_after(after_key,key)
+                if seen[key] then return end
+                local out,inserted={},false
+                for _,name in ipairs(order) do
+                    out[#out+1]=name
+                    if name==after_key then out[#out+1]=key; inserted=true end
+                end
+                if not inserted then out[#out+1]=key end
+                order=out; seen[key]=true
+            end
+            ensure_after("sync","sleep")
+            ensure_after("sleep","miuread_settings")
+            home.action_order=order
+            home.action_layout_version=3
+            self:save_preferences(current)
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end
@@ -1278,32 +1404,6 @@ function Store:book_dir(id) local p=self:book_cache_path(id); U.mkdir(p); return
 function Store:epub_path(filename) local p=self:epub_root().."/"..tostring(filename); U.mkdir(self:epub_root()); return p end
 
 local function basename(path) return tostring(path or ""):match("([^/]+)$") end
-function Store:migrate_legacy_epubs()
-    local all=self.db:readSetting("library",{}) or {}
-    local changed=false
-    local root=self:epub_root()
-    local function move_record(record)
-        if type(record)~="table" or type(record.file)~="string" or record.file=="" then return end
-        if not U.file_exists(record.file) then return end
-        if record.file:sub(1,#root+1)==root.."/" then return end
-        if record.file:sub(1,#self.cache_books_dir+1)~=self.cache_books_dir.."/" then return end
-        local name=basename(record.file); if not name then return end
-        local target=root.."/"..name
-        if U.file_exists(target) then
-            local stem,ext=name:match("^(.*)(%.epub)$")
-            target=root.."/"..tostring(stem or name).." [迁移]"..tostring(ext or "")
-        end
-        local ok=os.rename(record.file,target)
-        if not ok then ok=U.copy_file(record.file,target); if ok then os.remove(record.file) end end
-        if ok then record.file=target; record.directory=root; changed=true end
-    end
-    for _,book in pairs(all) do
-        for _,record in pairs(book.variants or {}) do move_record(record) end
-        for _,row in pairs(book.chapters or {}) do for _,record in pairs(row or {}) do move_record(record) end end
-        if changed then book.directory=root end
-    end
-    if changed then self.db:saveSetting("library",all) end
-end
 function Store:library() return self:get("library",{}) end
 function Store:book(id) return self:library()[tostring(id)] end
 function Store:save_book(id,patch)
@@ -1496,7 +1596,8 @@ local function filename_key(path)
     local name=tostring(basename(path) or ""):lower()
     -- Treat harmless spacing differences around the variant suffix as the same
     -- filename, but only relink when the match is unique.
-    return name:gsub("[%s　]+", "")
+    name=name:gsub("%s+", "")
+    return name:gsub("　", "")
 end
 
 local function identity_from_blob(blob,identity)
@@ -1557,7 +1658,8 @@ local function metadata_key(value)
     text=text:gsub("%.epub$","")
     text=text:gsub("%s*%[[^%]]-%]%s*$","")
     text=text:gsub("%s*【.-】%s*$","")
-    text=text:gsub("[%s%c%p　]+","")
+    text=text:gsub("[%s%c%p]+","")
+    text=text:gsub("　","")
     for _,mark in ipairs({"，","。","！","？","：","；","“","”","‘","’","《","》","〈","〉","（","）","【","】","·","—","…"}) do
         text=text:gsub(mark,"",1e6)
     end
@@ -1700,7 +1802,7 @@ function Store:file_record_from_identity(path,meta,relink)
                 partial_range=meta.partial_range==true,range_start_index=tonumber(meta.range_start_index),
                 range_end_index=tonumber(meta.range_end_index),range_start_title=meta.range_start_title,
                 range_end_title=meta.range_end_title,annotation_pending=meta.annotation_pending==true or nil,
-                annotation_error_kind=meta.annotation_error_kind,recovered=true,
+                annotation_error_kind=meta.annotation_error_kind,core_map_hash=meta.core_map_hash,recovered=true,
             }
             if standalone and uid~="" then
                 record.chapter_uid=uid
@@ -1724,7 +1826,7 @@ function Store:file_record_from_identity(path,meta,relink)
             partial_range=meta.partial_range==true,range_start_index=tonumber(meta.range_start_index),
             range_end_index=tonumber(meta.range_end_index),range_start_title=meta.range_start_title,
             range_end_title=meta.range_end_title,annotation_pending=meta.annotation_pending==true or nil,
-            annotation_error_kind=meta.annotation_error_kind,
+            annotation_error_kind=meta.annotation_error_kind,core_map_hash=meta.core_map_hash,
         }
         if standalone and uid~="" then record.chapter_uid=uid; book.chapters[uid]={[kind]=record}
         else book.variants[kind]=record end
@@ -1767,6 +1869,26 @@ function Store:invalidate_report_contexts(reason)
 end
 function Store:session(id) return self:get("sessions",{})[tostring(id)] end
 function Store:save_session(id,patch,flush_now) local a=self:get("sessions",{}); local k=tostring(id); a[k]=U.merge(a[k] or {},patch or {}); self.db:saveSetting("sessions",a); if flush_now~=false then self:flush() end; return a[k] end
+function Store:invalidate_book_sync_context(id,reason,core_map_hash)
+    local sessions=self:get("sessions",{})
+    local key=tostring(id or "")
+    if key=="" then return false end
+    local row=type(sessions[key])=="table" and sessions[key] or {}
+    for _,field in ipairs({
+        "legacy_report_context","report_context","report_login_session_id","report_core_map_hash",
+        "remote_verified","verified_at","verified_reason","verified_local_percent","verified_remote_percent",
+        "verification_login_session_id","progress_upload_state","progress_upload_verified_at","progress_upload_source",
+        "pending_report_seconds"
+    }) do row[field]=nil end
+    row.sync_context_invalidated_at=os.time()
+    row.sync_context_invalidated_reason=tostring(reason or "book_context_changed")
+    row.book_core_map_hash=tostring(core_map_hash or row.book_core_map_hash or "")
+    row.pending_report_seconds=0
+    sessions[key]=row
+    self.db:saveSetting("sessions",sessions)
+    self:flush()
+    return true,row
+end
 function Store:clear_session(id) local a=self:get("sessions",{}); a[tostring(id)]=nil; self:set("sessions",a) end
 function Store:shelf_cache() return U.merge(defaults.shelf_cache,self:get("shelf_cache",{})) end
 function Store:save_shelf_cache(v) self:set("shelf_cache",U.merge(defaults.shelf_cache,v or {})) end

@@ -96,12 +96,13 @@ local function background(width, height)
     return fixed_frame(width, height, {background = Blitbuffer.COLOR_WHITE})
 end
 
-local TapBox = InputContainer:extend{dimen = nil, callback = nil, hold_callback = nil}
+local TapBox = InputContainer:extend{dimen = nil, callback = nil, hold_callback = nil, _hold_handled = false}
 function TapBox:init()
     self.dimen = self.dimen or Geom:new{w = 1, h = 1}
     self.ges_events = {
         TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}},
         HoldSelect = {GestureRange:new{ges = "hold", range = self.dimen}},
+        HoldReleaseSelect = {GestureRange:new{ges = "hold_release", range = self.dimen}},
     }
 end
 function TapBox:getSize() return Geom:new{w = self.dimen.w, h = self.dimen.h} end
@@ -110,6 +111,10 @@ function TapBox:paintTo(bb, x, y)
     if self[1] then self[1]:paintTo(bb, x, y) end
 end
 function TapBox:onTapSelect()
+    if self._hold_handled then
+        self._hold_handled = false
+        return true
+    end
     local now=os.clock()
     if now<(tonumber(self._miu_tap_block_until) or 0) then return true end
     self._miu_tap_block_until=now+.20
@@ -117,8 +122,17 @@ function TapBox:onTapSelect()
     return true
 end
 function TapBox:onHoldSelect()
+    self._hold_handled = self.hold_callback ~= nil
     if self.hold_callback then self.hold_callback(self.dimen and self.dimen:copy() or nil) end
     return self.hold_callback ~= nil
+end
+function TapBox:onHoldReleaseSelect()
+    if self._hold_handled then
+        self._hold_handled = false
+        self._miu_tap_block_until = os.clock() + .20
+        return true
+    end
+    return false
 end
 function TapBox:handleEvent(event)
     -- Child cards only own taps. Let swipes reach HomeWidget first so the
@@ -162,6 +176,9 @@ local function image_widget(path, width, height, ink_boost)
             -- target ratio, and this avoids the visible inner blank frame that
             -- scale-to-fit produced on Kindle.
             scale_factor = nil,
+            -- Always use MuPDF scaling for covers. Legacy scaling is faster on
+            -- a few old devices but visibly softer at small e-ink sizes.
+            use_legacy_image_scaling = false,
             file_do_cache = true,
         }
         image:getSize()
@@ -179,14 +196,40 @@ local function image_widget(path, width, height, ink_boost)
     return nil
 end
 
-local function placeholder(width, height, title)
-    local mark = U.utf8_sub(tostring(title or "书"):gsub("^%s+", ""), 1, 1)
-    if mark == "" then mark = "书" end
+local function placeholder(width, height, title, author)
+    title = U.trim(tostring(title or "未命名"))
+    author = U.trim(tostring(author or ""))
+    if title == "" then title = "未命名" end
+    local pad = UiScale.dp(3, 2, 5)
+    local content_w = math.max(1, width - pad * 2)
+    local content_h = math.max(1, height - pad * 2)
+    local title_h = math.max(1, math.floor(content_h * (author ~= "" and .58 or .78)))
+    local author_h = math.max(1, content_h - title_h)
+    local body = VerticalGroup:new{
+        align = "center",
+        TextBoxWidget:new{
+            text = U.utf8_truncate(title, 24, "…"),
+            face = face("cfont", 10.8, 15.5), bold = true,
+            width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = title_h,
+            height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
+        },
+    }
+    if author ~= "" then
+        body[#body + 1] = TextBoxWidget:new{
+            text = U.utf8_truncate(author, 18, "…"),
+            face = face("smallinfofont", 7.8, 10.8),
+            width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = author_h,
+            height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
+            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        }
+    end
     return fixed_frame(width, height, {
         bordersize = UiScale.line("thin"),
         radius = UiScale.radius(6, 4, 12),
+        padding = pad,
         background = Blitbuffer.COLOR_WHITE,
-    }, TextWidget:new{text = mark, face = face("cfont", 18, 22), bold = true})
+        color = Blitbuffer.COLOR_GRAY,
+    }, body)
 end
 
 local function solid_bar(width, height, color)
@@ -271,10 +314,12 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
         math.floor(inner_h * .82)
     ))
     local cover_h = math.max(UiScale.dp(108, 92, 155), math.min(inner_h, math.floor(cover_w / .68)))
-    local cover = image_widget(book.cover_path, cover_w, cover_h, .10) or placeholder(cover_w, cover_h, book.title)
+    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .05) or placeholder(cover_w, cover_h, book.title, book.author)
     local gap = math.max(UiScale.dp(9, 7, 14), math.floor(width * .014))
     local text_w = math.max(1, inner_w - cover_w - gap)
     local heading_h = UiScale.dp(22, 20, 30)
+    local refresh_w = book.on_refresh_metadata and math.max(UiScale.dp(28, 25, 40), heading_h) or 0
+    local heading_text_w = math.max(1, text_w - (refresh_w > 0 and refresh_w + UiScale.dp(3, 2, 5) or 0))
     local title_h = UiScale.dp(compact and 44 or 54, compact and 40 or 48, compact and 64 or 76)
     local line_h = UiScale.dp(27, 23, 36)
     local description_h = math.max(UiScale.dp(52, 44, 78), inner_h - heading_h - title_h - line_h * 3)
@@ -313,7 +358,7 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
     table.insert(text, TextBoxWidget:new{
         text = tostring(book.heading or "最近阅读"),
         face = face("smallinfofont", 10.5, 15), bold = true,
-        width = text_w, height = heading_h, height_adjust = false,
+        width = heading_text_w, height = heading_h, height_adjust = false,
         height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
     })
     table.insert(text, TextBoxWidget:new{
@@ -364,9 +409,28 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
             text,
         }),
     }
-    return tappable(width, height, content, callback, function(anchor)
+    local layers = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+    -- Paint the card once, then place small transparent input zones over it.
+    -- The refresh zone is registered before the full-card zone so tapping the
+    -- icon cannot accidentally open the book underneath.
+    layers[#layers + 1] = content
+    if refresh_w > 0 then
+        local refresh_x = frame_inset + pad + cover_w + gap + math.max(0, text_w - refresh_w)
+        local refresh_y = frame_inset + pad
+        layers[#layers + 1] = OffsetContainer:new{
+            x_off = refresh_x, y_off = refresh_y,
+            tappable(refresh_w, heading_h, Ui.icon("refresh", refresh_w, heading_h,
+                math.max(UiScale.dp(17, 15, 24), math.floor(heading_h * .72)), {
+                    face = UiScale.iconFace("cfont", 14, 19, 11),
+                }), function()
+                if book.on_refresh_metadata then book.on_refresh_metadata() end
+            end),
+        }
+    end
+    layers[#layers + 1] = tappable(width, height, Widget:new{dimen = Geom:new{w = width, h = height}}, callback, function(anchor)
         if hold_callback then hold_callback(book, anchor) end
     end)
+    return layers
 end
 
 local function welcome_card(width, height, callback)
@@ -424,6 +488,27 @@ local function shelf_folder_card(folder, width, height, callback)
     end)
 end
 
+local function outlined_badge_text(text, width, height, badge_face)
+    local layer = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+    local radius = math.max(2, UiScale.dp(2, 2, 3))
+    local offsets = {
+        {-radius,0},{radius,0},{0,-radius},{0,radius},
+        {-radius,-radius},{-radius,radius},{radius,-radius},{radius,radius},
+    }
+    for _, off in ipairs(offsets) do
+        layer[#layer + 1] = OffsetContainer:new{
+            x_off = off[1], y_off = off[2],
+            CenterContainer:new{dimen = Geom:new{w = width, h = height}, TextWidget:new{
+                text = text, face = badge_face, bold = true, fgcolor = Blitbuffer.COLOR_WHITE,
+            }},
+        }
+    end
+    layer[#layer + 1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, TextWidget:new{
+        text = text, face = badge_face, bold = true, fgcolor = Blitbuffer.COLOR_BLACK,
+    }}
+    return layer
+end
+
 local function shelf_book_card(book, width, height, callback, hold_callback)
     if book and (book.local_folder==true or book.kind=="folder") then
         return shelf_folder_card(book,width,height,callback)
@@ -439,21 +524,27 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
     if progress >= 100 then reading_badge = "已读"
     elseif progress > 0 then reading_badge = tostring(math.floor(progress + .5)) .. "%" end
 
+    local download_active = book.download_active == true
+    local download_progress = math.max(0, math.min(1, tonumber(book.download_progress) or 0))
     if status == "已生成" or status == "已下载" or status == "未生成" or status == "未开始"
-        or status == "已读完" or status:match("^阅读%s+%d+%%$") then
+        or status == "已读完" or status:match("^阅读%s+%d+%%$")
+        or status:match("下载中") or status:match("生成中") then
         status = ""
     end
     status = U.utf8_truncate(status, 10, "")
-    local status_important = status:match("下载中") or status:match("生成中")
-        or status == "失败" or status == "待修复" or status == "排队中"
+    local status_important = status == "失败" or status == "待修复" or status == "排队中"
+        or status == "批注待修复"
     if not status_important then status = "" end
 
     local title_h = math.max(UiScale.dp(29, 25, 40), math.min(UiScale.dp(39, 32, 47), math.floor(height * .155)))
     local status_h = status ~= "" and UiScale.dp(18, 15, 25) or 0
+    local download_h = download_active and UiScale.dp(4, 3, 6) or 0
     local vgap = UiScale.dp(2, 2, 4)
-    local cover_h = math.max(UiScale.dp(78, 64, 108), height - title_h - status_h - vgap * (status_h > 0 and 2 or 1))
+    local extra_h = status_h + download_h
+    local extra_gaps = (status_h > 0 and 1 or 0) + (download_h > 0 and 1 or 0)
+    local cover_h = math.max(UiScale.dp(78, 64, 108), height - title_h - extra_h - vgap * (1 + extra_gaps))
     local cover_w = math.max(UiScale.dp(54, 46, 78), math.min(math.floor(inner_w * .995), math.floor(cover_h * .715)))
-    local cover = image_widget(book.cover_path, cover_w, cover_h, .13) or placeholder(cover_w, cover_h, book.title)
+    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .06) or placeholder(cover_w, cover_h, book.title, book.author)
 
     local cover_layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
     cover_layer[#cover_layer + 1] = cover
@@ -462,23 +553,17 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
         local inset = UiScale.dp(2, 1, 4)
         cover_layer[#cover_layer + 1] = OffsetContainer:new{
             x_off = inset, y_off = inset,
-            fixed_frame(badge, badge, {
-                bordersize = UiScale.line("thin"), radius = UiScale.radius(5, 4, 8), padding = 0,
-                background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_BLACK,
-            }, TextWidget:new{text = "✓", face = face("cfont", 9.2, 13), bold = true, fgcolor = Blitbuffer.COLOR_BLACK}),
+            outlined_badge_text("✓", badge, badge, face("cfont", 9.4, 13.5)),
         }
     end
     if reading_badge ~= "" then
         local chars = math.max(2, U.utf8_len(reading_badge))
-        local badge_w = math.max(UiScale.dp(31, 26, 45), UiScale.dp(11, 9, 16) + chars * UiScale.dp(7, 6, 10))
+        local badge_w = math.max(UiScale.dp(31, 26, 45), UiScale.dp(9, 8, 14) + chars * UiScale.dp(7, 6, 10))
         local badge_h = UiScale.dp(20, 17, 27)
         local inset = UiScale.dp(2, 1, 4)
         cover_layer[#cover_layer + 1] = OffsetContainer:new{
             x_off = math.max(0, cover_w - badge_w - inset), y_off = inset,
-            fixed_frame(badge_w, badge_h, {
-                bordersize = UiScale.line("thin"), radius = UiScale.radius(5, 4, 8), padding = UiScale.dp(1, 1, 2),
-                background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_BLACK,
-            }, TextWidget:new{text = reading_badge, face = face("smallinfofont", 9.2, 13), bold = true, fgcolor = Blitbuffer.COLOR_BLACK}),
+            outlined_badge_text(reading_badge, badge_w, badge_h, face("smallinfofont", 9.2, 13)),
         }
     end
 
@@ -488,7 +573,13 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
         face = face("cfont", 11.5, 16), bold = true, width = inner_w, height = title_h,
         height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
     }
-    if status_h > 0 then
+    if download_h > 0 then
+        body[#body + 1] = VerticalSpan:new{height = vgap}
+        body[#body + 1] = CenterContainer:new{
+            dimen = Geom:new{w = inner_w, h = download_h},
+            progress_bar(math.max(UiScale.dp(44, 38, 68), math.floor(cover_w * .86)), download_h, download_progress),
+        }
+    elseif status_h > 0 then
         body[#body + 1] = TextBoxWidget:new{
             text = status, face = face("smallinfofont", 8.5, 12), bold = true, width = inner_w, height = status_h,
             height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center", fgcolor = Blitbuffer.COLOR_BLACK,
@@ -756,35 +847,91 @@ function HomeWidget:onHomeShelfSwipe(_,ges)
 end
 
 function HomeWidget:_build_header(children, m)
-    local menu_w = math.max(UiScale.dp(64, 58, 88), math.min(UiScale.dp(84, 68, 100), math.floor(m.content_w * .11)))
-    local title_w = math.max(UiScale.dp(78, 72, 108), math.min(UiScale.dp(108, 86, 126), math.floor(m.content_w * .14)))
-    local account_w = math.max(UiScale.dp(118, 108, 190), math.min(UiScale.dp(210, 150, 250), math.floor(m.content_w * .25)))
-    local gap = math.max(5, math.floor(m.content_w * .009))
-    local status_w = math.max(1, m.content_w - title_w - account_w - menu_w - gap * 3)
+    -- Independent compact groups: account | Wi-Fi/SSID | sync | time | battery.
+    local gap = math.max(UiScale.dp(2, 2, 4), math.floor(m.content_w * .003))
+    local title_w = math.max(UiScale.dp(66, 58, 86), math.floor(m.content_w * .10))
+    local account_w = math.max(UiScale.dp(112, 98, 145), math.floor(m.content_w * .15))
+    local sync_w = math.max(UiScale.dp(94, 82, 124), math.floor(m.content_w * .13))
+    local time_w = math.max(UiScale.dp(57, 51, 74), math.floor(m.content_w * .075))
+    local battery_w = math.max(UiScale.dp(78, 69, 102), math.floor(m.content_w * .10))
+    local menu_w = math.max(UiScale.dp(62, 55, 82), math.floor(m.content_w * .085))
+    local wifi_w = math.max(UiScale.dp(132, 116, 176),
+        m.content_w - title_w - account_w - sync_w - time_w - battery_w - menu_w - gap * 6)
+    local used = title_w + account_w + wifi_w + sync_w + time_w + battery_w + menu_w + gap * 6
+    if used > m.content_w then
+        wifi_w = math.max(UiScale.dp(92, 82, 122), wifi_w - (used - m.content_w))
+    end
+    local account_text=tostring(self.opts.account_name or "")
+    if account_text=="" then account_text="未登录" end
+    local wifi_text=tostring(self.opts.wifi_text or "")
+    if wifi_text=="" then wifi_text="Wi-Fi" end
+    local sync_text=tostring(self.opts.sync_text or "已同步")
     local header = HorizontalGroup:new{
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = title_w, h = m.header_h}, TextWidget:new{
             text = self.opts.title or "觅阅",
-            face = face("cfont", 16, 20),
+            face = face("cfont", 16.8, 21),
             bold = true,
         }},
         HorizontalSpan:new{width = gap},
-        tappable(status_w, m.header_h, Ui.textbox(tostring(self.opts.status_line or ""),
-            status_w, m.header_h, face("smallinfofont", 10, 14), {
-                bold = true, alignment = "right", halign = "right", fgcolor = Blitbuffer.COLOR_BLACK,
-            }), self.opts.on_quick_panel),
-        HorizontalSpan:new{width = gap},
-        tappable(account_w, m.header_h, Ui.textbox(tostring(self.opts.account_name or "账户"),
-            account_w, m.header_h, face("smallinfofont", 10, 14), {
-                bold = true, alignment = "right", halign = "right", fgcolor = Blitbuffer.COLOR_BLACK,
+        tappable(account_w, m.header_h, Ui.textbox(account_text,
+            account_w, m.header_h, face("smallinfofont", 10.8, 14.8), {
+                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+                height_overflow_show_ellipsis = true,
             }), self.opts.on_account),
         HorizontalSpan:new{width = gap},
-        tappable(menu_w, math.max(UiScale.dp(34, 32, 44), m.header_h - UiScale.dp(4, 3, 8)),
-            Ui.icon("more", menu_w, math.max(UiScale.dp(34, 32, 44), m.header_h - UiScale.dp(4, 3, 8)),
-                UiScale.dp(22, 19, 30), {face = UiScale.iconFace("cfont", 16, 22, 13)}), function()
-            logger.info("[MiuRead][Home] quick panel tapped")
-            if self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel()
-            elseif self.opts and self.opts.on_menu then self.opts.on_menu() end
+        tappable(wifi_w, m.header_h, LeftContainer:new{
+            dimen=Geom:new{w=wifi_w,h=m.header_h},
+            HorizontalGroup:new{
+                align="center",
+                Ui.icon("wifi",UiScale.dp(22,19,29),m.header_h,UiScale.dp(18,16,24),{icon_key="wifi"}),
+                HorizontalSpan:new{width=UiScale.dp(2,2,4)},
+                Ui.textbox(wifi_text,math.max(1,wifi_w-UiScale.dp(24,21,33)),m.header_h,
+                    face("smallinfofont",10.5,14.5),{
+                        bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
+                        height_overflow_show_ellipsis=true,
+                    }),
+            },
+        }, self.opts.on_quick_panel),
+        HorizontalSpan:new{width = gap},
+        tappable(sync_w, m.header_h, LeftContainer:new{
+            dimen=Geom:new{w=sync_w,h=m.header_h},
+            HorizontalGroup:new{
+                align="center",
+                Ui.icon("sync",UiScale.dp(20,18,27),m.header_h,UiScale.dp(16,14,21),{icon_key="sync"}),
+                HorizontalSpan:new{width=UiScale.dp(2,1,3)},
+                Ui.textbox(sync_text,math.max(1,sync_w-UiScale.dp(22,19,30)),m.header_h,
+                    face("smallinfofont",10.1,14),{
+                        bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
+                        height_overflow_show_ellipsis=true,
+                    }),
+            },
+        }, self.opts.on_quick_panel),
+        HorizontalSpan:new{width = gap},
+        Ui.textbox(tostring(self.opts.time_text or "--:--"),time_w,m.header_h,
+            face("smallinfofont",10.6,14.6),{
+                bold=true,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
+            }),
+        HorizontalSpan:new{width = gap},
+        CenterContainer:new{
+            dimen=Geom:new{w=battery_w,h=m.header_h},
+            HorizontalGroup:new{
+                align="center",
+                Ui.icon("battery",UiScale.dp(22,19,29),m.header_h,UiScale.dp(17,15,22),{icon_key="battery"}),
+                HorizontalSpan:new{width=UiScale.dp(2,1,3)},
+                Ui.textbox(tostring(self.opts.battery_text or "--%"),math.max(1,battery_w-UiScale.dp(24,21,33)),m.header_h,
+                    face("smallinfofont",10.6,14.6),{
+                        bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
+                    }),
+            },
+        },
+        HorizontalSpan:new{width = gap},
+        tappable(menu_w, m.header_h,
+            fixed_frame(menu_w, m.header_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
+                Ui.text("更多", menu_w, m.header_h, face("smallinfofont", 10.8, 14.8), {bold = true})), function()
+            logger.info("[MiuRead][Home] more menu tapped")
+            if self.opts and self.opts.on_menu then self.opts.on_menu()
+            elseif self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel() end
         end),
     }
     self:_add(children, m.margin, m.margin, header)
@@ -1056,6 +1203,9 @@ function HomeWidget:update(opts, refresh_kind)
     elseif refresh_kind == "header" and self.header_dimen then previous_region = self.header_dimen:copy()
     elseif refresh_kind == "content" and self.content_dimen then previous_region = self.content_dimen:copy() end
     self.opts = opts or self.opts or {}
+    if type(self.opts.on_interaction)=="function" then
+        self._miu_resume_interaction_callback=self.opts.on_interaction
+    end
     self:_rebuild()
     self:_mark_dirty(refresh_kind or "full", previous_region)
     return self
@@ -1179,35 +1329,75 @@ function HomeWidget:_close_rotation_transients()
     end
 end
 
+function HomeWidget:_capture_pending_dimensions()
+    self._pending_screen_w=Screen:getWidth()
+    self._pending_screen_h=Screen:getHeight()
+    self._pending_rotation=Screen.getRotationMode and Screen:getRotationMode() or nil
+    self._pending_dimension_refresh=true
+    return true
+end
+
+function HomeWidget:_commit_pending_dimensions(force_rebuild)
+    local sw,sh=Screen:getWidth(),Screen:getHeight()
+    local rotation=Screen.getRotationMode and Screen:getRotationMode() or nil
+    self._pending_screen_w,self._pending_screen_h=sw,sh
+    self._pending_rotation=rotation
+    local changed=force_rebuild==true or sw~=self._last_screen_w or sh~=self._last_screen_h
+        or rotation~=self._last_rotation
+    self._pending_dimension_refresh=false
+    if not changed then return false end
+    self:_close_rotation_transients()
+    self:_clear_inactive_section_cache()
+    self:_rebuild()
+    return true
+end
+
 function HomeWidget:_schedule_dimension_refresh()
     self._dimension_refresh_generation = (tonumber(self._dimension_refresh_generation) or 0) + 1
     local generation = self._dimension_refresh_generation
-    if self._dimension_refresh_task then UIManager:unschedule(self._dimension_refresh_task) end
-    self:_close_rotation_transients()
-    local last_w, last_h, stable, attempts = nil, nil, 0, 0
-    -- Rotation and the final framebuffer size may arrive as separate events.
-    -- Keep only the newest settle task and rebuild once after the size is stable.
+    if self._dimension_refresh_task then
+        UIManager:unschedule(self._dimension_refresh_task)
+        self._dimension_refresh_task=nil
+    end
+    self:_capture_pending_dimensions()
+
+    -- Parked Home and the lock-screen path must stay completely passive. The
+    -- latest geometry is applied once, immediately before Home becomes active.
+    if self._miu_input_suspended==true or self._miu_device_suspended==true then
+        return true
+    end
+
+    local last_w,last_h,last_rotation,stable,attempts=nil,nil,nil,0,0
     local task
     task=function()
         if self._miu_closed or self._dimension_refresh_task~=task
             or generation ~= self._dimension_refresh_generation then return end
-        attempts = attempts + 1
-        local sw, sh = Screen:getWidth(), Screen:getHeight()
-        local rotation=Screen.getRotationMode and Screen:getRotationMode() or nil
-        if sw == last_w and sh == last_h then stable = stable + 1
-        else last_w, last_h, stable = sw, sh, 0 end
-        if stable >= 1 or attempts >= 8 then
+        if self._miu_input_suspended==true or self._miu_device_suspended==true then
             self._dimension_refresh_task=nil
-            if sw == self._last_screen_w and sh == self._last_screen_h and rotation==self._last_rotation then return end
-            self:_clear_inactive_section_cache()
-            self:_rebuild()
-            UIManager:setDirty(self, "full")
+            self:_capture_pending_dimensions()
             return
         end
-        UIManager:scheduleIn(.08, task)
+        attempts=attempts+1
+        local sw,sh=Screen:getWidth(),Screen:getHeight()
+        local rotation=Screen.getRotationMode and Screen:getRotationMode() or nil
+        if sw==last_w and sh==last_h and rotation==last_rotation then
+            stable=stable+1
+        else
+            last_w,last_h,last_rotation,stable=sw,sh,rotation,0
+        end
+        if stable<2 and attempts<8 then
+            UIManager:scheduleIn(.12,task)
+            return
+        end
+        self._dimension_refresh_task=nil
+        local changed=self:_commit_pending_dimensions(false)
+        if changed then UIManager:setDirty(self,"full") end
+        logger.info("[MiuRead][Rotation] home committed",
+            "samples=",tostring(attempts),"changed=",tostring(changed),
+            "size=",tostring(sw).."x"..tostring(sh),"rotation=",tostring(rotation))
     end
     self._dimension_refresh_task=task
-    UIManager:scheduleIn(.06, task)
+    UIManager:scheduleIn(.30,task)
     return true
 end
 function HomeWidget:onScreenResize() return self:_schedule_dimension_refresh() end
@@ -1270,10 +1460,31 @@ function HomeView.park()
     live_widget._miu_resume_waiting_interaction=false
     return true
 end
-function HomeView.unpark(skip_dirty)
+function HomeView.suspend()
     if not HomeView.is_shown() then return false end
+    live_widget._miu_device_suspended=true
+    live_widget._dimension_refresh_generation=(tonumber(live_widget._dimension_refresh_generation) or 0)+1
+    if live_widget._dimension_refresh_task then
+        UIManager:unschedule(live_widget._dimension_refresh_task)
+        live_widget._dimension_refresh_task=nil
+    end
+    live_widget:_capture_pending_dimensions()
+    return true
+end
+function HomeView.unpark(skip_dirty,opts)
+    if not HomeView.is_shown() then return false end
+    opts=type(opts)=="table" and opts or {}
+    live_widget._miu_device_suspended=false
+    local rebuilt=live_widget:_commit_pending_dimensions(false)
     live_widget._miu_input_suspended=false
-    if skip_dirty~=true then UIManager:setDirty(live_widget,"ui") end
+    if type(opts.on_interaction)=="function" then
+        live_widget._miu_resume_interaction_callback=opts.on_interaction
+        live_widget._miu_resume_waiting_interaction=true
+        live_widget._miu_last_interaction_at=0
+    end
+    if live_widget._metrics_cache then live_widget:_register_top_swipe(live_widget._metrics_cache) end
+    if skip_dirty~=true then UIManager:setDirty(live_widget,rebuilt and "full" or "ui")
+    elseif rebuilt then UIManager:setDirty(live_widget,"full") end
     return true
 end
 -- FileManager is recreated after ReaderUI closes so KOReader's docless
@@ -1311,17 +1522,19 @@ end
 function HomeView.resume(opts)
     if not HomeView.is_shown() then return false end
     opts=opts or {}
+    live_widget._miu_device_suspended=false
+    local rebuilt=live_widget:_commit_pending_dimensions(opts.rebuild_visual==true)
     live_widget._miu_input_suspended=false
     live_widget._miu_resume_interaction_callback=opts.on_interaction
     live_widget._miu_resume_waiting_interaction=true
     live_widget._miu_last_interaction_at=0
     if live_widget._metrics_cache then live_widget:_register_top_swipe(live_widget._metrics_cache) end
-    HomeView.raise(true)
-    -- Do not call update() or _rebuild() here.  Repaint the existing surface so
-    -- wake-up work is bounded and every current TapBox remains attached.
-    UIManager:setDirty(live_widget,"full")
+    -- Resume never reorders UIManager._window_stack. If the long-sleep visual
+    -- geometry is stale, rebuild this existing widget in place and repaint it.
+    UIManager:setDirty(live_widget,rebuilt and "full" or "ui")
     return true
 end
+
 function HomeView.close(full_refresh)
     HomeView.prune_duplicates()
     if live_widget and not live_widget._miu_closed then UIManager:close(live_widget) end
@@ -1364,6 +1577,8 @@ function HomeView.show(opts, refresh_kind)
     end
     home_generation = home_generation + 1
     widget._miu_home_generation = home_generation
+    widget._miu_resume_interaction_callback=opts.on_interaction
+    widget._miu_resume_waiting_interaction=false
     live_widget = widget
     UIManager:show(widget, "ui", widget.dimen)
     HomeView.prune_duplicates()

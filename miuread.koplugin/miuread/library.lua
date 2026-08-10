@@ -13,6 +13,15 @@ local COVER_EXTENSIONS={
     [".svg"]=true,
 }
 
+local function cover_download_url(url)
+    url=tostring(url or "")
+    if url=="" then return url end
+    -- WeRead CDN cover URLs encode image size in the /tN_ token. t9 keeps a
+    -- noticeably cleaner source for e-ink downscaling without downloading
+    -- full-resolution artwork. Non-WeRead URLs are left untouched.
+    return url:gsub("/t%d+_", "/t9_")
+end
+
 local function truthy(value)
     if value==true then return true end
     if tonumber(value)==1 then return true end
@@ -104,6 +113,8 @@ local function book(row,raw_index,archive_map)
         category=b.category or row.category,
         description=b.intro or b.description or b.summary or row.intro or row.description or row.summary,
         publisher=b.publisher or row.publisher,
+        version=tonumber(b.version or b.bookVersion or b.book_version
+            or row.version or row.bookVersion or row.book_version),
         updateTime=tonumber(row.updateTime or b.updateTime or row.bookUpdateTime or 0) or 0,
         progress=tonumber(row.progress or row.readingProgress or b.progress or 0) or 0,
         finished=(row.finished==true or tonumber(row.progress or row.readingProgress or 0)>=100),
@@ -570,7 +581,8 @@ function Library:cache_cover(b,options)
         if cached then return cached end
         if removed and persist_index then self.store:set("cover_index",index) end
     end
-    local data=self.http:download(b.cover,{
+    local download_url=cover_download_url(b.cover)
+    local data=self.http:download(download_url,{
         auth=false,
         retries=options.retries==nil and 1 or options.retries,
         timeout=options.timeout or {8,15},
@@ -587,6 +599,8 @@ function Library:cache_cover(b,options)
     end
 
     local base=self.store.covers_dir.."/"..U.id_name(b.bookId)
+    local suffix=tostring(options.cache_suffix or ""):gsub("[^%w_%-]","")
+    if suffix~="" then base=base.."-"..suffix end
     local path=base..ext
     local written,write_error=U.atomic_write(path,data,true)
     if not written then error("cover write failed: "..tostring(write_error or "unknown")) end

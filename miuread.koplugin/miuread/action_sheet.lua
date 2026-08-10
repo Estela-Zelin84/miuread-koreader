@@ -1,7 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
-local Device = require("device")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -9,7 +8,6 @@ local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
-local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
@@ -19,11 +17,11 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local TransientGuard = require("miuread.transient_guard")
 local UiScale = require("miuread.ui_scale")
 
-local Screen = Device.screen
 local live_sheet
-local MAX_PRIMARY_ACTIONS = 6
+local MAX_PRIMARY_ACTIONS = 10
 
 local function clock_ms()
     return math.floor((os.clock() or 0) * 1000 + .5)
@@ -61,6 +59,30 @@ local function fixed_frame(width, height, options, content)
     }
 end
 
+-- Clean chat-bubble pointer. It uses the same black outline and white fill as
+-- the panel and overlaps the panel border slightly so the tail reads as one
+-- shape with the panel. The pointer is only created for anchored sheets.
+local BubblePointer = Widget:extend{width = 20, height = 10, direction = "up"}
+function BubblePointer:getSize() return Geom:new{w = self.width, h = self.height} end
+function BubblePointer:paintTo(bb, x, y)
+    if not bb or type(bb.paintRect) ~= "function" then return end
+    local w = math.max(9, math.floor(tonumber(self.width) or 20))
+    local h = math.max(5, math.min(18, math.floor(tonumber(self.height) or 10)))
+    local t = math.max(1, UiScale.line("thin"))
+    local denom = math.max(1, h - 1)
+    for row = 0, h - 1 do
+        local step = self.direction == "down" and (h - 1 - row) or row
+        local span = math.max(1, math.floor(1 + (w - 1) * step / denom))
+        if span % 2 == 0 then span = span + 1 end
+        span = math.min(w, span)
+        local sx = x + math.floor((w - span) / 2)
+        bb:paintRect(sx, y + row, span, 1, Blitbuffer.COLOR_BLACK)
+        if span > t * 2 + 1 then
+            bb:paintRect(sx + t, y + row, span - t * 2, 1, Blitbuffer.COLOR_WHITE)
+        end
+    end
+end
+
 local TapBox = InputContainer:extend{dimen = nil, callback = nil}
 function TapBox:init()
     self.dimen = self.dimen or Geom:new{w = 1, h = 1}
@@ -82,75 +104,10 @@ local function tappable(width, height, child, callback)
     return tap
 end
 
--- A very small, fixed-cost accent. It suggests a pencil-drawn frame without
--- tracing every edge or doing any unbounded work on the UI thread.
-local PencilAccent = Widget:extend{width = 1, height = 1, seed = 1, danger = false}
-function PencilAccent:getSize() return Geom:new{w = self.width, h = self.height} end
-function PencilAccent:paintTo(bb, x, y)
-    if not bb or type(bb.paintRect) ~= "function" then return end
-    local t = math.max(1, UiScale.line("thin"))
-    local inset = UiScale.dp(5, 4, 8)
-    local short = math.max(UiScale.dp(10, 8, 15), math.floor(self.width * .10))
-    local color = self.danger and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY
-    local shift = (tonumber(self.seed) or 1) % 2
-    -- Six paint calls total, regardless of card dimensions.
-    bb:paintRect(x + inset + shift, y + 1, short, t, color)
-    bb:paintRect(x + 1, y + inset + shift, t, short, color)
-    bb:paintRect(x + self.width - inset - short - shift, y + self.height - t - 1, short, t, color)
-    bb:paintRect(x + self.width - t - 1, y + self.height - inset - short - shift, t, short, color)
-    bb:paintRect(x + inset + short + UiScale.dp(3, 2, 5), y + 2, UiScale.dp(5, 4, 8), t, color)
-    bb:paintRect(x + self.width - inset - short - UiScale.dp(8, 6, 12), y + self.height - t - 2, UiScale.dp(5, 4, 8), t, color)
-end
-
-local function light_card(width, height, options, content)
-    options = options or {}
-    local layers = OverlapGroup:new{
-        dimen = Geom:new{w = width, h = height},
-        allow_mirroring = false,
-    }
-    layers[#layers + 1] = fixed_frame(width, height, {
-        bordersize = UiScale.line("thin"),
-        padding = options.padding or 0,
-        radius = UiScale.radius(7, 5, 11),
-        background = Blitbuffer.COLOR_WHITE,
-        color = options.danger and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-    }, content)
-    layers[#layers + 1] = PencilAccent:new{
-        width = width,
-        height = height,
-        seed = options.seed or 1,
-        danger = options.danger == true,
-    }
-    return layers
-end
-
--- Filled pointer with an open base. It overlaps the panel border by two pixels,
--- covering the seam so the tail and bubble read as one shape. The row count is
--- bounded by pointer height (normally 9-16 rows).
-local BubblePointer = Widget:extend{width = 20, height = 10, direction = "up", overlap = 2}
-function BubblePointer:getSize() return Geom:new{w = self.width, h = self.height} end
-function BubblePointer:paintTo(bb, x, y)
-    if not bb or type(bb.paintRect) ~= "function" then return end
-    local w = math.max(7, math.floor(self.width or 20))
-    local h = math.max(5, math.min(20, math.floor(self.height or 10)))
-    local t = math.max(1, UiScale.line("thin"))
-    local denom = math.max(1, h - 1)
-    for row = 0, h - 1 do
-        local step = self.direction == "down" and (h - 1 - row) or row
-        local span = math.max(1, math.floor(1 + (w - 1) * step / denom))
-        if span % 2 == 0 then span = span + 1 end
-        span = math.min(w, span)
-        local sx = x + math.floor((w - span) / 2)
-        bb:paintRect(sx, y + row, span, 1, Blitbuffer.COLOR_BLACK)
-        if span > t * 2 + 1 then
-            bb:paintRect(sx + t, y + row, span - t * 2, 1, Blitbuffer.COLOR_WHITE)
-        end
-    end
-end
-
 local SheetWidget = InputContainer:extend{
     name = "miuread_action_sheet",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
     covers_fullscreen = true,
     stop_events_propagation = true,
     opts = nil,
@@ -230,11 +187,11 @@ function SheetWidget:_card(action, width, height, seed)
         }}
     end
 
-    local card = light_card(width, height, {
-        padding = pad,
-        danger = action.danger == true,
-        seed = seed,
-    }, content)
+    local card=fixed_frame(width,height,{
+        bordersize=UiScale.line("thin"),padding=pad,
+        radius=UiScale.radius(7,5,11),background=Blitbuffer.COLOR_WHITE,
+        color=action.danger and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+    },content)
     return tappable(width, height, card, function()
         if not enabled then return end
         self:_close(action.callback)
@@ -244,28 +201,14 @@ end
 function SheetWidget:_footer(action, width, height)
     if type(action) ~= "table" then return nil end
     local enabled = action.enabled ~= false
-    local layers = OverlapGroup:new{
+    local content = CenterContainer:new{
         dimen = Geom:new{w = width, h = height},
-        allow_mirroring = false,
-    }
-    layers[#layers + 1] = OffsetContainer:new{
-        x_off = 0,
-        y_off = 0,
-        LineWidget:new{
-            background = Blitbuffer.COLOR_GRAY,
-            dimen = Geom:new{w = width, h = math.max(1, UiScale.line("thin"))},
+        TextWidget:new{
+            text = tostring(action.label or action.text or "更多操作"),
+            face = UiScale.face("cfont", 9.8, 13.8, 8.4),
+            bold = true,
+            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
         },
-    }
-    layers[#layers + 1] = TextBoxWidget:new{
-        text = tostring(action.label or action.text or "更多操作  ›"),
-        face = UiScale.face("cfont", 9.8, 13.8, 8.4),
-        bold = true,
-        width = width,
-        height = height,
-        height_adjust = false,
-        height_overflow_show_ellipsis = true,
-        alignment = "center",
-        fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
     }
     local tap = TapBox:new{
         dimen = Geom:new{w = width, h = height},
@@ -273,8 +216,46 @@ function SheetWidget:_footer(action, width, height)
             if enabled then self:_close(action.callback) end
         end,
     }
-    tap[1] = layers
+    tap[1] = content
     return tap
+end
+
+function SheetWidget:_footer_group(actions, width, height)
+    actions = type(actions) == "table" and actions or {}
+    local visible = {}
+    for _, action in ipairs(actions) do
+        if type(action) == "table" and action.hidden ~= true then
+            visible[#visible + 1] = action
+            if #visible >= 4 then break end
+        end
+    end
+    if #visible == 0 then return nil end
+    local gap = UiScale.dp(4, 3, 6)
+    local cell_w = math.floor((width - gap * (#visible - 1)) / #visible)
+    local row = HorizontalGroup:new{align = "center"}
+    for index, action in ipairs(visible) do
+        local enabled = action.enabled ~= false
+        local label = tostring(action.label or action.text or "更多")
+        local content = CenterContainer:new{
+            dimen = Geom:new{w = cell_w, h = height},
+            TextWidget:new{
+                text = label,
+                face = UiScale.face("cfont", 9.3, 13.3, 8.2),
+                bold = true,
+                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+            },
+        }
+        local tap = TapBox:new{
+            dimen = Geom:new{w = cell_w, h = height},
+            callback = function()
+                if enabled then self:_close(action.callback) end
+            end,
+        }
+        tap[1] = content
+        row[#row + 1] = tap
+        if index < #visible then row[#row + 1] = HorizontalSpan:new{width = gap} end
+    end
+    return CenterContainer:new{dimen=Geom:new{w=width,h=height},row}
 end
 
 local function normalized_anchor(anchor)
@@ -300,9 +281,6 @@ function SheetWidget:_build()
     local outer_margin = UiScale.dp(10, 8, 18)
     local pad = UiScale.dp(10, 8, 15)
     local gap = UiScale.dp(8, 6, 12)
-    local pointer_h = UiScale.dp(11, 9, 16)
-    local pointer_w = UiScale.dp(24, 20, 34)
-    local pointer_overlap = math.max(1, UiScale.line("thick"))
     local count = #actions
     local ratio
     if self.opts.width_ratio then
@@ -323,21 +301,32 @@ function SheetWidget:_build()
     local has_subtitle = tostring(self.opts.subtitle or "") ~= ""
     local title_h = has_title and UiScale.dp(has_subtitle and 32 or 29, has_subtitle and 29 or 26, has_subtitle and 44 or 39) or 0
     local subtitle_h = has_subtitle and UiScale.dp(21, 19, 29) or 0
-    local card_h = UiScale.dp(58, 53, 79)
+    local requested_columns=math.max(1,math.min(3,math.floor(tonumber(self.opts.columns) or 0)))
+    local card_h = requested_columns==3 and UiScale.dp(64,58,84) or UiScale.dp(58,53,79)
     local footer_action = type(self.opts.footer_action) == "table" and self.opts.footer_action or nil
-    local footer_h = footer_action and UiScale.dp(39, 35, 52) or 0
+    local footer_actions = type(self.opts.footer_actions) == "table" and self.opts.footer_actions or nil
+    local has_footer_actions = footer_actions and #footer_actions > 0
+    local footer_h = (footer_action or has_footer_actions) and UiScale.dp(39, 35, 52) or 0
+    local footer_gap_h = footer_h > 0 and UiScale.dp(8, 7, 12) or 0
     local show_close = self.opts.show_close == true
     if show_close and count < MAX_PRIMARY_ACTIONS then
         actions[#actions + 1] = {icon = "×", label = tostring(self.opts.close_label or "关闭"), close_only = true}
         count = #actions
     end
-    local columns = count <= 1 and 1 or 2
-    local rows = math.max(1, math.ceil(count / columns))
-    local card_w = columns == 1 and inner_w or math.floor((inner_w - gap) / 2)
+    local columns
+    if tonumber(self.opts.columns) then
+        columns=math.max(1,math.min(3,math.floor(tonumber(self.opts.columns))))
+        columns=math.min(columns,math.max(1,count))
+    else
+        columns=count<=1 and 1 or 2
+    end
+    local wide_last = self.opts.wide_last == true and columns == 2 and count % 2 == 1
+    local rows = count > 0 and math.ceil(count / columns) or 0
+    local card_w = columns == 1 and inner_w or math.floor((inner_w - gap * (columns - 1)) / columns)
     local header_h = title_h + subtitle_h
     local content_h = header_h + (header_h > 0 and count > 0 and gap or 0)
         + rows * card_h + math.max(0, rows - 1) * gap
-        + (footer_h > 0 and (gap + footer_h) or 0)
+        + (footer_h > 0 and ((header_h > 0 or rows > 0) and footer_gap_h or 0) + footer_h or 0)
     local panel_h = pad * 2 + content_h
     local max_h = math.floor(sh * (metrics.portrait and .66 or .82))
     panel_h = math.min(max_h, panel_h)
@@ -373,22 +362,32 @@ function SheetWidget:_build()
     local index = 1
     for row = 1, rows do
         local row_group = HorizontalGroup:new{align = "center"}
-        for col = 1, columns do
+        if wide_last and row == rows then
             local action = actions[index]
-            if action then
-                row_group[#row_group + 1] = self:_card(action, card_w, card_h, index * 3 + row)
-            else
-                row_group[#row_group + 1] = Widget:new{dimen = Geom:new{w = card_w, h = card_h}}
-            end
-            if col < columns then row_group[#row_group + 1] = HorizontalSpan:new{width = gap} end
+            if action then row_group[#row_group + 1] = self:_card(action, inner_w, card_h, index * 3 + row) end
             index = index + 1
+        else
+            for col = 1, columns do
+                local action = actions[index]
+                if action then
+                    row_group[#row_group + 1] = self:_card(action, card_w, card_h, index * 3 + row)
+                else
+                    row_group[#row_group + 1] = Widget:new{dimen = Geom:new{w = card_w, h = card_h}}
+                end
+                if col < columns then row_group[#row_group + 1] = HorizontalSpan:new{width = gap} end
+                index = index + 1
+            end
         end
         list[#list + 1] = row_group
         if row < rows then list[#list + 1] = VerticalSpan:new{height = gap} end
     end
     if footer_h > 0 then
-        list[#list + 1] = VerticalSpan:new{height = gap}
-        list[#list + 1] = self:_footer(footer_action, inner_w, footer_h)
+        list[#list + 1] = VerticalSpan:new{height = footer_gap_h}
+        if has_footer_actions then
+            list[#list + 1] = self:_footer_group(footer_actions, inner_w, footer_h)
+        else
+            list[#list + 1] = self:_footer(footer_action, inner_w, footer_h)
+        end
     end
 
     local panel = fixed_frame(panel_w, panel_h, {
@@ -402,6 +401,9 @@ function SheetWidget:_build()
     local anchor = normalized_anchor(self.opts.anchor)
     local x = math.floor((sw - panel_w) / 2)
     local y = math.floor((sh - panel_h) / 2)
+    local pointer_w = UiScale.dp(22, 18, 30)
+    local pointer_h = UiScale.dp(10, 8, 14)
+    local pointer_overlap = math.max(1, UiScale.line("thin") + 1)
     local pointer_direction, pointer_x, pointer_y
     if anchor then
         local center_x = anchor.x + anchor.w / 2
@@ -410,9 +412,10 @@ function SheetWidget:_build()
         local below_space = sh - outer_margin - below_y
         local above_space = anchor.y - outer_margin
         local prefer = tostring(self.opts.preferred_direction or "")
-        local place_below = (prefer ~= "above" and below_space >= panel_h + pointer_h - pointer_overlap)
-            or (above_space < panel_h + pointer_h and below_space >= panel_h + pointer_h - pointer_overlap)
-        local place_above = not place_below and above_space >= panel_h + pointer_h - pointer_overlap
+        local need = panel_h + pointer_h - pointer_overlap
+        local place_below = (prefer ~= "above" and below_space >= need)
+            or (above_space < need and below_space >= need)
+        local place_above = not place_below and above_space >= need
         if place_below then
             pointer_direction = "up"
             pointer_y = below_y
@@ -450,7 +453,7 @@ function SheetWidget:_build()
         layers[#layers + 1] = OffsetContainer:new{
             x_off = pointer_x,
             y_off = pointer_y,
-            BubblePointer:new{width = pointer_w, height = pointer_h, direction = pointer_direction, overlap = pointer_overlap},
+            BubblePointer:new{width = pointer_w, height = pointer_h, direction = pointer_direction},
         }
     end
     self[1] = layers
@@ -483,8 +486,19 @@ function SheetWidget:onScreenResize() return self:_close() end
 function SheetWidget:onRotation() return self:_close() end
 function SheetWidget:onShow()
     UIManager:setDirty(self, function() return "ui", self.bubble_dimen or self.panel_dimen end)
+    local delay=tonumber(self.opts and self.opts.auto_close)
+    if delay and delay>0 then
+        self._auto_close_callback=function()
+            if not self._closed then self:_close() end
+        end
+        UIManager:scheduleIn(delay,self._auto_close_callback)
+    end
 end
 function SheetWidget:onCloseWidget()
+    if self._auto_close_callback then
+        pcall(UIManager.unschedule,UIManager,self._auto_close_callback)
+        self._auto_close_callback=nil
+    end
     local region = self.bubble_dimen and self.bubble_dimen:copy() or (self.panel_dimen and self.panel_dimen:copy() or nil)
     local action = self.pending_action
     self.pending_action = nil
@@ -523,27 +537,52 @@ local function show_fallback(opts, reason)
             end,
         }}
     end
-    local footer = type(opts.footer_action) == "table" and opts.footer_action or nil
-    if footer then
-        buttons[#buttons + 1] = {{
-            text = tostring(footer.label or footer.text or "更多操作"),
-            enabled = footer.enabled ~= false,
-            callback = function()
-                UIManager:close(dialog)
-                if footer.enabled ~= false and footer.callback then
-                    UIManager:scheduleIn(.04, function()
-                        local ok, err = pcall(footer.callback)
-                        if not ok then logger.warn("[MiuRead][ActionSheet] fallback footer failed", tostring(err)) end
-                    end)
-                end
-            end,
-        }}
+    local footer_actions = type(opts.footer_actions) == "table" and opts.footer_actions or nil
+    if footer_actions and #footer_actions > 0 then
+        local row = {}
+        for _, footer in ipairs(footer_actions) do
+            if type(footer) == "table" and footer.hidden ~= true and #row < 3 then
+                row[#row + 1] = {
+                    text = tostring(footer.label or footer.text or "更多"),
+                    enabled = footer.enabled ~= false,
+                    callback = function()
+                        UIManager:close(dialog)
+                        if footer.enabled ~= false and footer.callback then
+                            UIManager:scheduleIn(.04, function()
+                                local ok, err = pcall(footer.callback)
+                                if not ok then logger.warn("[MiuRead][ActionSheet] fallback footer failed", tostring(err)) end
+                            end)
+                        end
+                    end,
+                }
+            end
+        end
+        if #row > 0 then buttons[#buttons + 1] = row end
+    else
+        local footer = type(opts.footer_action) == "table" and opts.footer_action or nil
+        if footer then
+            buttons[#buttons + 1] = {{
+                text = tostring(footer.label or footer.text or "更多操作"),
+                enabled = footer.enabled ~= false,
+                callback = function()
+                    UIManager:close(dialog)
+                    if footer.enabled ~= false and footer.callback then
+                        UIManager:scheduleIn(.04, function()
+                            local ok, err = pcall(footer.callback)
+                            if not ok then logger.warn("[MiuRead][ActionSheet] fallback footer failed", tostring(err)) end
+                        end)
+                    end
+                end,
+            }}
+        end
     end
     buttons[#buttons + 1] = {{text = "关闭", callback = function() UIManager:close(dialog) end}}
     local title = tostring(opts.title or "操作")
     local subtitle = tostring(opts.subtitle or "")
     if subtitle ~= "" then title = title .. "\n\n" .. subtitle end
     dialog = ButtonDialog:new{title = title, title_align = "left", buttons = buttons}
+    dialog._miuread_transient = true
+    dialog._miuread_modal_surface = true
     logger.warn("[MiuRead][ActionSheet] using fallback", tostring(reason or "unknown"))
     UIManager:show(dialog)
     return dialog
@@ -554,19 +593,24 @@ function ActionSheet.close()
     if live_sheet and not live_sheet._closed then live_sheet:_close() end
     live_sheet = nil
 end
+function ActionSheet.invalidate(_)
+    -- Closed widgets are intentionally never cached or reused.
+    return true
+end
 function ActionSheet.show(opts)
+    TransientGuard.close_all()
     ActionSheet.close()
     opts = opts or {}
     local ok, sheet = pcall(SheetWidget.new, SheetWidget, {opts = opts})
-    if not ok or not sheet then
-        return show_fallback(opts, sheet)
-    end
+    if not ok or not sheet then return show_fallback(opts, sheet) end
     live_sheet = sheet
     local shown, show_err = pcall(UIManager.show, UIManager, sheet, "ui", sheet.bubble_dimen or sheet.panel_dimen)
     if not shown then
         live_sheet = nil
         return show_fallback(opts, show_err)
     end
+    local cache_key=tostring(opts.cache_key or "")
+    if cache_key~="" then logger.info("[MiuRead][ActionSheet] fresh", "key=", cache_key) end
     return sheet
 end
 return ActionSheet
