@@ -396,6 +396,8 @@ function Plugin:init()
     self._home_post_reader_protect_until=0
     self._home_modal_cooldown_until=0
     self._home_ui_resume_task=nil
+    self._home_manual_metadata_retry_task=nil
+    self._home_pending_network_metadata_key=nil
     -- Ordinary UI preferences are written into LuaSettings immediately but
     -- their flash flush is coalesced. Critical auth/download/session state
     -- continues to use Store:set() and remains synchronous.
@@ -2738,6 +2740,12 @@ function Plugin:_home_resume_visible_work_after_idle()
         local covers=self._home_visible_cover_targets or {}
         self:_home_schedule_local_metadata(metadata)
         self:_home_schedule_remote_covers(covers)
+        local pending_network_key=self._home_pending_network_metadata_key
+        self._home_pending_network_metadata_key=nil
+        if pending_network_key and self._home_hero
+            and self:_home_network_metadata_key(self._home_hero)==pending_network_key then
+            self:_home_schedule_network_metadata(self._home_hero,false)
+        end
         UIManager:scheduleIn(.85,function()
             if HomeView.is_shown() and not self:_active_reader_ui() and not self:_home_ui_busy() then
                 self:_home_schedule_cover_derivatives(covers)
@@ -2823,6 +2831,8 @@ function Plugin:_home_freeze_for_suspend()
     self:_home_unschedule_task("_home_refresh_task")
     self:_home_unschedule_task("_home_render_refresh_task")
     self:_home_unschedule_task("_home_resume_background_task")
+    self:_home_unschedule_task("_home_manual_metadata_retry_task")
+    self._home_pending_network_metadata_key=nil
     self._home_refresh_debounce_generation=(tonumber(self._home_refresh_debounce_generation) or 0)+1
     self._home_render_refresh_generation=(tonumber(self._home_render_refresh_generation) or 0)+1
     self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
@@ -4181,6 +4191,12 @@ function Plugin:_reader_preferences()
     if reader.show_status~=false then reader.show_status=false; changed=true end
     if reader.show_recent~=false then reader.show_recent=false; changed=true end
     if type(reader.recent_actions)~="table" or #reader.recent_actions>0 then reader.recent_actions={}; changed=true end
+    if reader.edge_guard_enabled==nil then reader.edge_guard_enabled=true; changed=true end
+    local edge_percent=tonumber(reader.edge_guard_percent)
+    if edge_percent~=5 and edge_percent~=10 and edge_percent~=15 and edge_percent~=20 then
+        reader.edge_guard_percent=10
+        changed=true
+    end
 
     local fixed_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}
     local fixed_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true}
@@ -4222,6 +4238,29 @@ function Plugin:_save_reader_preferences(reader,preferences)
     preferences=preferences or self.store:preferences()
     preferences.reader_ui=reader
     self.store:save_preferences(preferences)
+end
+
+function Plugin:_reader_edge_guard_state()
+    local reader=self:_reader_preferences()
+    local percent=tonumber(reader.edge_guard_percent) or 10
+    if percent~=5 and percent~=10 and percent~=15 and percent~=20 then percent=10 end
+    return reader.edge_guard_enabled~=false,percent
+end
+
+function Plugin:_reader_toggle_edge_guard()
+    local reader,preferences=self:_reader_preferences()
+    reader.edge_guard_enabled=reader.edge_guard_enabled==false
+    self:_save_reader_preferences(reader,preferences)
+    return reader.edge_guard_enabled~=false
+end
+
+function Plugin:_reader_set_edge_guard_percent(percent)
+    percent=tonumber(percent)
+    if percent~=5 and percent~=10 and percent~=15 and percent~=20 then return false end
+    local reader,preferences=self:_reader_preferences()
+    reader.edge_guard_percent=percent
+    self:_save_reader_preferences(reader,preferences)
+    return true
 end
 
 function Plugin:reader_quick_panel_settings_menu()
@@ -4278,6 +4317,79 @@ function Plugin:download_reader_policy_menu()
         end}
     end
     return rows
+end
+
+function Plugin:_download_network_mode()
+    return tostring((self.store:preferences() or {}).download_network_mode or "auto")=="ipv4" and "ipv4" or "auto"
+end
+
+function Plugin:_download_network_mode_label()
+    return self:_download_network_mode()=="ipv4" and "IPv4" or "自动"
+end
+
+function Plugin:_set_download_network_mode(mode,quiet)
+    mode=tostring(mode or "auto")=="ipv4" and "ipv4" or "auto"
+    local preferences=self.store:preferences()
+    preferences.download_network_mode=mode
+    self.store:save_preferences(preferences)
+    local active=self.download_task and self.download_task:busy()
+    if active then
+        local ok,err=self.download_task:set_network_mode(mode)
+        if not ok then
+            logger.warn("[MiuRead][Download] active network mode switch unavailable",tostring(err))
+            if quiet~=true then self:toast("设置已保存，将从下一次下载生效",3) end
+            return false
+        end
+    end
+    if quiet~=true then
+        self:toast(mode=="ipv4" and "下载网络已切换为 IPv4" or "下载网络已恢复自动选择",3)
+    end
+    return true
+end
+
+function Plugin:download_network_mode_menu()
+    return {
+        {text="自动（推荐）",radio=true,checked_func=function() return self:_download_network_mode()=="auto" end,callback=function() self:_set_download_network_mode("auto") end},
+        {text="仅 IPv4",radio=true,checked_func=function() return self:_download_network_mode()=="ipv4" end,callback=function() self:_set_download_network_mode("ipv4") end},
+    }
+end
+
+function Plugin:_show_download_ipv4_suggestion(runtime,state)
+    if not runtime or runtime.network_prompted==true then return end
+    runtime.network_prompted=true
+    -- Mark the current task as already prompted before showing the dialog.
+    -- The worker keeps downloading, and a UI transition/restart cannot turn
+    -- the same detection into repeated prompts. Choosing IPv4 below overwrites
+    -- this task-local silent marker immediately.
+    if self.download_task and self.download_task:busy() then
+        self.download_task:dismiss_network_suggestion()
+    end
+    local auto=tonumber(state and state.network_auto_seconds)
+    local ipv4=tonumber(state and state.network_ipv4_seconds)
+    local comparison=""
+    if auto and ipv4 then
+        comparison="\n\n自动线路约 "..string.format("%.1f",auto).." 秒，IPv4 约 "..string.format("%.1f",ipv4).." 秒。"
+    end
+    local dialog
+    dialog=ButtonDialog:new{
+        title="检测到 IPv4 下载更快\n\n当前下载多次响应较慢。觅阅已对同一服务器进行了两组网络对照，两组测试中 IPv4 都明显更快。"..comparison.."\n\n是否切换到 IPv4？",
+        title_align="center",
+        buttons={
+            {{text="切换 IPv4",callback=function()
+                UIManager:close(dialog)
+                local switched=self:_set_download_network_mode("ipv4",true)
+                if switched then
+                    self:status_toast("下载网络","已切换为 IPv4，当前下载从下一次请求开始使用",4)
+                else
+                    self:status_toast("下载网络","IPv4 设置已保存，将从下一次下载生效",4)
+                end
+            end}},
+            {{text="继续当前网络",callback=function()
+                UIManager:close(dialog)
+            end}},
+        },
+    }
+    UIManager:show(dialog)
 end
 
 function Plugin:show_home_layout_dialog()
@@ -5691,7 +5803,9 @@ function Plugin:_home_refresh_one_book_metadata(book,network_too)
         end
     end
     local network_started=false
-    if network_too~=false then network_started=self:_home_schedule_network_metadata(book,true)==true end
+    if network_too~=false then
+        network_started=self:_home_schedule_network_metadata(book,true,false,nil,true)==true
+    end
     if local_changed then self:_refresh_home_view(network_started and "本地信息已更新，正在网络补全" or "书籍信息已更新","content")
     elseif network_started then self:toast("正在从网络补全书籍信息…",2)
     elseif path=="" or not U.file_exists(path) then
@@ -5825,26 +5939,31 @@ function Plugin:_home_refresh_current_network_metadata(book)
     end
 
     self:toast("正在更新这本书的信息和封面…",2)
-    local state={metadata_done=false,metadata_ok=false,cover_done=false,cover_ok=false,finished=false}
+    local state={metadata_done=false,metadata_ok=false,metadata_partial=false,cover_done=false,cover_ok=false,finished=false}
     local function finish()
         if state.finished or not state.metadata_done or not state.cover_done then return end
         state.finished=true
         if state.metadata_ok and state.cover_ok then
-            self:toast("书籍信息和封面已更新",2)
+            self:toast(state.metadata_partial
+                and "封面和书籍信息已刷新，部分资料暂未找到"
+                or "书籍信息和封面已更新",2)
         elseif state.cover_ok then
-            self:toast("封面已更新，网络书籍信息暂未补全",2)
+            self:toast("封面已更新，网络书籍信息更新失败",2)
         elseif state.metadata_ok then
-            self:toast("书籍信息已更新，封面更新失败",2)
+            self:toast(state.metadata_partial
+                and "书籍信息已刷新，部分资料暂未找到；封面更新失败"
+                or "书籍信息已更新，封面更新失败",2)
         else
             self:toast("当前书籍更新失败，请稍后重试",2)
         end
     end
 
-    local metadata_started=self:_home_schedule_network_metadata(book,true,true,function(ok)
+    local metadata_started=self:_home_schedule_network_metadata(book,true,true,function(ok,_,detail)
         state.metadata_done=true
         state.metadata_ok=ok==true
+        state.metadata_partial=type(detail)=="table" and detail.partial==true
         finish()
-    end)==true
+    end,true)==true
     if not metadata_started then state.metadata_done=true end
 
     local cover_started=self:_home_force_refresh_current_cover(book,function(ok)
@@ -6591,6 +6710,8 @@ function Plugin:_home_stop_background(reason)
     self:_flush_home_preferences()
     self._home_resume_generation=(tonumber(self._home_resume_generation) or 0)+1
     self:_home_unschedule_task("_home_resume_background_task")
+    self:_home_unschedule_task("_home_manual_metadata_retry_task")
+    self._home_pending_network_metadata_key=nil
     self._home_resume_barrier=false
     self._home_suspended=false
     self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
@@ -6938,6 +7059,32 @@ local function home_network_patch_has_data(patch)
     return false
 end
 
+local HOME_NETWORK_DETAIL_FIELDS={"description","category","publisher","published_date","isbn"}
+
+local function home_network_patch_field_count(patch)
+    if type(patch)~="table" then return 0 end
+    local count=0
+    for _,key in ipairs({"title","author","description","category","publisher","published_date","language","isbn","pages"}) do
+        if U.trim(tostring(patch[key] or ""))~="" then count=count+1 end
+    end
+    return count
+end
+
+local function home_network_missing_fields(book,patch)
+    book=type(book)=="table" and book or {}
+    patch=type(patch)=="table" and patch or {}
+    local missing={}
+    for _,key in ipairs(HOME_NETWORK_DETAIL_FIELDS) do
+        local value=patch[key]
+        if value==nil or value=="" then value=book[key] end
+        if key=="description" and U.trim(tostring(value or ""))=="" then
+            value=book.intro or book.summary
+        end
+        if U.trim(tostring(value or ""))=="" then missing[#missing+1]=key end
+    end
+    return missing
+end
+
 function Plugin:_home_merge_network_patch(book,patch)
     if type(book)~="table" or type(patch)~="table" then return false end
     local changed=false
@@ -6987,13 +7134,70 @@ function Plugin:_home_save_network_metadata(book,patch,completed)
     return count>0
 end
 
-function Plugin:_home_schedule_network_metadata(book,force,silent,on_done)
-    if self:_home_ui_busy() then
-        self._home_resume_pending_work=self._home_resume_pending_work or {}
-        self._home_resume_pending_work.metadata=true
+function Plugin:_home_queue_manual_network_metadata(book,force,silent,on_done)
+    if self._home_manual_metadata_retry_task then
+        logger.info("[MiuRead][HomeMetadata] manual request already queued",
+            "book=",tostring(book and (book.bookId or book.book_id) or ""))
         return false
     end
-    if type(book)~="table" or not HomeView.is_shown() then return false end
+    local deadline=monotonic_wall_time()+12
+    local task
+    task=function()
+        if self._home_manual_metadata_retry_task~=task then return end
+        if not HomeView.is_shown() or self:_active_reader_ui() then
+            self._home_manual_metadata_retry_task=nil
+            logger.info("[MiuRead][HomeMetadata] manual queue cancelled", "reason=home_hidden")
+            if on_done then on_done(false,nil,{error="home_hidden"}) end
+            return
+        end
+        if not self:is_online() then
+            self._home_manual_metadata_retry_task=nil
+            logger.info("[MiuRead][HomeMetadata] manual queue cancelled", "reason=offline")
+            if on_done then on_done(false,nil,{error="offline"}) end
+            return
+        end
+        local blocked=self:_home_background_blocked()
+        local busy=self.home_metadata_async and self.home_metadata_async:busy()
+        if blocked or busy then
+            if monotonic_wall_time()<deadline then
+                UIManager:scheduleIn(.25,task)
+                return
+            end
+            self._home_manual_metadata_retry_task=nil
+            logger.warn("[MiuRead][HomeMetadata] manual queue timed out",
+                "book=",tostring(book and (book.bookId or book.book_id) or ""),
+                "blocked=",tostring(blocked),"busy=",tostring(busy))
+            if on_done then on_done(false,nil,{error="worker_busy_timeout"}) end
+            return
+        end
+        self._home_manual_metadata_retry_task=nil
+        local started=self:_home_schedule_network_metadata(book,force,silent,on_done,true)
+        if not started and on_done then on_done(false,nil,{error="retry_start_failed"}) end
+    end
+    self._home_manual_metadata_retry_task=task
+    UIManager:scheduleIn(.18,task)
+    logger.info("[MiuRead][HomeMetadata] manual request queued",
+        "book=",tostring(book and (book.bookId or book.book_id) or ""))
+    return true
+end
+
+function Plugin:_home_schedule_network_metadata(book,force,silent,on_done,explicit)
+    explicit=explicit==true
+    if type(book)~="table" or not HomeView.is_shown() or self:_active_reader_ui() then return false end
+    if explicit then
+        -- A user-requested metadata refresh must not be rejected by the quiet
+        -- window created by that very tap. It still yields to real lifecycle
+        -- transitions/suspend and stays on the background worker.
+        if self:_home_background_blocked() then
+            return self:_home_queue_manual_network_metadata(book,force,silent,on_done)
+        end
+    elseif self:_home_ui_busy() then
+        self._home_resume_pending_work=self._home_resume_pending_work or {}
+        self._home_resume_pending_work.metadata=true
+        local pending_key=self:_home_network_metadata_key(book)
+        if pending_key~="" then self._home_pending_network_metadata_key=pending_key end
+        return false
+    end
     local home=self:_home_preferences()
     if home.network_metadata==false and force~=true then return false end
     local key=self:_home_network_metadata_key(book)
@@ -7008,10 +7212,18 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done)
         end
         return false
     end
-    if not self:is_online() or not self.home_metadata_async or self.home_metadata_async:busy()
-        or not self.home_metadata_async:available() then return false end
+    if not self:is_online() or not self.home_metadata_async or not self.home_metadata_async:available() then return false end
+    if self.home_metadata_async:busy() then
+        if explicit then return self:_home_queue_manual_network_metadata(book,force,silent,on_done) end
+        return false
+    end
     local candidate=U.copy(book)
     local id=tostring(candidate.bookId or candidate.book_id or "")
+    if self._home_pending_network_metadata_key==key then self._home_pending_network_metadata_key=nil end
+    if explicit then
+        logger.info("[MiuRead][HomeMetadata] manual requested",
+            "book=",id~="" and id or key)
+    end
     local started,err=self.home_metadata_async:run("home-network-metadata",function()
         local patch={}
         if id~="" and not Protocol.is_mp_account(id) then
@@ -7046,10 +7258,12 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done)
         return patch
     end,function(result)
         if not result or result.ok~=true then
-            logger.warn("[MiuRead][Home] network metadata unavailable",tostring(result and result.error or "unknown"))
+            logger.warn("[MiuRead][HomeMetadata] network metadata unavailable",
+                "book=",id~="" and id or key,
+                "error=",tostring(result and result.error or "unknown"))
             if not cached_completed then self:_home_save_network_metadata(candidate,{},false) end
             if force==true and silent~=true then self:toast("网络图书信息更新失败，请稍后重试",2) end
-            if on_done then on_done(false) end
+            if on_done then on_done(false,nil,{error=tostring(result and result.error or "unknown")}) end
             return
         end
         local patch=type(result.value)=="table" and result.value or {}
@@ -7058,18 +7272,44 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done)
             for k,v in pairs(cached.patch) do if v~=nil and v~="" then saved_patch[k]=v end end
         end
         for k,v in pairs(patch) do if v~=nil and v~="" then saved_patch[k]=v end end
-        local completed=home_network_patch_has_data(saved_patch)
-        self:_home_save_network_metadata(candidate,saved_patch,completed)
+        local found=home_network_patch_has_data(saved_patch)
+        self:_home_save_network_metadata(candidate,saved_patch,found)
         if self._home_hero and self:_home_network_metadata_key(self._home_hero)==key then
             local changed=self:_home_merge_network_patch(self._home_hero,patch)
             if changed and HomeView.is_shown() then self:_home_schedule_render_refresh("content") end
         end
+        local missing=home_network_missing_fields(candidate,saved_patch)
+        local detail={
+            partial=found and #missing>0,
+            complete=found and #missing==0,
+            missing=missing,
+            fields=home_network_patch_field_count(saved_patch),
+            source=tostring(saved_patch.metadata_source or patch.metadata_source or "unknown"),
+        }
+        logger.info("[MiuRead][HomeMetadata] completed",
+            "book=",id~="" and id or key,
+            "found=",tostring(found),
+            "fields=",tostring(detail.fields),
+            "source=",detail.source,
+            "missing=",#missing>0 and table.concat(missing,",") or "none")
         if force==true and silent~=true then
-            self:toast(completed and "当前书籍的网络信息已更新" or "暂未找到可补全的网络信息",2)
+            if not found then
+                self:toast("暂未找到可补全的网络信息",2)
+            elseif #missing>0 then
+                self:toast("网络书籍信息已刷新，部分资料暂未找到",2)
+            else
+                self:toast("当前书籍的网络信息已更新",2)
+            end
         end
-        if on_done then on_done(completed,patch) end
+        if on_done then on_done(found,patch,detail) end
     end,35)
-    if not started then logger.warn("[MiuRead][Home] network metadata worker not started",tostring(err)) end
+    if not started then
+        logger.warn("[MiuRead][HomeMetadata] network metadata worker not started",
+            "book=",id~="" and id or key,"error=",tostring(err))
+        if explicit and self.home_metadata_async and self.home_metadata_async:busy() then
+            return self:_home_queue_manual_network_metadata(book,force,silent,on_done)
+        end
+    end
     return started==true
 end
 
@@ -10240,22 +10480,61 @@ function Plugin:show_reader_control_center(initial_category)
     return true
 end
 
+function Plugin:_show_reader_edge_guard_panel(back_callback)
+    ReaderSettingsDialog.show{
+        title="边缘翻页防误触",
+        subtitle="左右边缘点击优先翻页，避免划线评论抢占翻页操作",
+        on_back=back_callback or function() self:show_reader_quick_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        sections=function()
+            local enabled,percent=self:_reader_edge_guard_state()
+            local rows={
+                {label="边缘翻页防误触",value=enabled and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function()
+                    self:_reader_toggle_edge_guard()
+                end},
+            }
+            local range_rows={}
+            for _,value in ipairs({5,10,15,20}) do
+                local selected=value
+                range_rows[#range_rows+1]={
+                    label=tostring(selected).."%",
+                    value=selected==10 and "推荐" or "左右各占屏幕宽度",
+                    value_bold=percent==selected,
+                    checked=percent==selected,
+                    enabled=enabled,
+                    keep_open=true,
+                    callback=function() self:_reader_set_edge_guard_percent(selected) end,
+                }
+            end
+            return {
+                {title="状态",rows=rows},
+                {title="保护范围",rows=range_rows},
+            }
+        end,
+    }
+    return true
+end
+
 function Plugin:_reader_quick_definitions()
+    local edge_enabled=self:_reader_edge_guard_state()
     return {
         toc={key="toc",icon="toc",label="目录",callback=function() self:_show_reader_toc(function() self:show_reader_quick_panel() end) end},
         progress={key="progress",icon="progress",label="进度",callback=function() self:_show_reader_progress_control(function() self:show_reader_quick_panel() end) end},
-        search={key="search",icon="search",label="搜索",callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
-        back={key="back",icon="undo",label="回到阅读处",callback=function() self:_reader_go_back_location() end},
+        search={key="search",icon="search",label="搜索",icon_scale=.94,callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
+        back={key="back",icon="undo",label="回到阅读",icon_scale=.98,callback=function() self:_reader_go_back_location() end},
         font={key="font",icon="font",label="字体",callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end},
         spacing={key="spacing",icon="line-spacing",label="行距",callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end},
         page={key="page",icon="display",label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
-        comments={key="comments",icon="comment",label="评论",active=self:_thoughts_enabled(),callback=function()
+        comments={key="comments",icon="comment",label="评论",icon_scale=1.16,icon_nudge_y=-1,active=self:_thoughts_enabled(),callback=function()
             self:_show_reader_comment_settings(function() self:show_reader_quick_panel() end)
         end,hold_callback=function()
             self:_toggle_thoughts_enabled()
             UIManager:scheduleIn(.05,function() self:show_reader_quick_panel() end)
         end},
-        annotations={key="annotations",icon="highlight",label="批注",callback=function() self:_show_reader_annotation_panel(function() self:show_reader_quick_panel() end) end},
+        annotations={key="annotations",icon="highlight",label="批注",icon_scale=1.28,icon_nudge_y=-2,callback=function() self:_show_reader_annotation_panel(function() self:show_reader_quick_panel() end) end},
+        edge_guard={key="edge_guard",icon=edge_enabled and "edge-guard" or "edge-guard-off",label="防误触",icon_scale=1.02,active=edge_enabled,callback=function()
+            self:_show_reader_edge_guard_panel(function() self:show_reader_quick_panel() end)
+        end},
         sync={key="sync",icon="sync",label="同步",callback=function() self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end},
     }
 end
@@ -10278,6 +10557,7 @@ function Plugin:_reader_quick_panel_options()
         definitions.back,
         definitions.annotations,
         definitions.comments,
+        definitions.edge_guard,
     }
 
     local typeset={
@@ -12314,6 +12594,11 @@ function Plugin:_on_download_progress(runtime,state)
     if self:_download_dialog_is_shown(runtime) then
         runtime.dialog:set_state(state)
     end
+    if state and state.network_ipv4_suggested==true
+        and state.stage~="package" and state.stage~="done" and state.stage~="error"
+        and state.stage~="cancelled" then
+        self:_show_download_ipv4_suggestion(runtime,state)
+    end
     self:_write_download_state("active",self:_active_download_payload(runtime,state),false)
     local home_percent=self:_download_percent(state)
     local home_mark=math.floor(home_percent/10)*10
@@ -13105,6 +13390,7 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
     end
     local prefs=self.store:preferences()
     if opt.images==nil then opt.images=prefs.images end
+    opt.network_mode=tostring(prefs.download_network_mode or "auto")=="ipv4" and "ipv4" or "auto"
     opt.active_document_path=self:_current_document_path()
     local runtime={book=U.copy(b),options=U.copy(opt),last_state={stage="prepare",current=0,total=1,percent=0,chapter=b.title or ""},background=start_in_background==true,dialog=nil,started_at=os.time(),open_after=open_after==true,done=done,notified_milestones={}}
     self._download_runtime=runtime
@@ -15510,7 +15796,9 @@ function Plugin:_toggle_home_network_metadata()
     local home,preferences=self:_home_preferences()
     home.network_metadata=home.network_metadata==false
     self:_save_home_preferences(home,preferences)
-    if home.network_metadata and self._home_hero then self:_home_schedule_network_metadata(self._home_hero,false) end
+    if home.network_metadata and self._home_hero then
+        self:_home_schedule_network_metadata(self._home_hero,true,true,nil,true)
+    end
     self:toast(home.network_metadata and "已开启网络补全图书信息" or "已关闭网络补全图书信息",2)
 end
 
@@ -15924,6 +16212,7 @@ function Plugin:download_settings_menu()
     local policy_label=policy=="allow" and "允许后台下载" or (policy=="after_reading" and "退出阅读后下载" or "每次询问")
     local items={
         {text="阅读时下载策略",post_text=policy_label,sub_item_table_func=function() return self:download_reader_policy_menu() end},
+        {text="下载网络",post_text=self:_download_network_mode_label(),sub_item_table_func=function() return self:download_network_mode_menu() end},
         {text="下载关键进度提示",checked_func=function() return self.store:preferences().download_notice_enabled~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_notice_enabled") end},
         {text="下载完成提醒",checked_func=function() return self.store:preferences().download_complete_notice~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_complete_notice") end},
     }
@@ -16763,10 +17052,46 @@ function Plugin:_show_thought_href(href)
     return true
 end
 
+function Plugin:_thought_edge_page_turn(ges)
+    local enabled,percent=self:_reader_edge_guard_state()
+    if not enabled then return false end
+    local pos=ges and ges.pos
+    local x=pos and tonumber(pos.x)
+    local width=Device.screen and Device.screen:getWidth()
+    if not x or not width or width<=0 then return false end
+
+    local ratio=math.max(.05,math.min(.20,(tonumber(percent) or 10)/100))
+    local inverse=self.ui and self.ui.view and self.ui.view.inverse_reading_order==true
+    local diff
+    if x<=width*ratio then
+        diff=inverse and 1 or -1
+    elseif x>=width*(1-ratio) then
+        diff=inverse and -1 or 1
+    else
+        return false
+    end
+
+    -- Keep KOReader's own tap-turn preference authoritative. The guard only
+    -- resolves a collision between an edge annotation link and a page turn.
+    if _G.G_reader_settings and type(G_reader_settings.nilOrFalse)=="function"
+        and not G_reader_settings:nilOrFalse("page_turns_disable_tap") then
+        return false
+    end
+    if not self.ui or type(self.ui.handleEvent)~="function" then return false end
+
+    local ok,handled=pcall(self.ui.handleEvent,self.ui,Event:new("GotoViewRel",diff))
+    if not ok or handled~=true then return false end
+    self:_mark_reader_busy(2)
+    logger.dbg("[MiuRead][ThoughtPopup] edge annotation tap converted to page turn",
+        "percent=",tostring(percent),"direction=",diff<0 and "backward" or "forward")
+    return true
+end
+
 function Plugin:_on_thought_tap(ges)
     if not self.ui or not self.ui.link or not self.ui.link.getLinkFromGes then return false end
     local ok,link=pcall(self.ui.link.getLinkFromGes,self.ui.link,ges); if not ok or not link then return false end
     local href=extract_thought_href(link,{},0); if not href then return false end
+    if self:_thought_edge_page_turn(ges) then return true end
     return self:_show_thought_href(href)
 end
 function Plugin:_setup_thought_tap()
