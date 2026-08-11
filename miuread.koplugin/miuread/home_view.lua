@@ -848,6 +848,8 @@ end
 
 function HomeWidget:_build_header(children, m)
     -- Independent compact groups: account | Wi-Fi/SSID | sync | time | battery.
+    -- Keep direct references to the text widgets so minute/device updates can
+    -- repaint only the changed header field instead of rebuilding the home.
     local gap = math.max(UiScale.dp(2, 2, 4), math.floor(m.content_w * .003))
     local title_w = math.max(UiScale.dp(66, 58, 86), math.floor(m.content_w * .10))
     local account_w = math.max(UiScale.dp(112, 98, 145), math.floor(m.content_w * .15))
@@ -866,6 +868,31 @@ function HomeWidget:_build_header(children, m)
     local wifi_text=tostring(self.opts.wifi_text or "")
     if wifi_text=="" then wifi_text="Wi-Fi" end
     local sync_text=tostring(self.opts.sync_text or "已同步")
+
+    local account_cell=Ui.textbox(account_text,
+        account_w, m.header_h, face("smallinfofont", 10.8, 14.8), {
+            bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+            height_overflow_show_ellipsis = true,
+        })
+    local wifi_value_cell=Ui.textbox(wifi_text,math.max(1,wifi_w-UiScale.dp(24,21,33)),m.header_h,
+        face("smallinfofont",10.5,14.5),{
+            bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
+            height_overflow_show_ellipsis=true,
+        })
+    local sync_value_cell=Ui.textbox(sync_text,math.max(1,sync_w-UiScale.dp(22,19,30)),m.header_h,
+        face("smallinfofont",10.1,14),{
+            bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
+            height_overflow_show_ellipsis=true,
+        })
+    local time_cell=Ui.textbox(tostring(self.opts.time_text or "--:--"),time_w,m.header_h,
+        face("smallinfofont",10.6,14.6),{
+            bold=true,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
+        })
+    local battery_value_cell=Ui.textbox(tostring(self.opts.battery_text or "--%"),math.max(1,battery_w-UiScale.dp(24,21,33)),m.header_h,
+        face("smallinfofont",10.6,14.6),{
+            bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
+        })
+
     local header = HorizontalGroup:new{
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = title_w, h = m.header_h}, TextWidget:new{
@@ -874,11 +901,7 @@ function HomeWidget:_build_header(children, m)
             bold = true,
         }},
         HorizontalSpan:new{width = gap},
-        tappable(account_w, m.header_h, Ui.textbox(account_text,
-            account_w, m.header_h, face("smallinfofont", 10.8, 14.8), {
-                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
-                height_overflow_show_ellipsis = true,
-            }), self.opts.on_account),
+        tappable(account_w, m.header_h, account_cell, self.opts.on_account),
         HorizontalSpan:new{width = gap},
         tappable(wifi_w, m.header_h, LeftContainer:new{
             dimen=Geom:new{w=wifi_w,h=m.header_h},
@@ -886,11 +909,7 @@ function HomeWidget:_build_header(children, m)
                 align="center",
                 Ui.icon("wifi",UiScale.dp(22,19,29),m.header_h,UiScale.dp(18,16,24),{icon_key="wifi"}),
                 HorizontalSpan:new{width=UiScale.dp(2,2,4)},
-                Ui.textbox(wifi_text,math.max(1,wifi_w-UiScale.dp(24,21,33)),m.header_h,
-                    face("smallinfofont",10.5,14.5),{
-                        bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
-                        height_overflow_show_ellipsis=true,
-                    }),
+                wifi_value_cell,
             },
         }, self.opts.on_quick_panel),
         HorizontalSpan:new{width = gap},
@@ -900,18 +919,11 @@ function HomeWidget:_build_header(children, m)
                 align="center",
                 Ui.icon("sync",UiScale.dp(20,18,27),m.header_h,UiScale.dp(16,14,21),{icon_key="sync"}),
                 HorizontalSpan:new{width=UiScale.dp(2,1,3)},
-                Ui.textbox(sync_text,math.max(1,sync_w-UiScale.dp(22,19,30)),m.header_h,
-                    face("smallinfofont",10.1,14),{
-                        bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
-                        height_overflow_show_ellipsis=true,
-                    }),
+                sync_value_cell,
             },
         }, self.opts.on_quick_panel),
         HorizontalSpan:new{width = gap},
-        Ui.textbox(tostring(self.opts.time_text or "--:--"),time_w,m.header_h,
-            face("smallinfofont",10.6,14.6),{
-                bold=true,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
-            }),
+        time_cell,
         HorizontalSpan:new{width = gap},
         CenterContainer:new{
             dimen=Geom:new{w=battery_w,h=m.header_h},
@@ -919,10 +931,7 @@ function HomeWidget:_build_header(children, m)
                 align="center",
                 Ui.icon("battery",UiScale.dp(22,19,29),m.header_h,UiScale.dp(17,15,22),{icon_key="battery"}),
                 HorizontalSpan:new{width=UiScale.dp(2,1,3)},
-                Ui.textbox(tostring(self.opts.battery_text or "--%"),math.max(1,battery_w-UiScale.dp(24,21,33)),m.header_h,
-                    face("smallinfofont",10.6,14.6),{
-                        bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
-                    }),
+                battery_value_cell,
             },
         },
         HorizontalSpan:new{width = gap},
@@ -934,6 +943,26 @@ function HomeWidget:_build_header(children, m)
             elseif self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel() end
         end),
     }
+
+    self._header_text_refs={
+        account=account_cell[1],
+        wifi=wifi_value_cell[1],
+        sync=sync_value_cell[1],
+        time=time_cell[1],
+        battery=battery_value_cell[1],
+    }
+    local field_x=m.margin+title_w+gap
+    self._header_field_dimens={}
+    self._header_field_dimens.account=Geom:new{x=field_x,y=m.margin,w=account_w,h=m.header_h}
+    field_x=field_x+account_w+gap
+    self._header_field_dimens.wifi=Geom:new{x=field_x,y=m.margin,w=wifi_w,h=m.header_h}
+    field_x=field_x+wifi_w+gap
+    self._header_field_dimens.sync=Geom:new{x=field_x,y=m.margin,w=sync_w,h=m.header_h}
+    field_x=field_x+sync_w+gap
+    self._header_field_dimens.time=Geom:new{x=field_x,y=m.margin,w=time_w,h=m.header_h}
+    field_x=field_x+time_w+gap
+    self._header_field_dimens.battery=Geom:new{x=field_x,y=m.margin,w=battery_w,h=m.header_h}
+
     self:_add(children, m.margin, m.margin, header)
     self:_add(children, m.margin, m.margin + m.header_h,
         LineWidget:new{
@@ -958,6 +987,15 @@ function HomeWidget:_grid_geometry(m, width, available_h, count, force_rows)
     return columns, rows, col_gap, row_gap, card_w, card_h
 end
 
+local function shelf_book_key(book)
+    if type(book) ~= "table" then return "" end
+    local id = tostring(book.bookId or book.book_id or "")
+    if id ~= "" then return id end
+    local file = tostring(book.file or "")
+    if file ~= "" then return "file:" .. file end
+    return ""
+end
+
 function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_open, on_hold, force_rows)
     if #books == 0 then return 0 end
     local columns, rows, col_gap, row_gap, card_w, card_h = self:_grid_geometry(m, width, height, #books, force_rows)
@@ -971,10 +1009,17 @@ function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_ope
         local row = math.floor(slot / columns)
         local col = slot % columns
         local item_w = folder and (card_w * 2 + col_gap) or card_w
-        self:_add(children,
-            x + col * (card_w + col_gap),
-            y + row * (card_h + row_gap),
-            shelf_book_card(book, item_w, card_h, on_open, on_hold))
+        local item_x = x + col * (card_w + col_gap)
+        local item_y = y + row * (card_h + row_gap)
+        self:_add(children,item_x,item_y,shelf_book_card(book, item_w, card_h, on_open, on_hold))
+        if self._building_shelf_slots and not folder then
+            local key=shelf_book_key(book)
+            if key~="" then
+                self._building_shelf_slots[key]={
+                    parent=children,index=#children,x=item_x,y=item_y,w=item_w,h=card_h,book=book,
+                }
+            end
+        end
         slot = slot + weight
     end
     return rows * card_h + math.max(0, rows - 1) * row_gap
@@ -1116,13 +1161,14 @@ function HomeWidget:_clear_inactive_section_cache()
     self._section_cache_clock=0
 end
 
-function HomeWidget:_remember_section_layer(cache_id,layer,region)
+function HomeWidget:_remember_section_layer(cache_id,layer,region,slots)
     if not cache_id or not layer then return end
     self._section_layer_cache=type(self._section_layer_cache)=="table" and self._section_layer_cache or {}
     self._section_cache_clock=(tonumber(self._section_cache_clock) or 0)+1
     self._section_layer_cache[cache_id]={
         layer=layer,
         region=region and region:copy() or nil,
+        slots=slots,
         used=self._section_cache_clock,
     }
     local count=0
@@ -1162,12 +1208,17 @@ function HomeWidget:_rebuild()
     self:_build_sections(static_body_layer, m, compact, "static")
     children[#children + 1] = static_body_layer
     self._static_body_layer = static_body_layer
+    self._static_body_layer_index = #children
     local section_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+    self._building_shelf_slots={}
     self:_build_sections(section_layer, m, compact, "section")
+    local section_slots=self._building_shelf_slots
+    self._building_shelf_slots=nil
     children[#children + 1] = section_layer
     self._section_layer = section_layer
+    self._section_book_slots=section_slots
     self._section_layer_index = #children
-    self:_remember_section_layer(self:_section_cache_id(self.opts),section_layer,self.section_dimen)
+    self:_remember_section_layer(self:_section_cache_id(self.opts),section_layer,self.section_dimen,section_slots)
     local previous = self[1]
     self[1] = children
     if previous and previous ~= children and previous.free then pcall(previous.free, previous) end
@@ -1178,6 +1229,7 @@ function HomeWidget:_mark_dirty(kind, previous_region)
     if kind == "section" then region = self.section_dimen
     elseif kind == "header" then region = self.header_dimen
     elseif kind == "content" then region = self.content_dimen
+    elseif kind == "page" then region = self.dimen
     else
         UIManager:setDirty(self, "full")
         return
@@ -1201,7 +1253,8 @@ function HomeWidget:update(opts, refresh_kind)
     local previous_region
     if refresh_kind == "section" and self.section_dimen then previous_region = self.section_dimen:copy()
     elseif refresh_kind == "header" and self.header_dimen then previous_region = self.header_dimen:copy()
-    elseif refresh_kind == "content" and self.content_dimen then previous_region = self.content_dimen:copy() end
+    elseif refresh_kind == "content" and self.content_dimen then previous_region = self.content_dimen:copy()
+    elseif refresh_kind == "page" and self.dimen then previous_region = self.dimen:copy() end
     self.opts = opts or self.opts or {}
     if type(self.opts.on_interaction)=="function" then
         self._miu_resume_interaction_callback=self.opts.on_interaction
@@ -1209,6 +1262,51 @@ function HomeWidget:update(opts, refresh_kind)
     self:_rebuild()
     self:_mark_dirty(refresh_kind or "full", previous_region)
     return self
+end
+
+function HomeWidget:updateHeader(fields)
+    fields=type(fields)=="table" and fields or {}
+    self.opts=self.opts or {}
+    local refs=type(self._header_text_refs)=="table" and self._header_text_refs or {}
+    local dimens=type(self._header_field_dimens)=="table" and self._header_field_dimens or {}
+    local mapping={
+        account_name={ref="account",default="未登录"},
+        wifi_text={ref="wifi",default="Wi-Fi"},
+        sync_text={ref="sync",default="已同步"},
+        time_text={ref="time",default="--:--"},
+        battery_text={ref="battery",default="--%"},
+    }
+    local changed_region
+    local changed=false
+    local fallback=false
+    for key,spec in pairs(mapping) do
+        if fields[key]~=nil then
+            local value=tostring(fields[key] or "")
+            local display=value~="" and value or spec.default
+            if tostring(self.opts[key] or "")~=value then
+                self.opts[key]=value
+                changed=true
+                local ref=refs[spec.ref]
+                if ref and type(ref.setText)=="function" then
+                    ref:setText(display)
+                    local region=dimens[spec.ref]
+                    if region then changed_region=changed_region and changed_region:combine(region) or region:copy() end
+                else
+                    fallback=true
+                end
+            end
+        end
+    end
+    if not changed then return true end
+    if fallback or not changed_region then return self:update(self.opts,"header") end
+    local safety=UiScale.dp(3,2,5)
+    local x=math.max(0,(changed_region.x or 0)-safety)
+    local y=math.max(0,(changed_region.y or 0)-safety)
+    local right=math.min(Screen:getWidth(),(changed_region.x or 0)+(changed_region.w or 1)+safety)
+    local bottom=math.min(Screen:getHeight(),(changed_region.y or 0)+(changed_region.h or 1)+safety)
+    local region=Geom:new{x=x,y=y,w=math.max(1,right-x),h=math.max(1,bottom-y)}
+    UIManager:setDirty(self,function() return "ui",region end)
+    return true
 end
 
 function HomeWidget:updateSection(opts)
@@ -1241,18 +1339,26 @@ function HomeWidget:updateSection(opts)
     local cached=cache_id and cache[cache_id] or nil
     local section_layer=cached and cached.layer or nil
     local cache_hit=section_layer~=nil
+    local section_slots
     if not section_layer then
         section_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+        self._building_shelf_slots={}
         self:_build_sections(section_layer, m, tostring(self.opts.layout_style or "standard") == "compact", "section")
-        self:_remember_section_layer(cache_id,section_layer,self.section_dimen)
-    elseif cached.region then
-        self.section_dimen=cached.region:copy()
-        self._section_cache_clock=(tonumber(self._section_cache_clock) or 0)+1
-        cached.used=self._section_cache_clock
+        section_slots=self._building_shelf_slots
+        self._building_shelf_slots=nil
+        self:_remember_section_layer(cache_id,section_layer,self.section_dimen,section_slots)
+    else
+        section_slots=cached.slots
+        if cached.region then
+            self.section_dimen=cached.region:copy()
+            self._section_cache_clock=(tonumber(self._section_cache_clock) or 0)+1
+            cached.used=self._section_cache_clock
+        end
     end
     local old = root[self._section_layer_index]
     root[self._section_layer_index] = section_layer
     self._section_layer = section_layer
+    self._section_book_slots=section_slots
     -- Old layers stay alive in the bounded cache. They are freed on eviction,
     -- full rebuild or home close, so switching back does not recreate covers.
     self:_mark_dirty("section", previous_region)
@@ -1260,6 +1366,66 @@ function HomeWidget:updateSection(opts)
         "key=",tostring(cache_id or "none"),"cache_hit=",tostring(cache_hit),
         "ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
     return self
+end
+
+
+function HomeWidget:updateHero(hero)
+    self.opts = self.opts or {}
+    self.opts.hero = hero
+    local m = self._metrics_cache
+    local root = self[1]
+    if not m or not root or not self._static_body_layer_index
+        or Screen:getWidth() ~= self._last_screen_w or Screen:getHeight() ~= self._last_screen_h then
+        return self:update(self.opts, "content")
+    end
+    local previous_region = self.content_dimen and self.content_dimen:copy() or nil
+    local previous_section = self.section_dimen and self.section_dimen:copy() or nil
+    local layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+    self:_build_sections(layer, m, tostring(self.opts.layout_style or "standard") == "compact", "static")
+    local current_section = self.section_dimen and self.section_dimen:copy() or nil
+    local same_geometry = previous_section and current_section
+        and previous_section.x == current_section.x and previous_section.y == current_section.y
+        and previous_section.w == current_section.w and previous_section.h == current_section.h
+    if not same_geometry then
+        if layer.free then pcall(layer.free, layer) end
+        return self:update(self.opts, "content")
+    end
+    local old = root[self._static_body_layer_index]
+    root[self._static_body_layer_index] = layer
+    self._static_body_layer = layer
+    if old and old ~= layer and old.free then pcall(old.free, old) end
+    self:_mark_dirty("content", previous_region)
+    return self
+end
+
+function HomeWidget:updateBook(book_id)
+    local key=tostring(book_id or "")
+    if key=="" then return false end
+    local slots=type(self._section_book_slots)=="table" and self._section_book_slots or {}
+    local slot=slots[key]
+    if not slot or not slot.parent or not slot.index then return false end
+    local book
+    for _,candidate in ipairs(self.opts.shelf_books or {}) do
+        if shelf_book_key(candidate)==key then book=candidate; break end
+    end
+    if not book then return false end
+    local old=slot.parent[slot.index]
+    local replacement=OffsetContainer:new{
+        x_off=slot.x,y_off=slot.y,
+        shelf_book_card(book,slot.w,slot.h,self.opts.on_open_book,self.opts.on_hold_book),
+    }
+    slot.parent[slot.index]=replacement
+    slot.book=book
+    if old and old~=replacement and old.free then pcall(old.free,old) end
+    local safety=UiScale.dp(3,2,5)
+    local x=math.max(0,slot.x-safety)
+    local y=math.max(0,slot.y-safety)
+    local right=math.min(Screen:getWidth(),slot.x+slot.w+safety)
+    local bottom=math.min(Screen:getHeight(),slot.y+slot.h+safety)
+    local region=Geom:new{x=x,y=y,w=math.max(1,right-x),h=math.max(1,bottom-y)}
+    UIManager:setDirty(self,function() return "ui",region end)
+    logger.info("[MiuRead][HomeBook] updated", "book=",key,"w=",tostring(slot.w),"h=",tostring(slot.h))
+    return true
 end
 
 function HomeWidget:init()
@@ -1551,11 +1717,32 @@ function HomeView.refresh(kind)
     if not ok then logger.warn("[MiuRead][Home] refresh failed", tostring(err)); return false end
     return true
 end
+function HomeView.update_header(fields)
+    if not HomeView.is_shown() or not live_widget.updateHeader then return false end
+    local ok, updated = pcall(live_widget.updateHeader, live_widget, fields or {})
+    if not ok then logger.warn("[MiuRead][Home] header update failed", tostring(updated)); return false end
+    return updated~=false
+end
+function HomeView.update_time(text)
+    return HomeView.update_header{time_text=tostring(text or "--:--")}
+end
 function HomeView.update_section(opts)
     if not HomeView.is_shown() or not live_widget.updateSection then return false end
     local ok, err = pcall(live_widget.updateSection, live_widget, opts or {})
     if not ok then logger.warn("[MiuRead][Home] section update failed", tostring(err)); return false end
     return true
+end
+function HomeView.update_book(book_id)
+    if not HomeView.is_shown() or not live_widget.updateBook then return false end
+    local ok, updated = pcall(live_widget.updateBook, live_widget, book_id)
+    if not ok then logger.warn("[MiuRead][Home] book update failed", tostring(updated)); return false end
+    return updated==true
+end
+function HomeView.update_hero(hero)
+    if not HomeView.is_shown() or not live_widget.updateHero then return false end
+    local ok, updated = pcall(live_widget.updateHero, live_widget, hero)
+    if not ok then logger.warn("[MiuRead][Home] hero update failed", tostring(updated)); return false end
+    return updated~=false
 end
 function HomeView.show(opts, refresh_kind)
     opts = opts or {}
