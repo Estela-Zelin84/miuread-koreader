@@ -75,6 +75,14 @@ local function normalize_progress_ratio(value)
     return value
 end
 
+local function native_progress_percent(value)
+    local ratio = normalize_progress_ratio(value) or 0
+    -- The Web Reader uses parseInt(100 * ratio), i.e. floor for the valid
+    -- non-negative range. Sending a rounded percentage can disagree with co by
+    -- one whole percentage point on long books.
+    return math.floor(math.max(0, math.min(1, ratio)) * 100)
+end
+
 local function chapter_uid(chapter)
     return chapter and (chapter.chapterUid or chapter.uid or chapter.chapter_uid)
 end
@@ -129,7 +137,7 @@ local function standalone_position(book, ratio)
         chapter_uid = chapter_uid(selected) or source_uid,
         chapter_idx = chapter_index(selected, book.source_chapter_index),
         chapter_offset = offset,
-        progress = math.floor(whole_ratio * 100 + 0.5),
+        progress = native_progress_percent(whole_ratio),
         source = "standalone_chapter",
     }
 end
@@ -314,11 +322,78 @@ local function refresh_context(client, book_id, book, force)
     return book, true
 end
 
+local function native_local_position(book, ratio)
+    if book.local_native_chapter_offset ~= true then return nil end
+    if tostring(book.local_chapter_offset_basis or "") ~= "wr_data_co" then
+        return nil, "native chapter offset basis mismatch"
+    end
+
+    local uid = tostring(book.local_chapter_uid or "")
+    local offset = tonumber(book.local_chapter_offset)
+    if uid == "" or offset == nil then
+        return nil, "native local position incomplete"
+    end
+    offset = math.max(0, math.floor(offset + 0.5))
+
+    local chapters = type(book.chapters) == "table" and book.chapters or {}
+    local selected
+    for _, chapter in ipairs(chapters) do
+        if tostring(chapter_uid(chapter) or "") == uid
+            and not Content.is_structural_chapter(chapter) then
+            selected = chapter
+            break
+        end
+    end
+    if not selected then
+        return nil, "native local chapter not found in catalog"
+    end
+
+    local whole_ratio = math.max(0, math.min(1, tonumber(ratio) or 0))
+    if book.source_is_standalone == true then
+        -- For standalone EPUBs the parent intentionally reports chapter-local
+        -- ratio. Convert only `pr` back to whole-book space; native `co` stays
+        -- untouched because it is raw XHTML source position, not wordCount.
+        local total, before = 0, 0
+        local found = false
+        for _, chapter in ipairs(chapters) do
+            local words = trusted_words(book, chapter)
+            if not found and tostring(chapter_uid(chapter) or "") == uid then
+                found = true
+            elseif not found then
+                before = before + words
+            end
+            total = total + words
+        end
+        local words = trusted_words(book, selected)
+        if not found or words <= 0 or total <= 0 then
+            return nil, "standalone native progress catalog unavailable"
+        end
+        whole_ratio = math.max(0, math.min(1, (before + words * whole_ratio) / total))
+    end
+
+    return {
+        chapter_uid = chapter_uid(selected) or uid,
+        chapter_idx = chapter_index(selected, book.local_chapter_idx or book.chapter_idx),
+        chapter_offset = offset,
+        progress = native_progress_percent(whole_ratio),
+        source = "native_wr_data_co",
+        native_offset = true,
+        offset_basis = "wr_data_co",
+    }
+end
+
 local function estimate_position(book, progress_ratio)
     local chapters = type(book.chapters) == "table" and book.chapters or {}
     local ratio = normalize_progress_ratio(progress_ratio)
         or normalize_progress_ratio(book.progress)
         or 0
+
+    local native, native_error = native_local_position(book, ratio)
+    if native then return native end
+    -- An explicitly native offset must never silently fall through to the old
+    -- wordCount clamp, otherwise a valid Web Reader source coordinate can be
+    -- truncated before upload.
+    if book.local_native_chapter_offset == true then return nil, native_error end
 
     if book.source_is_standalone == true then
         local mapped, map_error = standalone_position(book, ratio)
@@ -328,7 +403,7 @@ local function estimate_position(book, progress_ratio)
                 chapter_uid = book.remote_chapter_uid or book.chapter_uid or 0,
                 chapter_idx = tonumber(book.remote_chapter_idx or book.chapter_idx) or 0,
                 chapter_offset = tonumber(book.remote_chapter_offset or book.chapter_offset) or 0,
-                progress = math.floor((normalize_progress_ratio(book.remote_progress or book.progress) or 0) * 100 + 0.5),
+                progress = native_progress_percent(book.remote_progress or book.progress),
                 source = "remote_fallback",
             }
         end
@@ -369,7 +444,7 @@ local function estimate_position(book, progress_ratio)
             chapter_uid=chapter_uid(chapter),
             chapter_idx=chapter_index(chapter,book.local_chapter_idx or book.chapter_idx),
             chapter_offset=offset,
-            progress=math.floor(ratio*100+0.5),
+            progress=native_progress_percent(ratio),
             source=found and total>0 and "trusted_local_chapter_global" or "trusted_local_chapter",
         }
     end
@@ -386,7 +461,7 @@ local function estimate_position(book, progress_ratio)
                     chapter_uid=chapter_uid(item),
                     chapter_idx=chapter_index(item,0),
                     chapter_offset=math.max(0,math.min(words,math.floor(target-before))),
-                    progress=math.floor(ratio*100+0.5),
+                    progress=native_progress_percent(ratio),
                     source="catalog_ratio",
                 }
             end
@@ -427,6 +502,8 @@ local function build_payload(book_id, elapsed_seconds, book, progress_ratio)
         local_chapter_idx=book.local_chapter_idx,
         remote_chapter_uid=book.remote_chapter_uid,
         remote_chapter_idx=book.remote_chapter_idx,
+        native_chapter_offset=position.native_offset == true,
+        chapter_offset_basis=position.offset_basis or book.local_chapter_offset_basis,
     }
     return payload, position, public
 end
@@ -463,6 +540,7 @@ local BOOK_PATCH_KEYS = {
     "book_id", "bookId", "title", "author", "reader_url",
     "psvts", "pclts", "token", "chapters", "progress",
     "chapter_uid", "chapter_idx", "chapter_offset", "chapter_word_count",
+    "local_native_chapter_offset", "local_chapter_offset_basis",
     "source_is_standalone", "source_chapter_uid", "source_chapter_index",
     "source_chapter_word_count", "source_chapter_title",
     "catalog_complete", "remote_progress_loaded", "remote_progress",
@@ -563,6 +641,20 @@ function Worker.run(job)
     end
     book = context_or_error
     context_changed = initial_context_changed == true
+
+    -- Catalog/context preparation must be possible before progress verification.
+    -- In this mode the worker performs only reader-state/catalog reads and never
+    -- sends a read-report request, so preparing a chapter map cannot alter cloud
+    -- progress or fabricate reading time.
+    if job.context_only == true then
+        return finish(settings, book, {
+            ok = true,
+            context_only = true,
+            response_summary = "reader context and full catalog ready",
+            path = "context_only",
+            payload_public = { context_only = true, payload_fields_complete = false },
+        }, true)
+    end
 
     local accepted, result, first_error, first_kind, first_position, first_public, first_meta = attempt_report(
         client, book_id, elapsed_seconds, book, progress_ratio

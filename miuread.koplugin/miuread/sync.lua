@@ -10,6 +10,7 @@ local Http = require("miuread.http")
 local ReadReportWorker = require("miuread.legacy_adapter_worker")
 local BookIntegrity = require("miuread.book_integrity")
 local PrecisePosition = require("miuread.precise_position")
+local SourcePosition = require("miuread.source_position")
 local U = require("miuread.util")
 
 local Sync = {}
@@ -17,11 +18,14 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 14
+local READ_REPORT_SERVICE_VERSION = 15
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
 local READER_BUSY_PATH = "/tmp/miuread-reader-busy.until"
+
+-- beta.45: source-anchor reports may carry the Web Reader's native raw-XHTML
+-- UTF-16 `co`. Whole-book inverse mapping remains only as a `pr`/fallback aid.
 
 local function reader_interaction_busy(host)
     if type(host) == "table" then
@@ -37,6 +41,9 @@ end
 
 local function report_ratio_from_position(position)
     position = type(position) == "table" and position or {}
+    if position.standalone == true and tonumber(position.chapter_ratio) ~= nil then
+        return U.clamp(tonumber(position.chapter_ratio), 0, 1)
+    end
     if position.standalone == true and tonumber(position.chapter_percent) ~= nil then
         return U.clamp(tonumber(position.chapter_percent) / 100, 0, 1)
     end
@@ -210,24 +217,29 @@ local function positions_match(submitted,remote,threshold)
     if submitted_uid~="" and remote_uid~="" and submitted_uid~=remote_uid then
         return false,"chapter_uid_mismatch"
     end
+
+    -- chapterUid + chapterOffset are the authoritative reading coordinates.
+    -- Whole-book percentages may differ when the catalog contains a different
+    -- number of structural chapters, so never reject an exact coordinate match
+    -- merely because the derived percentages disagree.
+    if submitted_uid~="" and remote_uid~="" then
+        local a,b=tonumber(submitted.offset or submitted.chapter_offset),tonumber(remote.offset or remote.chapter_offset)
+        local chapter_words=tonumber(submitted.chapter_word_count) or 0
+        if a~=nil and b~=nil then
+            local tolerance=submitted.native_offset==true and 12
+                or math.max(12,math.floor(chapter_words*0.005))
+            if math.abs(a-b)<=tolerance then return true,"chapter_offset_match" end
+            return false,"chapter_offset_mismatch"
+        end
+    end
+
     local submitted_percent=tonumber(submitted.progress)
     local remote_percent=tonumber(remote.percent)
     if submitted_percent~=nil and remote_percent~=nil
         and math.abs(submitted_percent-remote_percent)>threshold then
         return false,"progress_mismatch"
     end
-    if submitted_uid~="" and remote_uid~="" then
-        local a,b=tonumber(submitted.offset or submitted.chapter_offset),tonumber(remote.offset or remote.chapter_offset)
-        local chapter_words=tonumber(submitted.chapter_word_count) or 0
-        if a~=nil and b~=nil then
-            local tolerance=math.max(256,math.floor(chapter_words*0.04))
-            if math.abs(a-b)>tolerance and submitted_percent~=nil and remote_percent~=nil
-                and math.abs(submitted_percent-remote_percent)>math.max(0.5,threshold/2) then
-                return false,"chapter_offset_mismatch"
-            end
-        end
-    end
-    return true
+    return true,"percent_match"
 end
 
 local function context_from(state, fallback)
@@ -250,7 +262,7 @@ local function map_position(chapters, ratio, fallback)
     fallback = fallback or {}
     if #chapters == 0 then
         return {
-            progress = math.floor(ratio * 100 + .5),
+            progress = U.clamp(ratio * 100, 0, 100),
             chapter_uid = fallback.chapter_uid or 0,
             chapter_index = tonumber(fallback.chapter_index or 0) or 0,
             offset = tonumber(fallback.offset or 0) or 0,
@@ -264,7 +276,7 @@ local function map_position(chapters, ratio, fallback)
         local words = math.max(1, tonumber(ch.word_count or 0) or 0)
         if target <= acc + words or index == #chapters then
             return {
-                progress = math.floor(ratio * 100 + .5),
+                progress = U.clamp(ratio * 100, 0, 100),
                 chapter_uid = ch.uid or 0,
                 chapter_index = tonumber(ch.index) or index,
                 offset = math.max(0, math.floor(target - acc)),
@@ -288,41 +300,25 @@ local function chapter_words(chapter)
     return math.max(1, tonumber(chapter and (chapter.wordCount or chapter.word_count) or 0) or 0)
 end
 
-local function map_standalone_position(chapters, source_uid, ratio, fallback)
-    chapters = type(chapters) == "table" and chapters or {}
-    source_uid = tostring(source_uid or "")
-    ratio = U.clamp(tonumber(ratio) or 0, 0, 1)
-    fallback = fallback or {}
-    if source_uid == "" or #chapters == 0 then return nil end
-
-    local total, before, selected = 0, 0, nil
-    for _, chapter in ipairs(chapters) do
-        local words = chapter_words(chapter)
-        if not selected and tostring(chapter_uid(chapter) or "") == source_uid then
-            selected = chapter
-        elseif not selected then
-            before = before + words
+local function readable_local_chapter_count(chapters)
+    local count = 0
+    for _, chapter in ipairs(type(chapters) == "table" and chapters or {}) do
+        if type(chapter) == "table" and chapter.structural ~= true
+            and tostring(chapter_uid(chapter) or "") ~= "" then
+            count = count + 1
         end
-        total = total + words
     end
-    if not selected or total <= 0 then return nil end
+    return count
+end
 
-    local words = chapter_words(selected)
-    local offset = math.max(0, math.min(words, math.floor(words * ratio + .5)))
-    local progress = U.clamp(((before + offset) / total) * 100, 0, 100)
-    return {
-        progress = progress,
-        chapter_uid = chapter_uid(selected) or source_uid,
-        chapter_index = chapter_index(selected, fallback.chapter_index),
-        offset = offset,
-        summary = selected.title or fallback.summary or "",
-        standalone = true,
-        safe = true,
-        chapter_percent = math.floor(ratio * 100 + .5),
-        chapter_word_count = words,
-        total_word_count = total,
-        words_before = before,
-    }
+local function local_chapter_by_uid(chapters, wanted_uid)
+    wanted_uid = tostring(wanted_uid or "")
+    if wanted_uid == "" then return nil end
+    for index, chapter in ipairs(type(chapters) == "table" and chapters or {}) do
+        if type(chapter) == "table" and tostring(chapter_uid(chapter) or "") == wanted_uid then
+            return chapter, index
+        end
+    end
 end
 
 local function catalog_progress_from_remote(remote, chapters)
@@ -378,7 +374,8 @@ function Sync:new(reader, api, store, host, async, identity_async)
         daemon=nil, daemon_poll=nil, daemon_status_stamp=nil,
         daemon_context=nil, daemon_last_persist=0, daemon_generation=0,
         daemon_restart_count=0, auth_recovery_busy=false, auth_recovery_at=0,
-        auto_repair_busy=false, daemon_auth_retry_at=0, auth_transitioning=false,
+        auto_repair_busy=false, repair_busy=false, repair_book_id=nil, repair_generation=0,
+        daemon_auth_retry_at=0, auth_transitioning=false,
         control_write_task=nil, session_started_at=0,
         precise_position_cache={}, precise_due_refreshed=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
@@ -428,18 +425,54 @@ end
 function Sync:local_ratio()
     local ui = self.host.ui
     if not ui or not ui.document then return nil end
+    local document = ui.document
+
+    -- For reflowable documents, prefer the current XPointer's continuous
+    -- document Y coordinate. ReaderFooter.percent_finished is page/page-count
+    -- and therefore quantized to one rendered KOReader page; converting that
+    -- back into WeRead's whole-book word space makes the absolute error grow
+    -- with book length. CRE exposes a continuous position for the same XPointer
+    -- we already use for precise source anchoring, so keep that precision here.
+    local height = document.info and tonumber(document.info.doc_height) or nil
+    if ui.rolling and height and height > 0 and type(document.getPosFromXPointer) == "function" then
+        local xp = ui.rolling.xpointer
+        if (xp == nil or tostring(xp) == "") and type(document.getXPointer) == "function" then
+            local ok_xp, current_xp = pcall(document.getXPointer, document)
+            if ok_xp then xp = current_xp end
+        end
+        if xp ~= nil and tostring(xp) ~= "" then
+            local ok_pos, y = pcall(document.getPosFromXPointer, document, xp)
+            y = ok_pos and tonumber(y) or nil
+            if y then
+                self.last_local_ratio_source = "xpointer_doc_pos"
+                return U.clamp(y / height, 0, 1)
+            end
+        end
+    end
+
+    -- current_pos is also continuous and cheaper than page/page-count. Keep it
+    -- as the second choice when an XPointer position cannot be resolved.
+    if ui.rolling and height and height > 0 then
+        local pos = tonumber(ui.rolling.current_pos)
+        if pos then
+            self.last_local_ratio_source = "rolling_doc_pos"
+            return U.clamp(pos / height, 0, 1)
+        end
+    end
+
     local footer = ui.view and ui.view.footer
     local value = footer and tonumber(footer.percent_finished)
-    if value then return value > 1 and U.clamp(value / 100, 0, 1) or U.clamp(value, 0, 1) end
-    local document = ui.document
+    if value then
+        self.last_local_ratio_source = "footer_page_ratio"
+        return value > 1 and U.clamp(value / 100, 0, 1) or U.clamp(value, 0, 1)
+    end
     if document.getCurrentPage and document.getPageCount then
         local a, page = pcall(document.getCurrentPage, document)
         local b, total = pcall(document.getPageCount, document)
-        if a and b and tonumber(total) and tonumber(total) > 0 then return U.clamp(tonumber(page) / tonumber(total), 0, 1) end
-    end
-    if ui.rolling and document.info then
-        local pos, height = tonumber(ui.rolling.current_pos), tonumber(document.info.doc_height)
-        if pos and height and height > 0 then return U.clamp(pos / height, 0, 1) end
+        if a and b and tonumber(total) and tonumber(total) > 0 then
+            self.last_local_ratio_source = "document_page_ratio"
+            return U.clamp(tonumber(page) / tonumber(total), 0, 1)
+        end
     end
 end
 
@@ -449,10 +482,77 @@ function Sync:_core_map_hash(record)
     return BookIntegrity.record_hash(record.book,record.record)
 end
 
-function Sync:position(record, ratio, chapters)
+function Sync:_record_mode(record)
+    record = record or self:record()
+    local local_map = record and record.record and record.record.chapter_map or {}
+    local explicit_uid = tostring(record and record.record and record.record.chapter_uid or "")
+    local readable = readable_local_chapter_count(local_map)
+    if explicit_uid ~= "" and readable <= 1 then
+        return "standalone", explicit_uid, readable
+    end
+    return "full", nil, readable
+end
+
+function Sync:_book_catalog_is_complete(record, catalog)
+    catalog = type(catalog) == "table" and catalog or {}
+    if #catalog == 0 or type(record) ~= "table" then return false end
+    local book = type(record.book) == "table" and record.book or {}
+    local row = type(record.record) == "table" and record.record or {}
+    local expected = tonumber(row.catalog_chapter_count or row.expected_catalog_chapter_count)
+    if expected and expected > 0 then return #catalog >= expected end
+    if tostring(book.core_catalog_hash or "") ~= "" then return true end
+    local mode = self:_record_mode(record)
+    local local_map = type(row.chapter_map) == "table" and row.chapter_map or {}
+    if mode ~= "standalone" and row.partial_range ~= true
+        and BookIntegrity.maps_equivalent(local_map, catalog) then
+        return true
+    end
+    return false
+end
+
+function Sync:_progress_catalog(record)
+    record = record or self:record()
+    if not record then return {}, "missing_record" end
+    local book_id = tostring(record.book and record.book.book_id or "")
+    local core_hash = self:_core_map_hash(record)
+    local auth = self.store:auth()
+    local login_id = tostring(auth.login_session_id or "")
+    local session = self.store:session(book_id) or {}
+
+    local function context_catalog(context, source, session_bound)
+        if type(context) ~= "table" or context.catalog_complete ~= true
+            or type(context.chapters) ~= "table" or #context.chapters == 0 then return nil end
+        if tostring(context.book_id or context.bookId or book_id) ~= book_id then return nil end
+        local context_core = tostring(context.core_map_hash or "")
+        if core_hash ~= "" and context_core ~= "" and context_core ~= core_hash then return nil end
+        if session_bound then
+            if tostring(session.report_login_session_id or "") ~= login_id then return nil end
+            local session_core = tostring(session.report_core_map_hash or "")
+            if core_hash ~= "" and session_core ~= "" and session_core ~= core_hash then return nil end
+            if core_hash ~= "" and context_core == "" and session_core == "" then return nil end
+        elseif core_hash ~= "" and context_core == "" then
+            return nil
+        end
+        return context.chapters, source
+    end
+
+    local chapters, source = context_catalog(self.daemon_context, "daemon_context", false)
+    if chapters then return chapters, source end
+    chapters, source = context_catalog(session.legacy_report_context, "session_context", true)
+    if chapters then return chapters, source end
+
+    local catalog = record.book and record.book.catalog or {}
+    if self:_book_catalog_is_complete(record, catalog) then return catalog, "book_catalog" end
+    return {}, "missing"
+end
+
+function Sync:position(record, ratio, chapters, full_catalog)
     ratio = ratio or self:local_ratio() or 0
     local local_map = chapters or (record.record and record.record.chapter_map) or {}
-    local full_map = (record.book and record.book.catalog) or local_map
+    local full_map = full_catalog
+    if type(full_map) ~= "table" or #full_map == 0 then
+        full_map = select(1, self:_progress_catalog(record))
+    end
     local mapped,map_error=BookIntegrity.position_from_maps(local_map,full_map,ratio,{
         chapter_uid = record.record and record.record.chapter_uid or 0,
         summary = record.book.title,
@@ -473,15 +573,15 @@ function Sync:_decorate_legacy_context(context, record)
     local core_hash=self:_core_map_hash(record)
     context.book_id=tostring(record and record.book and record.book.book_id or context.book_id or "")
     context.core_map_hash=core_hash
-    local full_catalog=record and record.book and record.book.catalog
+    local full_catalog=select(1,self:_progress_catalog(record))
     if type(full_catalog)=="table" and #full_catalog>0 then
         context.chapters=U.copy(full_catalog)
         context.catalog_complete=true
     end
-    local standalone_uid = record and record.record and record.record.chapter_uid
-    if standalone_uid ~= nil and tostring(standalone_uid) ~= "" then
+    local mode, standalone_uid = self:_record_mode(record)
+    if mode == "standalone" and standalone_uid then
         local local_map = record.record.chapter_map or {}
-        local local_chapter = local_map[1] or {}
+        local local_chapter = local_chapter_by_uid(local_map, standalone_uid) or local_map[1] or {}
         context.source_is_standalone = true
         context.source_chapter_uid = tostring(standalone_uid)
         context.source_chapter_index = chapter_index(local_chapter, 0)
@@ -501,57 +601,438 @@ function Sync:local_position(ratio)
     local record = self:record()
     if not record then return nil end
     ratio = ratio or self:local_ratio() or 0
-    local standalone_uid = record.record and record.record.chapter_uid
-    if standalone_uid ~= nil and tostring(standalone_uid) ~= "" then
-        local session = self.store:session(record.book.book_id) or {}
-        local auth=self.store:auth()
-        local context_matches=tostring(session.report_login_session_id or "")
-            ==tostring(auth.login_session_id or "")
-        local context = self.daemon_context
-            or (context_matches and type(session.legacy_report_context) == "table" and session.legacy_report_context)
-            or {}
-        local position = context.catalog_complete == true and map_standalone_position(context.chapters, standalone_uid, ratio, {
-            chapter_index = record.record and record.record.chapter_map
-                and record.record.chapter_map[1] and record.record.chapter_map[1].index,
-            summary = record.book.title,
-        }) or nil
-        if position then return position end
-        return {
-            progress = nil,
-            chapter_uid = tostring(standalone_uid),
-            standalone = true,
-            safe = false,
-            chapter_percent = math.floor(U.clamp(ratio, 0, 1) * 100 + .5),
-            summary = record.book.title,
-        }
-    end
     local position = self:position(record, ratio)
     position.safe = position.safe~=false and position.progress~=nil and tostring(position.chapter_uid or "")~=""
-    position.standalone = false
+    local mode = self:_record_mode(record)
+    position.standalone = mode == "standalone"
     position.epub_percent = math.floor(U.clamp(ratio, 0, 1) * 100 + .5)
     position.chapter_percent = tonumber(position.chapter_percent) or position.epub_percent
     return position
 end
 
+function Sync:_prefer_inverse_cloud_mapping(record, position)
+    if type(position) ~= "table" or position.safe ~= true then return position end
+    record = record or self:record()
+    if not record or type(record.record) ~= "table" then return position end
+
+    local native_offset = position.native_offset == true
+        and tostring(position.offset_basis or position.position_basis or "") == "wr_data_co"
+    local local_map = type(record.record.chapter_map) == "table" and record.record.chapter_map or {}
+    local catalog = self:_precision_catalog(record)
+    -- Whole-book inverse mapping is still useful for `pr`, but native Web
+    -- Reader `co` is source-coordinate based and must never be overwritten by
+    -- a wordCount-space estimate.
+    if record.record.partial_range == true
+        or not BookIntegrity.maps_equivalent(local_map, catalog) then
+        position.inverse_mapping_used = false
+        position.inverse_mapping_reason = "local_map_not_full_catalog"
+        return position
+    end
+
+    local ratio = self:local_ratio()
+    if ratio == nil then
+        position.inverse_mapping_used = false
+        position.inverse_mapping_reason = "local_global_ratio_missing"
+        return position
+    end
+    local inverse = self:position(record, ratio, local_map, catalog)
+    if type(inverse) ~= "table" or inverse.safe ~= true
+        or tostring(inverse.chapter_uid or "") == "" then
+        position.inverse_mapping_used = false
+        position.inverse_mapping_reason = tostring(type(inverse) == "table"
+            and inverse.mapping_error or "inverse_position_unavailable")
+        return position
+    end
+
+    local source_uid = tostring(position.chapter_uid or "")
+    local inverse_uid = tostring(inverse.chapter_uid or "")
+    local source_offset = tonumber(position.chapter_offset or position.offset)
+    local inverse_offset = tonumber(inverse.chapter_offset or inverse.offset)
+    position.source_anchor_offset = source_offset
+    position.source_anchor_progress = tonumber(position.progress)
+    position.source_anchor_chapter_ratio = tonumber(position.chapter_ratio)
+    position.inverse_offset = inverse_offset
+    position.inverse_progress = tonumber(inverse.progress)
+    position.inverse_delta = source_offset ~= nil and inverse_offset ~= nil
+        and (inverse_offset - source_offset) or nil
+    position.local_global_ratio = U.clamp(tonumber(ratio) or 0, 0, 1)
+
+    if source_uid == "" or inverse_uid == "" or source_uid ~= inverse_uid then
+        position.inverse_mapping_used = false
+        position.inverse_mapping_reason = "inverse_chapter_mismatch"
+        position.inverse_chapter_uid = inverse_uid
+        logger.info("[MiuRead][ProgressOffset]",
+            "book=", tostring(record.book and record.book.book_id or ""),
+            "chapter=", source_uid ~= "" and source_uid or "-",
+            native_offset and "native_co=" or "source_co=", tostring(source_offset or "-"),
+            "inverse_co=", tostring(inverse_offset or "-"),
+            native_offset and "selected=native" or "selected=source", "reason=chapter_mismatch")
+        return position
+    end
+
+    if inverse_offset == nil then
+        position.inverse_mapping_used = false
+        position.inverse_mapping_reason = "inverse_offset_missing"
+        return position
+    end
+
+    if native_offset then
+        -- Native co remains untouched. Only the whole-book progress percentage
+        -- adopts the continuous inverse whole-book ratio so `pr` stays aligned
+        -- with beta43's long-book precision improvements.
+        position.progress = tonumber(inverse.progress) or position.progress
+        position.chapter_word_count = tonumber(inverse.chapter_word_count) or position.chapter_word_count
+        position.total_word_count = tonumber(inverse.total_word_count) or position.total_word_count
+        position.words_before = tonumber(inverse.words_before) or position.words_before
+        position.inverse_mapping_used = true
+        position.inverse_mapping_role = "progress_only"
+        logger.info("[MiuRead][ProgressOffset]",
+            "book=", tostring(record.book and record.book.book_id or ""),
+            "chapter=", source_uid,
+            "native_co=", tostring(source_offset or "-"),
+            "source_word_co=", tostring(position.source_word_offset or "-"),
+            "inverse_co=", tostring(inverse_offset),
+            "global_ratio=", string.format("%.8f", tonumber(position.local_global_ratio) or 0),
+            "ratio_source=", tostring(self.last_local_ratio_source or "-"),
+            "selected=native")
+        return position
+    end
+
+    -- Legacy beta43 fallback: when native source coordinates are unavailable,
+    -- retain the proven full-book inverse mapping for chapter offset.
+    position.offset = inverse_offset
+    position.chapter_offset = inverse_offset
+    position.progress = tonumber(inverse.progress) or position.progress
+    position.chapter_word_count = tonumber(inverse.chapter_word_count) or position.chapter_word_count
+    position.total_word_count = tonumber(inverse.total_word_count) or position.total_word_count
+    position.words_before = tonumber(inverse.words_before) or position.words_before
+    if tonumber(position.chapter_word_count) and tonumber(position.chapter_word_count) > 0 then
+        position.chapter_ratio = U.clamp(inverse_offset / tonumber(position.chapter_word_count), 0, 1)
+        position.chapter_percent = math.floor(position.chapter_ratio * 100 + 0.5)
+    end
+    position.source = "inverse_cloud_map"
+    position.position_basis = "inverse_remote_chapter_offset"
+    position.offset_basis = "inverse_remote_chapter_offset"
+    position.native_offset = false
+    position.inverse_mapping_used = true
+
+    logger.info("[MiuRead][ProgressOffset]",
+        "book=", tostring(record.book and record.book.book_id or ""),
+        "chapter=", source_uid,
+        "source_co=", tostring(source_offset or "-"),
+        "inverse_co=", tostring(inverse_offset),
+        "delta=", tostring(position.inverse_delta or "-"),
+        "global_ratio=", string.format("%.8f", tonumber(position.local_global_ratio) or 0),
+        "ratio_source=", tostring(self.last_local_ratio_source or "-"),
+        "selected=inverse")
+    return position
+end
 function Sync:_precision_catalog(record)
-    local standalone_uid = record and record.record and record.record.chapter_uid
-    if standalone_uid ~= nil and tostring(standalone_uid) ~= "" then
-        local context = self.daemon_context
-        if not (type(context) == "table" and context.catalog_complete == true
-            and type(context.chapters) == "table" and #context.chapters > 0) then
-            local session = self.store:session(record.book.book_id) or {}
-            local auth = self.store:auth()
-            if tostring(session.report_login_session_id or "") == tostring(auth.login_session_id or "") then
-                context = type(session.legacy_report_context) == "table" and session.legacy_report_context or nil
+    local catalog = select(1, self:_progress_catalog(record))
+    return type(catalog) == "table" and catalog or {}
+end
+
+function Sync:_prepare_progress_catalog(callback)
+    local record = self:record()
+    if not record then return false, "position_context_missing" end
+    local book_id = tostring(record.book and record.book.book_id or "")
+    if book_id == "" then return false, "book_id_missing" end
+    local auth = self.store:auth()
+    local account = type(auth.account) == "table" and auth.account or {}
+    local login_snapshot = tostring(auth.login_session_id or "")
+    local vid_snapshot = tostring(account.vid or "")
+    if login_snapshot == "" or vid_snapshot == "" then return false, "authentication_required" end
+
+    local worker
+    if self.identity_async and self.identity_async:available() and not self.identity_async:busy() then
+        worker = self.identity_async
+    elseif self.async and self.async:available() and not self.async:busy() then
+        worker = self.async
+    elseif (self.identity_async and self.identity_async:busy()) or (self.async and self.async:busy()) then
+        return false, "catalog_worker_busy"
+    else
+        return false, "catalog_worker_unavailable"
+    end
+
+    local generation = tonumber(self.record_generation or 0) or 0
+    local path = tostring(record.path or "")
+    local core_hash = self:_core_map_hash(record)
+    local session = self.store:session(book_id) or {}
+    local saved = type(session.legacy_report_context) == "table" and session.legacy_report_context or nil
+    local context_matches = saved ~= nil
+        and tostring(session.report_login_session_id or "") == login_snapshot
+        and (tostring(session.report_core_map_hash or "") == ""
+            or tostring(session.report_core_map_hash or "") == tostring(core_hash or ""))
+    local legacy_book = U.copy(context_matches and saved or {})
+    legacy_book.book_id = book_id
+    legacy_book.title = record.book.title
+    self:_decorate_legacy_context(legacy_book, record)
+
+    -- Even before the full catalog exists, preserve the current local chapter
+    -- identity so the context worker can choose a sensible reader chapter.
+    local local_guess = map_position((record.record and record.record.chapter_map) or {},
+        self:local_ratio() or 0, {chapter_uid=record.record and record.record.chapter_uid, summary=record.book.title})
+    if type(local_guess) == "table" then
+        legacy_book.local_chapter_uid = local_guess.chapter_uid
+        legacy_book.local_chapter_idx = local_guess.chapter_index
+        legacy_book.local_chapter_offset = local_guess.offset
+        legacy_book.local_native_chapter_offset = false
+        legacy_book.local_chapter_offset_basis = "catalog_word_fallback"
+        local row = local_chapter_by_uid(record.record and record.record.chapter_map or {}, local_guess.chapter_uid)
+        legacy_book.local_chapter_word_count = tonumber(row and (row.word_count or row.wordCount) or 0) or 0
+    end
+
+    local ratio_snapshot = self:local_ratio() or 0
+    local book_title = tostring(record.book.title or "")
+    logger.info("[MiuRead][ProgressMap] catalog prepare started",
+        "book=", book_id, "mode=", self:_record_mode(record),
+        "local_chapters=", tostring(#((record.record and record.record.chapter_map) or {})),
+        "core=", tostring(core_hash):sub(1,12))
+
+    local started, run_error = worker:run("progress_catalog_context", function()
+        return ReadReportWorker.run{
+            book_id = book_id,
+            book_title = book_title,
+            book = legacy_book,
+            core_map_hash = core_hash,
+            progress_ratio = ratio_snapshot,
+            elapsed_seconds = 0,
+            cookies = auth.cookies or {},
+            api_key = auth.api_key or "",
+            wr_ticket = auth.wr_ticket or "",
+            wr_wrpa = auth.wr_wrpa or "",
+            allow_renewal = false,
+            force_context = true,
+            context_only = true,
+        }
+    end, function(result)
+        local current = self:record()
+        local current_auth = self.store:auth()
+        local current_account = type(current_auth.account) == "table" and current_auth.account or {}
+        if generation ~= tonumber(self.record_generation or 0)
+            or not current or tostring(current.book and current.book.book_id or "") ~= book_id
+            or tostring(current.path or "") ~= path then
+            if callback then callback(nil, "stale_catalog_result", {error_kind="context"}) end
+            return
+        end
+        if login_snapshot ~= tostring(current_auth.login_session_id or "")
+            or vid_snapshot ~= tostring(current_account.vid or "") then
+            if callback then callback(nil, "login_changed", {error_kind="authentication"}) end
+            return
+        end
+        local value = result and result.ok == true and result.value or nil
+        local context = type(value) == "table" and value.legacy_context or nil
+        if type(value) ~= "table" or value.accepted ~= true
+            or type(context) ~= "table" or context.catalog_complete ~= true
+            or type(context.chapters) ~= "table" or #context.chapters == 0 then
+            local err = tostring((type(value)=="table" and value.error) or (result and result.error) or "catalog_context_failed")
+            local kind = tostring(type(value)=="table" and value.error_kind or "context")
+            logger.warn("[MiuRead][ProgressMap] catalog prepare failed", "book=",book_id,
+                "kind=",kind,"reason=",err)
+            if callback then callback(nil, err, {error_kind=kind}) end
+            return
+        end
+        context.core_map_hash = core_hash
+
+        -- Keep a catalog that has already produced a verified cloud position
+        -- stable for the rest of the verification TTL. A transient Web Reader
+        -- catalog that adds/removes structural chapters must not silently change
+        -- the whole-book percentage basis from e.g. 22 to 23 chapters.
+        local verified_at=tonumber(session.verified_at or 0) or 0
+        local verified_age=os.time()-verified_at
+        local saved_verified=session.remote_verified==true
+            and verified_at>0 and verified_age>=0 and verified_age<=(tonumber(self.verification_ttl) or 14400)
+            and type(saved)=="table" and saved.catalog_complete==true
+            and type(saved.chapters)=="table" and #saved.chapters>0
+        if saved_verified then
+            local saved_hash=BookIntegrity.core_map_hash(book_id,saved.chapters,{})
+            local new_hash=BookIntegrity.core_map_hash(book_id,context.chapters,{})
+            if saved_hash~="" and new_hash~="" and saved_hash~=new_hash then
+                logger.warn("[MiuRead][ProgressMap] catalog drift ignored during verified session",
+                    "book=",book_id,"kept=",tostring(#saved.chapters),
+                    "new=",tostring(#context.chapters))
+                context=U.copy(saved)
+                context.core_map_hash=core_hash
             end
         end
-        if type(context) == "table" and context.catalog_complete == true
-            and type(context.chapters) == "table" and #context.chapters > 0 then
-            return context.chapters
+
+        if value.cookies_changed and type(value.cookies) == "table" then
+            local latest_auth = self.store:auth()
+            latest_auth.cookies = value.cookies
+            if value.wr_ticket_changed then latest_auth.wr_ticket = value.wr_ticket end
+            if value.wr_wrpa_changed then latest_auth.wr_wrpa = value.wr_wrpa end
+            self.store:save_auth(latest_auth)
         end
+        self.daemon_context = U.copy(context)
+        self.store:save_session(book_id,{
+            legacy_report_context=U.copy(context),
+            report_login_session_id=login_snapshot,
+            report_core_map_hash=core_hash,
+            book_core_map_hash=core_hash,
+            last_stage="完整章节信息已准备",
+        })
+        logger.info("[MiuRead][ProgressMap] catalog ready", "book=",book_id,
+            "chapters=",tostring(#context.chapters),"source=context_only")
+        if callback then callback(context.chapters, nil, {source="context_only"}) end
+    end, 55)
+    if not started then return false, run_error end
+    return true
+end
+
+function Sync:resolve_local_progress(callback, options)
+    options = options or {}
+    local record = self:record()
+    if not record then return false, "position_context_missing" end
+    local book_id = tostring(record.book and record.book.book_id or "")
+    local generation = tonumber(self.record_generation or 0) or 0
+    local path = tostring(record.path or "")
+
+    local function still_current()
+        local current = self:record()
+        return generation == tonumber(self.record_generation or 0)
+            and current and tostring(current.book and current.book.book_id or "") == book_id
+            and tostring(current.path or "") == path
     end
-    local catalog = record and record.book and record.book.catalog
-    return type(catalog) == "table" and catalog or {}
+
+    local function emit(stage, detail)
+        if type(options.on_stage) == "function" then pcall(options.on_stage, stage, detail) end
+    end
+
+    local function complete_fallback(prepared, source_error)
+        if not still_current() then
+            if callback then callback(nil, "stale_position_result", {error_kind="context"}) end
+            return
+        end
+        local ratio = self:local_ratio() or 0
+        local position = options.precise == false and self:local_position(ratio)
+            or self:_position_for_report(ratio, true)
+        if type(position) == "table" and position.safe == true and position.progress ~= nil
+            and tostring(position.chapter_uid or "") ~= "" then
+            if source_error then position.precision_fallback = position.precision_fallback or tostring(source_error) end
+            if callback then callback(position, nil, {source=position.source or position.position_basis}) end
+            return
+        end
+        local mapping_error = tostring(type(position)=="table" and position.mapping_error or source_error or "position_unavailable")
+        if options.prepare_catalog ~= false and prepared ~= true then
+            emit("mapping_preparing", mapping_error)
+            local started, err = self:_prepare_progress_catalog(function(chapters, prepare_error, meta)
+                if chapters then
+                    -- Re-run once with the freshly cached full catalog. This is
+                    -- also the recovery path for stale/incomplete stored catalogs.
+                    local next_options = U.copy(options)
+                    next_options._catalog_prepared = true
+                    next_options.on_stage = options.on_stage
+                    self:resolve_local_progress(callback, next_options)
+                elseif callback then
+                    callback(nil, prepare_error or "catalog_prepare_failed", meta or {error_kind="context"})
+                end
+            end)
+            if started then return end
+            if callback then callback(nil, tostring(err or "catalog_prepare_unavailable"), {error_kind="busy"}) end
+            return
+        end
+        if callback then callback(nil, mapping_error, {error_kind="position"}) end
+    end
+
+    local catalog, catalog_source = self:_progress_catalog(record)
+    local prepared = options._catalog_prepared == true
+    if type(catalog) ~= "table" or #catalog == 0 then
+        if options.prepare_catalog == false or prepared then
+            complete_fallback(prepared, "full_catalog_missing")
+            return true
+        end
+        emit("mapping_preparing", "full_catalog_missing")
+        local started, err = self:_prepare_progress_catalog(function(chapters, prepare_error, meta)
+            if chapters then
+                local next_options = U.copy(options)
+                next_options._catalog_prepared = true
+                next_options.on_stage = options.on_stage
+                self:resolve_local_progress(callback, next_options)
+            elseif callback then
+                callback(nil, prepare_error or "catalog_prepare_failed", meta or {error_kind="context"})
+            end
+        end)
+        if not started then return false, err end
+        return true
+    end
+
+    logger.info("[MiuRead][ProgressMap] position resolving",
+        "book=",book_id,"mode=",self:_record_mode(record),
+        "catalog=",tostring(catalog_source),"chapters=",tostring(#catalog))
+
+    if options.precise == false then
+        complete_fallback(prepared, nil)
+        return true
+    end
+
+    emit("position_locating", catalog_source)
+    local started, source_error = self:_source_position_async(function(position, err)
+        if position then
+            logger.info("[MiuRead][ProgressSource] ready", "book=",book_id,
+                "chapter=",tostring(position.chapter_uid or "-"),
+                "offset=",tostring(position.offset or "-"),
+                "basis=",tostring(position.offset_basis or position.position_basis or "-"),
+                "native=",tostring(position.native_offset == true),
+                "progress=",string.format("%.3f",tonumber(position.progress) or 0),
+                "cache=",tostring(position.source_cache_hit == true))
+            if callback then callback(position, nil, {source=position.source or "weread_source_anchor"}) end
+            return
+        end
+        emit("position_fallback", err)
+        complete_fallback(prepared, err)
+    end)
+    if started then return true end
+    emit("position_fallback", source_error)
+    complete_fallback(prepared, source_error)
+    return true
+end
+
+function Sync:_source_position_async(callback)
+    local record = self:record()
+    local ui = self.host and self.host.ui or nil
+    if not record or not ui or not ui.document then return false, "position_context_missing" end
+    -- The source-coordinate path is intentionally subprocess-only. If this
+    -- device cannot fork a worker, keep the existing local precision path
+    -- rather than doing a network request on the Reader UI thread.
+    if not self.async or not self.async:available() then return false, "source_worker_unavailable" end
+    if self.async:busy() then return false, "source_worker_busy" end
+
+    local anchor, anchor_error = PrecisePosition.capture(
+        ui, record, self:_precision_catalog(record))
+    if not anchor then return false, anchor_error end
+
+    local generation = tonumber(self.record_generation or 0) or 0
+    local book_id = tostring(record.book and record.book.book_id or "")
+    local path = tostring(record.path or "")
+    local reader = self.reader
+    local record_snapshot = {
+        book = U.copy(record.book or {}),
+        record = U.copy(record.record or {}),
+        variant = record.variant,
+        path = record.path,
+    }
+    local started, run_error = self.async:run("progress_source_position", function()
+        return SourcePosition.locate(reader, record_snapshot, anchor)
+    end, function(result)
+        local current = self:record()
+        if generation ~= tonumber(self.record_generation or 0)
+            or not current
+            or tostring(current.book and current.book.book_id or "") ~= book_id
+            or tostring(current.path or "") ~= path then
+            if callback then callback(nil, "stale_position_result") end
+            return
+        end
+        if result and result.ok == true and type(result.value) == "table"
+            and result.value.safe == true then
+            local adjusted = self:_prefer_inverse_cloud_mapping(current, result.value)
+            adjusted.captured_at = os.time()
+            if callback then callback(adjusted, nil) end
+            return
+        end
+        if callback then callback(nil, tostring(result and result.error or "source_position_failed")) end
+    end, 40)
+    if not started then return false, run_error end
+    return true
 end
 
 function Sync:_position_for_report(ratio, precise)
@@ -565,6 +1046,7 @@ function Sync:_position_for_report(ratio, precise)
     local position, err = PrecisePosition.locate(
         ui, record, self:_precision_catalog(record), self.precise_position_cache)
     if position then
+        position = self:_prefer_inverse_cloud_mapping(record, position)
         position.epub_percent = math.floor(U.clamp(tonumber(ratio) or self:local_ratio() or 0, 0, 1) * 100 + .5)
         logger.info("[MiuRead][Progress] precise position",
             "book=", tostring(record.book and record.book.book_id or ""),
@@ -589,58 +1071,83 @@ function Sync:jump_remote(remote)
     remote = remote or {}
     local record = self:record()
     if not record then return false, "未识别到当前觅阅书籍" end
-    local standalone_uid = record.record and record.record.chapter_uid
-    if standalone_uid == nil or tostring(standalone_uid) == "" then
-        return self:jump(remote.percent), nil
-    end
-
-    local remote_uid = remote.chapter_uid
-    if remote_uid == nil or tostring(remote_uid) ~= tostring(standalone_uid) then
-        return false, "云端位置不在当前下载章节中"
-    end
-
-    local session = self.store:session(record.book.book_id) or {}
-    local auth=self.store:auth()
-    local context_matches=tostring(session.report_login_session_id or "")
-        ==tostring(auth.login_session_id or "")
-    local context = self.daemon_context
-        or (context_matches and type(session.legacy_report_context) == "table" and session.legacy_report_context)
-        or {}
-    if context.catalog_complete ~= true then return false, "完整目录尚未准备好" end
-    local chapters = type(context.chapters) == "table" and context.chapters or {}
-    local selected, before, total
-    before, total = 0, 0
-    for _, chapter in ipairs(chapters) do
-        local words = chapter_words(chapter)
-        if not selected and tostring(chapter_uid(chapter) or "") == tostring(standalone_uid) then
-            selected = chapter
-        elseif not selected then
-            before = before + words
+    local mode, standalone_uid = self:_record_mode(record)
+    local ok, err
+    if mode ~= "standalone" or not standalone_uid then
+        ok = self:jump(remote.percent)
+        err = ok and nil or "无法跳转到云端阅读位置"
+    else
+        local remote_uid = remote.chapter_uid
+        if remote_uid == nil or tostring(remote_uid) ~= tostring(standalone_uid) then
+            return false, "云端位置不在当前下载章节中"
         end
-        total = total + words
-    end
-    if not selected then return false, "暂时无法换算当前章节位置" end
 
-    local words = chapter_words(selected)
-    local local_ratio
-    if tonumber(remote.offset) then
-        local_ratio = tonumber(remote.offset) / words
-    elseif tonumber(remote.percent) and total > 0 then
-        local target = U.clamp(tonumber(remote.percent), 0, 100) / 100 * total
-        local_ratio = (target - before) / words
+        local chapters = select(1,self:_progress_catalog(record))
+        if type(chapters) ~= "table" or #chapters == 0 then return false, "完整目录尚未准备好" end
+        local selected, before, total
+        before, total = 0, 0
+        for _, chapter in ipairs(chapters) do
+            local words = chapter_words(chapter)
+            if not selected and tostring(chapter_uid(chapter) or "") == tostring(standalone_uid) then
+                selected = chapter
+            elseif not selected then
+                before = before + words
+            end
+            total = total + words
+        end
+        if not selected then return false, "暂时无法换算当前章节位置" end
+
+        local words = chapter_words(selected)
+        local local_ratio
+        if tonumber(remote.offset) then
+            local_ratio = tonumber(remote.offset) / words
+        elseif tonumber(remote.percent) and total > 0 then
+            local target = U.clamp(tonumber(remote.percent), 0, 100) / 100 * total
+            local_ratio = (target - before) / words
+        end
+        if local_ratio == nil then return false, "云端位置缺少章节内偏移" end
+        local_ratio = U.clamp(local_ratio, 0, 1)
+        ok = self:jump(local_ratio * 100)
+        err = ok and nil or "无法跳转到云端阅读位置"
     end
-    if local_ratio == nil then return false, "云端位置缺少章节内偏移" end
-    local_ratio = U.clamp(local_ratio, 0, 1)
-    return self:jump(local_ratio * 100), nil
+
+    return ok, err
 end
 
 function Sync:is_verified(book_id)
     book_id = tostring(book_id or "")
+    if book_id=="" then return false end
     local auth=self.store:auth()
-    if book_id == "" or tostring(self.verified_book_id or "") ~= book_id
-        or tostring(self.verified_login_session_id or "")~=tostring(auth.login_session_id or "") then return false end
-    local age = os.time() - (tonumber(self.verified_at or 0) or 0)
-    return age >= 0 and age <= (tonumber(self.verification_ttl) or 14400)
+    local login=tostring(auth.login_session_id or "")
+    local ttl=tonumber(self.verification_ttl) or 14400
+
+    if tostring(self.verified_book_id or "")==book_id
+        and tostring(self.verified_login_session_id or "")==login then
+        local age=os.time()-(tonumber(self.verified_at or 0) or 0)
+        if age>=0 and age<=ttl then return true end
+    end
+
+    -- Verification must survive closing/reopening the book and KOReader restarts.
+    -- Restore it only for the same account and the same generated book mapping.
+    local session=self.store:session(book_id) or {}
+    local verified_at=tonumber(session.verified_at or 0) or 0
+    local age=os.time()-verified_at
+    if session.remote_verified~=true or verified_at<=0 or age<0 or age>ttl
+        or tostring(session.verification_login_session_id or "")~=login then return false end
+    local record=self:record()
+    if not record or tostring(record.book and record.book.book_id or "")~=book_id then return false end
+    local current_core=self:_core_map_hash(record)
+    local verified_core=tostring(session.verified_core_map_hash or session.report_core_map_hash or "")
+    if current_core=="" or verified_core=="" or verified_core~=current_core then return false end
+
+    self.verified_book_id=book_id
+    self.verified_at=verified_at
+    self.verified_local_percent=tonumber(session.verified_local_percent)
+    self.verified_remote_percent=tonumber(session.verified_remote_percent)
+    self.verified_login_session_id=login
+    logger.info("[MiuRead][Sync] restored verified state",
+        "book=",book_id,"age=",tostring(age),"core=",current_core:sub(1,12))
+    return true
 end
 
 function Sync:is_current_verified()
@@ -663,6 +1170,8 @@ function Sync:clear_verified(reason)
         self.store:save_session(tostring(old_book), {
             remote_verified=false, verified_at=nil, verified_reason=tostring(reason or "cleared"),
             verified_local_percent=nil, verified_remote_percent=nil,
+            verified_chapter_uid=nil, verified_chapter_offset=nil,
+            verified_core_map_hash=nil, verified_catalog_hash=nil,
         })
     end
     logger.info("[MiuRead][Sync] progress verification cleared", tostring(reason or "cleared"))
@@ -694,21 +1203,9 @@ end
 function Sync:_remote_catalog(book_id)
     local record=self:record()
     if not record or tostring(record.book.book_id or "")~=tostring(book_id or "") then return {} end
-    local map=(record.book and record.book.catalog) or (record.record and record.record.chapter_map) or {}
-    local standalone_uid=record.record and record.record.chapter_uid
-    if standalone_uid~=nil and tostring(standalone_uid)~="" then
-        local session=self.store:session(record.book.book_id) or {}
-        local auth=self.store:auth()
-        local context_matches=tostring(session.report_login_session_id or "")
-            ==tostring(auth.login_session_id or "")
-        local context=self.daemon_context
-            or (context_matches and type(session.legacy_report_context)=="table" and session.legacy_report_context)
-            or {}
-        if context.catalog_complete==true and type(context.chapters)=="table" and #context.chapters>0 then
-            map=context.chapters
-        end
-    end
-    return type(map)=="table" and map or {}
+    local map=select(1,self:_progress_catalog(record))
+    if type(map)=="table" and #map>0 then return map end
+    return type(record.record and record.record.chapter_map)=="table" and record.record.chapter_map or {}
 end
 
 function Sync:_normalize_remote_progress(remote,book_id)
@@ -804,7 +1301,7 @@ function Sync:remote(book_id, callback, options)
     if not ok then callback(nil, err) end
 end
 
-function Sync:mark_verified(book_id, reason, local_percent, remote_percent)
+function Sync:mark_verified(book_id, reason, local_percent, remote_percent, position)
     book_id = tostring(book_id or "")
     if book_id == "" then return false end
     self.verified_book_id = book_id
@@ -812,20 +1309,31 @@ function Sync:mark_verified(book_id, reason, local_percent, remote_percent)
     self.verified_local_percent = tonumber(local_percent)
     self.verified_remote_percent = tonumber(remote_percent)
     self.verified_login_session_id = tostring(self.store:auth().login_session_id or "")
+    local core_hash=self:_core_map_hash()
+    position=type(position)=="table" and position or nil
+    local catalog=select(1,self:_progress_catalog(self:record()))
+    local catalog_hash=(type(catalog)=="table" and #catalog>0)
+        and BookIntegrity.core_map_hash(book_id,catalog,{}) or ""
     self.store:save_session(book_id, {
         remote_verified=true, verified_at=self.verified_at,
         verified_reason=tostring(reason or "confirmed"),
         verified_local_percent=self.verified_local_percent,
         verified_remote_percent=self.verified_remote_percent,
+        verified_chapter_uid=position and tostring(position.chapter_uid or position.chapterUid or "") or nil,
+        verified_chapter_offset=position and tonumber(position.chapter_offset or position.offset) or nil,
         verification_login_session_id=self.verified_login_session_id,
-        report_core_map_hash=self:_core_map_hash(),
+        verified_core_map_hash=core_hash,
+        verified_catalog_hash=catalog_hash~="" and catalog_hash or nil,
+        report_core_map_hash=core_hash,
         progress_local_percent=self.verified_local_percent, pending=false,
     })
     self.store:update_cached_progress(book_id, self.verified_local_percent)
     logger.info("[MiuRead][Sync] cloud progress verified",
         "book=", book_id, "reason=", tostring(reason or "confirmed"),
         "local=", tostring(self.verified_local_percent or "-"),
-        "remote=", tostring(self.verified_remote_percent or "-"))
+        "remote=", tostring(self.verified_remote_percent or "-"),
+        "chapter=",tostring(position and position.chapter_uid or "-"),
+        "offset=",tostring(position and (position.chapter_offset or position.offset) or "-"))
     return true
 end
 
@@ -1052,6 +1560,37 @@ function Sync:repair_current(callback)
     local core_hash=self:_core_map_hash(record)
     if core_hash=="" then if callback then callback(false,"当前书籍章节映射不完整") end; return false end
 
+    -- Automatic repair, manual repair and repeated taps must share one job.
+    -- Starting a second transaction used to leave an old verification callback
+    -- alive after the first repair had already succeeded.
+    if self.repair_busy==true then
+        if tostring(self.repair_book_id or "")==book_id then
+            logger.info("[MiuRead][SyncRepair] duplicate repair ignored","book=",book_id)
+            if callback then callback(false,"检查与修复正在进行",nil,{error_kind="busy",already_running=true}) end
+            return true
+        end
+        logger.info("[MiuRead][SyncRepair] repair busy for another book",
+            "active=",tostring(self.repair_book_id or "-"),"requested=",book_id)
+        if callback then callback(false,"上一项检查与修复正在结束") end
+        return false
+    end
+    self.repair_busy=true
+    self.repair_book_id=book_id
+    self.repair_generation=(tonumber(self.repair_generation) or 0)+1
+    local generation=self.repair_generation
+
+    local function active()
+        return self.repair_busy==true
+            and tostring(self.repair_book_id or "")==book_id
+            and generation==tonumber(self.repair_generation or 0)
+    end
+    local function release()
+        if generation==tonumber(self.repair_generation or 0) then
+            self.repair_busy=false
+            self.repair_book_id=nil
+        end
+    end
+
     local daemon=self.daemon
     if daemon and daemon.active then
         daemon.active=false
@@ -1071,9 +1610,18 @@ function Sync:repair_current(callback)
     self.failure_notified=false
 
     local finished=false
-    local function fail(result,value)
-        if finished then return end
+    local function cancel(result,value)
+        if finished or not active() then return end
         finished=true
+        release()
+        self.state="waiting"
+        logger.info("[MiuRead][SyncRepair] cancelled","book=",book_id,"reason=",tostring(result or "cancelled"))
+        if callback then callback(false,tostring(result or "检查与修复已取消"),nil,value or {error_kind="cancelled"}) end
+    end
+    local function fail(result,value)
+        if finished or not active() then return end
+        finished=true
+        release()
         local err=tostring(result or "阅读同步修复失败")
         local kind=(value and value.error_kind) or nil
         if Http.is_auth_error(err) then kind="authentication" end
@@ -1084,7 +1632,7 @@ function Sync:repair_current(callback)
     end
 
     local function commit(result,position,value,remote)
-        if finished then return end
+        if finished or not active() then return end
         local auth=self.store:auth()
         local login=tostring(auth.login_session_id or "")
         local candidate=value and value.legacy_context
@@ -1094,6 +1642,7 @@ function Sync:repair_current(callback)
         end
         candidate.core_map_hash=core_hash
         finished=true
+        release()
         self.store:save_session(book_id,{
             legacy_report_context=U.copy(candidate),
             report_login_session_id=login,
@@ -1119,10 +1668,15 @@ function Sync:repair_current(callback)
         self.last_error_kind=nil
         self.consecutive_failures=0
         self.failure_notified=false
-        self:mark_verified(book_id,"repair_cloud_verified",position and position.progress,remote and remote.percent)
+        self:mark_verified(book_id,"repair_cloud_verified",position and position.progress,remote and remote.percent,position)
         self.state="waiting"
         if self.store:preferences().sync.time_enabled==true and not self.suspended then
-            UIManager:scheduleIn(1,function() self:start("manual_repair_success") end)
+            UIManager:scheduleIn(1,function()
+                local current=self:record()
+                if current and tostring(current.book and current.book.book_id or "")==book_id then
+                    self:start("manual_repair_success")
+                end
+            end)
         end
         logger.info("[MiuRead][SyncRepair] cloud verification accepted",
             "book=",book_id,
@@ -1132,17 +1686,18 @@ function Sync:repair_current(callback)
     end
 
     local function verify(result,position,value,attempt)
+        if not active() then return end
         attempt=tonumber(attempt) or 1
         self.store:save_session(book_id,{last_stage="正在回读微信读书云端位置确认修复结果"})
         UIManager:scheduleIn(attempt==1 and 1.4 or 2.4,function()
-            if finished then return end
+            if finished or not active() then return end
             local current=self:record()
             if not current or tostring(current.book.book_id or "")~=book_id then
-                fail("书籍已切换，已取消旧书同步修复",{error_kind="context"})
+                cancel("书籍已切换，已取消旧书同步修复",{error_kind="cancelled"})
                 return
             end
             self:remote(book_id,function(remote,remote_error)
-                if finished then return end
+                if finished or not active() then return end
                 local matched,reason=positions_match(position,remote,self.store:preferences().sync.threshold)
                 if matched then
                     commit(result,position,value,remote)
@@ -1165,6 +1720,7 @@ function Sync:repair_current(callback)
     end
 
     local function run_upload(force_context,label)
+        if not active() then return false end
         logger.info("[MiuRead][SyncRepair] "..tostring(label or "testing context"),
             "book=",book_id,"core=",core_hash:sub(1,12))
         self.store:save_session(book_id,{last_stage=force_context and "正在重新建立当前书籍章节同步信息" or "正在验证原有章节同步信息"})
@@ -1173,6 +1729,7 @@ function Sync:repair_current(callback)
             if daemon and daemon.paths and daemon.paths.context then os.remove(daemon.paths.context) end
         end
         local started=self:upload(0,function(ok,result,position,value)
+            if not active() then return end
             if ok then
                 verify(result,position,value,1)
                 return
@@ -1198,6 +1755,7 @@ function Sync:repair_current(callback)
         and tostring(session.report_core_map_hash or "")==core_hash
 
     local function after_auth()
+        if not active() then return end
         if can_preserve then
             run_upload(false,"testing preserved context")
         else
@@ -1211,6 +1769,7 @@ function Sync:repair_current(callback)
             "previous_kind=",prior_kind~="" and prior_kind or "unknown")
         self.store:save_session(book_id,{last_stage="正在验证微信读书登录状态"})
         local started=self:_recover_auth_once("read_report",prior_error,function(recovered,detail)
+            if not active() then return end
             if recovered then after_auth()
             else fail(tostring(detail or "微信读书登录验证失败"),{error_kind="authentication"}) end
         end,true)
@@ -1275,7 +1834,8 @@ function Sync:upload(elapsed, callback, options)
     legacy_book.book_id = book_id
     legacy_book.title = record.book.title
     self:_decorate_legacy_context(legacy_book, record)
-    local position_snapshot=self:_position_for_report(ratio,options.precise_position==true or options.progress_only==true)
+    local position_snapshot=type(options.position_override)=="table" and U.copy(options.position_override)
+        or self:_position_for_report(ratio,options.precise_position==true or options.progress_only==true)
     self:_save_local_snapshot(book_id,position_snapshot)
     if type(position_snapshot)~="table" or position_snapshot.safe~=true or position_snapshot.progress==nil
         or tostring(position_snapshot.chapter_uid or "")=="" then
@@ -1291,6 +1851,8 @@ function Sync:upload(elapsed, callback, options)
     legacy_book.local_chapter_idx=position_snapshot.chapter_index or position_snapshot.chapter_idx
     legacy_book.local_chapter_offset=position_snapshot.offset or position_snapshot.chapter_offset
     legacy_book.local_chapter_word_count=position_snapshot.chapter_word_count
+    legacy_book.local_native_chapter_offset=position_snapshot.native_offset == true
+    legacy_book.local_chapter_offset_basis=position_snapshot.offset_basis or position_snapshot.position_basis
     legacy_book.progress=position_snapshot.progress
     legacy_book.core_map_hash=core_hash
     local report_ratio=report_ratio_from_position(position_snapshot)
@@ -1512,8 +2074,35 @@ function Sync:upload(elapsed, callback, options)
     return true
 end
 
-function Sync:upload_progress(callback)
-    return self:upload(0,callback,{silent=true,progress_only=true,precise_position=true})
+function Sync:upload_progress(callback, options)
+    options = options or {}
+    self.state = "progress_locating"
+    self.last_stage = "正在定位当前阅读位置"
+    if type(options.position_override) == "table" then
+        return self:upload(0,callback,{
+            silent=true,progress_only=true,
+            position_override=options.position_override,
+        })
+    end
+    local started, resolve_error = self:resolve_local_progress(function(position, err, meta)
+        if not position then
+            if callback then callback(false,err,nil,{error_kind=meta and meta.error_kind or "position"}) end
+            return
+        end
+        self:upload(0,callback,{
+            silent=true,progress_only=true,
+            position_override=position,
+        })
+    end,{
+        precise=true,
+        prepare_catalog=true,
+        on_stage=options.on_stage,
+    })
+    if not started then
+        if callback then callback(false,resolve_error,nil,{error_kind="busy"}) end
+        return false
+    end
+    return true
 end
 
 function Sync:_notify_failure()
@@ -1544,9 +2133,15 @@ function Sync:compare(local_percent, remote)
 end
 
 function Sync:jump(percent)
-    percent = math.floor(U.clamp(percent, 0, 100) + .5)
+    -- KOReader accepts fractional GotoPercent values. Do not round this to an
+    -- integer: +/-0.5% of a long book is several phone pages and was the last
+    -- visible book-length-dependent error in cloud -> local positioning.
+    percent = U.clamp(tonumber(percent) or 0, 0, 100)
     local ui = self.host.ui
     if not ui or not ui.document then return false end
+    logger.info("[MiuRead][ProgressJump]",
+        "percent=", string.format("%.6f", percent),
+        "ratio_source=", tostring(self.last_local_ratio_source or "-"))
     return pcall(function()
         if ui.rolling and ui.rolling.onGotoPercent then ui.rolling:onGotoPercent(percent)
         else ui:handleEvent(Event:new("GotoPercent", percent)) end
@@ -1773,6 +2368,8 @@ function Sync:_write_daemon_control(active, immediate, extra)
     if not daemon then return false end
     extra = type(extra) == "table" and extra or {}
     local precise_position = extra._precise_position == true
+    local position_override = type(extra._position_override) == "table"
+        and U.copy(extra._position_override) or nil
 
     local function write_now()
         self.control_write_task = nil
@@ -1793,13 +2390,15 @@ function Sync:_write_daemon_control(active, immediate, extra)
         local position=nil
         local record=self:record()
         if record and book_id~="" and tostring(record.book.book_id or "")==book_id then
-            position=self:_position_for_report(nil,precise_position)
+            position=position_override or self:_position_for_report(nil,precise_position)
             if type(position)=="table" and position.safe==true then
                 self:_save_local_snapshot(book_id,position)
             else
                 position=nil
             end
         end
+        local native_offset_flag = existing.local_native_chapter_offset == true
+        if position then native_offset_flag = position.native_offset == true end
         local control = {
             active = active ~= false and d.active == true,
             generation = own_generation,
@@ -1815,6 +2414,9 @@ function Sync:_write_daemon_control(active, immediate, extra)
             local_chapter_idx = position and position.chapter_index or existing.local_chapter_idx,
             local_chapter_offset = position and (position.chapter_offset or position.offset) or existing.local_chapter_offset,
             local_chapter_word_count = position and position.chapter_word_count or existing.local_chapter_word_count,
+            local_native_chapter_offset = native_offset_flag,
+            local_chapter_offset_basis = position and (position.offset_basis or position.position_basis or "")
+                or existing.local_chapter_offset_basis,
             position_source = position and position.source or existing.position_source,
             position_basis = position and position.position_basis or existing.position_basis,
             position_precision_ms = position and position.precision_ms or existing.position_precision_ms,
@@ -1823,7 +2425,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
             updated_at = os.time(),
         }
         for key, value in pairs(extra) do
-            if key ~= "_precise_position" then control[key] = value end
+            if key ~= "_precise_position" and key ~= "_position_override" then control[key] = value end
         end
         -- Never activate a reporting interval without a current, safe position.
         if control.active and (not position or tostring(control.local_chapter_uid or "")=="") then
@@ -2140,11 +2742,41 @@ function Sync:_maybe_refresh_precise_position()
     if due <= 0 or tonumber(self.precise_due_refreshed or 0) == due then return false end
     if due - os.time() > PRECISE_POSITION_LEAD_SECONDS then return false end
     if reader_interaction_busy(self.host) then return false end
-    -- Refresh once shortly before the child report. Page turns themselves keep
-    -- their existing memory-only path and never parse chapter text.
-    local wrote = self:_write_daemon_control(true, true, {_precise_position=true})
+
+    -- First write a cheap, current fallback so the child never has to wait for
+    -- source-coordinate work. This does not scan chapter text.
+    local fallback = self:local_position()
+    if type(fallback) == "table" and fallback.safe == true then
+        self:_write_daemon_control(true, true, {_position_override=fallback})
+    end
     self.precise_due_refreshed = due
-    return wrote == true
+
+    -- Source XHTML fetch + PosMap build run only in the subprocess. Page turns
+    -- still only mark activity/control dirty and never scan text.
+    local started, source_error = self:_source_position_async(function(position, err)
+        local current_daemon = self.daemon
+        if not current_daemon or current_daemon.active ~= true or self.suspended then return end
+        if position then
+            logger.info("[MiuRead][Progress] interval source position",
+                "chapter=", tostring(position.chapter_uid or "-"),
+                "offset=", tostring(position.offset or "-"),
+                "basis=", tostring(position.offset_basis or position.position_basis or "-"),
+                "native=", tostring(position.native_offset == true),
+                "progress=", string.format("%.3f", tonumber(position.progress) or 0),
+                "cache=", tostring(position.source_cache_hit == true))
+            self:_save_local_snapshot(tostring(current_daemon.book_id or ""), position)
+            self:_write_daemon_control(true, true, {_position_override=position})
+        else
+            logger.info("[MiuRead][Progress] interval source position skipped",
+                "reason=", tostring(err or "unknown"))
+        end
+    end)
+    if started then return true end
+
+    logger.info("[MiuRead][Progress] interval source worker unavailable",
+        "reason=", tostring(source_error or "unknown"))
+    if type(fallback) == "table" and fallback.safe == true then return true end
+    return self:_write_daemon_control(true, true, {_precise_position=true}) == true
 end
 
 function Sync:_schedule_daemon_poll(delay)
@@ -2261,6 +2893,8 @@ function Sync:_start_daemon(reason)
     legacy_book.local_chapter_idx=position_snapshot.chapter_index
     legacy_book.local_chapter_offset=position_snapshot.chapter_offset or position_snapshot.offset
     legacy_book.local_chapter_word_count=position_snapshot.chapter_word_count
+    legacy_book.local_native_chapter_offset=position_snapshot.native_offset == true
+    legacy_book.local_chapter_offset_basis=position_snapshot.offset_basis or position_snapshot.position_basis
     legacy_book.progress=position_snapshot.progress
     legacy_book.core_map_hash=core_hash
     self:_save_local_snapshot(book_id,position_snapshot)
