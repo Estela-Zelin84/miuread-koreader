@@ -6,6 +6,7 @@
 local Font = require("ui/font")
 local FontList = require("fontlist")
 local Freetype = require("ffi/freetype")
+local Screen = require("device").screen
 local logger = require("logger")
 
 local FaceFactory = {
@@ -127,12 +128,22 @@ function FaceFactory:getFontPaths(font_name)
     return paths
 end
 
-function FaceFactory:_buildFace(path, size)
+function FaceFactory:_buildFace(path, size, scale_size)
     path = realpath(path)
-    size = math.max(8, math.floor(tonumber(size) or 0))
-    if not path or size <= 0 then return nil end
+    local orig_size = math.max(8, math.floor(tonumber(size) or 0))
+    if not path or orig_size <= 0 then return nil end
+    -- Font:getFace() treats its size argument as a logical KOReader size and
+    -- applies Screen:scaleBySize() before opening FreeType. Custom UI fonts
+    -- must do the same or they become dramatically smaller on 300-ppi Kindles.
+    local scaled_size = orig_size
+    if scale_size ~= false and Screen and type(Screen.scaleBySize) == "function" then
+        local ok_scale, value = pcall(Screen.scaleBySize, Screen, orig_size)
+        if ok_scale and tonumber(value) and tonumber(value) > 0 then
+            scaled_size = math.max(8, math.floor(tonumber(value) + .5))
+        end
+    end
 
-    local ok, ftsize = pcall(Freetype.newFaceSize, path, size)
+    local ok, ftsize = pcall(Freetype.newFaceSize, path, scaled_size)
     if not ok or not ftsize then
         logger.warn("[MiuRead][ThoughtPopup] unable to open fallback font:", tostring(path))
         return nil
@@ -141,10 +152,10 @@ function FaceFactory:_buildFace(path, size)
     local face = {
         orig_font = path,
         realname = path,
-        size = size,
-        orig_size = size,
+        size = scaled_size,
+        orig_size = orig_size,
         ftsize = ftsize,
-        hash = path .. "|" .. tostring(size),
+        hash = path .. "|" .. tostring(scaled_size),
         is_real_bold = false,
         hb_features = {"+kern", "+liga"},
         fallbacks = {},
@@ -157,11 +168,11 @@ function FaceFactory:_buildFace(path, size)
     return face
 end
 
-function FaceFactory:_getFallbackFace(path, size)
+function FaceFactory:_getFallbackFace(path, size, scale_size)
     if not path then return nil end
-    local key = path .. "|" .. tostring(size)
+    local key = path .. "|" .. tostring(size) .. "|" .. (scale_size == false and "final" or "logical")
     if self.fallback_cache[key] then return self.fallback_cache[key] end
-    local face = self:_buildFace(path, size)
+    local face = self:_buildFace(path, size, scale_size)
     if face then self.fallback_cache[key] = face end
     return face
 end
@@ -174,7 +185,7 @@ local FALLBACK_FONT_NAMES = {
     "NotoSansSymbols2-Regular.ttf",
 }
 
-function FaceFactory:_addFallbacks(face, size)
+function FaceFactory:_addFallbacks(face, size, scale_size)
     if not face then return end
     local paths, seen = {}, {}
     if face.orig_font then seen[face.orig_font] = true end
@@ -191,26 +202,44 @@ function FaceFactory:_addFallbacks(face, size)
 
     local fallbacks = {}
     for _, path in ipairs(paths) do
-        local fallback = self:_getFallbackFace(path, size)
+        local fallback = self:_getFallbackFace(path, size, scale_size)
         if fallback then fallbacks[#fallbacks + 1] = fallback end
     end
     fallbacks[#fallbacks + 1] = false
     face.fallbacks = fallbacks
 end
 
-local function legacy_face(font_name, size, fallback_name)
-    if type(font_name) == "string" and font_name ~= "" then
-        local ok, face = pcall(Font.getFace, Font, font_name, size)
-        if ok and face then return face end
+local function unscale_size(final_size)
+    final_size = math.max(8, math.floor(tonumber(final_size) or 12))
+    if not Screen or type(Screen.scaleBySize) ~= "function" then return final_size end
+    local best, best_diff = final_size, math.huge
+    for logical = 8, math.min(255, final_size + 32) do
+        local ok, scaled = pcall(Screen.scaleBySize, Screen, logical)
+        scaled = ok and tonumber(scaled) or nil
+        if scaled then
+            local diff = math.abs(scaled - final_size)
+            if diff < best_diff then best, best_diff = logical, diff end
+            if diff == 0 then break end
+        end
     end
-    return Font:getFace(fallback_name or "cfont", size)
+    return best
 end
 
-function FaceFactory:getFace(font_name, size, fallback_name)
+local function legacy_face(font_name, size, fallback_name, size_is_final)
+    local logical_size = size_is_final and unscale_size(size) or size
+    if type(font_name) == "string" and font_name ~= "" then
+        local ok, face = pcall(Font.getFace, Font, font_name, logical_size)
+        if ok and face then return face end
+    end
+    return Font:getFace(fallback_name or "cfont", logical_size)
+end
+
+function FaceFactory:_getFace(font_name, size, fallback_name, scale_size)
     self:init()
     size = math.max(8, math.floor(tonumber(size) or 12))
     fallback_name = fallback_name or "cfont"
-    local key = table.concat({tostring(font_name or ""), tostring(size), fallback_name, self.emoji_path or ""}, "|")
+    local mode = scale_size == false and "final" or "logical"
+    local key = table.concat({tostring(font_name or ""), tostring(size), fallback_name, self.emoji_path or "", mode}, "|")
     if self.face_cache[key] then return self.face_cache[key] end
 
     local path
@@ -230,15 +259,27 @@ function FaceFactory:getFace(font_name, size, fallback_name)
         end
     end
 
-    local face = path and self:_buildFace(path, size) or nil
+    local face = path and self:_buildFace(path, size, scale_size) or nil
     if face then
-        self:_addFallbacks(face, size)
+        self:_addFallbacks(face, size, scale_size)
         self.face_cache[key] = face
         return face
     end
 
     -- Compatibility fallback for KOReader builds whose font internals differ.
-    return legacy_face(font_name, size, fallback_name)
+    return legacy_face(font_name, size, fallback_name, scale_size == false)
+end
+
+-- Logical KOReader size: used by MiuRead UI and preview widgets. The factory
+-- applies Screen:scaleBySize exactly once, matching Font:getFace semantics.
+function FaceFactory:getFace(font_name, size, fallback_name)
+    return self:_getFace(font_name, size, fallback_name, true)
+end
+
+-- Final device-scaled size: used by the native comment popup, whose layout and
+-- pagination metrics are already calculated from the final scaled size.
+function FaceFactory:getFinalFace(font_name, size, fallback_name)
+    return self:_getFace(font_name, size, fallback_name, false)
 end
 
 function FaceFactory:signature()

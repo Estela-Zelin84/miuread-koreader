@@ -68,6 +68,7 @@ local ReaderListDialog=require("miuread.reader_list_dialog")
 local ReaderControlCenter=require("miuread.reader_control_center")
 local ReaderProgressDialog=require("miuread.reader_progress_dialog")
 local ReaderSettingsDialog=require("miuread.reader_settings_dialog")
+local ReaderTypographyDialog=require("miuread.reader_typography_dialog")
 local ReaderTocDialog=require("miuread.reader_toc_dialog")
 local ReaderFrontlightDialog=require("miuread.reader_frontlight_dialog")
 local DataMigration=require("miuread.data_migration")
@@ -116,10 +117,15 @@ local HOME_ACTION_ITEM_ORDER={"refresh","search","downloads","sync","sleep","miu
 local HOME_ACTION_ITEM_DEFAULT={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false}
 local HOME_ACTION_LAYOUT_VERSION=3
 local HOME_PANEL_ITEM_V1_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","frontlight","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
-local HOME_PANEL_ITEM_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
 local HOME_PANEL_ITEM_V1_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
-local HOME_PANEL_ITEM_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
-local HOME_PANEL_LAYOUT_VERSION=2
+local HOME_PANEL_ITEM_V2_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
+local HOME_PANEL_ITEM_V2_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
+-- The pull-down row can use eight slots. Bluetooth is a conditional candidate:
+-- supported Kindle devices receive it, while unsupported devices fall through
+-- to Sync as the eighth useful control.
+local HOME_PANEL_ITEM_ORDER={"wifi","bluetooth","rotate","screenshot","full_refresh","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep"}
+local HOME_PANEL_ITEM_DEFAULT={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,koreader_settings=true,return_koreader=true,quit=true,sync=true,miuread_settings=false,downloads=false,restart=false,sleep=false}
+local HOME_PANEL_LAYOUT_VERSION=3
 local READER_QUICK_ITEM_LEGACY_ORDER={"home","toc","progress","font","typeset","sync","current_book","downloads","full_refresh","koreader_menu","sleep","more"}
 local READER_QUICK_ITEM_LEGACY_DEFAULT={home=true,toc=true,progress=true,font=true,typeset=true,sync=true,current_book=true,downloads=false,full_refresh=false,koreader_menu=false,sleep=false,more=true}
 local READER_QUICK_ITEM_V2_ORDER={"home","toc","progress","font","sync","more","typeset","current_book","downloads","full_refresh","koreader_menu","sleep"}
@@ -2337,6 +2343,40 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
 end
 
 
+function Plugin:_bluetooth_state(_force)
+    -- Bluetooth is owned by KOReader's loaded Bluetooth controller/plugin.
+    -- MiuRead only exposes the existing capability in its toolbar.
+    local manager=rawget(_G,"KOBluetoothStateManager")
+    local controller=rawget(_G,"_bt_controller_instance")
+    if not manager or not controller or type(manager.isOn)~="function" then
+        return {known=true,supported=false,enabled=false}
+    end
+    local ok,enabled=pcall(function() return manager:isOn()==true end)
+    if not ok then return {known=false,supported=true,enabled=false} end
+    return {known=true,supported=true,enabled=enabled==true}
+end
+
+function Plugin:_bluetooth_supported()
+    local state=self:_bluetooth_state(false)
+    return state.supported==true
+end
+
+function Plugin:_home_panel_item_available(key)
+    if key=="bluetooth" then return self:_bluetooth_supported() end
+    if key=="sleep" then return Device:canSuspend()==true end
+    return true
+end
+
+function Plugin:_bluetooth_toggle()
+    if not self:_bluetooth_supported() then
+        self:toast("当前 KOReader 未提供蓝牙控制",2)
+        return false
+    end
+    -- Reuse the Bluetooth controller's registered KOReader event.
+    UIManager:sendEvent(Event:new("ToggleBluetooth"))
+    return true
+end
+
 function Plugin:_home_preferences()
     local preferences=self.store:preferences()
     preferences.home_ui=type(preferences.home_ui)=="table" and preferences.home_ui or {}
@@ -2499,25 +2539,34 @@ function Plugin:_home_preferences()
     -- Never reintroduce the retired homepage-frontlight key from merged legacy
     -- preferences. Direct frontlight control is rendered by HomeQuickPanel.
     if home.action_items.frontlight~=nil then home.action_items.frontlight=nil; changed=true end
-    -- Pull-down layout v2 keeps one horizontal row of six controls. Migrate
-    -- the old recommended row before frontlight is removed from the selectable
-    -- shortcut list; customized rows keep their enabled choices when possible.
+    -- Pull-down layout v3 expands the control strip from six to eight slots.
+    -- Old recommended layouts move to the new recommendation. Customized
+    -- layouts keep their choices and receive Bluetooth as an opt-in candidate.
     if (tonumber(home.panel_layout_version) or 0)<HOME_PANEL_LAYOUT_VERSION then
         home.panel_items=type(home.panel_items)=="table" and home.panel_items or {}
         home.panel_order=type(home.panel_order)=="table" and home.panel_order or U.copy(HOME_PANEL_ITEM_V1_ORDER)
-        local old_recommended=quick_boolean_layout_matches(home.panel_items,HOME_PANEL_ITEM_V1_DEFAULT,HOME_PANEL_ITEM_V1_ORDER)
+        local old_v1_recommended=quick_boolean_layout_matches(home.panel_items,HOME_PANEL_ITEM_V1_DEFAULT,HOME_PANEL_ITEM_V1_ORDER)
             and quick_order_matches(home.panel_order,HOME_PANEL_ITEM_V1_ORDER)
-        -- Preserve the existing six shortcut choices. Only the old optional
-        -- frontlight tile is removed because frontlight now has its own direct
-        -- control section immediately below this row.
-        if old_recommended then
-            home.panel_items.quit=true
-            home.panel_items.sleep=false
+        local old_v2_recommended=quick_boolean_layout_matches(home.panel_items,HOME_PANEL_ITEM_V2_DEFAULT,HOME_PANEL_ITEM_V2_ORDER)
+            and quick_order_matches(home.panel_order,HOME_PANEL_ITEM_V2_ORDER)
+        if old_v1_recommended or old_v2_recommended then
+            home.panel_items={}
+            for _,key in ipairs(HOME_PANEL_ITEM_ORDER) do home.panel_items[key]=HOME_PANEL_ITEM_DEFAULT[key]==true end
+            home.panel_order=U.copy(HOME_PANEL_ITEM_ORDER)
+        else
+            home.panel_items.frontlight=nil
+            if home.panel_items.bluetooth==nil then home.panel_items.bluetooth=false end
+            local seen,kept={},{}
+            for _,name in ipairs(home.panel_order) do
+                if name~="frontlight" and HOME_PANEL_ITEM_DEFAULT[name]~=nil and not seen[name] then
+                    seen[name]=true; kept[#kept+1]=name
+                end
+            end
+            for _,name in ipairs(HOME_PANEL_ITEM_ORDER) do
+                if not seen[name] then seen[name]=true; kept[#kept+1]=name end
+            end
+            home.panel_order=kept
         end
-        home.panel_items.frontlight=nil
-        local kept={}
-        for _,name in ipairs(home.panel_order) do if name~="frontlight" then kept[#kept+1]=name end end
-        home.panel_order=kept
         home.panel_layout_version=HOME_PANEL_LAYOUT_VERSION
         changed=true
     end
@@ -2529,9 +2578,9 @@ function Plugin:_home_preferences()
     end
     local panel_enabled=0
     for _,key in ipairs(home.panel_order or HOME_PANEL_ITEM_ORDER) do
-        if home.panel_items[key]==true then
+        if home.panel_items[key]==true and self:_home_panel_item_available(key) then
             panel_enabled=panel_enabled+1
-            if panel_enabled>6 then home.panel_items[key]=false; changed=true end
+            if panel_enabled>8 then home.panel_items[key]=false; changed=true end
         end
     end
     if type(home.hidden_local_files)~="table" then home.hidden_local_files={}; changed=true end
@@ -2698,7 +2747,7 @@ function Plugin:_home_bump_section_revision(section)
 end
 
 function Plugin:_home_enabled()
-    return tostring(self._runtime_mode or rawget(_G,RUNTIME_MODE_KEY) or "desktop")=="desktop"
+    return tostring(self._runtime_mode or rawget(_G,RUNTIME_MODE_KEY) or "plugin")=="desktop"
 end
 
 function Plugin:_configured_home_enabled()
@@ -4491,8 +4540,8 @@ local HOME_ACTION_LABELS={
     miuread_settings="觅阅设置",all_books="全部书籍",history="阅读历史",file_manager="文件管理",screenshot="截图",
 }
 local HOME_PANEL_LABELS={
-    wifi="Wi-Fi",rotate="方向锁定",screenshot="截图",koreader_settings="KOReader 设置",
-    return_koreader="返回 KOReader",quit="退出 KOReader",frontlight="前光",sync="同步",
+    wifi="Wi-Fi",bluetooth="蓝牙",rotate="方向锁定",screenshot="截图",koreader_settings="KOReader 设置",
+    return_koreader="返回 KOReader",quit="退出 KO",frontlight="前光",sync="同步",
     miuread_settings="觅阅设置",downloads="下载",restart="重启 KOReader",sleep="休眠",full_refresh="全屏刷新",
 }
 
@@ -4501,13 +4550,15 @@ function Plugin:_home_toggle_group_item(group,key)
     local is_action=group=="action"
     local items_key=is_action and "action_items" or "panel_items"
     local order=is_action and HOME_ACTION_ITEM_ORDER or HOME_PANEL_ITEM_ORDER
-    local max_count=6
+    local max_count=is_action and 6 or 8
     local items=home[items_key] or {}
     local currently=items[key]==true
     local count=0
-    for _,name in ipairs(order) do if items[name]==true then count=count+1 end end
+    for _,name in ipairs(order) do
+        if items[name]==true and (is_action or self:_home_panel_item_available(name)) then count=count+1 end
+    end
     if not currently and count>=max_count then
-        self:toast((is_action and "主页快捷栏最多显示六项" or "下滑工具栏最多显示六项"),2)
+        self:toast((is_action and "主页快捷栏最多显示六项" or "下滑工具栏最多显示八项"),2)
         return false
     end
     items[key]=not currently
@@ -4521,12 +4572,17 @@ function Plugin:_home_move_group_item(group,key,delta)
     local home,preferences=self:_home_preferences()
     local order_key=group=="action" and "action_order" or "panel_order"
     local order=home[order_key] or {}
-    local index
-    for i,name in ipairs(order) do if name==key then index=i; break end end
-    if not index then return false end
-    local target=index+(tonumber(delta) or 0)
-    if target<1 or target>#order then return false end
-    order[index],order[target]=order[target],order[index]
+    local positions={}
+    for index,name in ipairs(order) do
+        if group=="action" or self:_home_panel_item_available(name) then positions[#positions+1]=index end
+    end
+    local visible_index
+    for index,position in ipairs(positions) do if order[position]==key then visible_index=index; break end end
+    if not visible_index then return false end
+    local target_visible=visible_index+(tonumber(delta) or 0)
+    if target_visible<1 or target_visible>#positions then return false end
+    local source_position,target_position=positions[visible_index],positions[target_visible]
+    order[source_position],order[target_position]=order[target_position],order[source_position]
     home[order_key]=order
     self:_save_home_preferences(home,preferences)
     if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
@@ -4538,21 +4594,30 @@ function Plugin:_home_group_order_menu(group)
     local order=group=="action" and (home.action_order or HOME_ACTION_ITEM_ORDER) or (home.panel_order or HOME_PANEL_ITEM_ORDER)
     local labels=group=="action" and HOME_ACTION_LABELS or HOME_PANEL_LABELS
     local rows={}
-    for index,key in ipairs(order) do
-        local item_key,item_index=key,index
-        rows[#rows+1]={
-            text=labels[item_key] or item_key,post_text=tostring(item_index),
-            sub_item_table_func=function()
-                local current=self:_home_preferences()[group=="action" and "action_order" or "panel_order"] or order
-                local current_index
-                for i,name in ipairs(current) do if name==item_key then current_index=i; break end end
-                current_index=current_index or item_index
-                return {
-                    {text="上移",enabled_func=function() return current_index>1 end,callback=function() self:_home_move_group_item(group,item_key,-1) end},
-                    {text="下移",enabled_func=function() return current_index<#current end,callback=function() self:_home_move_group_item(group,item_key,1) end},
-                }
-            end,
-        }
+    local visible_index=0
+    for _,key in ipairs(order) do
+        local item_key=key
+        if group=="action" or self:_home_panel_item_available(item_key) then
+            visible_index=visible_index+1
+            local item_index=visible_index
+            rows[#rows+1]={
+                text=labels[item_key] or item_key,post_text=tostring(item_index),
+                sub_item_table_func=function()
+                    local current=self:_home_preferences()[group=="action" and "action_order" or "panel_order"] or order
+                    local visible={}
+                    for _,name in ipairs(current) do
+                        if group=="action" or self:_home_panel_item_available(name) then visible[#visible+1]=name end
+                    end
+                    local current_index
+                    for i,name in ipairs(visible) do if name==item_key then current_index=i; break end end
+                    current_index=current_index or item_index
+                    return {
+                        {text="上移",enabled_func=function() return current_index>1 end,callback=function() self:_home_move_group_item(group,item_key,-1) end},
+                        {text="下移",enabled_func=function() return current_index<#visible end,callback=function() self:_home_move_group_item(group,item_key,1) end},
+                    }
+                end,
+            }
+        end
     end
     return rows
 end
@@ -4568,12 +4633,14 @@ function Plugin:_home_group_settings_menu(group)
     local rows={}
     for _,key in ipairs(order) do
         local item_key=key
-        rows[#rows+1]={
-            text=labels[item_key] or item_key,
-            checked_func=function() return self:_home_preferences()[items_key][item_key]==true end,
-            keep_menu_open=true,
-            callback=function() self:_home_toggle_group_item(group,item_key) end,
-        }
+        if is_action or self:_home_panel_item_available(item_key) then
+            rows[#rows+1]={
+                text=labels[item_key] or item_key,
+                checked_func=function() return self:_home_preferences()[items_key][item_key]==true end,
+                keep_menu_open=true,
+                callback=function() self:_home_toggle_group_item(group,item_key) end,
+            }
+        end
     end
     rows[#rows+1]={text="调整顺序",sub_item_table_func=function() return self:_home_group_order_menu(group) end}
     rows[#rows+1]={text="恢复推荐布局",callback=function()
@@ -4598,8 +4665,10 @@ function Plugin:_home_group_enabled_count(group)
     local order=is_action and HOME_ACTION_ITEM_ORDER or HOME_PANEL_ITEM_ORDER
     local items=home[is_action and "action_items" or "panel_items"] or {}
     local count=0
-    for _,key in ipairs(order) do if items[key]==true then count=count+1 end end
-    return count
+    for _,key in ipairs(order) do
+        if items[key]==true and (is_action or self:_home_panel_item_available(key)) then count=count+1 end
+    end
+    return math.min(count,is_action and 6 or 8)
 end
 
 function Plugin:_home_restore_all_quick_defaults()
@@ -4621,7 +4690,7 @@ end
 function Plugin:home_customization_menu()
     return {
         {text="主页快捷栏",post_text=tostring(self:_home_group_enabled_count("action")).." / 6",sub_item_table_func=function() return self:home_action_settings_menu() end},
-        {text="下滑工具栏",post_text=tostring(self:_home_group_enabled_count("panel")).." / 6",sub_item_table_func=function() return self:home_panel_settings_menu() end},
+        {text="下滑工具栏",post_text=tostring(self:_home_group_enabled_count("panel")).." / 8",sub_item_table_func=function() return self:home_panel_settings_menu() end},
         {text="恢复全部推荐布局",post_text="主页 + 下滑工具栏",callback=function() self:_home_restore_all_quick_defaults() end},
     }
 end
@@ -8940,9 +9009,37 @@ function Plugin:_home_frontlight()
     return self:_show_frontlight_panel{placement="center"}
 end
 
+function Plugin:_koreader_device_listener()
+    local ui=self.ui
+    if ui and ui.devicelistener then return ui.devicelistener end
+    local ok_reader,ReaderUI=pcall(require,"apps/reader/readerui")
+    if ok_reader and ReaderUI and ReaderUI.instance and ReaderUI.instance.devicelistener then
+        return ReaderUI.instance.devicelistener
+    end
+    local ok_fm,FileManager=pcall(require,"apps/filemanager/filemanager")
+    if ok_fm and FileManager and FileManager.instance and FileManager.instance.devicelistener then
+        return FileManager.instance.devicelistener
+    end
+    return nil
+end
+
 function Plugin:_home_toggle_night()
-    UIManager:broadcastEvent(Event:new("ToggleNightMode"))
-    UIManager:scheduleIn(.2,function() UIManager:setDirty("all","full") end)
+    local listener=self:_koreader_device_listener()
+    if not (listener and type(listener.onToggleNightMode)=="function") then
+        self:info("当前 KOReader 暂时无法切换夜间模式")
+        return false
+    end
+    local before=self:_reader_night_enabled()
+    local ok,err=pcall(listener.onToggleNightMode,listener)
+    if not ok then
+        logger.warn("[MiuRead][NightMode] native toggle failed",tostring(err))
+        self:info("夜间模式切换失败")
+        return false
+    end
+    UIManager:scheduleIn(.08,function()
+        local after=self:_reader_night_enabled()
+        if after==before then logger.warn("[MiuRead][NightMode] state unchanged after native toggle") end
+    end)
     return true
 end
 
@@ -9010,7 +9107,15 @@ function Plugin:_home_full_refresh(confirmed)
         UIManager:show(dialog)
         return true
     end
-    UIManager:setDirty("all","full")
+    local listener=self:_koreader_device_listener()
+    if listener and type(listener.onFullRefresh)=="function" then
+        local ok,err=pcall(listener.onFullRefresh,listener)
+        if ok then return true end
+        logger.warn("[MiuRead][Refresh] native full refresh failed",tostring(err))
+    end
+    -- Compatibility fallback for KOReader builds where the active UI listener
+    -- is temporarily unavailable during a desktop transition.
+    UIManager:broadcastEvent(Event:new("FullRefresh"))
     return true
 end
 
@@ -9178,6 +9283,7 @@ function Plugin:show_home_quick_panel(more_expanded)
     else wifi_detail="未连接" end
     local download_detail=tostring(self._home_panel_download_detail or "")
     local sync_label=self:_home_sync_status_label()
+    local bluetooth_state=self:_bluetooth_state(false)
     local definitions={
         wifi={
             icon="Wi-Fi",
@@ -9186,6 +9292,10 @@ function Plugin:show_home_quick_panel(more_expanded)
             callback=function() self:_home_wifi_toggle() end,
             hold_callback=function() self:_home_wifi_settings() end
         },
+        bluetooth=bluetooth_state.supported==true and {
+            icon="bluetooth",icon_key="bluetooth",label="蓝牙",detail=bluetooth_state.enabled==true and "已开启" or "已关闭",
+            callback=function() self:_bluetooth_toggle() end
+        } or nil,
         rotate={
             icon="方向",icon_key=self:_orientation_icon_key(),label="方向锁定",detail=self:_orientation_status_label(),
             callback=function() self:_orientation_toggle_lock() end,
@@ -9194,7 +9304,7 @@ function Plugin:show_home_quick_panel(more_expanded)
         screenshot={icon="▣",icon_key="screenshot",label="截图",detail="",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
         koreader_settings={icon="⚙",icon_key="ko-reader",label="KO设置",detail="",callback=function() self:_show_native_koreader_menu() end},
         return_koreader={icon="←",icon_key="return",label="返回KO",detail="",callback=function() self:_home_close_to_native(true) end},
-        quit={icon="⏻",icon_key="power",label="退出 KOReader",detail="",callback=function() self:_quit_koreader() end},
+        quit={icon="⏻",icon_key="power",label="退出 KO",detail="",callback=function() self:_quit_koreader() end},
         sync={icon="⇅",icon_key="sync",label="同步",detail=sync_label,callback=function() self:_sync_home_pending() end,hold_callback=function(anchor) self:_show_home_sync_popup(anchor) end},
         miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",detail="",callback=function() self:_show_home_settings_center() end},
         downloads={icon="⇩",icon_key="download",label="下载",detail=download_detail,
@@ -9211,7 +9321,7 @@ function Plugin:show_home_quick_panel(more_expanded)
     local buttons={}
     for _,key in ipairs(home.panel_order or HOME_PANEL_ITEM_ORDER) do
         if home.panel_items[key]==true and definitions[key] then buttons[#buttons+1]=definitions[key] end
-        if #buttons>=6 then break end
+        if #buttons>=8 then break end
     end
 
     local battery=tonumber(state.battery) and (tostring(math.floor(state.battery+.5)).."%") or "未知"
@@ -9836,28 +9946,40 @@ function Plugin:_thoughts_enabled_label()
     return self:_thoughts_enabled() and "已开启" or "已关闭"
 end
 
-function Plugin:_thought_font_size_label()
-    local level=tostring((self.store:preferences().thoughts or {}).font or "standard")
-    local labels={small="小（18）",standard="标准（22）",large="大（26）",xlarge="特大（30）"}
-    return labels[level] or labels.standard
+function Plugin:_thought_font_size_value(prefs)
+    prefs=prefs or (self.store:preferences().thoughts or {})
+    local numeric=tonumber(prefs.font_size)
+    if numeric then return math.max(12,math.min(48,math.floor(numeric+.5))) end
+    local legacy={small=18,standard=22,large=26,xlarge=30}
+    return legacy[tostring(prefs.font or "standard")] or 22
 end
 
-function Plugin:_set_thought_font_size(level)
-    local allowed={small=true,standard=true,large=true,xlarge=true}
-    level=allowed[tostring(level or "")] and tostring(level) or "standard"
+function Plugin:_thought_font_size_label()
+    return tostring(self:_thought_font_size_value())
+end
+
+function Plugin:_set_thought_font_size(value,quiet)
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-    p.thoughts.font=level
-    self:_save_ui_preferences(p,"thought_font")
+    local target=math.max(12,math.min(48,math.floor((tonumber(value) or self:_thought_font_size_value(p.thoughts))+.5)))
+    p.thoughts.font_size=target
+    -- Keep the legacy field readable for one compatibility cycle, but the
+    -- continuous numeric value is authoritative from beta.8 onward.
+    p.thoughts.font=nil
+    self:_save_ui_preferences(p,"thought_font_size")
     self:_refresh_thought_display(p.thoughts)
-    self:toast("评论字号已设为："..self:_thought_font_size_label(),2)
+    if quiet~=true then self:toast("评论字号："..tostring(target),1.2) end
     return true
+end
+
+function Plugin:_adjust_thought_font_size(delta)
+    return self:_set_thought_font_size(self:_thought_font_size_value()+(tonumber(delta) or 0),true)
 end
 
 function Plugin:_refresh_thought_display(prefs)
     prefs=prefs or (self.store:preferences().thoughts or {})
     if ThoughtNativePopup and type(ThoughtNativePopup.refresh_font)=="function" then
         pcall(ThoughtNativePopup.refresh_font,
-            self:_thought_font_size(prefs.font or "standard"),
+            self:_thought_font_size(self:_thought_font_size_value(prefs)),
             self:_thought_font_name(prefs))
     end
 end
@@ -9872,29 +9994,55 @@ end
 
 function Plugin:_show_reader_comment_settings(back_callback)
     local return_to_comments=function() self:_show_reader_comment_settings(back_callback) end
-    ReaderSettingsDialog.show{
+    local function comment_preview_text()
+        return "这是一段评论文字，用来预览当前字体、字号和实际阅读效果。"
+    end
+    ReaderTypographyDialog.show{
         title="评论显示",
         subtitle=function()
-            if not self:_thoughts_enabled() then return "阅读评论已关闭, 划线与本地评论数据仍保留" end
+            if not self:_thoughts_enabled() then return "阅读评论已关闭 · 划线与评论数据仍保留" end
             local prefs=self.store:preferences().thoughts or {}
-            return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · "..self:_thought_font_size_label()
+            return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · 字号 "..self:_thought_font_size_label()
         end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
         on_home=function() return self:return_to_miuread_home("reader surface") end,
-        rows=function()
+        controls=function()
             local prefs=self.store:preferences().thoughts or {}
             local follow=prefs.follow_body_font==true
-            local level=tostring(prefs.font or "standard")
             return {
-                {label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function() self:_toggle_thoughts_enabled() end},
-                {label="评论字体跟随正文",value=follow and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:_toggle_thought_follow_body_font() end},
-                {label="固定字体",value=self:_thought_font_face_label(prefs),enabled=not follow,callback=function()
+                {kind="select",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_toggle_thoughts_enabled() end},
+                {kind="select",label="评论字体",value=follow and ("跟随正文 · "..self:_reader_font_label()) or self:_thought_font_face_label(prefs),close=true,callback=function()
                     self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),return_to_comments)
                 end},
-                {label="小",value=level=="small" and "18 · 已选择" or "18",checked=level=="small",keep_open=true,callback=function() self:_set_thought_font_size("small") end},
-                {label="标准",value=level=="standard" and "22 · 已选择" or "22",checked=level=="standard",keep_open=true,callback=function() self:_set_thought_font_size("standard") end},
-                {label="大",value=level=="large" and "26 · 已选择" or "26",checked=level=="large",keep_open=true,callback=function() self:_set_thought_font_size("large") end},
-                {label="特大",value=level=="xlarge" and "30 · 已选择" or "30",checked=level=="xlarge",keep_open=true,callback=function() self:_set_thought_font_size("xlarge") end},
+                {kind="step",label="字号",value=function() return self:_thought_font_size_label() end,
+                    on_decrease=function() self:_adjust_thought_font_size(-1) end,
+                    on_increase=function() self:_adjust_thought_font_size(1) end,
+                    on_decrease_hold=function() self:_adjust_thought_font_size(-3) end,
+                    on_increase_hold=function() self:_adjust_thought_font_size(3) end},
+                {kind="select",label="跟随正文字体",value=follow and "已开启" or "已关闭",value_bold=true,callback=function() self:_toggle_thought_follow_body_font() end},
+            }
+        end,
+        preview_label="评论预览",
+        preview_text=comment_preview_text,
+        preview_font=function() return self:_thought_font_name(self.store:preferences().thoughts or {}) end,
+        preview_size=function() return self:_thought_font_size_value() end,
+        preview_line_height=.18,
+        actions=function()
+            return {
+                {label="恢复默认",callback=function()
+                    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+                    p.thoughts.font_size=22; p.thoughts.font=nil; p.thoughts.font_face=""; p.thoughts.follow_body_font=false
+                    self:_save_ui_preferences(p,"thought_font_reset")
+                    self:_refresh_thought_display(p.thoughts)
+                    self:toast("评论显示已恢复默认",1.5)
+                end},
+                {label="应用到全部评论",primary=true,callback=function()
+                    -- 评论显示偏好本身就是觅阅全局偏好；这里显式保存并
+                    -- 给用户一个明确的“应用到全部”操作，而不再另造一份状态。
+                    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+                    self:_save_ui_preferences(p,"thought_font_global")
+                    self:toast("已应用到全部评论",1.5)
+                end},
             }
         end,
     }
@@ -9910,13 +10058,17 @@ function Plugin:_reader_font_label()
     return name~="" and name or "KOReader 默认"
 end
 
-function Plugin:_reader_font_size_label()
+function Plugin:_reader_font_size_value()
     local ui=self.ui
     local font=ui and ui.font
     local configurable=ui and ui.document and ui.document.configurable or nil
-    local current=font and tonumber(font.font_size)
+    return font and tonumber(font.font_size)
         or (ui and ui.rolling and tonumber(ui.rolling.font_size))
         or (configurable and tonumber(configurable.font_size))
+end
+
+function Plugin:_reader_font_size_label()
+    local current=self:_reader_font_size_value()
     return current and tostring(math.floor(current+.5)) or "未知"
 end
 
@@ -9949,7 +10101,7 @@ function Plugin:_reader_wifi_summary()
     if state.wifi_on==false then return "Wi-Fi关",false end
     if state.wifi_on==nil then return "Wi-Fi",true end
     local ssid=U.trim(tostring(state.wifi_name or ""))
-    if ssid~="" then return U.utf8_truncate(ssid,18,"…"),false end
+    if ssid~="" then return ssid,false end
     if state.online==true then return "已连接",false end
     return "Wi-Fi!",true
 end
@@ -9987,6 +10139,7 @@ function Plugin:_reader_toolbar_header(title)
     elseif wifi_label=="Wi-Fi!" then wifi_text="未连接"
     elseif wifi_label=="Wi-Fi" then wifi_text="状态未知" end
     local battery=self:_reader_battery_label()
+    local bluetooth_state=self:_bluetooth_state(false)
     local device_ms=math.floor((os.clock()-device_started)*1000+.5)
 
     local state_started=os.clock()
@@ -10018,6 +10171,9 @@ function Plugin:_reader_toolbar_header(title)
         wifi_label=wifi_text,wifi_alert=wifi_alert,
         wifi_callback=function() return self:_show_reader_wifi_quick_panel(function() self:show_reader_quick_panel() end) end,
         wifi_hold_callback=function() return self:_reader_wifi_settings(function() self:show_reader_quick_panel() end) end,
+        bluetooth_visible=bluetooth_state.supported==true,
+        bluetooth_label=bluetooth_state.enabled==true and "蓝牙开" or "蓝牙关",
+        bluetooth_callback=bluetooth_state.supported==true and function() return self:_bluetooth_toggle() end or nil,
         sync_label=sync_text,sync_alert=sync_alert,
         sync_callback=function() return self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end,
         battery_label=battery,
@@ -10488,6 +10644,45 @@ function Plugin:_show_reader_annotation_actions(item,kind,anchor,refresh_callbac
     return true
 end
 
+function Plugin:_reader_record_inline_actions(item,kind,back_callback)
+    local function refresh_records()
+        local next_kind=self:_reader_annotation_type(item) or kind
+        self:_show_reader_records(next_kind,back_callback)
+    end
+    local actions={{label="跳转正文",close=true,callback=function() self:_reader_goto_annotation(item) end}}
+    if kind=="highlight" then
+        actions[#actions+1]={label="添加想法",callback=function()
+            self:_reader_edit_annotation_note(item,true,refresh_records)
+        end}
+        actions[#actions+1]={label="删除划线",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除这条划线？","删除划线",function()
+                self:_reader_delete_annotation_item(item,refresh_records)
+            end,refresh_records)
+        end}
+    elseif kind=="thought" then
+        actions[#actions+1]={label="修改想法",callback=function()
+            self:_reader_edit_annotation_note(item,false,refresh_records)
+        end}
+        actions[#actions+1]={label="删除想法",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除这条想法？\n\n原划线会继续保留。","删除想法",function()
+                self:_reader_delete_annotation_note(item,refresh_records)
+            end,refresh_records)
+        end}
+        actions[#actions+1]={label="删除全部",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除整条批注？\n\n划线和想法都会被删除。","全部删除",function()
+                self:_reader_delete_annotation_item(item,refresh_records)
+            end,refresh_records)
+        end}
+    else
+        actions[#actions+1]={label="删除书签",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除这枚书签？","删除书签",function()
+                self:_reader_delete_annotation_item(item,refresh_records)
+            end,refresh_records)
+        end}
+    end
+    return actions
+end
+
 function Plugin:_reader_record_rows(kind,back_callback)
     local annotations=(self.ui and self.ui.annotation and self.ui.annotation.annotations)
         or (self.ui and self.ui.bookmark and self.ui.bookmark.bookmarks) or {}
@@ -10501,13 +10696,7 @@ function Plugin:_reader_record_rows(kind,back_callback)
                 label=excerpt~="" and excerpt or (kind=="bookmark" and "书页书签" or "无文字内容"),
                 value=page and ("第 "..tostring(page).." 页") or "",
                 detail=tostring(item.datetime or item.date or ""),
-                callback=function() self:_reader_goto_annotation(target) end,
-                hold_callback=function(anchor)
-                    self:_show_reader_annotation_actions(target,kind,anchor,function()
-                        local next_kind=self:_reader_annotation_type(target) or kind
-                        self:_show_reader_records(next_kind,back_callback)
-                    end)
-                end,
+                inline_actions=function() return self:_reader_record_inline_actions(target,kind,back_callback) end,
             }
         end
     end
@@ -10579,7 +10768,7 @@ function Plugin:_show_reader_annotation_panel(back_callback)
                     {icon="thought",label="想法",value=tostring(visible_counts.thought or 0),callback=function() self:_show_reader_records("thought",return_to_panel) end},
                     {icon="search",label="搜索全部批注",value="划线 想法 书签",callback=function() self:show_annotation_search_dialog(return_to_panel) end},
                 }},
-                self:annotation_sync_diagnostic_only() and {title="批注坐标诊断 · beta.11",rows={
+                self:annotation_sync_diagnostic_only() and {title="批注坐标诊断",rows={
                     {icon="warning",label="云端批注写入",value="已暂停 · 防止错误 range",value_bold=true,enabled=false},
                     {icon="diagnostics",label="生成本书坐标诊断",value="导出 raw / coord / range",value_bold=true,callback=function()
                         self:sync_local_annotations_now()
@@ -10615,7 +10804,7 @@ function Plugin:_show_reader_records(initial_kind,back_callback)
     local labels={bookmark="书签",highlight="划线",thought="想法"}
     ReaderListDialog.show{
         title="阅读记录",
-        subtitle="点击跳转 · 长按管理",
+        subtitle="点击记录展开操作 · 跳转、修改与删除都在当前列表完成",
         initial_category=labels[initial_kind] and initial_kind or "bookmark",
         categories=function()
             return {
@@ -10624,7 +10813,7 @@ function Plugin:_show_reader_records(initial_kind,back_callback)
                 {key="thought",label="想法",items=self:_reader_record_rows("thought",back_callback),empty_text="当前书籍还没有自己的想法"},
             }
         end,
-        page_size=5,
+        page_size=4,
         on_back=back_callback or (self:_home_enabled() and function() self:show_reader_quick_panel() end or function() self:_show_koreader_reader_menu() end),
         on_home=self:_home_enabled() and function() return self:return_to_miuread_home("reader surface") end or nil,
     }
@@ -10754,29 +10943,78 @@ function Plugin:_reader_show_history(back_callback)
         return false
     end,back_callback or function() self:show_reader_quick_panel() end)
 end
+function Plugin:_reader_apply_typography_defaults()
+    if not (G_reader_settings and type(G_reader_settings.saveSetting)=="function") then
+        self:info("当前 KOReader 暂时无法保存全局排版默认")
+        return false
+    end
+    local face=self:_reader_font_label()
+    local size=self:_reader_font_size_value()
+    local weight=self:_reader_font_weight_value()
+    local spacing=self:_reader_line_spacing_value()
+    if face and face~="" and face~="KOReader 默认" then G_reader_settings:saveSetting("cre_font",face) end
+    if size then G_reader_settings:saveSetting("copt_font_size",size) end
+    G_reader_settings:saveSetting("copt_font_base_weight",weight)
+    G_reader_settings:saveSetting("copt_line_spacing",spacing)
+    if type(G_reader_settings.flush)=="function" then pcall(G_reader_settings.flush,G_reader_settings) end
+    self:toast("已设为 KOReader 全部书籍默认",1.8)
+    return true
+end
+
+function Plugin:_reader_restore_typography_defaults()
+    local size=G_reader_settings and tonumber(G_reader_settings:readSetting("copt_font_size")) or nil
+    local weight=G_reader_settings and tonumber(G_reader_settings:readSetting("copt_font_base_weight")) or nil
+    local spacing=G_reader_settings and tonumber(G_reader_settings:readSetting("copt_line_spacing")) or nil
+    if size then
+        local current=self:_reader_font_size_value()
+        if current then self:_reader_adjust_font_size(size-current) end
+    end
+    if weight then self:_reader_set_font_weight(weight) end
+    if spacing then self:_reader_set_line_spacing(spacing) end
+    local default_face=G_reader_settings and tostring(G_reader_settings:readSetting("cre_font") or "") or ""
+    local font=self.ui and self.ui.font or nil
+    if default_face~="" and font and type(font.onSetFont)=="function" then pcall(font.onSetFont,font,default_face) end
+    self:toast("已恢复 KOReader 默认排版",1.5)
+    return true
+end
+
 function Plugin:_show_reader_font_panel(back_callback)
     local return_to_font=function() self:_show_reader_font_panel(back_callback) end
-    ReaderSettingsDialog.show{
-        title="字体",
+    ReaderTypographyDialog.show{
+        title="字体与排版",
         subtitle=function() return self:_reader_font_label().." · 字号 "..self:_reader_font_size_label() end,
-        hero=function()
-            return {
-                value=self:_reader_font_size_label(),
-                on_decrease=function() self:_reader_adjust_font_size(-1) end,
-                on_increase=function() self:_reader_adjust_font_size(1) end,
-            }
-        end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
         on_home=function() return self:return_to_miuread_home("reader surface") end,
-        sections=function()
+        controls=function()
             return {
-                {title="字体",rows={
-                    {label="正文字体",value=self:_reader_font_label(),callback=function() self:_show_reader_font_face_menu(return_to_font) end},
-                    {label="字体粗细",value=self:_reader_font_weight_label(),callback=function() self:_show_reader_weight_panel(return_to_font) end},
-                }},
-                {title="更多",rows={
-                    {label="高级排版",value="版式与字符间距",callback=function() self:_show_reader_advanced_typeset_panel(return_to_font) end},
-                }},
+                {kind="select",label="字体",value=self:_reader_font_label(),close=true,callback=function() self:_show_reader_font_face_menu(return_to_font) end},
+                {kind="step",label="字号",value=function() return self:_reader_font_size_label() end,
+                    on_decrease=function() self:_reader_adjust_font_size(-1) end,on_increase=function() self:_reader_adjust_font_size(1) end,
+                    on_decrease_hold=function() self:_reader_adjust_font_size(-3) end,on_increase_hold=function() self:_reader_adjust_font_size(3) end},
+                {kind="step",label="字重",value=function() return string.format("%.2f",self:_reader_font_weight_value()) end,
+                    on_decrease=function() self:_reader_adjust_font_weight(-.25) end,on_increase=function() self:_reader_adjust_font_weight(.25) end,
+                    on_decrease_hold=function() self:_reader_adjust_font_weight(-.5) end,on_increase_hold=function() self:_reader_adjust_font_weight(.5) end},
+                {kind="step",label="行距",value=function() return tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%" end,
+                    on_decrease=function() self:_reader_adjust_line_spacing(-5) end,on_increase=function() self:_reader_adjust_line_spacing(5) end,
+                    on_decrease_hold=function() self:_reader_adjust_line_spacing(-10) end,on_increase_hold=function() self:_reader_adjust_line_spacing(10) end},
+                {kind="select",label="高级排版",value="字符间距与更多版式",close=true,callback=function() self:_show_reader_advanced_typeset_panel(return_to_font) end},
+            }
+        end,
+        preview_label="正文预览",
+        preview_text="阅读是一件很私人的事情。合适的字体、字号和行距，会直接影响长时间阅读体验。",
+        preview_font=function()
+            local font=self.ui and self.ui.font or nil
+            return font and font.font_face or nil
+        end,
+        preview_size=function() return math.max(12,math.min(48,self:_reader_font_size_value() or 22)) end,
+        preview_line_height=function()
+            local spacing=self:_reader_line_spacing_value()
+            return math.max(.05,math.min(.60,(spacing-100)/180+.12))
+        end,
+        actions=function()
+            return {
+                {label="恢复当前书籍",callback=function() self:_reader_restore_typography_defaults() end},
+                {label="设为全部书籍默认",primary=true,callback=function() self:_reader_apply_typography_defaults() end},
             }
         end,
     }
@@ -10895,55 +11133,46 @@ function Plugin:_reader_frontlight_bounds()
 end
 
 function Plugin:_reader_frontlight_enabled()
+    local powerd=self:_reader_power_device()
+    if not powerd then return false end
+    if type(powerd.isFrontlightOn)=="function" then
+        local ok,value=pcall(powerd.isFrontlightOn,powerd)
+        if ok then return value==true end
+    end
     local minimum=self:_reader_frontlight_bounds()
     return (self:_reader_frontlight_value() or minimum)>minimum
 end
 
 function Plugin:_reader_set_frontlight(value)
-    local powerd=self:_reader_power_device()
-    if not powerd then self:info("当前设备没有可调前光"); return false end
+    local listener=self:_koreader_device_listener()
+    if not (listener and type(listener.onSetFlIntensity)=="function") then
+        self:info("当前 KOReader 暂时无法调整前光")
+        return false
+    end
     local minimum,maximum=self:_reader_frontlight_bounds()
     local target=math.max(minimum,math.min(maximum,math.floor((tonumber(value) or minimum)+.5)))
-    local current=self:_reader_frontlight_value() or minimum
-    local ok=false
-    if target<=minimum then
-        if current>minimum then
-            self._miuread_last_frontlight=current
-            if type(powerd.turnOffFrontlight)=="function" then ok=pcall(powerd.turnOffFrontlight,powerd)
-            elseif type(powerd.toggleFrontlight)=="function" then ok=pcall(powerd.toggleFrontlight,powerd)
-            elseif type(powerd.setIntensity)=="function" then ok=pcall(powerd.setIntensity,powerd,minimum) end
-        else
-            ok=true
-        end
-    elseif type(powerd.setIntensity)=="function" then
-        ok=pcall(powerd.setIntensity,powerd,target)
-    elseif type(powerd.turnOnFrontlight)=="function" then
-        ok=pcall(powerd.turnOnFrontlight,powerd)
+    local ok,err=pcall(listener.onSetFlIntensity,listener,target)
+    if not ok then
+        logger.warn("[MiuRead][Frontlight] native intensity failed",tostring(err))
+        self:info("前光调整失败")
+        return false
     end
-    if type(powerd.updateResumeFrontlightState)=="function" then pcall(powerd.updateResumeFrontlightState,powerd) end
-    if ok then
-        local actual=self:_reader_frontlight_value() or target
-        if actual>minimum then self._miuread_last_frontlight=actual end
-        if UIManager and type(UIManager.broadcastEvent)=="function" then
-            pcall(UIManager.broadcastEvent,UIManager,Event:new("FrontlightStateChanged"))
-        end
-    else
-        self:info("当前设备暂时无法直接调整前光")
-    end
-    return ok
+    return true
 end
 
 function Plugin:_reader_toggle_frontlight()
-    local minimum,maximum=self:_reader_frontlight_bounds()
-    local current=self:_reader_frontlight_value() or minimum
-    if current>minimum then
-        self._miuread_last_frontlight=current
-        return self:_reader_set_frontlight(minimum)
+    local listener=self:_koreader_device_listener()
+    if not (listener and type(listener.onToggleFrontlight)=="function") then
+        self:info("当前 KOReader 暂时无法切换前光")
+        return false
     end
-    local fallback=math.min(maximum,minimum+math.max(1,math.ceil((maximum-minimum)/10)))
-    local target=tonumber(self._miuread_last_frontlight) or fallback
-    target=math.max(minimum+1,math.min(maximum,target))
-    return self:_reader_set_frontlight(target)
+    local ok,err=pcall(listener.onToggleFrontlight,listener)
+    if not ok then
+        logger.warn("[MiuRead][Frontlight] native toggle failed",tostring(err))
+        self:info("前光切换失败")
+        return false
+    end
+    return true
 end
 
 function Plugin:_reader_adjust_frontlight(delta)
@@ -10974,20 +11203,16 @@ function Plugin:_reader_warmth_state()
 end
 
 function Plugin:_reader_set_warmth(value)
-    local powerd=self:_reader_power_device()
     local state=self:_reader_warmth_state()
-    if not (powerd and state and type(powerd.setWarmth)=="function") then return false end
+    local listener=self:_koreader_device_listener()
+    if not (state and listener and type(listener.onSetFlWarmth)=="function") then return false end
     local target=math.max(state.min,math.min(state.max,math.floor((tonumber(value) or state.value)+.5)))
-    local device_value=target
-    if type(powerd.fromNativeWarmth)=="function" then
-        local ok,converted=pcall(powerd.fromNativeWarmth,powerd,target)
-        if ok and tonumber(converted) then device_value=tonumber(converted) end
+    local ok,err=pcall(listener.onSetFlWarmth,listener,target)
+    if not ok then
+        logger.warn("[MiuRead][Frontlight] native warmth failed",tostring(err))
+        return false
     end
-    local ok=pcall(powerd.setWarmth,powerd,device_value)
-    if ok and UIManager and type(UIManager.broadcastEvent)=="function" then
-        pcall(UIManager.broadcastEvent,UIManager,Event:new("FrontlightStateChanged"))
-    end
-    return ok
+    return true
 end
 
 function Plugin:_reader_adjust_warmth(delta)
@@ -11111,35 +11336,133 @@ function Plugin:_reader_toggle_footer_setting(key,inverted)
 end
 
 function Plugin:_reader_refresh_rate_label()
-    if type(UIManager.getRefreshRate)~="function" then return "系统默认" end
-    local ok,rate=pcall(UIManager.getRefreshRate,UIManager)
-    rate=ok and tonumber(rate) or nil
+    local rate=tonumber(UIManager.FULL_REFRESH_COUNT)
+    if not rate and type(UIManager.getRefreshRate)=="function" then
+        local ok,value=pcall(UIManager.getRefreshRate,UIManager)
+        if ok then rate=tonumber(value) end
+    end
     if not rate then return "系统默认" end
+    if rate==0 then return "从不" end
+    if rate<0 then return "每章" end
     if rate<=1 then return "每页" end
     return "每 "..tostring(math.floor(rate+.5)).." 页"
 end
 
-function Plugin:_reader_cycle_refresh_rate()
-    if type(UIManager.setRefreshRate)~="function" then
-        self:info("当前设备暂时无法直接调整刷新频率")
-        return false
-    end
-    local values={1,6,12,24,48}
-    local current
+function Plugin:_reader_refresh_rates()
+    local day,night
     if type(UIManager.getRefreshRate)=="function" then
-        local ok,value=pcall(UIManager.getRefreshRate,UIManager)
-        if ok then current=tonumber(value) end
+        local ok,a,b=pcall(UIManager.getRefreshRate,UIManager)
+        if ok then day,night=tonumber(a),tonumber(b) end
     end
-    local target=values[1]
-    for index,value in ipairs(values) do
-        if current and current<=value then
-            target=current<value and value or values[index%#values+1]
-            break
-        end
+    if day==nil then day=tonumber(UIManager.FULL_REFRESH_COUNT) end
+    if night==nil then night=day end
+    return day,night
+end
+
+function Plugin:_reader_set_refresh_rates(day,night)
+    if UIManager and type(UIManager.broadcastEvent)=="function" then
+        UIManager:broadcastEvent(Event:new("SetRefreshRates",day,night))
+        return true
     end
-    local ok=pcall(UIManager.setRefreshRate,UIManager,target)
-    if not ok then self:info("刷新频率调整失败") end
-    return ok
+    return false
+end
+
+function Plugin:_reader_set_both_refresh_rates(rate)
+    if UIManager and type(UIManager.broadcastEvent)=="function" then
+        UIManager:broadcastEvent(Event:new("SetBothRefreshRates",rate))
+        return true
+    end
+    return false
+end
+
+function Plugin:_reader_refresh_custom_values(index)
+    index=math.max(1,math.min(3,math.floor(tonumber(index) or 1)))
+    local key="refresh_rate_"..tostring(index)
+    local defaults={12,22,99}
+    local day=G_reader_settings and tonumber(G_reader_settings:readSetting(key)) or nil
+    local night=G_reader_settings and tonumber(G_reader_settings:readSetting("night_"..key)) or nil
+    day=day or defaults[index]
+    night=night or day
+    return day,night,key
+end
+
+function Plugin:_reader_edit_refresh_custom(index,back_callback)
+    local day,night,key=self:_reader_refresh_custom_values(index)
+    local ok,DoubleSpinWidget=pcall(require,"ui/widget/doublespinwidget")
+    if not ok or not DoubleSpinWidget then self:info("当前 KOReader 暂时无法编辑自定义刷新频率"); return false end
+    local widget
+    widget=DoubleSpinWidget:new{
+        title_text="自定义刷新 "..tostring(index),
+        info_text="普通与夜间模式分别设置全刷间隔；-1 表示每章。",
+        left_value=day,left_min=-1,left_max=200,left_step=1,left_hold_step=10,left_text="普通",
+        right_value=night,right_min=-1,right_max=200,right_step=1,right_hold_step=10,right_text="夜间",
+        ok_text="保存",
+        callback=function(left,right)
+            if G_reader_settings then
+                G_reader_settings:saveSetting(key,left)
+                G_reader_settings:saveSetting("night_"..key,right)
+            end
+            self:_reader_set_refresh_rates(left,right)
+        end,
+        close_callback=function() if back_callback then UIManager:scheduleIn(.05,back_callback) end end,
+    }
+    UIManager:show(widget)
+    return true
+end
+
+function Plugin:_show_reader_refresh_settings(back_callback)
+    local return_to_refresh=function() self:_show_reader_refresh_settings(back_callback) end
+    ReaderSettingsDialog.show{
+        title="刷新设置",
+        subtitle=function()
+            local day,night=self:_reader_refresh_rates()
+            local function label(v)
+                if v==nil then return "默认" end
+                if v==0 then return "从不" end
+                if v<0 then return "每章" end
+                if v==1 then return "每页" end
+                return "每 "..tostring(math.floor(v+.5)).." 页"
+            end
+            return "普通 "..label(day).." · 夜间 "..label(night)
+        end,
+        on_back=back_callback or function() self:_show_reader_page_display_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        sections=function()
+            local day,night=self:_reader_refresh_rates()
+            local rows={
+                {label="从不全刷",value="0",checked=day==0 and night==0,keep_open=true,callback=function() self:_reader_set_both_refresh_rates(0) end},
+                {label="每页",value="1",checked=day==1 and night==1,keep_open=true,callback=function() self:_reader_set_both_refresh_rates(1) end},
+                {label="每 6 页",value="6",checked=day==6 and night==6,keep_open=true,callback=function() self:_reader_set_both_refresh_rates(6) end},
+            }
+            for index=1,3 do
+                local d,n=self:_reader_refresh_custom_values(index)
+                local i=index
+                rows[#rows+1]={label="自定义 "..tostring(i),value=tostring(d).." / "..tostring(n),checked=day==d and night==n,callback=function()
+                    self:_reader_edit_refresh_custom(i,return_to_refresh)
+                end}
+            end
+            rows[#rows+1]={label="每章",value="-1",checked=day==-1 and night==-1,keep_open=true,callback=function() self:_reader_set_both_refresh_rates(-1) end}
+            local chapter=G_reader_settings and G_reader_settings:isTrue("refresh_on_chapter_boundaries") or false
+            local second=G_reader_settings and G_reader_settings:isTrue("no_refresh_on_second_chapter_page") or false
+            local images=G_reader_settings and G_reader_settings:nilOrTrue("refresh_on_pages_with_images") or true
+            return {
+                {title="全刷频率",rows=rows},
+                {title="附加规则",rows={
+                    {label="章节开始始终全刷",value=chapter and "已开启" or "已关闭",keep_open=true,callback=function() UIManager:broadcastEvent(Event:new("ToggleFlashOnChapterBoundaries")) end},
+                    {label="新章节第二页不全刷",value=second and "已开启" or "已关闭",keep_open=true,callback=function() UIManager:broadcastEvent(Event:new("ToggleNoFlashOnSecondChapterPage")) end},
+                    {label="含图片页面始终全刷",value=images and "已开启" or "已关闭",keep_open=true,callback=function() UIManager:broadcastEvent(Event:new("ToggleFlashOnPagesWithImages")) end},
+                    {label="立即全屏刷新",value="清除当前残影",callback=function() self:_home_full_refresh() end},
+                }},
+            }
+        end,
+    }
+    return true
+end
+
+function Plugin:_reader_cycle_refresh_rate()
+    -- Kept for compatibility with old dispatcher callbacks. The visible entry
+    -- now opens the complete KOReader-compatible refresh settings page.
+    return self:_show_reader_refresh_settings()
 end
 
 function Plugin:_show_reader_page_display_panel(back_callback)
@@ -11161,7 +11484,7 @@ function Plugin:_show_reader_page_display_panel(back_callback)
                 info_rows[#info_rows+1]={label="电量",value=self:_reader_footer_setting_label("battery"),keep_open=true,callback=function() self:_reader_toggle_footer_setting("battery") end}
             end
             local behavior_rows={
-                {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,keep_open=true,callback=function() self:_reader_cycle_refresh_rate() end},
+                {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,callback=function() self:_show_reader_refresh_settings(function() self:_show_reader_page_display_panel(back_callback) end) end},
                 {label="全屏刷新",value="立即执行",callback=function() self:_home_full_refresh() end},
                 {label="屏幕方向",value=self:_reader_rotation_label(),callback=function() self:_show_orientation_panel() end},
                 {label="夜间模式",value=self:_reader_night_label(),keep_open=true,callback=function() self:_home_toggle_night() end},
@@ -11390,7 +11713,7 @@ function Plugin:_show_reader_refresh_panel(back_callback)
         on_home=function() return self:return_to_miuread_home("reader surface") end,
         rows=function()
             return {
-                {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,keep_open=true,callback=function() self:_reader_cycle_refresh_rate() end},
+                {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,callback=function() self:_show_reader_refresh_settings(function() self:_show_reader_refresh_panel(back_callback) end) end},
                 {label="全屏刷新",value="立即执行",callback=function() self:_home_full_refresh() end},
                 {label="夜间模式",value=self:_reader_night_label(),keep_open=true,callback=function() self:_home_toggle_night() end},
                 {label="页面显示",value="状态栏与阅读信息",callback=function() self:_show_reader_page_display_panel(function() self:_show_reader_refresh_panel(back_callback) end) end},
@@ -17664,7 +17987,7 @@ function Plugin:thought_font_settings_menu()
         {text="固定字体",post_text=self:_thought_font_face_label(prefs),enabled_func=function()
             return (self.store:preferences().thoughts or {}).follow_body_font~=true
         end,sub_item_table_func=function() return self:thought_font_face_menu() end},
-        {text="字体大小",sub_item_table_func=function() return self:thought_font_menu() end},
+        {text="字体大小",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_menu() end},
     }
 end
 
@@ -17759,16 +18082,18 @@ function Plugin:thought_font_face_menu()
     return rows
 end
 function Plugin:thought_font_menu()
-    local choices={{"small","小"},{"standard","标准（默认）"},{"large","大"},{"xlarge","特大"}}
+    local choices={18,22,26,30}
     local rows={}
-    for _,choice in ipairs(choices) do
-        local key,label=choice[1],choice[2]
-        rows[#rows+1]={text=label,radio=true,checked_func=function() return tostring((self.store:preferences().thoughts or {}).font or "standard")==key end,callback=function()
-            self:_set_thought_font_size(key)
+    for _,value in ipairs(choices) do
+        local target=value
+        rows[#rows+1]={text=tostring(target),radio=true,checked_func=function() return self:_thought_font_size_value()==target end,callback=function()
+            self:_set_thought_font_size(target)
         end}
     end
+    rows[#rows+1]={text="阅读界面可用 − / + 精细调整",enabled=false}
     return rows
 end
+
 function Plugin:_download_dir_path()
     local custom=U.trim((self.store:preferences() or {}).download_dir or "")
     if custom~="" then return custom end
@@ -18189,14 +18514,24 @@ function Plugin:_teardown_thought_tap()
     if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then pcall(function() self.ui:unRegisterTouchZones({{id="miuread_thought_popup",overrides={"tap_link"}}}) end) end
     self._thought_tap_setup=nil
 end
-function Plugin:_thought_font_size(level)
-    -- These are final KOReader font-size values, matching the scale used by
-    -- document text. Each level is scaled exactly once for the current device;
-    -- no hidden ratio or legacy level conversion is applied afterwards.
-    local nominal={small=18,standard=22,large=26,xlarge=30}
-    local value=nominal[tostring(level or "standard")] or nominal.standard
-    return math.max(value,Device.screen:scaleBySize(value))
+function Plugin:_thought_font_size(value)
+    -- The native comment popup uses this same final size for layout metrics and
+    -- glyph rendering. The popup explicitly uses ThoughtFaceFactory:getFinalFace()
+    -- so the device scale is applied exactly once. UI preview callers stay logical.
+    local logical
+    if tonumber(value) then logical=math.max(12,math.min(48,math.floor(tonumber(value)+.5)))
+    else
+        local legacy={small=18,standard=22,large=26,xlarge=30}
+        logical=legacy[tostring(value or "standard")] or 22
+    end
+    local scaled=logical
+    if Device and Device.screen and type(Device.screen.scaleBySize)=="function" then
+        local ok,result=pcall(Device.screen.scaleBySize,Device.screen,logical)
+        if ok and tonumber(result) then scaled=math.max(logical,math.floor(tonumber(result)+.5)) end
+    end
+    return scaled
 end
+
 local function usable_font_name(value)
     if type(value)~="string" then return nil end
     value=value:match("^%s*(.-)%s*$")
@@ -18354,7 +18689,7 @@ function Plugin:_open_thought_info(info,generation)
                 tostring(info.book_id or ""), tostring(info.chapter_uid or ""),
                 tostring(info.range or ""), tostring(native_signature or ""),
             }, "|"),
-            font_size=self:_thought_font_size(prefs.font),
+            font_size=self:_thought_font_size(self:_thought_font_size_value(prefs)),
             font_name=self:_thought_font_name(prefs),
             width_ratio=tonumber(prefs.width_ratio) or 0.91,
             height_ratio=tonumber(prefs.height_ratio) or 0.55,

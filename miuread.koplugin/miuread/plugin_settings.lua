@@ -50,7 +50,7 @@ end
 function M.annotation_sync(plugin)
     if plugin:annotation_sync_diagnostic_only() then
         return {
-            {text="批注坐标诊断（beta.11）",post_text="云端写入已暂停",enabled=false},
+            {text="批注坐标诊断",post_text="云端写入已暂停",enabled=false},
             {text="诊断方式",post_text="打开书籍后在阅读页“批注”中生成",enabled=false},
             {text="导出内容",post_text="raw.xhtml · coord.xhtml · range-debug.json",enabled=false},
         }
