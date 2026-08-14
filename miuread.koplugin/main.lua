@@ -6368,6 +6368,167 @@ function Plugin:show_home_search_dialog()
     d:onShowKeyboard()
 end
 
+--- Build a map from book_id to {title, author} using home rows and the store library.
+function Plugin:_annotation_book_title_map()
+    local map = {}
+    for _, book in ipairs(self:_home_all_rows()) do
+        local id = tostring(book.bookId or book.book_id or "")
+        if id ~= "" then
+            map[id] = {
+                title = tostring(book.title or "未命名"),
+                author = tostring(book.author or ""),
+            }
+        end
+    end
+    for id, book in pairs(self.store:library() or {}) do
+        id = tostring(id)
+        if not map[id] then
+            map[id] = {
+                title = tostring(book.title or "未命名"),
+                author = tostring(book.author or ""),
+            }
+        end
+    end
+    return map
+end
+
+function Plugin:show_annotation_search_dialog(back_callback)
+    local d
+    d = InputDialog:new{
+        title = "搜索批注",
+        description = "在全部书籍的划线、想法和书签中搜索",
+        input = tostring(self._annotation_last_search or ""),
+        buttons = {{
+            {text = "取消", id = "close", callback = function()
+                UIManager:close(d)
+                if back_callback then UIManager:scheduleIn(.05, back_callback) end
+            end},
+            {text = "搜索", is_enter_default = true, callback = function()
+                local query = U.trim(d:getInputText())
+                UIManager:close(d)
+                if query == "" then
+                    if back_callback then UIManager:scheduleIn(.05, back_callback) end
+                    return
+                end
+                self._annotation_last_search = query
+                self:status_toast("搜索批注", "正在查找「"..query.."」", 2)
+                UIManager:nextTick(function()
+                    self:_annotation_run_search(query, back_callback)
+                end)
+            end},
+        }},
+    }
+    UIManager:show(d)
+    d:onShowKeyboard()
+    return true
+end
+
+function Plugin:_annotation_run_search(query, back_callback)
+    local results = LocalAnnotationDatabase.search_all(self.store, query, 200)
+    if type(results) ~= "table" then results = {} end
+    return self:_annotation_search_results(query, results, back_callback)
+end
+
+function Plugin:_annotation_search_results(query, results, back_callback)
+    local title_map = self:_annotation_book_title_map()
+    local kind_labels = { bookmark = "书签", highlight = "划线", thought = "想法" }
+    local kind_icons = { bookmark = "bookmark", highlight = "highlight", thought = "thought" }
+
+    local function build_excerpt(result)
+        local field = result.matched_field or ""
+        local text = result.matched_text or ""
+        if text == "" then
+            if result.note and result.note ~= "" then text = result.note
+            elseif result.selected_text and result.selected_text ~= "" then text = result.selected_text
+            elseif result.anchor_text and result.anchor_text ~= "" then text = result.anchor_text
+            elseif result.text and result.text ~= "" then text = result.text
+            else text = "无文字内容" end
+        end
+        text = text:gsub("%s+", " ")
+        text = U.trim(text)
+        -- If the note exists and is different from the matched text, show it as part of the excerpt.
+        if result.note and result.note ~= "" and field ~= "note" then
+            local note_clean = U.trim(tostring(result.note):gsub("%s+", " "))
+            if note_clean ~= "" and note_clean ~= text then
+                text = text .. "\n📝 " .. note_clean
+            end
+        end
+        return text
+    end
+
+    local rows = {}
+    for _, result in ipairs(results) do
+        local book_info = title_map[result.book_id] or { title = "未知书籍", author = "" }
+        local kind_label = kind_labels[result.kind] or result.kind or ""
+        local excerpt = build_excerpt(result)
+        local value_parts = {}
+        if kind_label ~= "" then value_parts[#value_parts + 1] = kind_label end
+        if result.page then value_parts[#value_parts + 1] = "第 " .. tostring(result.page) .. " 页" end
+        local value_text = table.concat(value_parts, " · ")
+
+        rows[#rows + 1] = {
+            icon = kind_icons[result.kind] or "",
+            label = U.utf8_truncate(excerpt, 120, "…"),
+            detail = U.utf8_truncate(book_info.title, 40, "…")
+                .. (book_info.author ~= "" and (" · " .. U.utf8_truncate(book_info.author, 20, "…")) or ""),
+            value = value_text,
+            callback = function()
+                self:_annotation_open_result(result, book_info, back_callback)
+            end,
+        }
+    end
+
+    ReaderListDialog.show{
+        title = "批注搜索",
+        subtitle = "「"..tostring(query).."」 · "..tostring(#rows).." 处",
+        items = rows,
+        page_size = 5,
+        empty_text = "没有找到匹配的批注",
+        on_back = function()
+            self:show_annotation_search_dialog(back_callback)
+        end,
+        on_home = self:_home_enabled() and function()
+            return self:return_to_miuread_home("annotation search")
+        end or nil,
+    }
+    return true
+end
+
+function Plugin:_annotation_open_result(result, book_info, back_callback)
+    -- If the book is currently open, try to navigate to the annotation page.
+    local current = self:_current_book_record()
+    local current_id = current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
+    if current_id ~= "" and current_id == result.book_id and self.ui and self.ui.document then
+        if result.page and type(self.ui.handleEvent) == "function" then
+            local link = self.ui and self.ui.link
+            if link and type(link.addCurrentLocationToStack) == "function" then
+                pcall(link.addCurrentLocationToStack, link)
+            end
+            self.ui:handleEvent(Event:new("GotoPage", tonumber(result.page)))
+            return true
+        end
+    end
+
+    -- Otherwise, find the book in the library and open it.
+    local target_book
+    for _, book in ipairs(self:_home_all_rows()) do
+        local id = tostring(book.bookId or book.book_id or "")
+        if id == result.book_id then
+            target_book = book
+            break
+        end
+    end
+    if target_book then
+        self:_home_open_book(target_book)
+        return true
+    end
+
+    -- Fallback: show book info.
+    self:info("《" .. tostring(book_info.title or "未知书籍") .. "》\n\n"
+        .. "这本书不在当前书架中，请先下载后查看批注。")
+    return false
+end
+
 function Plugin:_home_local_book_details(book)
     local lines={tostring(book.title or "未命名")}
     if U.trim(tostring(book.author or ""))~="" then lines[#lines+1]="作者："..tostring(book.author) end
@@ -6711,9 +6872,10 @@ function Plugin:_show_home_search_popup(anchor)
         preferred_direction="below",
         width_ratio=.58,
         title="搜索",
-        subtitle="从主页直接查找或浏览书籍",
+        subtitle="查找书籍或在批注中搜索",
         actions={
             {icon="⌕",label="搜索书籍",detail="按书名或作者查找",callback=function() self:show_home_search_dialog() end},
+            {icon="✎",label="搜索批注",detail="在划线、想法和书签中搜索",callback=function() self:show_annotation_search_dialog() end},
             {icon="▦",label="全部书籍",detail="打开完整书架",callback=function() self:show_home_all_books() end},
         },
     }
@@ -6926,6 +7088,7 @@ function Plugin:_home_action_function_actions(key,anchor)
     } end
     if key=="search" then return {
         {icon="⌕",label="搜索书籍",detail="按书名或作者查找",callback=function() self:show_home_search_dialog() end},
+        {icon="✎",label="搜索批注",detail="在划线、想法和书签中搜索",callback=function() self:show_annotation_search_dialog() end},
         {icon="▦",label="全部书籍",detail="打开完整书架",callback=function() self:show_home_all_books() end},
         {icon="◷",label="阅读历史",detail="查看最近阅读记录",callback=function() self:show_home_reading_history() end},
         {icon="▤",label="本地书库",detail="浏览本地书籍",callback=function() self:show_home_local_library() end},
@@ -10181,6 +10344,7 @@ function Plugin:_show_reader_annotation_panel(back_callback)
                     {icon="bookmark",label="书签",value=tostring(visible_counts.bookmark or 0),callback=function() self:_show_reader_records("bookmark",return_to_panel) end},
                     {icon="highlight",label="划线",value=tostring(visible_counts.highlight or 0),callback=function() self:_show_reader_records("highlight",return_to_panel) end},
                     {icon="thought",label="想法",value=tostring(visible_counts.thought or 0),callback=function() self:_show_reader_records("thought",return_to_panel) end},
+                    {icon="search",label="搜索批注",value="全部书籍",callback=function() self:show_annotation_search_dialog(return_to_panel) end},
                 }},
                 self:annotation_sync_diagnostic_only() and {title="批注坐标诊断 · beta.11",rows={
                     {icon="warning",label="云端批注写入",value="已暂停 · 防止错误 range",value_bold=true,enabled=false},
@@ -11106,6 +11270,7 @@ function Plugin:_reader_control_categories()
             {icon="toc",label="目录",value="当前章节",callback=function() self:_show_reader_toc(back_to("reading")) end},
             {icon="progress",label="阅读进度",value=(self:_reader_progress_percent() and (tostring(math.floor(self:_reader_progress_percent()+.5)).."%") or ""),callback=function() self:_show_reader_progress_control(back_to("reading")) end},
             {icon="search",label="书内搜索",value="搜索当前书籍",callback=function() self:_reader_show_search(back_to("reading")) end},
+            {icon="highlight",label="搜索批注",value="全部书籍划线与想法",callback=function() self:show_annotation_search_dialog(back_to("reading")) end},
             {icon="undo",label="回到阅读处",value="返回跳转前位置",callback=function() self:_reader_go_back_location() end},
             {icon="highlight",label="批注",value=self:_reader_annotation_summary_label(),callback=function() self:_show_reader_annotation_panel(back_to("reading")) end},
             {icon="comment",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_settings(back_to("reading")) end},
