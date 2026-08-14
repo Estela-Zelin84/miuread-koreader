@@ -1,10 +1,11 @@
 local SQLiteStore = require("miuread.sqlite_store")
 local Digests = require("miuread.digests")
 local lfs = require("libs/libkoreader-lfs")
+local logger = require("logger")
 
 local LocalAnnotationDatabase = {}
 
-LocalAnnotationDatabase.SCHEMA_VERSION = 4
+LocalAnnotationDatabase.SCHEMA_VERSION = 5
 LocalAnnotationDatabase.FILE_NAME = "local_annotations.sqlite3"
 
 local function database_path(store, book_id)
@@ -48,6 +49,7 @@ local function initialize(conn)
             coord_version INTEGER NOT NULL DEFAULT 0,
             coord_source TEXT NOT NULL DEFAULT '',
             coord_verify TEXT NOT NULL DEFAULT '',
+            sync_kind TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0
         );
@@ -66,15 +68,18 @@ local function initialize(conn)
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN coord_version INTEGER NOT NULL DEFAULT 0;")
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN coord_source TEXT NOT NULL DEFAULT '';")
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN coord_verify TEXT NOT NULL DEFAULT '';")
+    safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN sync_kind TEXT NOT NULL DEFAULT '';")
 
     if previous > 0 and previous < LocalAnnotationDatabase.SCHEMA_VERSION then
-        -- beta.6 may have marked records as locate_failed before context-aware
-        -- chapter/range resolution was available. Retry only records that are
-        -- definitely still local; never reset unknown mutations or remote IDs.
+        -- 4.5.0 changes coordinate confidence, bookmark recovery and sync-time
+        -- kind inference. Re-evaluate only mutations that are definitely local.
+        -- `unknown`/delete_unknown may already exist remotely and must never be
+        -- reset into a blind retry.
         conn:exec([[
             UPDATE local_annotations
                SET sync_state = 'local_only', last_stage = '', last_error = ''
-             WHERE present = 1 AND remote_id = '' AND sync_state = 'locate_failed';
+             WHERE present = 1 AND remote_id = ''
+               AND sync_state IN ('locate_failed','metadata_failed','coord_failed');
         ]])
     end
 
@@ -288,7 +293,8 @@ local SELECT_COLUMNS = [[
     selected_text, context_before, context_after, anchor_text, note,
     datetime, drawer, source_path, present, sync_state, range_key,
     remote_id, chapter_uid, chapter_idx, book_version, last_stage, last_error,
-    last_attempt_at, coord_version, coord_source, coord_verify, created_at, updated_at
+    last_attempt_at, coord_version, coord_source, coord_verify, created_at, updated_at,
+    sync_kind
 ]]
 
 local function row_from_sql(row)
@@ -308,7 +314,7 @@ local function row_from_sql(row)
         last_error=tostring(row[25] or ""), last_attempt_at=tonumber(row[26] or 0) or 0,
         coord_version=tonumber(row[27] or 0) or 0, coord_source=tostring(row[28] or ""),
         coord_verify=tostring(row[29] or ""), created_at=tonumber(row[30] or 0) or 0,
-        updated_at=tonumber(row[31] or 0) or 0,
+        updated_at=tonumber(row[31] or 0) or 0, sync_kind=tostring(row[32] or ""),
     }
 end
 
@@ -419,6 +425,26 @@ function LocalAnnotationDatabase.mark_state(store, book_id, local_id, state, fie
     return update_state(store, book_id, local_id, state, fields)
 end
 
+function LocalAnnotationDatabase.set_sync_kind(store, book_id, local_id, kind)
+    kind = tostring(kind or "")
+    if kind ~= "" and kind ~= "bookmark" and kind ~= "highlight" and kind ~= "thought" then
+        return nil, "invalid sync kind"
+    end
+    local conn = open(store, book_id, false)
+    local ok, err = xpcall(function()
+        local statement = conn:prepare([[
+            UPDATE local_annotations
+               SET sync_kind = ?, updated_at = ?
+             WHERE local_id = ?
+        ]])
+        statement:bind(kind, os.time(), tostring(local_id or "")):step()
+        statement:close()
+    end, debug.traceback)
+    pcall(conn.close, conn)
+    if not ok then return nil, tostring(err) end
+    return true
+end
+
 function LocalAnnotationDatabase.delete_row(store, book_id, local_id)
     if not LocalAnnotationDatabase.exists(store, book_id) then return true end
     local conn = open(store, book_id, false)
@@ -515,680 +541,127 @@ end
 -- Aggregate pending local mutations across every generated book. The home
 -- screen uses this instead of pretending there is a "current book" while no
 -- reader is open.
-function LocalAnnotationDatabase.global_summary(store)
-    local out = {pending=0, failed=0, delete_pending=0, bookmark=0, highlight=0, thought=0, books=0}
-    for _, path in ipairs(database_paths(store)) do
-        local ok_conn, conn = pcall(SQLiteStore.open, path, true)
-        if ok_conn and conn then
-            local ok = pcall(function()
-                local statement = conn:prepare([[
-                    SELECT kind, sync_state, COUNT(*) FROM local_annotations
-                     WHERE sync_state IN
-                        ('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown')
-                     GROUP BY kind, sync_state
-                ]])
-                local touched = false
-                while true do
-                    local row = statement:step()
-                    if not row then break end
-                    local kind, state_name = tostring(row[1] or ""), tostring(row[2] or "")
-                    local count = tonumber(row[3] or 0) or 0
-                    if count > 0 then touched = true end
-                    out.pending = out.pending + count
-                    if out[kind] ~= nil then out[kind] = out[kind] + count end
-                    if state_name == "delete_pending" or state_name == "delete_unknown" then
-                        out.delete_pending = out.delete_pending + count
-                    end
-                    if FAILURE_STATES[state_name] then out.failed = out.failed + count end
-                end
-                statement:close()
-                if touched then out.books = out.books + 1 end
-            end)
-            pcall(conn.close, conn)
-            if not ok then -- ignore one damaged cache DB; the rest remain usable
-            end
-        end
-    end
-    return out
-end
 
-function LocalAnnotationDatabase.pending_books(store, limit)
-    limit = math.max(1, tonumber(limit) or 100)
-    local by_book, order = {}, {}
-    for _, path in ipairs(database_paths(store)) do
-        local ok_conn, conn = pcall(SQLiteStore.open, path, true)
-        if ok_conn and conn then
-            pcall(function()
-                local statement = conn:prepare([[
-                    SELECT book_id, kind, sync_state, COUNT(*) FROM local_annotations
-                     WHERE sync_state IN
-                        ('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown')
-                     GROUP BY book_id, kind, sync_state
-                ]])
-                while true do
-                    local row = statement:step()
-                    if not row then break end
-                    local book_id = tostring(row[1] or "")
-                    local kind, state_name = tostring(row[2] or ""), tostring(row[3] or "")
-                    local count = tonumber(row[4] or 0) or 0
-                    if book_id ~= "" and count > 0 then
-                        local item = by_book[book_id]
-                        if not item then
-                            item = {book_id=book_id, pending=0, failed=0, bookmark=0, highlight=0, thought=0}
-                            by_book[book_id] = item
-                            order[#order + 1] = item
-                        end
-                        item.pending = item.pending + count
-                        if item[kind] ~= nil then item[kind] = item[kind] + count end
-                        if FAILURE_STATES[state_name] then item.failed = item.failed + count end
-                    end
-                end
-                statement:close()
-            end)
-            pcall(conn.close, conn)
-        end
-    end
-    table.sort(order, function(a, b)
-        if a.failed ~= b.failed then return a.failed > b.failed end
-        if a.pending ~= b.pending then return a.pending > b.pending end
-        return a.book_id < b.book_id
-    end)
-    while #order > limit do table.remove(order) end
-    return order
-end
-
-function LocalAnnotationDatabase.failures(store, book_id, limit)
-    if not LocalAnnotationDatabase.exists(store, book_id) then return {} end
-    local conn = open(store, book_id, false)
-    local out = {}
-    local ok, err = xpcall(function()
-        local statement = conn:prepare([[
-            SELECT kind, sync_state, last_stage, last_error
-              FROM local_annotations
-             WHERE book_id = ? AND last_error <> ''
-             ORDER BY updated_at DESC LIMIT ?
-        ]])
-        statement:bind(tostring(book_id or ""), math.max(1, tonumber(limit) or 6))
-        while true do
-            local row = statement:step()
-            if not row then break end
-            out[#out + 1] = {
-                kind=tostring(row[1] or ""), state=tostring(row[2] or ""),
-                stage=tostring(row[3] or ""), error=tostring(row[4] or ""),
-            }
-        end
-        statement:close()
-    end, debug.traceback)
-    pcall(conn.close, conn)
-    if not ok then return nil, tostring(err) end
-    return out
-end
-
---- Escape a string so it can be used as a literal in a SQL LIKE pattern.
--- Uses backslash as the escape character to match the ESCAPE '\' clause.
 local function escape_like(value)
     return (tostring(value or ""):gsub("[%%_\\]", "\\%0"))
 end
 
---- Full-text search across annotation databases of every cached book.
--- Returns a flat list of matches sorted by recency (updated_at DESC).
--- Each result contains: book_id, kind, page, datetime, matched_field,
--- matched_text, excerpt.
---
--- The search is case-insensitive for ASCII and performs plain substring
--- matching for CJK text via SQL LIKE. Multiple terms are AND-ed: every
--- term must appear in at least one searchable column of the same row.
---
--- @param store      Store instance
--- @param query      Raw query string (whitespace-separated terms)
--- @param limit      Maximum results (default 200)
--- @param options    { only_present = true (default) }
-function LocalAnnotationDatabase.search_all(store, query, limit, options)
-    limit = math.max(1, tonumber(limit) or 200)
-    options = type(options) == "table" and options or {}
-    local only_present = options.only_present ~= false
-
-    -- Split query into individual search terms (whitespace separated).
-    local terms = {}
-    local raw = tostring(query or "")
-    for term in raw:gmatch("%S+") do
-        local escaped = escape_like(term)
-        if escaped ~= "" then terms[#terms + 1] = escaped end
+-- Read-only full-text search across every cached book annotation database.
+-- Multiple whitespace-separated terms are AND-ed, while each term may occur
+-- in any searchable text field of the same annotation row.
+function LocalAnnotationDatabase.search_all(store, query, limit)
+    limit = math.max(1, math.min(500, tonumber(limit) or 200))
+    local plain_terms, escaped_terms = {}, {}
+    for term in tostring(query or ""):gmatch("%S+") do
+        if term ~= "" then
+            plain_terms[#plain_terms + 1] = term
+            escaped_terms[#escaped_terms + 1] = escape_like(term)
+        end
     end
-    if #terms == 0 then return {} end
+    if #plain_terms == 0 then return {} end
 
-    -- Build a LIKE clause that requires every term to match at least one
-    -- searchable column on the same row. We OR the columns for each term,
-    -- then AND across terms.
-    local SEARCH_COLUMNS = {
-        "selected_text", "note", "anchor_text",
-        "context_before", "context_after", "text",
+    local columns = {
+        "selected_text", "note", "anchor_text", "text",
+        "context_before", "context_after",
     }
-    local clauses = {}
-    local bindings = {}
-    for _, term in ipairs(terms) do
-        local or_parts = {}
-        for _, col in ipairs(SEARCH_COLUMNS) do
-            or_parts[#or_parts + 1] = col .. " LIKE ? ESCAPE '\\'"
+    local clauses, bindings = {}, {}
+    for _, term in ipairs(escaped_terms) do
+        local choices = {}
+        for _, column in ipairs(columns) do
+            choices[#choices + 1] = column .. " LIKE ? ESCAPE '\\'"
             bindings[#bindings + 1] = "%" .. term .. "%"
         end
-        clauses[#clauses + 1] = "(" .. table.concat(or_parts, " OR ") .. ")"
-    end
-    local where = table.concat(clauses, " AND ")
-    if only_present then
-        where = where .. " AND present = 1"
+        clauses[#clauses + 1] = "(" .. table.concat(choices, " OR ") .. ")"
     end
 
     local sql = [[
-        SELECT book_id, kind, page, datetime, updated_at,
-               selected_text, note, anchor_text,
-               context_before, context_after, text
+        SELECT local_id, book_id, kind, pos0, pos1, xpointer, page,
+               text, selected_text, note, anchor_text, context_before,
+               context_after, datetime, updated_at, source_path, sync_state
           FROM local_annotations
-         WHERE ]] .. where .. [[
+         WHERE present = 1 AND ]] .. table.concat(clauses, " AND ") .. [[
          ORDER BY updated_at DESC
          LIMIT ?
     ]]
 
-    local results = {}
+    local out = {}
     for _, path in ipairs(database_paths(store)) do
         local ok_conn, conn = pcall(SQLiteStore.open, path, true)
         if ok_conn and conn then
-            pcall(function()
+            local ok, err = xpcall(function()
                 local statement = conn:prepare(sql)
-                for _, value in ipairs(bindings) do
-                    statement:bind(value)
-                end
-                statement:bind(limit)
+                local values = {}
+                for _, value in ipairs(bindings) do values[#values + 1] = value end
+                values[#values + 1] = limit
+                statement:bind(unpack(values))
                 while true do
                     local row = statement:step()
                     if not row then break end
-                    local selected_text = tostring(row[6] or "")
-                    local note = tostring(row[7] or "")
-                    local anchor_text = tostring(row[8] or "")
-                    local context_before = tostring(row[9] or "")
-                    local context_after = tostring(row[10] or "")
-                    local text = tostring(row[11] or "")
-                    -- Determine which field matched and build the best excerpt.
-                    local matched_field, matched_text
-                    local field_order = {
-                        {"selected_text", selected_text},
-                        {"note", note},
-                        {"anchor_text", anchor_text},
-                        {"text", text},
-                        {"context_before", context_before},
-                        {"context_after", context_after},
+                    local fields = {
+                        selected_text = tostring(row[9] or ""),
+                        note = tostring(row[10] or ""),
+                        anchor_text = tostring(row[11] or ""),
+                        text = tostring(row[8] or ""),
+                        context_before = tostring(row[12] or ""),
+                        context_after = tostring(row[13] or ""),
                     }
-                    for _, entry in ipairs(field_order) do
-                        local field_name, field_value = entry[1], entry[2]
-                        if field_value ~= "" then
-                            local lower_field = field_value:lower()
-                            local all_found = true
-                            for _, term in ipairs(terms) do
-                                local lower_term = term:lower()
-                                if not lower_field:find(lower_term, 1, true) then
-                                    all_found = false
-                                    break
-                                end
+                    -- Pick the field containing the most query terms for the
+                    -- visible excerpt. SQL already guarantees all terms exist
+                    -- somewhere on this row.
+                    local matched_field, matched_text, matched_score = "", "", -1
+                    for _, name in ipairs({"note","selected_text","anchor_text","text","context_before","context_after"}) do
+                        local value = fields[name]
+                        if value ~= "" then
+                            local lower = value:lower()
+                            local score = 0
+                            for _, term in ipairs(plain_terms) do
+                                if lower:find(term:lower(), 1, true) then score = score + 1 end
                             end
-                            if all_found then
-                                matched_field = field_name
-                                matched_text = field_value
-                                break
+                            if score > matched_score then
+                                matched_field, matched_text, matched_score = name, value, score
                             end
                         end
                     end
-                    -- Fallback: use the first non-empty text field.
-                    if not matched_text then
-                        for _, entry in ipairs(field_order) do
-                            if entry[2] ~= "" then
-                                matched_field = entry[1]
-                                matched_text = entry[2]
-                                break
-                            end
-                        end
-                    end
-                    results[#results + 1] = {
-                        book_id = tostring(row[1] or ""),
-                        kind = tostring(row[2] or ""),
-                        page = tonumber(row[3]),
-                        datetime = tostring(row[4] or ""),
-                        updated_at = tonumber(row[5] or 0) or 0,
-                        selected_text = selected_text,
-                        note = note,
-                        anchor_text = anchor_text,
-                        context_before = context_before,
-                        context_after = context_after,
-                        text = text,
-                        matched_field = matched_field or "",
-                        matched_text = matched_text or "",
+                    out[#out + 1] = {
+                        local_id = tostring(row[1] or ""),
+                        book_id = tostring(row[2] or ""),
+                        kind = tostring(row[3] or ""),
+                        pos0 = tostring(row[4] or ""),
+                        pos1 = tostring(row[5] or ""),
+                        xpointer = tostring(row[6] or ""),
+                        page = tonumber(row[7]),
+                        text = fields.text,
+                        selected_text = fields.selected_text,
+                        note = fields.note,
+                        anchor_text = fields.anchor_text,
+                        context_before = fields.context_before,
+                        context_after = fields.context_after,
+                        datetime = tostring(row[14] or ""),
+                        updated_at = tonumber(row[15] or 0) or 0,
+                        source_path = tostring(row[16] or ""),
+                        sync_state = tostring(row[17] or ""),
+                        matched_field = matched_field,
+                        matched_text = matched_text,
                     }
-                    if #results >= limit then break end
                 end
                 statement:close()
-            end)
+            end, debug.traceback)
             pcall(conn.close, conn)
+            if not ok then
+                logger.warn("[MiuRead][LocalAnnotations] search skipped database", tostring(path), tostring(err))
+            end
         end
-        if #results >= limit then break end
     end
 
-    -- Re-sort by updated_at DESC in case databases were visited out of order.
-    table.sort(results, function(a, b)
+    table.sort(out, function(a, b)
         if a.updated_at ~= b.updated_at then return a.updated_at > b.updated_at end
-        return tostring(a.book_id) < tostring(b.book_id)
+        if a.book_id ~= b.book_id then return a.book_id < b.book_id end
+        return a.local_id < b.local_id
     end)
-    while #results > limit do table.remove(results) end
-    return results
-end
-
-return LocalAnnotationDatabase
-    return tostring(value or ""):match("^%s*(.-)%s*$") ~= ""
-end
-
---- Canonical KOReader annotation classification used by both snapshot and UI.
--- A drawer means a text highlight. It is a thought only when the note has
--- actual non-whitespace content; Lua treats "" as truthy, so `item.note and`
--- is not safe here.
-function LocalAnnotationDatabase.annotation_kind(item)
-    if type(item) ~= "table" then return nil end
-    if item.drawer then
-        return nonempty(item.note) and "thought" or "highlight"
-    end
-    return "bookmark"
-end
-
-local function stable_id(book_id, item, kind)
-    for _, key in ipairs({"id", "uuid", "annotation_id", "annotationId"}) do
-        local value = scalar(item[key])
-        if value ~= "" then return "ko:" .. value end
-    end
-    local pos0 = scalar(item.pos0 or item.start)
-    local pos1 = scalar(item.pos1 or item["end"])
-    local xpointer = scalar(item.xpointer)
-    local page = scalar(item.page or item.pageno)
-    local datetime = scalar(item.datetime or item.date)
-    local base = table.concat({
-        tostring(book_id or ""), tostring(kind or ""), pos0, pos1,
-        xpointer, page, datetime,
-    }, "\31")
-    if pos0 == "" and pos1 == "" and xpointer == "" and page == "" then
-        base = base .. "\31" .. scalar(item.text or item.notes)
-            .. "\31" .. scalar(item.note)
-    end
-    return "miu:" .. Digests.md5(base):lower()
-end
-
-local function compact(book_id, item, source_path, resolver)
-    if type(item) ~= "table" then return nil end
-    local kind = LocalAnnotationDatabase.annotation_kind(item)
-    if not kind then return nil end
-    local resolved = {}
-    if type(resolver) == "function" then
-        local ok, value = pcall(resolver, item, kind)
-        if ok and type(value) == "table" then resolved = value end
-    end
-    local page_value = item.page or item.pageno
-    local xpointer = item.xpointer
-    if (xpointer == nil or xpointer == "") and kind == "bookmark"
-        and type(page_value) == "string" and tonumber(page_value) == nil then
-        xpointer = page_value
-    end
-    local item_text = scalar(item.text or item.notes)
-    local selected = tostring(resolved.selected_text or "")
-    if selected == "" and kind ~= "bookmark" then selected = item_text end
-    return {
-        local_id = stable_id(book_id, item, kind),
-        book_id = tostring(book_id or ""),
-        kind = kind,
-        pos0 = scalar(item.pos0 or item.start),
-        pos1 = scalar(item.pos1 or item["end"]),
-        xpointer = scalar(xpointer),
-        page = tonumber(page_value),
-        text = item_text,
-        selected_text = selected,
-        context_before = tostring(resolved.context_before or ""),
-        context_after = tostring(resolved.context_after or ""),
-        anchor_text = tostring(resolved.anchor_text or ""),
-        note = scalar(item.note),
-        datetime = scalar(item.datetime or item.date),
-        drawer = scalar(item.drawer),
-        source_path = tostring(source_path or ""),
-        chapter_uid = tostring(resolved.chapter_uid or resolved.uid or ""),
-        chapter_idx = tonumber(resolved.chapter_idx or resolved.index),
-    }
-end
-
-function LocalAnnotationDatabase.path(store, book_id)
-    return database_path(store, book_id)
-end
-
-function LocalAnnotationDatabase.exists(store, book_id)
-    return lfs.attributes(database_path(store, book_id), "mode") == "file"
-end
-
---- Replace the current KOReader annotation snapshot without doing network work.
--- resolver(item, kind) may add chapter/context information while the document is open.
-function LocalAnnotationDatabase.snapshot(store, book_id, annotations, source_path, resolver)
-    book_id = tostring(book_id or "")
-    if book_id == "" then return nil, "bookId missing" end
-    annotations = type(annotations) == "table" and annotations or {}
-
-    local conn = open(store, book_id, false)
-    local ok, result = xpcall(function()
-        return SQLiteStore.transaction(conn, function()
-            local now = os.time()
-            local mark_missing = conn:prepare([[
-                UPDATE local_annotations SET present = 0, updated_at = ? WHERE book_id = ?
-            ]])
-            mark_missing:bind(now, book_id):step()
-            mark_missing:close()
-
-            local insert = conn:prepare([[
-                INSERT OR IGNORE INTO local_annotations(
-                    local_id, book_id, kind, pos0, pos1, xpointer, page,
-                    text, selected_text, context_before, context_after, anchor_text,
-                    note, datetime, drawer, source_path, chapter_uid, chapter_idx,
-                    present, sync_state, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'local_only', ?, ?)
-            ]])
-            local update = conn:prepare([[
-                UPDATE local_annotations
-                   SET book_id = ?, kind = ?, pos0 = ?, pos1 = ?, xpointer = ?, page = ?,
-                       text = ?,
-                       selected_text = CASE WHEN ? <> '' THEN ? ELSE selected_text END,
-                       context_before = CASE WHEN ? <> '' THEN ? ELSE context_before END,
-                       context_after = CASE WHEN ? <> '' THEN ? ELSE context_after END,
-                       anchor_text = CASE WHEN ? <> '' THEN ? ELSE anchor_text END,
-                       note = ?, datetime = ?, drawer = ?, source_path = ?,
-                       chapter_uid = CASE WHEN ? <> '' THEN ? ELSE chapter_uid END,
-                       chapter_idx = COALESCE(?, chapter_idx),
-                       present = 1, updated_at = ?
-                 WHERE local_id = ?
-            ]])
-
-            local count = 0
-            for _, item in ipairs(annotations) do
-                local row = compact(book_id, item, source_path, resolver)
-                if row then
-                    insert:bind(
-                        row.local_id, row.book_id, row.kind, row.pos0, row.pos1,
-                        row.xpointer, row.page, row.text, row.selected_text,
-                        row.context_before, row.context_after, row.anchor_text,
-                        row.note, row.datetime, row.drawer, row.source_path,
-                        row.chapter_uid, row.chapter_idx, now, now
-                    ):step()
-                    insert:clearbind():reset()
-                    update:bind(
-                        row.book_id, row.kind, row.pos0, row.pos1, row.xpointer, row.page,
-                        row.text,
-                        row.selected_text, row.selected_text,
-                        row.context_before, row.context_before,
-                        row.context_after, row.context_after,
-                        row.anchor_text, row.anchor_text,
-                        row.note, row.datetime, row.drawer, row.source_path,
-                        row.chapter_uid, row.chapter_uid, row.chapter_idx,
-                        now, row.local_id
-                    ):step()
-                    update:clearbind():reset()
-                    count = count + 1
-                end
-            end
-            insert:close()
-            update:close()
-
-            -- Records never seen by the server can disappear locally without a tombstone.
-            conn:exec([[
-                DELETE FROM local_annotations
-                 WHERE present = 0 AND remote_id = ''
-                   AND sync_state IN ('local_only','locate_failed','metadata_failed','coord_failed');
-            ]])
-            -- Anything already known/possibly known by the server is retained until
-            -- the cloud side is confirmed gone.
-            conn:exec([[
-                UPDATE local_annotations
-                   SET sync_state = 'delete_pending'
-                 WHERE present = 0
-                   AND sync_state IN ('synced','unknown','delete_unknown');
-            ]])
-            return {count=count, updated_at=now}
-        end)
-    end, debug.traceback)
-    pcall(conn.close, conn)
-    if not ok then return nil, tostring(result) end
-    return result
-end
-
-local SELECT_COLUMNS = [[
-    local_id, book_id, kind, pos0, pos1, xpointer, page, text,
-    selected_text, context_before, context_after, anchor_text, note,
-    datetime, drawer, source_path, present, sync_state, range_key,
-    remote_id, chapter_uid, chapter_idx, book_version, last_stage, last_error,
-    last_attempt_at, coord_version, coord_source, coord_verify, created_at, updated_at
-]]
-
-local function row_from_sql(row)
-    if not row then return nil end
-    return {
-        local_id=tostring(row[1] or ""), book_id=tostring(row[2] or ""),
-        kind=tostring(row[3] or ""), pos0=tostring(row[4] or ""), pos1=tostring(row[5] or ""),
-        xpointer=tostring(row[6] or ""), page=tonumber(row[7]), text=tostring(row[8] or ""),
-        selected_text=tostring(row[9] or ""), context_before=tostring(row[10] or ""),
-        context_after=tostring(row[11] or ""), anchor_text=tostring(row[12] or ""),
-        note=tostring(row[13] or ""), datetime=tostring(row[14] or ""),
-        drawer=tostring(row[15] or ""), source_path=tostring(row[16] or ""),
-        present=tonumber(row[17] or 0)==1, sync_state=tostring(row[18] or ""),
-        range_key=tostring(row[19] or ""), remote_id=tostring(row[20] or ""),
-        chapter_uid=tostring(row[21] or ""), chapter_idx=tonumber(row[22]),
-        book_version=tonumber(row[23] or 0) or 0, last_stage=tostring(row[24] or ""),
-        last_error=tostring(row[25] or ""), last_attempt_at=tonumber(row[26] or 0) or 0,
-        coord_version=tonumber(row[27] or 0) or 0, coord_source=tostring(row[28] or ""),
-        coord_verify=tostring(row[29] or ""), created_at=tonumber(row[30] or 0) or 0,
-        updated_at=tonumber(row[31] or 0) or 0,
-    }
-end
-
-function LocalAnnotationDatabase.list(store, book_id, limit)
-    if not LocalAnnotationDatabase.exists(store, book_id) then return {} end
-    local conn = open(store, book_id, true)
-    local out = {}
-    local ok, err = xpcall(function()
-        local statement = conn:prepare("SELECT " .. SELECT_COLUMNS .. [[
-            FROM local_annotations
-            WHERE book_id = ? AND present = 1
-            ORDER BY updated_at DESC LIMIT ?
-        ]])
-        statement:bind(tostring(book_id or ""), math.max(1, tonumber(limit) or 200))
-        while true do
-            local row = statement:step()
-            if not row then break end
-            out[#out + 1] = row_from_sql(row)
-        end
-        statement:close()
-    end, debug.traceback)
-    pcall(conn.close, conn)
-    if not ok then return nil, tostring(err) end
+    while #out > limit do table.remove(out) end
     return out
 end
 
-function LocalAnnotationDatabase.pending(store, book_id, limit)
-    if not LocalAnnotationDatabase.exists(store, book_id) then return {} end
-    local conn = open(store, book_id, false)
-    local out = {}
-    local ok, err = xpcall(function()
-        local statement = conn:prepare("SELECT " .. SELECT_COLUMNS .. [[
-            FROM local_annotations
-            WHERE book_id = ? AND sync_state IN
-                ('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown')
-            ORDER BY updated_at ASC LIMIT ?
-        ]])
-        statement:bind(tostring(book_id or ""), math.max(1, tonumber(limit) or 200))
-        while true do
-            local row = statement:step()
-            if not row then break end
-            out[#out + 1] = row_from_sql(row)
-        end
-        statement:close()
-    end, debug.traceback)
-    pcall(conn.close, conn)
-    if not ok then return nil, tostring(err) end
-    return out
-end
-
-local function update_state(store, book_id, local_id, state, fields)
-    fields = fields or {}
-    local conn = open(store, book_id, false)
-    local ok, err = xpcall(function()
-        local statement = conn:prepare([[
-            UPDATE local_annotations
-               SET sync_state = ?, range_key = CASE WHEN ? IS NULL THEN range_key ELSE ? END,
-                   remote_id = CASE WHEN ? IS NULL THEN remote_id ELSE ? END,
-                   book_version = CASE WHEN ? IS NULL THEN book_version ELSE ? END,
-                   chapter_uid = CASE WHEN ? IS NULL THEN chapter_uid ELSE ? END,
-                   chapter_idx = CASE WHEN ? IS NULL THEN chapter_idx ELSE ? END,
-                   coord_version = CASE WHEN ? IS NULL THEN coord_version ELSE ? END,
-                   coord_source = CASE WHEN ? IS NULL THEN coord_source ELSE ? END,
-                   coord_verify = CASE WHEN ? IS NULL THEN coord_verify ELSE ? END,
-                   last_stage = ?, last_error = ?, last_attempt_at = ?, updated_at = ?
-             WHERE local_id = ?
-        ]])
-        local range = fields.range_key
-        local remote = fields.remote_id
-        local version = fields.book_version
-        local chapter_uid = fields.chapter_uid
-        local chapter_idx = fields.chapter_idx
-        local coord_version = fields.coord_version
-        local coord_source = fields.coord_source
-        local coord_verify = fields.coord_verify
-        local now = os.time()
-        statement:bind(
-            tostring(state or "local_only"),
-            range, range, remote, remote,
-            version, version,
-            chapter_uid, chapter_uid,
-            chapter_idx, chapter_idx,
-            coord_version, coord_version,
-            coord_source, coord_source,
-            coord_verify, coord_verify,
-            tostring(fields.last_stage or ""), tostring(fields.last_error or ""),
-            tonumber(fields.last_attempt_at) or now, now,
-            tostring(local_id or "")
-        ):step()
-        statement:close()
-    end, debug.traceback)
-    pcall(conn.close, conn)
-    if not ok then return nil, tostring(err) end
-    return true
-end
-
-function LocalAnnotationDatabase.mark_synced(store, book_id, local_id, remote_id, range_key, book_version, fields)
-    fields = type(fields) == "table" and fields or {}
-    fields.remote_id = tostring(remote_id or "")
-    fields.range_key = tostring(range_key or "")
-    fields.book_version = tonumber(book_version) or 0
-    fields.last_stage = "done"
-    fields.last_error = ""
-    return update_state(store, book_id, local_id, "synced", fields)
-end
-
-function LocalAnnotationDatabase.mark_state(store, book_id, local_id, state, fields)
-    return update_state(store, book_id, local_id, state, fields)
-end
-
-function LocalAnnotationDatabase.delete_row(store, book_id, local_id)
-    if not LocalAnnotationDatabase.exists(store, book_id) then return true end
-    local conn = open(store, book_id, false)
-    local ok, err = xpcall(function()
-        local statement = conn:prepare("DELETE FROM local_annotations WHERE local_id = ?")
-        statement:bind(tostring(local_id or "")):step()
-        statement:close()
-    end, debug.traceback)
-    pcall(conn.close, conn)
-    if not ok then return nil, tostring(err) end
-    return true
-end
-
-function LocalAnnotationDatabase.summary(store, book_id)
-    if not LocalAnnotationDatabase.exists(store, book_id) then
-        return {total=0, bookmark=0, highlight=0, thought=0, pending=0, synced=0,
-            delete_pending=0, locate_failed=0, metadata_failed=0, coord_failed=0,
-            unknown=0, legacy_synced=0}
-    end
-    local conn = open(store, book_id, false)
-    local ok, result = xpcall(function()
-        local out = {total=0, bookmark=0, highlight=0, thought=0, pending=0, synced=0,
-            delete_pending=0, locate_failed=0, metadata_failed=0, coord_failed=0,
-            unknown=0, legacy_synced=0}
-        local statement = conn:prepare([[
-            SELECT kind, sync_state, COUNT(*) FROM local_annotations
-             WHERE book_id = ? AND (present = 1 OR sync_state IN ('delete_pending','delete_unknown'))
-             GROUP BY kind, sync_state
-        ]])
-        statement:bind(tostring(book_id or ""))
-        while true do
-            local row = statement:step()
-            if not row then break end
-            local kind = tostring(row[1] or "")
-            local state = tostring(row[2] or "")
-            local count = tonumber(row[3] or 0) or 0
-            out.total = out.total + count
-            if out[kind] ~= nil then out[kind] = out[kind] + count end
-            if state == "synced" then out.synced = out.synced + count
-            elseif state == "delete_pending" or state == "delete_unknown" then
-                out.delete_pending = out.delete_pending + count
-            elseif state == "locate_failed" then
-                out.locate_failed = out.locate_failed + count; out.pending = out.pending + count
-            elseif state == "metadata_failed" then
-                out.metadata_failed = out.metadata_failed + count; out.pending = out.pending + count
-            elseif state == "coord_failed" then
-                out.coord_failed = out.coord_failed + count; out.pending = out.pending + count
-            elseif state == "unknown" then
-                out.unknown = out.unknown + count; out.pending = out.pending + count
-            else
-                out.pending = out.pending + count
-            end
-        end
-        statement:close()
-        local legacy = conn:prepare([[
-            SELECT COUNT(*) FROM local_annotations
-             WHERE book_id = ? AND present = 1 AND sync_state = 'synced'
-               AND COALESCE(coord_version, 0) < 2
-        ]])
-        legacy:bind(tostring(book_id or ""))
-        local legacy_row = legacy:step()
-        out.legacy_synced = legacy_row and (tonumber(legacy_row[1] or 0) or 0) or 0
-        legacy:close()
-        return out
-    end, debug.traceback)
-    pcall(conn.close, conn)
-    if not ok then return nil, tostring(result) end
-    return result
-end
-
-local FAILURE_STATES = {
-    locate_failed=true, metadata_failed=true, coord_failed=true,
-    unknown=true, delete_unknown=true,
-}
-
-local function database_paths(store)
-    local root = tostring(store and store.cache_books_dir or "")
-    local out = {}
-    if root == "" or lfs.attributes(root, "mode") ~= "directory" then return out end
-    local ok, iter, state, var = pcall(lfs.dir, root)
-    if not ok or not iter then return out end
-    while true do
-        local name = iter(state, var)
-        var = name
-        if not name then break end
-        if name ~= "." and name ~= ".." then
-            local path = root .. "/" .. name .. "/" .. LocalAnnotationDatabase.FILE_NAME
-            if lfs.attributes(path, "mode") == "file" then out[#out + 1] = path end
-        end
-    end
-    return out
-end
-
--- Aggregate pending local mutations across every generated book. The home
--- screen uses this instead of pretending there is a "current book" while no
--- reader is open.
 function LocalAnnotationDatabase.global_summary(store)
     local out = {pending=0, failed=0, delete_pending=0, bookmark=0, highlight=0, thought=0, books=0}
     for _, path in ipairs(database_paths(store)) do

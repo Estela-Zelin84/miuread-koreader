@@ -621,14 +621,10 @@ local function build_footnote_section(img_notes, anchor_notes)
     return table.concat(parts)
 end
 
--- Some books (WeRead included) keep their original end-of-chapter footnote
--- paragraphs (e.g. <p class="footnote" id="fn_ref_1">) next to the reference
--- links. After convert_anchor_refs() rewrote those references to point at the
--- EPUB3 <aside> footnotes we generate, leaving the original paragraphs behind
--- would render every converted note a second time at the end of the chapter.
--- Remove the source paragraphs whose anchor was actually converted, plus the
--- footnote separator line that introduced them. Footnotes that were not
--- resolved (and whose original links were deliberately preserved) are kept.
+
+-- A converted EPUB3 footnote replaces the publisher's original endnote
+-- container. Keep unresolved source notes, but remove only source containers
+-- whose id/name was actually converted so the same note is not rendered twice.
 local function strip_converted_footnote_sources(html, notes)
     local converted = {}
     for _, note in ipairs(notes or {}) do
@@ -638,9 +634,6 @@ local function strip_converted_footnote_sources(html, notes)
     if not next(converted) then return html, 0 end
 
     local removed = 0
-    -- Only footnote-ish container tags are considered, and only elements whose
-    -- id/name was converted are removed; any other element is left byte-for-byte
-    -- intact (the replacement callback returns nil so gsub keeps the match).
     local tags = { "p", "li", "aside", "dd", "div" }
     for _, tag in ipairs(tags) do
         html = html:gsub("<" .. tag .. "(%s+[^>]*)>(.-)</" .. tag .. "%s*>", function(attrs, inner)
@@ -658,8 +651,6 @@ local function strip_converted_footnote_sources(html, notes)
     end
 
     if removed > 0 then
-        -- The generated <div class="footnotes"> section brings its own <hr/>,
-        -- so the original separator line(s) are no longer needed.
         html = html:gsub('<[hH][rR][^>]*%sclass="[^"]*footnote%-separator[^"]*"[^>]*%s*/?>', "")
             :gsub("<[hH][rR][^>]*%sclass='[^']*footnote%-separator[^']*'[^>]*%s*/?>", "")
     end
@@ -731,9 +722,6 @@ function Footnotes.process(html, meta)
 
     local html1,img_notes=Footnotes.convert_img_footnotes(html)
     local html2,anchor_notes=convert_anchor_refs(html1,anchor_texts,#img_notes)
-    -- Remove the original publisher footnote paragraphs that were converted into
-    -- the EPUB3 <aside> footnotes above, so the same note is not rendered twice
-    -- at the end of the chapter. Unresolved notes keep their original markup.
     local stripped_sources=0
     html2,stripped_sources=strip_converted_footnote_sources(html2,anchor_notes)
 
