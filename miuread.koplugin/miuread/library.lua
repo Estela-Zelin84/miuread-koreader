@@ -133,7 +133,6 @@ local function book(row,raw_index,archive_map)
         archiveName=archive and archive.archiveName or nil,
         archiveNames=archive and archive.archiveNamesText or nil,
         inArchive=archive~=nil,
-        raw=row,
     }
 end
 
