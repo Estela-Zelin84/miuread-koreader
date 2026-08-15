@@ -1630,6 +1630,10 @@ function Plugin:_refresh_shelf_async(on_ready,silent)
         self.store:save_shelf_cache({books=books,mp=mp,updated_at=os.time()})
         logger.info("[MiuRead][Shelf] refresh completed","mode=",tostring(mode),
             "books=",tostring(#books),"mp=",tostring(#mp))
+        local stats=self.library.last_shelf_filter
+        if stats and stats.kept==0 and stats.filtered>0 then
+            self:toast("所选书单在账号书架中没有书，已跳过 "..tostring(stats.filtered).." 本。\n可在“账号书架范围”改选书单或关闭过滤。",5)
+        end
         if on_ready then on_ready(books,mp,nil) end
     end
 
@@ -17713,6 +17717,7 @@ function Plugin:display_settings_menu()
         {text="觅阅显示大小",post_text=size_labels[home.display_size] or "标准",sub_item_table_func=function() return self:home_display_size_menu() end},
         {text="觅阅界面字体",post_text=self:_home_ui_font_label(home),sub_item_table_func=function() return self:home_ui_font_menu() end},
         {text="首页书架来源",post_text="选择显示项目",sub_item_table_func=function() return self:home_source_settings_menu() end},
+        {text="账号书架范围",post_text=self:_shelf_filter_label(),sub_item_table_func=function() return self:shelf_filter_settings_menu() end},
         {text="本地书籍",post_text=home.local_auto_update==true and "自动更新" or "手动更新",sub_item_table_func=function() return self:local_library_settings_menu() end},
         {text="公众号阅读",post_text="图片与缓存",sub_item_table_func=function() return self:mp_settings_menu() end},
         {text="主页快捷工具",post_text="最多六项",sub_item_table_func=function() return self:home_action_settings_menu() end},
@@ -17721,6 +17726,105 @@ function Plugin:display_settings_menu()
         {text="主页锁屏显示最近阅读封面",checked_func=function() return self:_home_preferences().lockscreen_recent~=false end,keep_menu_open=true,callback=function() self:_toggle_home_lockscreen() end},
         {text="显示书架封面",checked_func=function() return self.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("shelf_covers") end},
     }
+end
+
+function Plugin:_shelf_filter_prefs()
+    local p=self.store:preferences()
+    p.shelf_filter=type(p.shelf_filter)=="table" and p.shelf_filter or {enabled=false,archives={}}
+    p.shelf_filter.archives=type(p.shelf_filter.archives)=="table" and p.shelf_filter.archives or {}
+    return p
+end
+
+function Plugin:_shelf_filter_label()
+    local filter=self:_shelf_filter_prefs().shelf_filter
+    if filter.enabled~=true then return "全部书架" end
+    local count=0
+    for _ in pairs(filter.archives) do count=count+1 end
+    if count==0 then return "全部书架" end
+    return "指定书单 · "..tostring(count).." 个"
+end
+
+function Plugin:_shelf_filter_add_name(name)
+    name=U.trim(tostring(name or ""))
+    if name=="" then return end
+    local p=self:_shelf_filter_prefs()
+    p.shelf_filter.archives[name]=true
+    self.store:save_preferences(p)
+    self:toast("已添加书单："..name,2)
+end
+
+function Plugin:_shelf_filter_input()
+    local d
+    d=InputDialog:new{
+        title="添加书单名",
+        input="",
+        input_hint="需与微信读书内书单名完全一致",
+        buttons={{
+            {text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},
+            {text="添加",is_enter_default=true,callback=function()
+                local name=U.trim(d:getInputText() or "")
+                UIManager:close(d)
+                self:_shelf_filter_add_name(name)
+            end},
+        }},
+    }
+    UIManager:show(d)
+    d:onShowKeyboard()
+end
+
+function Plugin:shelf_filter_settings_menu()
+    -- checked_func runs on every menu repaint for every row, and preferences()
+    -- deep-merges the whole preference tree on each call, so a long booklist
+    -- would re-merge it once per row per paint. Keep a snapshot for the display
+    -- side; writes still re-read the store so a concurrent preference change is
+    -- never clobbered.
+    local view=self:_shelf_filter_prefs().shelf_filter
+    local selected=view.archives
+    local function write(mutate)
+        local p=self:_shelf_filter_prefs()
+        mutate(p.shelf_filter)
+        self.store:save_preferences(p)
+        view=p.shelf_filter
+        selected=view.archives
+    end
+    local rows={
+        {text="只同步指定书单",post_text="启动与刷新仅加载所选书单",checked_func=function()
+            return view.enabled==true
+        end,keep_menu_open=true,callback=function()
+            write(function(f) f.enabled=f.enabled~=true end)
+        end},
+        {text="本次加载全部书架",post_text="临时 · 不改变以上设置",callback=function()
+            self.library.load_all_once=true
+            self:toast("正在加载全部书架…",2)
+            self:_refresh_shelf_async(function(_,_,err)
+                if err then self:toast(err,4)
+                elseif self._shelf_view and not self._shelf_view._miu_closed then
+                    self:_reopen_shelf(self._last_shelf_mode,self._last_shelf_section)
+                else self:toast("已加载全部书架，下次刷新恢复所选书单",3) end
+            end,true)
+        end},
+        {text="手动添加书单名",post_text="书单未出现在下方列表时使用",callback=function() self:_shelf_filter_input() end},
+    }
+    local cached=self.store:get("shelf_archive_names",{})
+    local seen,list={},{}
+    for _,name in ipairs(type(cached)=="table" and cached or {}) do
+        if not seen[name] then seen[name]=true; list[#list+1]=name end
+    end
+    for name in pairs(selected) do
+        if not seen[name] then seen[name]=true; list[#list+1]=name end
+    end
+    if #list==0 then
+        rows[#rows+1]={text="暂无书单可选",post_text="刷新一次书架后显示",enabled=false}
+    end
+    for _,name in ipairs(list) do
+        local archive_name=name
+        rows[#rows+1]={text="书单 · "..archive_name,checked_func=function()
+            return selected[archive_name]==true
+        end,keep_menu_open=true,callback=function()
+            write(function(f) f.archives[archive_name]=(not f.archives[archive_name]) or nil end)
+        end}
+    end
+    return rows
 end
 
 function Plugin:_performance_mode_label()
