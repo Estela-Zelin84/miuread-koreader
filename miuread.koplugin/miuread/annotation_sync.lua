@@ -25,6 +25,10 @@ local function clean_text(value)
     return tostring(value or ""):gsub("%s", ""):gsub("%*", "")
 end
 
+-- Footnote-spanning highlights are resolved by PosMap against an exact
+-- display bridge. Only a real qqreader/footnote image tag can create a
+-- synthetic [N] token; literal bracketed numbers in prose are never removed.
+
 -- Official WeRead review abstracts are not guaranteed to be byte-identical to
 -- the shared range. A review may quote only a sub-span of that range. Treat a
 -- sufficiently long containment relationship as supporting evidence instead of
@@ -513,7 +517,7 @@ function AnnotationSync:_save_coordinate_diagnostics(book_id, chapters)
             official_anchors=official_anchor_rows(self.store, book_id, uid),
             notes={
                 "raw.xhtml is the complete decrypted chapter before MiuRead body extraction or image rewriting.",
-                "coord.xhtml is the exact raw-XHTML coordinate source used by MiuRead 4.5.0.",
+                "coord.xhtml is the exact raw-XHTML coordinate source used by MiuRead 4.5.1.",
                 "official_anchors are existing WeRead ranges from thoughts.sqlite3 and are the external reference.",
                 "A diagnostic export never performs cloud annotation writes.",
             },
@@ -547,7 +551,7 @@ function AnnotationSync:_save_coordinate_diagnostics(book_id, chapters)
         exported = exported + 1
     end
     local bundle_readme = table.concat({
-        "MiuRead 4.5.0 coordinate diagnostic bundle",
+        "MiuRead 4.5.1 coordinate diagnostic bundle",
         "Upload this annotation-coordinate-diagnostics folder to AI.",
         "Included when available: thoughts.sqlite3, local_annotations.sqlite3, generated.epub.",
         "Each chapter folder contains raw.xhtml, coord.xhtml and range-debug.json.",
@@ -746,18 +750,59 @@ function AnnotationSync:_locate(row, chapter_ctx)
     if mark_text == "" then return nil, "mark_text_missing" end
 
     local range_key, html_start, html_end_pos = PosMap.locateInjected(bridge, mark_text, opts)
-    if not range_key then return nil, tostring(html_start or "not_found") end
+    local locate_mode = "strict"
+    local locate_error = range_key and nil or tostring(html_start or "not_found")
+    local matched_text = mark_text
+
+    if not range_key then
+        local foot_bridge = PosMap.buildFootnoteDisplayBridge(chapter_ctx.html)
+        if foot_bridge then
+            local candidate_range, candidate_start, candidate_end, detail =
+                PosMap.locateFootnoteDisplay(foot_bridge, mark_text, opts)
+            if candidate_range and type(detail) == "table"
+                and clean_text(detail.display_text) == clean_text(mark_text) then
+                local candidate_resolved = Coord.resolveRangeOnMap(map, candidate_range)
+                local candidate_round = Coord.roundTrip(chapter_ctx.html, candidate_range)
+                if candidate_resolved
+                    and clean_text(candidate_resolved.text) == clean_text(detail.source_text)
+                    and candidate_round and candidate_round.ok then
+                    range_key, html_start, html_end_pos = candidate_range, candidate_start, candidate_end
+                    matched_text = detail.source_text
+                    locate_mode = "footnote_display_exact"
+                    logger.info("[MiuRead][AnnotationSync] exact footnote display bridge matched",
+                        "local=", tostring(row.local_id or ""),
+                        "footnotes=", tostring(detail.footnotes or foot_bridge.footnotes or 0),
+                        "range=", tostring(range_key))
+                else
+                    return nil, "footnote_display_range_verify_failed"
+                end
+            elseif candidate_range then
+                return nil, "footnote_display_text_verify_failed"
+            elseif candidate_start and tostring(candidate_start) == "ambiguous" then
+                return nil, "footnote_display_ambiguous"
+            else
+                return nil, "footnote_display_not_found:" .. tostring(candidate_start or locate_error or "not_found")
+            end
+        end
+    end
+
+    if not range_key then return nil, locate_error or "not_found" end
     local resolved = Coord.resolveRangeOnMap(map, range_key)
-    if not resolved or clean_text(resolved.text) ~= clean_text(mark_text) then
-        return nil, "range_verify_failed"
+    if not resolved or clean_text(resolved.text) ~= clean_text(matched_text) then
+        return nil, locate_mode == "footnote_display_exact"
+            and "footnote_display_range_verify_failed" or "range_verify_failed"
     end
     local round = Coord.roundTrip(chapter_ctx.html, range_key)
-    if not (round and round.ok) then return nil, "range_roundtrip_failed" end
+    if not (round and round.ok) then
+        return nil, locate_mode == "footnote_display_exact"
+            and "footnote_display_roundtrip_failed" or "range_roundtrip_failed"
+    end
     -- Upload the text re-extracted from coord_html, not the injected KOReader
     -- selection. This keeps markText/abstract free of local display markers.
     return {range=range_key, mark_text=resolved.text, html_start=html_start,
         html_end_pos=html_end_pos, point=false, coord_version=COORD_VERSION, coord_source=COORD_SOURCE,
-        local_confidence="strong", local_verify="text+context+roundtrip"}
+        local_confidence="strong", local_verify=locate_mode == "footnote_display_exact"
+            and "text+exact_footnote_display+roundtrip" or "text+context+roundtrip"}
 end
 
 local function coordinate_acceptance(located, verification)
@@ -780,6 +825,7 @@ end
 
 local function can_try_neighbour(error_code)
     error_code = tostring(error_code or "")
+    if error_code:find("^footnote_display_not_found:") then return true end
     return error_code == "not_found" or error_code == "bad_align"
         or error_code == "range_verify_failed" or error_code == "range_roundtrip_failed"
         or error_code == "bookmark_not_found" or error_code == "bookmark_range_roundtrip_failed"
@@ -892,6 +938,18 @@ local function auth_like_error(value)
         or lower:find("login", 1, true) ~= nil
         or lower:find("auth", 1, true) ~= nil
         or lower:find("-2012", 1, true) ~= nil
+end
+
+local function retryable_post_error(value)
+    if Http.is_network_error(value) or Http.is_rate_limit_error(value) or Http.is_auth_error(value) then return true end
+    local lower=tostring(value or ""):lower()
+    return lower:find("http 408",1,true)~=nil
+        or lower:find("http 425",1,true)~=nil
+        or lower:find("http 500",1,true)~=nil
+        or lower:find("http 502",1,true)~=nil
+        or lower:find("http 503",1,true)~=nil
+        or lower:find("http 504",1,true)~=nil
+        or lower:find("temporarily unavailable",1,true)~=nil
 end
 
 local function fetch_cloud_bookmarks(api, book_id)
@@ -1253,13 +1311,26 @@ function AnnotationSync:sync_book(book, record, options)
                                     stage_log(row, "post", true, remote_id ~= "" and "remote_id_saved" or "review_saved")
                                 end
                             elseif Http.is_network_error(value) then
+                                -- A lost response may still have reached WeRead. Reconcile
+                                -- before any retry so a duplicate annotation cannot be posted.
                                 remember_error(row, "unknown", value, "post", {
                                     range_key=located.range, book_version=write_version or 0,
                                     chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                                     coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=effective_verify,
                                 })
-                            else
+                            elseif retryable_post_error(value) then
+                                -- Authentication/rate-limit/5xx failures are recoverable and
+                                -- remain eligible for a later manual sync attempt.
                                 remember_error(row, "local_only", value, "post", {
+                                    range_key=located.range, book_version=write_version or 0,
+                                    chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
+                                    coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=effective_verify,
+                                })
+                            else
+                                -- Deterministic server rejection is not fixed by hammering the
+                                -- same payload again. Park it in the existing action-required
+                                -- state; the user can explicitly retry after metadata repair.
+                                remember_error(row, "metadata_failed", value, "post_rejected", {
                                     range_key=located.range, book_version=write_version or 0,
                                     chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                                     coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=effective_verify,

@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.0",
+    VERSION = "4.5.1",
     SCHEMA = 112,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -26,6 +26,22 @@ local C = {
     AUTO_UPDATE_INTERVAL = 24 * 60 * 60,
     AUTO_UPDATE_RETRY_INTERVAL = 6 * 60 * 60,
 
+    -- Manifest files are tiny. Fail over quickly between the official route and
+    -- mirrors, while package downloads keep their existing generous timeout.
+    UPDATE_MANIFEST_RETRIES = 0,
+    UPDATE_MANIFEST_CONNECT_TIMEOUT = 4,
+    UPDATE_MANIFEST_TOTAL_TIMEOUT = 8,
+
+    -- Warm only a small number of current-chapter comment groups after the
+    -- reader has been idle. This removes SQLite cold-open latency from taps
+    -- without moving large comment layouts into the foreground.
+    THOUGHT_PREWARM_DELAY = 2.8,
+    THOUGHT_PREWARM_GROUPS = 6,
+
+    -- Failed automatic cover fetches must not restart on every home gesture.
+    -- A manual refresh bypasses the runtime backoff once.
+    COVER_RETRY_DELAYS = {30, 120, 600, 1800},
+
     READ_INTERVAL = 60,
     IDLE_TIMEOUT = 600,
     REMOTE_THRESHOLD = 2,
@@ -46,6 +62,30 @@ local C = {
     PERFORMANCE_WINDOW_SECONDS = 10 * 60,
     PERFORMANCE_REPEAT_COUNT = 2,
     PERFORMANCE_PROMPT_COOLDOWN = 7 * 24 * 60 * 60,
+    -- Repeated measured lag immediately enables a temporary runtime-only
+    -- protection window. The user's persistent lightweight preference is not
+    -- changed; the temporary flag also reaches an already-running downloader.
+    PERFORMANCE_AUTO_PROTECT_SECONDS = 20 * 60,
+    PERFORMANCE_MEMORY_PROTECT_SECONDS = 30 * 60,
+
+    -- Automatic home maintenance is serialized on memory-constrained Kindles.
+    -- Soft pressure enables temporary lightweight behavior; critical pressure
+    -- defers optional heavy work until memory becomes available again.
+    BACKGROUND_MEMORY_SOFT_KB = 48 * 1024,
+    BACKGROUND_MEMORY_CRITICAL_KB = 28 * 1024,
+    BACKGROUND_MEMORY_CHECK_SECONDS = 3,
+    BACKGROUND_SERIAL_GAP_SECONDS = 0.35,
+    BACKGROUND_RETRY_SECONDS = 0.9,
+    BACKGROUND_LEASE_TIMEOUT_SECONDS = 300,
+    HOME_FOREGROUND_BARRIER_SECONDS = 2.2,
+    HOME_POST_READER_BARRIER_SECONDS = 4.0,
+    HOME_REMOTE_SHELF_TTL_SECONDS = 30 * 60,
+    HOME_LOCAL_SHELF_TTL_SECONDS = 60 * 60,
+    HOME_REMOTE_COVER_BATCH = 2,
+    HOME_REMOTE_COVER_GAP_SECONDS = 1.15,
+    HOME_DERIVATIVE_COVER_BATCH = 1,
+    HOME_DERIVATIVE_COVER_GAP_SECONDS = 1.15,
+    HOME_COVER_THUMB_OVERSAMPLE = 1.12,
 
     -- Different user-visible operations have different normal costs.
     -- Only repeated slow samples of the SAME kind are combined. A single
@@ -93,6 +133,41 @@ local C = {
     DOWNLOAD_NETWORK_RECOVERY_MAX_POLL_SECONDS = 15,
     DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS = 12,
     DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS = 300,
+
+    -- beta.23 keeps the five-minute sleep policy for a genuinely offline book,
+    -- but a worker that is still marked as active and produces no heartbeat is
+    -- recovered much earlier from its on-disk chapter checkpoint. Streaming
+    -- image transfers emit heartbeats, so large healthy archives are not
+    -- mistaken for a stall.
+    DOWNLOAD_STALL_RECOVERY_SECONDS = 120,
+    DOWNLOAD_STALL_RESTART_GRACE_SECONDS = 3,
+    DOWNLOAD_STALL_AUTO_RESTARTS = 1,
+    DOWNLOAD_TRANSFER_HEARTBEAT_SECONDS = 3,
+    DOWNLOAD_TRANSFER_HEARTBEAT_BYTES = 512 * 1024,
+    DOWNLOAD_STREAM_CHUNK_BYTES = 128 * 1024,
+
+    -- beta.19 heavy-resource arbitration. Ordinary background protection keeps
+    -- the beta.16 48/28 MB thresholds; only Native/FileManager transitions use
+    -- the higher guard because a resident download child plus FileManager can
+    -- exhaust old Kindle memory well before the global critical threshold.
+    HEAVY_NATIVE_HIBERNATE_KB = 96 * 1024,
+    HEAVY_NATIVE_CRITICAL_KB = 64 * 1024,
+    HEAVY_DOWNLOAD_RESUME_MIN_KB = 72 * 1024,
+    DOWNLOAD_HIBERNATE_WAIT_SECONDS = 8,
+    DOWNLOAD_INTERACTION_RESUME_DELAY = 2.5,
+    -- beta.21 foreground arbitration: ordinary UI interaction no longer hard-pauses
+    -- the download worker. Heavy local stages yield behind a short absolute
+    -- deadline instead, so a lost UI callback can never strand the task.
+    DOWNLOAD_UI_YIELD_SECONDS = 3,
+    DOWNLOAD_UI_HEAVY_YIELD_MAX_SECONDS = 4,
+    DOWNLOAD_INTERACTION_STALE_SECONDS = 12,
+    DOWNLOAD_TRANSITION_STALE_SECONDS = 60,
+    HEAVY_WATCH_SECONDS = 10,
+
+    -- beta.17 power lifecycle: short resumes are diagnosed but never forced
+    -- back to sleep. Resume keeps optional background work quiet briefly.
+    SHORT_WAKE_SECONDS = 5,
+    POWER_RESUME_QUIET_SECONDS = 1.0,
 
     -- Download networking stays automatic by default. A compatibility prompt
     -- is considered only after several genuinely slow responses, then confirmed
