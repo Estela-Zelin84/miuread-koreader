@@ -517,7 +517,7 @@ function AnnotationSync:_save_coordinate_diagnostics(book_id, chapters)
             official_anchors=official_anchor_rows(self.store, book_id, uid),
             notes={
                 "raw.xhtml is the complete decrypted chapter before MiuRead body extraction or image rewriting.",
-                "coord.xhtml is the exact raw-XHTML coordinate source used by MiuRead 4.5.1.",
+                "coord.xhtml is the exact raw-XHTML coordinate source used by MiuRead 4.5.0.",
                 "official_anchors are existing WeRead ranges from thoughts.sqlite3 and are the external reference.",
                 "A diagnostic export never performs cloud annotation writes.",
             },
@@ -551,7 +551,7 @@ function AnnotationSync:_save_coordinate_diagnostics(book_id, chapters)
         exported = exported + 1
     end
     local bundle_readme = table.concat({
-        "MiuRead 4.5.1 coordinate diagnostic bundle",
+        "MiuRead 4.5.0 coordinate diagnostic bundle",
         "Upload this annotation-coordinate-diagnostics folder to AI.",
         "Included when available: thoughts.sqlite3, local_annotations.sqlite3, generated.epub.",
         "Each chapter folder contains raw.xhtml, coord.xhtml and range-debug.json.",

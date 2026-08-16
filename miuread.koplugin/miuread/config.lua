@@ -1,13 +1,13 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.1",
-    SCHEMA = 112,
+    VERSION = "4.6.0",
+    SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
     -- 正式版更新清单由 tag 发布流程生成，并作为固定 stable-channel Release
-    -- 资源提供。main/update.json 仅用于把 4.1.2 等旧正式版桥接到 4.3.0；
-    -- 4.3.0 起插件自身只读取 stable-channel，避免旧桥接清单参与后续判断。
+    -- 资源提供。仓库根目录 update.json 仅作为旧正式版桥接入口；
+    -- 插件自身只读取 stable-channel，避免旧桥接清单参与后续判断。
     UPDATE_CHANNEL = "stable",
     UPDATE_CHANNEL_LABEL = "正式通道",
     UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
@@ -43,6 +43,10 @@ local C = {
     COVER_RETRY_DELAYS = {30, 120, 600, 1800},
 
     READ_INTERVAL = 60,
+    -- beta.24 never replays historical/suspend reading-time debt. Normal
+    -- reports stay on the established one-minute cadence and every request is
+    -- independently capped, avoiding burst uploads after reconnect/resume.
+    READ_REPORT_MAX_ELAPSED_SECONDS = 60,
     IDLE_TIMEOUT = 600,
     REMOTE_THRESHOLD = 2,
 
@@ -62,10 +66,10 @@ local C = {
     PERFORMANCE_WINDOW_SECONDS = 10 * 60,
     PERFORMANCE_REPEAT_COUNT = 2,
     PERFORMANCE_PROMPT_COOLDOWN = 7 * 24 * 60 * 60,
-    -- Repeated measured lag immediately enables a temporary runtime-only
-    -- protection window. The user's persistent lightweight preference is not
-    -- changed; the temporary flag also reaches an already-running downloader.
-    PERFORMANCE_AUTO_PROTECT_SECONDS = 20 * 60,
+    -- Repeated measured lag enables a temporary UI protection window. In
+    -- beta.26 this no longer throttles an already-running downloader; only a
+    -- manual lightweight choice or real memory pressure is global.
+    PERFORMANCE_AUTO_PROTECT_SECONDS = 10 * 60,
     PERFORMANCE_MEMORY_PROTECT_SECONDS = 30 * 60,
 
     -- Automatic home maintenance is serialized on memory-constrained Kindles.
@@ -77,15 +81,18 @@ local C = {
     BACKGROUND_SERIAL_GAP_SECONDS = 0.35,
     BACKGROUND_RETRY_SECONDS = 0.9,
     BACKGROUND_LEASE_TIMEOUT_SECONDS = 300,
-    HOME_FOREGROUND_BARRIER_SECONDS = 2.2,
-    HOME_POST_READER_BARRIER_SECONDS = 4.0,
+    HOME_FOREGROUND_BARRIER_SECONDS = 0.9,
+    HOME_POST_READER_BARRIER_SECONDS = 1.8,
+    -- Old taps delayed by a real UI stall are discarded instead of being
+    -- replayed against a different book after the screen catches up.
+    HOME_STALE_TAP_MS = 1200,
     HOME_REMOTE_SHELF_TTL_SECONDS = 30 * 60,
     HOME_LOCAL_SHELF_TTL_SECONDS = 60 * 60,
-    HOME_REMOTE_COVER_BATCH = 2,
-    HOME_REMOTE_COVER_GAP_SECONDS = 1.15,
-    HOME_DERIVATIVE_COVER_BATCH = 1,
-    HOME_DERIVATIVE_COVER_GAP_SECONDS = 1.15,
-    HOME_COVER_THUMB_OVERSAMPLE = 1.12,
+    HOME_REMOTE_COVER_BATCH = 4,
+    HOME_REMOTE_COVER_GAP_SECONDS = 0.45,
+    HOME_DERIVATIVE_COVER_BATCH = 2,
+    HOME_DERIVATIVE_COVER_GAP_SECONDS = 0.50,
+    HOME_COVER_THUMB_OVERSAMPLE = 1.22,
 
     -- Different user-visible operations have different normal costs.
     -- Only repeated slow samples of the SAME kind are combined. A single
@@ -99,19 +106,19 @@ local C = {
         reader_home = {slow_ms = 4000, extreme_ms = 8000, repeat_count = 2, single_extreme = true},
     },
 
-    -- Lightweight mode does not disable features. It gives the foreground
-    -- longer quiet windows, refreshes automatic sources less often, and
-    -- processes metadata/covers in smaller batches with wider gaps.
+    -- Lightweight mode does not disable features. Standard mode is faster in
+    -- beta.26 now that Home only works on the visible page; lightweight mode
+    -- keeps smaller cover batches and wider gaps as a fallback.
     LIGHTWEIGHT_HOME_REMOTE_TTL = 30 * 60,
     LIGHTWEIGHT_HOME_LOCAL_TTL = 60 * 60,
     LIGHTWEIGHT_HOME_IDLE_DELAY = 6,
     LIGHTWEIGHT_READER_IDLE_SECONDS = 1.5,
     LIGHTWEIGHT_LOCAL_METADATA_QUEUE = 3,
-    LIGHTWEIGHT_REMOTE_COVER_QUEUE = 4,
+    LIGHTWEIGHT_REMOTE_COVER_QUEUE = 2,
     LIGHTWEIGHT_DERIVATIVE_COVER_QUEUE = 1,
     LIGHTWEIGHT_METADATA_GAP = 0.75,
-    LIGHTWEIGHT_COVER_GAP = 0.65,
-    LIGHTWEIGHT_DERIVATIVE_GAP = 1.0,
+    LIGHTWEIGHT_COVER_GAP = 1.0,
+    LIGHTWEIGHT_DERIVATIVE_GAP = 1.1,
 
     -- Online features are verified by their real request. Renewal is recovery,
     -- never a prerequisite. Diagnostics never include account secrets.
@@ -140,6 +147,14 @@ local C = {
     -- image transfers emit heartbeats, so large healthy archives are not
     -- mistaken for a stall.
     DOWNLOAD_STALL_RECOVERY_SECONDS = 120,
+    -- beta.24 keeps normal downloads unrestricted, but a progress dialog that
+    -- is actually visible uses stage-aware health thresholds. Catalog/prep
+    -- stalls recover sooner; healthy content/image transfers get more room.
+    DOWNLOAD_FOREGROUND_STALL_NOTICE_SECONDS = 25,
+    DOWNLOAD_FOREGROUND_STALL_SECONDS = {
+        prepare = 50, catalog = 45, resume = 50, content = 75, images = 90,
+    },
+    DOWNLOAD_CANCEL_FORCE_SECONDS = 4,
     DOWNLOAD_STALL_RESTART_GRACE_SECONDS = 3,
     DOWNLOAD_STALL_AUTO_RESTARTS = 1,
     DOWNLOAD_TRANSFER_HEARTBEAT_SECONDS = 3,
@@ -153,12 +168,15 @@ local C = {
     HEAVY_NATIVE_HIBERNATE_KB = 96 * 1024,
     HEAVY_NATIVE_CRITICAL_KB = 64 * 1024,
     HEAVY_DOWNLOAD_RESUME_MIN_KB = 72 * 1024,
+    -- Remote cover fetching may coexist with a healthy download. It yields only
+    -- when a heavy download stage and real memory pressure overlap.
+    DOWNLOAD_COVER_COEXIST_MIN_KB = 80 * 1024,
     DOWNLOAD_HIBERNATE_WAIT_SECONDS = 8,
-    DOWNLOAD_INTERACTION_RESUME_DELAY = 2.5,
+    DOWNLOAD_INTERACTION_RESUME_DELAY = 1.8,
     -- beta.21 foreground arbitration: ordinary UI interaction no longer hard-pauses
     -- the download worker. Heavy local stages yield behind a short absolute
     -- deadline instead, so a lost UI callback can never strand the task.
-    DOWNLOAD_UI_YIELD_SECONDS = 3,
+    DOWNLOAD_UI_YIELD_SECONDS = 2,
     DOWNLOAD_UI_HEAVY_YIELD_MAX_SECONDS = 4,
     DOWNLOAD_INTERACTION_STALE_SECONDS = 12,
     DOWNLOAD_TRANSITION_STALE_SECONDS = 60,

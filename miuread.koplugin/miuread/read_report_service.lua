@@ -193,11 +193,12 @@ function Service.run(job)
         local interval = math.max(10, tonumber(current_job.interval) or tonumber(Config.READ_INTERVAL) or 60)
         -- The service process may be reused across books, but every reporting
         -- request is bound to one generation, book and immutable core map.
+        local time_only=current_job.time_only==true
         if tostring(control.book_id or "")~=tostring(current_job.book_id or "")
             or tostring(control.core_map_hash or "")~=tostring(current_job.core_map_hash or "")
             or tonumber(control.record_generation or -1)~=tonumber(current_job.record_generation or 0)
-            or control.position_safe~=true
-            or tostring(control.local_chapter_uid or "")=="" then
+            or (not time_only and (control.position_safe~=true
+                or tostring(control.local_chapter_uid or "")=="")) then
             sequence=sequence+1
             blocked=true
             write_service_status({
@@ -205,37 +206,40 @@ function Service.run(job)
                 error="stale or unsafe book context refused before report",
                 paused=true,retry_delay=0,consecutive_failures=consecutive_failures+1,
                 attempted_at=os.time(),completed_at=os.time(),elapsed_seconds=0,
-                final_flush=final_flush==true,flush_reason=reason,next_due=0,
+                final_flush=final_flush==true,flush_reason=reason,next_due=0,time_only=time_only,
             })
             consecutive_failures=consecutive_failures+1
             return 0
         end
-        -- Keep every request within one normal reporting interval. A small
-        -- suspend tail may be carried into the first post-resume request. The
-        -- carry is consumed when an attempt is made, matching the existing
-        -- no-replay rule for uncertain/failed intervals.
-        local base_elapsed=math.max(1,math.min(interval,math.floor(tonumber(elapsed) or interval)))
-        local room=math.max(0,interval-base_elapsed)
-        local carry_used=final_flush and 0 or math.min(carry_remaining,room)
-        elapsed=base_elapsed+carry_used
-        carry_remaining=math.max(0,carry_remaining-carry_used)
+        -- beta.24: never turn suspended/failed history into a later burst. Every
+        -- request contains only the fresh interval that led to this attempt and
+        -- is capped independently, even if an older service job still contains
+        -- a legacy carry value after OTA.
+        local maximum=math.max(10,tonumber(Config.READ_REPORT_MAX_ELAPSED_SECONDS) or 60)
+        local base_elapsed=math.max(1,math.min(interval,maximum,math.floor(tonumber(elapsed) or interval)))
+        local carry_used=0
+        elapsed=base_elapsed
+        carry_remaining=0
         sequence = sequence + 1
         local report_book=U.copy(book or {})
         report_book.book_id=tostring(current_job.book_id or "")
         report_book.core_map_hash=tostring(current_job.core_map_hash or "")
-        report_book.local_chapter_uid=control.local_chapter_uid
-        report_book.local_chapter_idx=tonumber(control.local_chapter_idx)
-        report_book.local_chapter_offset=tonumber(control.local_chapter_offset) or 0
-        report_book.local_chapter_word_count=tonumber(control.local_chapter_word_count) or 0
-        report_book.local_native_chapter_offset=control.local_native_chapter_offset == true
-        report_book.local_chapter_offset_basis=tostring(control.local_chapter_offset_basis or "")
-        report_book.progress=(tonumber(control.progress_ratio) or 0)*100
+        if not time_only then
+            report_book.local_chapter_uid=control.local_chapter_uid
+            report_book.local_chapter_idx=tonumber(control.local_chapter_idx)
+            report_book.local_chapter_offset=tonumber(control.local_chapter_offset) or 0
+            report_book.local_chapter_word_count=tonumber(control.local_chapter_word_count) or 0
+            report_book.local_native_chapter_offset=control.local_native_chapter_offset == true
+            report_book.local_chapter_offset_basis=tostring(control.local_chapter_offset_basis or "")
+            report_book.progress=(tonumber(control.progress_ratio) or 0)*100
+        end
         local report_job = {
             book_id = tostring(current_job.book_id or ""),
             book_title = tostring(current_job.book_title or current_job.book_id or ""),
             book = report_book,
             core_map_hash=tostring(current_job.core_map_hash or ""),
-            progress_ratio = tonumber(control.progress_ratio) or 0,
+            progress_ratio = time_only and nil or (tonumber(control.progress_ratio) or 0),
+            time_only = time_only,
             elapsed_seconds = elapsed,
             cookies = auth.cookies or {},
             api_key = auth.api_key or "",
@@ -256,7 +260,7 @@ function Service.run(job)
         if ok and type(result) == "table" then
             -- A candidate context only becomes authoritative after WeRead
             -- accepts this exact book/core-map request.
-            if result.accepted and type(result.legacy_context) == "table"
+            if result.accepted and not time_only and type(result.legacy_context) == "table"
                 and tostring(result.legacy_context.book_id or result.legacy_context.bookId or "")==tostring(current_job.book_id or "")
                 and tostring(result.legacy_context.core_map_hash or "")==tostring(current_job.core_map_hash or "") then
                 book = U.copy(result.legacy_context)
@@ -267,6 +271,7 @@ function Service.run(job)
             if result.wr_wrpa_changed then auth.wr_wrpa = result.wr_wrpa or "" end
 
             local out = public_result(result)
+            out.time_only=time_only
             local uncertain = result.uncertain == true or tostring(result.error_kind or "") == "unconfirmed"
             local kind = result.accepted and nil or (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error))
             if result.accepted then
@@ -401,7 +406,8 @@ function Service.run(job)
                     local interval = math.max(10, tonumber(loaded.interval) or tonumber(Config.READ_INTERVAL) or 60)
                     local first_delay = math.max(5, math.min(interval, tonumber(loaded.first_delay) or interval))
                     local now = os.time()
-                    carry_remaining=math.max(0,math.floor(tonumber(loaded.carry_elapsed) or 0))
+                    -- Historical suspend debt is intentionally not replayed.
+                    carry_remaining=0
                     next_due = now + first_delay
                     last_report_at = now
                     write_context()
