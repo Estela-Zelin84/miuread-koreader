@@ -18868,7 +18868,18 @@ function Plugin:_add_local_root_path(path)
     save(); return true
 end
 
+function Plugin:_ensure_path_chooser_base()
+    -- PathChooser:init() takes its ui from ReaderUI.instance or
+    -- FileManager.instance and FileChooser dereferences it unguarded
+    -- (folder_shortcuts, PathChanged). Opened straight from the MiuRead home
+    -- neither instance exists, so the chooser errors out inside new().
+    local ok,ReaderUI=pcall(require,"apps/reader/readerui")
+    if ok and ReaderUI and ReaderUI.instance then return true end
+    return self:_ensure_filemanager_base(HOME_RETURN_FILE,{conceal_under_home=true})==true
+end
+
 function Plugin:add_local_root_dialog()
+    if not self:_ensure_path_chooser_base() then self:info("暂时无法打开文件夹选择器，请稍后重试"); return end
     local current="/mnt/us/documents"
     if lfs.attributes(current,"mode")~="directory" then
         current=lfs.attributes("/mnt/onboard","mode")=="directory" and "/mnt/onboard" or "/mnt/us"
@@ -19482,6 +19493,7 @@ function Plugin:_validate_download_dir(path)
     return true
 end
 function Plugin:directory_dialog()
+    if not self:_ensure_path_chooser_base() then self:info("暂时无法打开文件夹选择器，请稍后重试"); return end
     local current=self:_download_dir_path()
     if lfs.attributes(current,"mode")~="directory" then
         if lfs.attributes("/mnt/us/documents","mode")=="directory" then current="/mnt/us/documents"
