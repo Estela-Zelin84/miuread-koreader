@@ -30,6 +30,8 @@ local TITLE_TRANSFORM_VERSION = 2
 local LEGACY_ANNOTATION_TRANSFORM_VERSION = 1
 local ANNOTATION_TRANSFORM_VERSION = 5
 local IMAGE_TRANSFORM_VERSION = 2
+local LEGACY_CONTENT_TRANSFORM_VERSION = 1
+local CONTENT_TRANSFORM_VERSION = 2
 
 local BASE_CSS = [[
 body { line-height: 1.75; margin: 5%; }
@@ -59,6 +61,17 @@ end
 
 local function plain(value)
     return tostring(value or ""):gsub("<[^>]+>", " "):gsub("&[%#%w]+;", " "):gsub("%s+", " ")
+end
+
+local function validate_body_fragment(fragment)
+    local lower=tostring(fragment or ""):lower()
+    local wrappers={"<body", "</body", "<html", "</html"}
+    for _,tag in ipairs(wrappers) do
+        if lower:find(tag,1,true) then
+            return nil,"章节正文仍包含 XHTML 外层标签："..tag
+        end
+    end
+    return true
 end
 
 -- Fold the full-width ASCII block (U+FF01-U+FF5E) onto plain ASCII so a title
@@ -491,11 +504,31 @@ end
 local function cache_save_assets(cache, uid, assets)
     local paths = chapter_paths(cache, uid)
     U.mkdir(paths.asset_dir)
-    local meta = {}
+    local meta,temporary_roots = {},{}
+    local function cleanup_temporary_roots()
+        for root in pairs(temporary_roots) do U.remove_tree(root) end
+    end
     for index, asset in ipairs(assets or {}) do
+        local temporary_root=tostring(asset._temporary_root or "")
+        if temporary_root~="" then temporary_roots[temporary_root]=true end
         local file = paths.asset_dir .. "/" .. string.format("%04d.bin", index)
-        local ok, err = U.atomic_write(file, asset.data or "", true)
-        if not ok then error("无法保存章节图片断点：" .. tostring(err)) end
+        local ok, err
+        if tostring(asset.data_path or "")~="" then
+            local stage=file..".stream-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
+            os.remove(stage)
+            ok,err=U.copy_file_stream(asset.data_path,stage,tonumber(Config.DOWNLOAD_STREAM_CHUNK_BYTES) or 128*1024)
+            if ok then
+                os.remove(file)
+                ok,err=os.rename(stage,file)
+                if not ok then os.remove(stage) end
+            end
+        else
+            ok,err=U.atomic_write(file,asset.data or "",true)
+        end
+        if not ok then
+            cleanup_temporary_roots()
+            error("无法保存章节图片断点：" .. tostring(err))
+        end
         meta[#meta + 1] = {
             href = asset.href,
             mime = asset.mime,
@@ -504,7 +537,11 @@ local function cache_save_assets(cache, uid, assets)
         }
     end
     local ok, err = DownloadDatabase.save_assets(cache.root, uid, meta)
-    if not ok then error("无法保存 SQLite 图片清单：" .. tostring(err)) end
+    if not ok then
+        cleanup_temporary_roots()
+        error("无法保存 SQLite 图片清单：" .. tostring(err))
+    end
+    cleanup_temporary_roots()
 end
 
 local function cache_load_assets(cache, entry)
@@ -512,9 +549,9 @@ local function cache_load_assets(cache, entry)
     if type(meta) ~= "table" then return nil, "图片断点清单缺失" end
     local assets = {}
     for _, item in ipairs(meta) do
-        local data = U.read_file(absolute(cache.root, item.file), true)
-        if data == nil then return nil, "章节图片断点缺失" end
-        assets[#assets + 1] = {href=item.href, mime=item.mime, source=item.source, data=data}
+        local file=absolute(cache.root,item.file)
+        if U.file_size(file)==nil then return nil,"章节图片断点缺失" end
+        assets[#assets + 1] = {href=item.href, mime=item.mime, source=item.source, data_path=file}
     end
     return assets
 end
@@ -548,6 +585,7 @@ local function cache_save_base(cache, chapter, coord_body, body, style, assets, 
     entry.image_only = state and state.image_only == true or false
     entry.image_summary = state and state.image_summary or nil
     entry.image_transform_version = IMAGE_TRANSFORM_VERSION
+    entry.content_transform_version = CONTENT_TRANSFORM_VERSION
     entry.title_transform_version = tonumber(entry.title_transform_version
         or cache.manifest.title_transform_version) or TITLE_TRANSFORM_VERSION
     entry.error = nil
@@ -579,6 +617,8 @@ local function cache_load_base(cache, entry)
                 "chapter=", tostring(entry.uid or ""))
         end
     end
+    local body_valid,body_error=validate_body_fragment(body)
+    if not body_valid then return nil,body_error end
     return body, style, assets, coord_body
 end
 
@@ -598,6 +638,7 @@ local function cache_save_final(cache, chapter, body, annotation, style, footnot
     entry.thoughts = annotation and (annotation.thought_count or 0) or 0
     entry.thought_entries = annotation and (annotation.thought_entry_count or 0) or 0
     entry.footnote_transform_version = FOOTNOTE_TRANSFORM_VERSION
+    entry.content_transform_version = CONTENT_TRANSFORM_VERSION
     entry.title_transform_version = tonumber(entry.title_transform_version
         or cache.manifest.title_transform_version) or TITLE_TRANSFORM_VERSION
     entry.annotation_transform_version = annotation and ANNOTATION_TRANSFORM_VERSION
@@ -642,6 +683,8 @@ end
 local function validate_cached_chapter(path)
     local raw, read_error=U.read_file(path,true)
     if type(raw)~="string" then return nil,read_error or "无法读取完成章节断点" end
+    local body_valid,body_error=validate_body_fragment(raw)
+    if not body_valid then raw=nil; return nil,body_error end
     local valid, validation_error=Footnotes.validate(raw)
     raw=nil
     return valid,validation_error
@@ -945,6 +988,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         core_map_hash=core_map_hash,
         images=U.copy(opt.image_summary or {}),
         image_transform_version=IMAGE_TRANSFORM_VERSION,
+        content_transform_version=CONTENT_TRANSFORM_VERSION,
         internal_links={links=link_stats.links or 0,rewritten=link_stats.rewritten or 0,
             unresolved=link_stats.unresolved or 0,critical=link_stats.unresolved_critical or 0},
     })
@@ -1012,6 +1056,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         core_map_hash=core_map_hash,
         image_count=#assets,image_summary=U.copy(opt.image_summary or {}),
         image_transform_version=IMAGE_TRANSFORM_VERSION,
+        content_transform_version=CONTENT_TRANSFORM_VERSION,
     }
     if standalone then
         record.chapter_uid = tostring(opt.chapter_uid)
@@ -1076,30 +1121,72 @@ function Downloader:book(input, opt, progress)
         local function worker_paused()
             return type(opt.paused)=="function" and opt.paused()==true
         end
+        local function hibernate_requested()
+            return type(opt.hibernating)=="function" and opt.hibernating()==true
+        end
+        local function check_hibernate()
+            if hibernate_requested() then
+                if type(opt.pause_ack)=="function" then pcall(opt.pause_ack,stage,false) end
+                error("__MIUREAD_HIBERNATE__:"..tostring(stage or "work"))
+            end
+        end
         local function lightweight_mode()
             local path=tostring(opt.performance_mode_path or "")
             return path~="" and U.file_exists(path)
         end
+        check_hibernate()
         while worker_paused() do
             if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
+            check_hibernate()
             if not pause_logged then
                 pause_logged=true
+                if type(opt.pause_ack)=="function" then pcall(opt.pause_ack,stage,true) end
                 logger.info("[MiuRead][Download] worker paused",tostring(stage or "work"))
             end
             pause(.25)
         end
-        if pause_logged then logger.info("[MiuRead][Download] worker resumed",tostring(stage or "work")) end
+        if pause_logged then
+            if type(opt.pause_ack)=="function" then pcall(opt.pause_ack,stage,false) end
+            logger.info("[MiuRead][Download] worker resumed",tostring(stage or "work"))
+        end
+        check_hibernate()
+
+        local heavy_stage = stage=="package" or stage=="transform"
+            or stage=="annotation_batch" or stage=="annotation_apply"
+            or stage=="underlines" or stage=="thoughts" or stage=="footnotes"
+            or stage=="images"
+
+        local function wait_until(deadline,maximum)
+            deadline=tonumber(deadline) or 0
+            if deadline<=os.time() then return end
+            local stop=math.min(deadline,os.time()+math.max(.5,tonumber(maximum) or 4))
+            while os.time()<stop do
+                if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
+                check_hibernate()
+                if worker_paused() then return respect_reader_priority(stage) end
+                pause(.20)
+            end
+        end
+
+        -- Home interaction uses a short absolute deadline. Light/network stages
+        -- keep moving with a tiny yield; expensive local transforms wait until
+        -- the UI has been quiet. A stale file is harmless because the timestamp
+        -- expires without any resume callback.
+        local ui_yield_until=tonumber(U.read_file(tostring(opt.foreground_yield_path or ""),true) or 0) or 0
+        if ui_yield_until>os.time() then
+            if heavy_stage then
+                wait_until(ui_yield_until,tonumber(Config.DOWNLOAD_UI_HEAVY_YIELD_MAX_SECONDS) or 4)
+            else
+                pause(.08)
+            end
+        end
 
         local active_path=tostring(opt.reader_active_path or "")
-        if active_path=="" or not U.file_exists(active_path) then return end
-        local busy_until=tonumber(U.read_file(tostring(opt.reader_busy_path or ""),true) or 0) or 0
-        local waited=0
-        while busy_until>os.time() and waited<30 do
-            if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
-            if worker_paused() then return respect_reader_priority(stage) end
-            pause(.25)
-            waited=waited+.25
-            busy_until=tonumber(U.read_file(tostring(opt.reader_busy_path or ""),true) or 0) or 0
+        if active_path~="" and U.file_exists(active_path) then
+            local busy_until=tonumber(U.read_file(tostring(opt.reader_busy_path or ""),true) or 0) or 0
+            if busy_until>os.time() then
+                if heavy_stage then wait_until(busy_until,4) else pause(.08) end
+            end
         end
         local delay
         if lightweight_mode() then
@@ -1112,6 +1199,7 @@ function Downloader:book(input, opt, progress)
             delay=stage=="chapter" and .12 or .05
         end
         pause(delay)
+        check_hibernate()
     end
     local book = normalized_book(input)
     if book.bookId == "" then error("bookId missing") end
@@ -1385,13 +1473,28 @@ function Downloader:book(input, opt, progress)
                         style=tostring(style or "").."\n"..Footnotes.FOOTNOTES_CSS
                     end
                 else
-                    foot_stats.fallback=true
-                    foot_stats.fallback_reason="validation_error"
-                    body=original_body
-                    style=original_style
-                    logger.warn("[MiuRead][Download] footnote transform fallback",
-                        "chapter=",uid,"reason=validation_error",
-                        "error=",tostring(footnote_error))
+                    local repaired,repaired_count=transformed,0
+                    if tostring(footnote_error or ""):find("脚注目标不存在：wtref_",1,true) then
+                        repaired,repaired_count=Footnotes.repair_missing_generated_backlinks(transformed)
+                    end
+                    local repaired_valid,repaired_error=Footnotes.validate(repaired)
+                    if repaired_count>0 and repaired_valid then
+                        body=repaired
+                        foot_stats.repaired_backlinks=repaired_count
+                        if foot_section and foot_section ~= "" then
+                            style=tostring(style or "").."\n"..Footnotes.FOOTNOTES_CSS
+                        end
+                        logger.warn("[MiuRead][Download] footnote missing backlink neutralized",
+                            "chapter=",uid,"count=",tostring(repaired_count))
+                    else
+                        foot_stats.fallback=true
+                        foot_stats.fallback_reason="validation_error"
+                        body=original_body
+                        style=original_style
+                        logger.warn("[MiuRead][Download] footnote transform fallback",
+                            "chapter=",uid,"reason=validation_error",
+                            "error=",tostring(repaired_error or footnote_error))
+                    end
                 end
             end
         end
@@ -1470,6 +1573,14 @@ function Downloader:book(input, opt, progress)
             })
         end
 
+        if entry and tonumber(entry.content_transform_version or LEGACY_CONTENT_TRANSFORM_VERSION)<CONTENT_TRANSFORM_VERSION then
+            logger.info("[MiuRead][Download] refreshing legacy chapter body checkpoint",
+                "chapter=",uid,"old_version=",tostring(entry.content_transform_version or LEGACY_CONTENT_TRANSFORM_VERSION),
+                "new_version=",tostring(CONTENT_TRANSFORM_VERSION))
+            cache_reset_entry(cache,uid)
+            entry=nil
+        end
+
         if entry and opt.images~=false
             and tonumber(entry.image_transform_version or cache.manifest.image_transform_version or 1)<IMAGE_TRANSFORM_VERSION then
             logger.info("[MiuRead][Download] refreshing legacy image checkpoint",
@@ -1478,9 +1589,10 @@ function Downloader:book(input, opt, progress)
             entry=nil
         end
 
-        -- Transformer version changes no longer force completed chapters to be
-        -- regenerated. The current transformers apply to new or genuinely changed
-        -- chapters, while existing XHTML remains stable for KOReader local notes.
+        -- Presentation-only transformer changes do not force completed chapters
+        -- to be regenerated. Content-normalization changes are different: keeping
+        -- legacy malformed XHTML would preserve a truncated EPUB, so those entries
+        -- are refreshed above before any completed checkpoint can be reused.
 
         if entry and entry.complete then
             local migrated=false
@@ -1539,8 +1651,25 @@ function Downloader:book(input, opt, progress)
 
         if not body then
             progress("content", index, expected, chapter.title)
+            local last_activity_at,last_activity_bytes=0,0
+            local function chapter_activity(kind,detail)
+                detail=type(detail)=="table" and detail or {}
+                local now=os.time()
+                local bytes=tonumber(detail.bytes) or 0
+                local heartbeat_seconds=math.max(1,tonumber(Config.DOWNLOAD_TRANSFER_HEARTBEAT_SECONDS) or 3)
+                local heartbeat_bytes=math.max(64*1024,tonumber(Config.DOWNLOAD_TRANSFER_HEARTBEAT_BYTES) or 512*1024)
+                if now-last_activity_at<heartbeat_seconds and bytes-last_activity_bytes<heartbeat_bytes then return end
+                last_activity_at=now
+                last_activity_bytes=math.max(last_activity_bytes,bytes)
+                local message=(kind=="image_extract") and "正在低内存整理章节图片" or "正在下载章节图片"
+                progress("content",index,expected,chapter.title,{message=message,activity=kind,transfer_bytes=bytes})
+            end
             local ok, downloaded, downloaded_style, downloaded_assets, state = pcall(
-                self.reader.chapter, self.reader, book, chapter, format, {images=opt.images})
+                self.reader.chapter, self.reader, book, chapter, format, {
+                    images=opt.images,
+                    activity=chapter_activity,
+                    yield=function(stage) respect_reader_priority(stage or "images") end,
+                })
             if not ok then
                 if Http.is_rate_limit_error(downloaded) then error(downloaded) end
                 if Http.is_auth_error(downloaded) then error(downloaded) end
@@ -1581,7 +1710,21 @@ function Downloader:book(input, opt, progress)
             -- ranges are interpreted only against this immutable chapter body.
             coord_body = type(state) == "table" and tostring(state.coord_html or "") or ""
             if coord_body == "" then coord_body = AnnotationCoord.fromDownloadedXhtml(downloaded) end
-            body = Codec.body(downloaded)
+            local body_count
+            body,body_count = Codec.body_fragment(downloaded)
+            local body_valid,body_error=validate_body_fragment(body)
+            if not body_valid then
+                logger.warn("[MiuRead][Download] chapter body normalization failed",
+                    "chapter=",uid,"decoded_bytes=",tostring(#tostring(downloaded or "")),
+                    "body_count=",tostring(body_count or 0),"error=",tostring(body_error))
+                if self.reader and type(self.reader.cleanup_transient_images)=="function" then
+                    self.reader:cleanup_transient_images()
+                end
+                return mark_failure(chapter,"正文结构解析失败："..tostring(body_error))
+            end
+            logger.info("[MiuRead][Download] chapter body normalized",
+                "chapter=",uid,"decoded_bytes=",tostring(#tostring(downloaded or "")),
+                "body_count=",tostring(body_count or 0),"merged_bytes=",tostring(#tostring(body or "")))
             body, style, new_assets = namespace_assets(body, downloaded_style, downloaded_assets, uid)
             entry = cache_save_base(cache, chapter, coord_body, body, style, new_assets, state)
         end
@@ -1608,6 +1751,7 @@ function Downloader:book(input, opt, progress)
                 annotation_error_map[uid]=nil
             end
             local extra_css,apply_stats
+            respect_reader_priority("annotation_apply")
             body,extra_css,apply_stats=self.annotations:apply(body,annotation,coord_body)
             entry.annotation_fallback=tonumber(apply_stats and apply_stats.fallback or 0) or 0
             entry.annotation_official=tonumber(apply_stats and apply_stats.official or 0) or 0
@@ -1697,41 +1841,121 @@ function Downloader:book(input, opt, progress)
     local image_summary
     chapters, assets, css_list, css_seen, annotation_summary, image_summary = rebuild_outputs()
 
-    -- The per-chapter downloader already retries missing images. A final EPUB
-    -- reference scan catches the narrower case where an image was downloaded but
-    -- a later transform/path rewrite left the final XHTML pointing at a resource
-    -- that will not be packaged. Repair only those chapters from their checkpoints.
-    local preflight,preflight_error=ResourceRefs.scan(chapters,table.concat(css_list,"\n"),assets)
+    -- Final resource verification has two responsibilities:
+    --   1) repair genuine image misses from the affected chapter checkpoints;
+    --   2) remove only references that remain local-and-missing after that repair,
+    --      proving they are stale/orphan markup rather than a transient network
+    --      failure. External URLs are never auto-dropped.
+    local function set_count_local(value)
+        local count=0
+        for _ in pairs(value or {}) do count=count+1 end
+        return count
+    end
+    local function same_set(a,b)
+        if set_count_local(a)~=set_count_local(b) then return false end
+        for key in pairs(a or {}) do if not (b and b[key]) then return false end end
+        return true
+    end
+    local function replace_css(value)
+        value=tostring(value or "")
+        css_list={}
+        css_seen={}
+        if value~="" then css_list[1]=value; css_seen[value]=true end
+    end
+
+    progress("resume", math.max(1,#chapters), math.max(1,expected), book.title,
+        {message="正在检查书籍图片完整性"})
+    local combined_css=table.concat(css_list,"\n")
+    local preflight,preflight_error=ResourceRefs.scan(chapters,combined_css,assets)
     if preflight then
+        -- Helper icons and footnote markers may be reintroduced by footnote
+        -- transforms or old checkpoints after Reader already localized images.
+        -- Drop only the known optional subset before deciding which chapters
+        -- deserve a network repair pass.
+        if set_count_local(preflight.missing)>0 then
+            local cleaned_css,cleanup_stats,cleanup_error=ResourceRefs.cleanup_missing_local(
+                chapters,combined_css,assets,{allowed=preflight.missing,allow_orphan=false})
+            if not cleaned_css then
+                logger.warn("[MiuRead][Download] optional image cleanup skipped",tostring(cleanup_error))
+            elseif tonumber(cleanup_stats.removed or 0)>0 then
+                replace_css(cleaned_css)
+                combined_css=cleaned_css
+                logger.info("[MiuRead][Download] optional final image references cleaned",
+                    "removed=",tostring(cleanup_stats.removed or 0),
+                    "chapters=",tostring(cleanup_stats.chapters or 0),
+                    "samples=",table.concat(cleanup_stats.samples or {},","))
+                preflight,preflight_error=ResourceRefs.scan(chapters,combined_css,assets)
+            end
+        end
+
+        local initial_missing=preflight and U.copy(preflight.missing or {}) or {}
         local affected={}
-        for uid in pairs(preflight.missing_chapters or {}) do affected[tostring(uid)]=true end
-        for uid in pairs(preflight.external_chapters or {}) do affected[tostring(uid)]=true end
-        local affected_count=0
-        for _ in pairs(affected) do affected_count=affected_count+1 end
+        if preflight then
+            for uid in pairs(preflight.missing_chapters or {}) do affected[tostring(uid)]=true end
+            for uid in pairs(preflight.external_chapters or {}) do affected[tostring(uid)]=true end
+        end
+        local affected_count=set_count_local(affected)
         if affected_count>0 then
-            local missing_count=0
-            for _ in pairs(preflight.missing or {}) do missing_count=missing_count+1 end
+            local missing_count=preflight and set_count_local(preflight.missing) or 0
             logger.warn("[MiuRead][Download] final image repair pass",
                 "chapters=",tostring(affected_count),
                 "missing=",tostring(missing_count),
-                "external=",tostring(#(preflight.external or {})))
+                "external=",tostring(preflight and #(preflight.external or {}) or 0))
             cache.manifest.final_repair_required=true
             cache.manifest.last_image_repair={
                 attempted_at=os.time(),chapters=affected_count,
-                missing_samples=U.copy(preflight.missing_details or {}),
-                external_samples=U.copy(preflight.external_details or {}),
+                missing_samples=U.copy(preflight and preflight.missing_details or {}),
+                external_samples=U.copy(preflight and preflight.external_details or {}),
             }
             cache_save(cache)
             for index,chapter in ipairs(selected) do
                 local uid=tostring(chapter.chapterUid or chapter.uid)
                 if affected[uid] then
-                    progress("resume",index,expected,chapter.title,{message="正在修复缺失的正文图片"})
+                    progress("resume",index,expected,chapter.title,{message="正在只修复缺失的正文图片"})
                     cache_reset_entry(cache,uid)
                     failure_map[uid]={uid=uid,title=chapter.title,error="最终图片引用需要重新获取"}
                     process_one(chapter,index,3)
                 end
             end
             chapters, assets, css_list, css_seen, annotation_summary, image_summary = rebuild_outputs()
+            combined_css=table.concat(css_list,"\n")
+
+            -- If exactly the same local references survive a completed repair
+            -- pass, they have no downloadable source in the current chapter
+            -- payload. They are stale markup (for example a template image name
+            -- or a legacy footnote icon), not a network failure. Remove only
+            -- this stable set; any new/different miss remains fatal in _save.
+            local post,post_error=ResourceRefs.scan(chapters,combined_css,assets)
+            if post and #(post.external or {})==0 and set_count_local(post.missing)>0
+                and same_set(initial_missing,post.missing)
+                and tonumber(image_summary.required_missing or 0)==0 then
+                local cleaned_css,cleanup_stats,cleanup_error=ResourceRefs.cleanup_missing_local(
+                    chapters,combined_css,assets,{allowed=post.missing,allow_orphan=true})
+                if cleaned_css and tonumber(cleanup_stats.removed or 0)>0 then
+                    replace_css(cleaned_css)
+                    combined_css=cleaned_css
+                    local verified,verified_error=ResourceRefs.scan(chapters,combined_css,assets)
+                    if verified and set_count_local(verified.missing)==0 and #(verified.external or {})==0 then
+                        cache.manifest.last_image_repair.orphan_cleaned=tonumber(cleanup_stats.orphan or 0) or 0
+                        cache.manifest.last_image_repair.optional_cleaned=tonumber(cleanup_stats.optional or 0) or 0
+                        cache.manifest.last_image_repair.cleaned_samples=U.copy(cleanup_stats.samples or {})
+                        logger.warn("[MiuRead][Download] stable orphan image references removed after repair",
+                            "removed=",tostring(cleanup_stats.removed or 0),
+                            "chapters=",tostring(cleanup_stats.chapters or 0),
+                            "samples=",table.concat(cleanup_stats.samples or {},","))
+                    elseif verified then
+                        logger.warn("[MiuRead][Download] orphan cleanup left unresolved resources",
+                            "missing=",tostring(set_count_local(verified.missing)),
+                            "external=",tostring(#(verified.external or {})))
+                    else
+                        logger.warn("[MiuRead][Download] orphan cleanup verification failed",tostring(verified_error))
+                    end
+                elseif cleanup_error then
+                    logger.warn("[MiuRead][Download] stable orphan cleanup skipped",tostring(cleanup_error))
+                end
+            elseif post_error then
+                logger.warn("[MiuRead][Download] post-repair resource scan failed",tostring(post_error))
+            end
         end
     elseif preflight_error then
         logger.warn("[MiuRead][Download] image repair preflight skipped",tostring(preflight_error))
