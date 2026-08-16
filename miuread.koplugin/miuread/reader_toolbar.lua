@@ -432,8 +432,7 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
         }
         holds = {
             type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
-            type(header.bluetooth_hold_callback) == "function" and function() self:_activate_hold(header.bluetooth_hold_callback, "蓝牙设备") end or nil,
-            nil,nil,nil,nil,
+            nil,nil,nil,nil,nil,
         }
         ref_keys = {"wifi","bluetooth","sync","battery","home","more"}
     else

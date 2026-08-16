@@ -133,6 +133,7 @@ local function book(row,raw_index,archive_map)
         archiveName=archive and archive.archiveName or nil,
         archiveNames=archive and archive.archiveNamesText or nil,
         inArchive=archive~=nil,
+        raw=row,
     }
 end
 
@@ -194,46 +195,14 @@ local function order_cloud_rows(rows)
     return rows
 end
 
-local function archive_allowed(selected,entry)
-    if not entry then return false end
-    for _,name in ipairs(entry.archiveNames or {}) do
-        if selected[name] then return true end
-    end
-    return false
-end
-
-function Library:_shelf_filter_selection(data)
-    local names={}
-    for _,archive in ipairs(archive_entries(data or {})) do
-        local name=tostring(archive.name or archive.title or archive.archiveName or "书单")
-        if name~="" then names[#names+1]=name end
-    end
-    if self.store and self.store.set_deferred and #names>0 then
-        pcall(self.store.set_deferred,self.store,"shelf_archive_names",names)
-    end
-    if self.load_all_once then
-        self.load_all_once=nil
-        return nil
-    end
-    if not (self.store and self.store.preferences) then return nil end
-    local ok,prefs=pcall(self.store.preferences,self.store)
-    if not ok or type(prefs)~="table" then return nil end
-    local filter=type(prefs.shelf_filter)=="table" and prefs.shelf_filter or {}
-    local selected=type(filter.archives)=="table" and filter.archives or {}
-    if filter.enabled~=true or next(selected)==nil then return nil end
-    return selected
-end
-
 function Library:normalize(data)
     data=type(data)=="table" and data or {}
     local books,mp={},{}
     local seen_books,seen_mp={},{}
     local archive_map=build_archive_map(data)
-    local selected_archives=self:_shelf_filter_selection(data)
     local src=data.books or data.bookList or data.updated or {}
     if type(src)~="table" then src={} end
     local raw_index=0
-    local filtered_out=0
     for _,r in ipairs(src) do
         raw_index=raw_index+1
         local b=book(r,raw_index,archive_map)
@@ -241,20 +210,9 @@ function Library:normalize(data)
             if Protocol.is_mp_account(b.bookId) then
                 if not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
             elseif not Protocol.is_mp(b.bookId) and not seen_books[b.bookId] then
-                if selected_archives==nil or archive_allowed(selected_archives,archive_map[b.bookId]) then
-                    books[#books+1]=b
-                    seen_books[b.bookId]=true
-                else
-                    filtered_out=filtered_out+1
-                end
+                books[#books+1]=b; seen_books[b.bookId]=true
             end
         end
-    end
-    if selected_archives~=nil then
-        self.last_shelf_filter={kept=#books,filtered=filtered_out}
-        logger.info("[MiuRead][ShelfFilter] applied","kept=",tostring(#books),"filtered=",tostring(filtered_out))
-    else
-        self.last_shelf_filter=nil
     end
     local extras={data.mp,data.mpBook,data.officialAccounts}
     for _,x in ipairs(extras) do
@@ -353,58 +311,43 @@ function Library:is_downloaded(id, library_snapshot)
     return b and record_state(b).downloaded or false
 end
 
-local function local_book_from_row(id,row,session)
-    if type(row)~="table" then return nil end
-    local state=record_state(row)
-    if not state.downloaded then return nil end
-    session=type(session)=="table" and session or {}
-    local b={
-        bookId=tostring(row.book_id or id or ""),
-        title=row.title or "未命名",
-        author=row.author or "",
-        cover=row.cover,
-        category=row.category,
-        updateTime=tonumber(row.updated_at or row.downloaded_at or 0) or 0,
-        progress=local_progress(session,row),
-        local_only=true,
-        downloaded=true,
-        file_missing=false,
-        downloadedAt=state.downloaded_at,
-        lastReadTime=tonumber(session.last_read_at or 0) or 0,
-        filename_search=state.filenames,
-        fileSize=state.file_size,
-        hasClean=state.has_clean,
-        hasNotes=state.has_notes,
-        annotation_pending=state.annotation_pending,
-        annotation_fallback=state.annotation_fallback,
-        access=U.copy(row.access or {}),
-        content_type=state.content_type or row.content_type,
-        local_record=row,
-    }
-    return b.bookId~="" and b or nil
-end
-
-function Library:local_book(id,library_snapshot,sessions_snapshot)
-    id=tostring(id or "")
-    if id=="" then return nil end
-    local source=library_snapshot or self.store:library()
-    local row=source and source[id] or nil
-    if type(row)~="table" then return nil end
-    local sessions=sessions_snapshot or self.store:get("sessions",{})
-    return local_book_from_row(id,row,sessions[id] or {})
-end
-
 function Library:local_books(library_snapshot,sessions_snapshot)
     local source=library_snapshot or self.store:library()
     local sessions=sessions_snapshot or self.store:get("sessions",{})
     local books,mp={},{}
     for id,row in pairs(source or {}) do
-        local b=local_book_from_row(id,row,sessions[tostring(id)] or {})
-        if b then
-            if Protocol.is_mp_account(b.bookId) then
-                mp[#mp+1]=b
-            elseif not Protocol.is_mp(b.bookId) then
-                books[#books+1]=b
+        local state=record_state(row)
+        if state.downloaded then
+            local session=sessions[tostring(id)] or {}
+            local b={
+                bookId=tostring(row.book_id or id or ""),
+                title=row.title or "未命名",
+                author=row.author or "",
+                cover=row.cover,
+                category=row.category,
+                updateTime=tonumber(row.updated_at or row.downloaded_at or 0) or 0,
+                progress=local_progress(session,row),
+                local_only=true,
+                downloaded=true,
+                file_missing=false,
+                downloadedAt=state.downloaded_at,
+                lastReadTime=tonumber(session.last_read_at or 0) or 0,
+                filename_search=state.filenames,
+                fileSize=state.file_size,
+                hasClean=state.has_clean,
+                hasNotes=state.has_notes,
+                annotation_pending=state.annotation_pending,
+                annotation_fallback=state.annotation_fallback,
+                access=U.copy(row.access or {}),
+                content_type=state.content_type or row.content_type,
+                local_record=row,
+            }
+            if b.bookId~="" then
+                if Protocol.is_mp_account(b.bookId) then
+                    mp[#mp+1]=b
+                elseif not Protocol.is_mp(b.bookId) then
+                    books[#books+1]=b
+                end
             end
         end
     end
@@ -441,26 +384,21 @@ local function merge_local_metadata(remote,local_book)
     return remote
 end
 
-function Library:account_row(remote,local_book)
-    if type(remote)~="table" then return nil end
-    local b=U.copy(remote)
-    local id=tostring(b.bookId or b.book_id or "")
-    if id=="" then return nil end
-    b.bookId=id
-    b.local_only=false
-    b.in_account_shelf=true
-    b.remote_status_known=true
-    if local_book then merge_local_metadata(b,local_book) else b.downloaded=false end
-    return b
-end
-
 function Library:account_rows(remote_rows,local_rows)
     local local_by_id=local_index(local_rows)
     local out={}
     for _,remote in ipairs(remote_rows or {}) do
-        local id=tostring(type(remote)=="table" and (remote.bookId or remote.book_id) or "")
-        local b=self:account_row(remote,local_by_id[id])
-        if b then out[#out+1]=b end
+        local b=U.copy(remote)
+        local id=tostring(b.bookId or b.book_id or "")
+        if id~="" then
+            b.bookId=id
+            b.local_only=false
+            b.in_account_shelf=true
+            b.remote_status_known=true
+            local local_book=local_by_id[id]
+            if local_book then merge_local_metadata(b,local_book) else b.downloaded=false end
+            out[#out+1]=b
+        end
     end
     return out
 end
