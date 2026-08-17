@@ -424,9 +424,13 @@ function Http:_jar()
     local jar, changed = Cookies.sanitize(original)
     if changed then
         auth.cookies = jar
-        self.store:save_auth(auth)
-        logger.info("[MiuRead][HTTP] removed temporary cookies from saved login",
-            "names=", table.concat(Cookies.names(jar), ","))
+        local saved,save_error=self.store:save_auth(auth)
+        if saved==true then
+            logger.info("[MiuRead][HTTP] removed temporary cookies from saved login",
+                "names=", table.concat(Cookies.names(jar), ","))
+        else
+            logger.warn("[MiuRead][HTTP] cookie cleanup not persisted",Util.first_line(save_error or "unknown",160))
+        end
     end
     return jar
 end
@@ -441,8 +445,13 @@ function Http:_save_jar(jar, expected_login_session_id)
     local cleaned = Cookies.sanitize(jar or {})
     if not Cookies.same(auth.cookies or {}, cleaned) then
         auth.cookies = cleaned
-        self.store:save_auth(auth)
+        local saved,save_error=self.store:save_auth(auth)
+        if saved~=true then
+            logger.warn("[MiuRead][HTTP] refreshed cookies not persisted",Util.first_line(save_error or "unknown",160))
+            return false,save_error
+        end
     end
+    return true
 end
 
 function Http:_save_response_auth_headers(headers, expected_login_session_id)
@@ -467,7 +476,11 @@ function Http:_save_response_auth_headers(headers, expected_login_session_id)
         changed = true
     end
     if changed then
-        self.store:save_auth(auth)
+        local saved,save_error=self.store:save_auth(auth)
+        if saved~=true then
+            logger.warn("[MiuRead][HTTP] public-account credential not persisted",Util.first_line(save_error or "unknown",160))
+            return false
+        end
         logger.info("[MiuRead][HTTP] public-account credential refreshed",
             "ticket=", tostring(auth.wr_ticket ~= ""), "wrpa=", tostring(auth.wr_wrpa ~= ""))
     end
@@ -864,7 +877,21 @@ function Http:download_to_file(url,path,opt)
         os.remove(path)
         error("download returned empty content")
     end
-    return path,headers,final,{length=size,preview=preview}
+    local expected=tonumber(hget(headers,"content-length") or "")
+    if expected and expected>=0 and size~=expected then
+        os.remove(path)
+        local attempt=math.max(1,tonumber(request_opt._integrity_attempt) or 1)
+        local maximum=math.max(1,tonumber(request_opt.integrity_attempts) or 2)
+        logger.warn("[MiuRead][HTTP] streamed download length mismatch",
+            "url=",Util.redact_url(url),"expected=",tostring(expected),"received=",tostring(size),
+            "attempt=",tostring(attempt),"maximum=",tostring(maximum))
+        if attempt<maximum then
+            request_opt._integrity_attempt=attempt+1
+            return self:download_to_file(url,path,request_opt)
+        end
+        error("download incomplete: expected "..tostring(expected).." bytes, received "..tostring(size))
+    end
+    return path,headers,final,{length=size,expected_length=expected,preview=preview}
 end
 
 Http.auth_error_code = auth_error_code

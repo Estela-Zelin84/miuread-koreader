@@ -578,25 +578,19 @@ function Plugin:_reader_provider_supported(path)
     path=normalized_reader_file(path)
     if not path then return false,"文件路径无效" end
     local ok_registry,registry=pcall(require,"document/documentregistry")
-    if not ok_registry or not registry then
+    if not ok_registry or not registry or type(registry.hasProvider)~="function" then
+        -- Do not invent a format verdict if KOReader's own registry is
+        -- unavailable. Defer to ReaderUI so a registry probe failure cannot
+        -- falsely block a format KOReader can actually open.
+        logger.warn("[MiuRead][Reader] document registry unavailable; defer format check to KOReader",tostring(path))
         return true,nil
     end
-    local has_provider=false
-    if type(registry.hasProvider)=="function" then
-        local ok,value=pcall(registry.hasProvider,registry,path)
-        if ok and value==true then has_provider=true end
+    local ok,has_provider=pcall(registry.hasProvider,registry,path)
+    if not ok then
+        logger.warn("[MiuRead][Reader] hasProvider failed; defer format check to KOReader",tostring(has_provider))
+        return true,nil
     end
-    local provider
-    if type(registry.getProvider)=="function" then
-        local ok,value=pcall(registry.getProvider,registry,path)
-        if ok then provider=value end
-    end
-    local ok_reader,ReaderUI=pcall(require,"apps/reader/readerui")
-    if ok_reader and ReaderUI and type(ReaderUI.extendProvider)=="function" then
-        local ok,value=pcall(ReaderUI.extendProvider,ReaderUI,path,provider)
-        if ok and value then provider=value end
-    end
-    if has_provider or provider then return true,nil end
+    if has_provider==true then return true,nil end
     local ext=tostring(path):lower():match("%.([%w]+)$") or "该"
     return false,"当前 KOReader 不支持 "..string.upper(ext).." 格式"
 end
@@ -1624,6 +1618,10 @@ function Plugin:on_auth_replacing(_old_auth,_new_auth)
     end
     if self.store.clear_login_bound_sessions then self.store:clear_login_bound_sessions("new_login") end
     if self.store.clear_account_shelf_cache then self.store:clear_account_shelf_cache() end
+end
+
+function Plugin:on_auth_commit_failed()
+    self._auth_transitioning=false
 end
 
 function Plugin:show_account_status()
@@ -3326,9 +3324,11 @@ end
 function Plugin:_save_home_preferences(home,preferences)
     preferences=preferences or self.store:preferences()
     preferences.home_ui=home
-    self.store:save_preferences(preferences)
+    local saved,err=self.store:save_preferences(preferences)
+    if saved~=true then return false,err end
     UiScale.setDisplayMode(home.display_size or "standard")
     UiScale.setFontName(self:_home_ui_font_name(home))
+    return true
 end
 
 function Plugin:_save_home_preferences_deferred(home,preferences,delay)
@@ -3345,8 +3345,12 @@ function Plugin:_save_home_preferences_deferred(home,preferences,delay)
     UIManager:scheduleIn(tonumber(delay) or 1.20,function()
         if generation~=self._home_state_save_generation or not self._home_state_save_pending then return end
         self._home_state_save_pending=false
-        self.store:flush()
-        logger.info("[MiuRead][HomeState] preferences saved after idle")
+        local saved,err=self.store:flush()
+        if saved==true then
+            logger.info("[MiuRead][HomeState] preferences saved after idle")
+        else
+            logger.warn("[MiuRead][HomeState] preferences save failed after idle",U.first_line(err or "unknown",160))
+        end
     end)
 end
 
@@ -3354,7 +3358,11 @@ function Plugin:_flush_home_preferences()
     if not self._home_state_save_pending then return false end
     self._home_state_save_generation=(tonumber(self._home_state_save_generation) or 0)+1
     self._home_state_save_pending=false
-    self.store:flush()
+    local saved,err=self.store:flush()
+    if saved~=true then
+        logger.warn("[MiuRead][HomeState] preferences save failed before leaving home",U.first_line(err or "unknown",160))
+        return false,err
+    end
     logger.info("[MiuRead][HomeState] preferences saved before leaving home")
     return true
 end
@@ -3427,7 +3435,11 @@ function Plugin:_set_mode_intro_pending(mode,reason)
     intro.pending_mode=mode
     intro.pending_reason=tostring(reason or "user_switch")
     intro.pending_at=os.time()
-    self.store:save_preferences(preferences)
+    local saved,err=self.store:save_preferences(preferences)
+    if saved~=true then
+        logger.warn("[MiuRead][Mode] intro state save failed",U.first_line(err or "unknown",160))
+        return false,err
+    end
     return true
 end
 
@@ -3494,7 +3506,21 @@ function Plugin:_set_home_mode(use_miuread_home)
     end
     home.enabled=enabled
     home.layout_version=23
-    self:_save_home_preferences(home,preferences)
+    local saved,save_error=self:_save_home_preferences(home,preferences)
+    if saved~=true then
+        logger.warn("[MiuRead][Mode] mode preference save failed",U.first_line(save_error or "unknown",180))
+        self:info("运行模式没有保存成功，当前模式不会改变。\n\n请稍后重试；本次不会重启 KOReader。")
+        return false
+    end
+    local persisted,persist_error=self.store:read_persisted("preferences")
+    local persisted_home=type(persisted)=="table" and persisted.home_ui or nil
+    if type(persisted_home)~="table" or persisted_home.enabled~=enabled then
+        logger.warn("[MiuRead][Mode] persisted mode verification failed",U.first_line(persist_error or "value mismatch",180))
+        self.store:reload()
+        self:info("运行模式保存后校验失败，当前模式不会改变。\n\n请稍后重试；本次不会重启 KOReader。")
+        return false
+    end
+    logger.info("[MiuRead][Mode] persisted mode verified","target=",target_mode)
     if self:_home_enabled()==enabled then
         self:_clear_mode_intro_pending()
         self:toast("已取消待切换模式，当前继续使用"..self:_runtime_mode_label(),3)
@@ -11003,14 +11029,27 @@ function Plugin:_mark_reader_busy(seconds,share_report)
     self._reader_busy_until=target
     local active_download=(self.download_task and self.download_task:busy()) or self._download_runtime~=nil
     local wrote=true
-    -- Keep page turns memory-only in the normal case. The shared /tmp marker is
-    -- written only when a visible panel gesture specifically asks the report
-    -- subprocess to yield, or while a download is already competing for I/O.
-    if active_download or share_report==true then wrote=U.atomic_write(path,tostring(target),true)==true end
-    -- Reader interaction still has priority, but no longer hard-pauses the
-    -- download worker. downloader.lua already observes reader_busy_path and now
-    -- lets network/light work continue while deferring heavy transforms/package
-    -- work until this absolute deadline expires.
+    -- Page turns publish only a tiny best-effort /tmp hint. This is not durable
+    -- state, so avoid the heavier atomic-write path and duplicate writes in the
+    -- same one-second clock tick.
+    if share_report=="fast" then
+        local shared_until=tonumber(self._reader_busy_shared_until or 0) or 0
+        if target>shared_until then
+            local f=io.open(path,"w")
+            if f then
+                wrote=f:write(tostring(target))~=nil
+                f:close()
+                if wrote then self._reader_busy_shared_until=target end
+            else
+                wrote=false
+            end
+        end
+    elseif active_download or share_report==true then
+        wrote=U.atomic_write(path,tostring(target),true)==true
+        if wrote then self._reader_busy_shared_until=target end
+    end
+    -- Reader interaction still has priority. downloader.lua observes this hint
+    -- and defers only heavy transforms/package work while the user is active.
     return wrote
 end
 
@@ -11143,28 +11182,259 @@ function Plugin:_reader_jump_percent(delta)
     return true
 end
 
+local function typography_heavy_stage(stage)
+    stage=tostring(stage or "")
+    return stage=="transform" or stage=="package"
+        or stage=="annotation_batch" or stage=="annotation_apply"
+end
+
+function Plugin:_reader_typography_pending_value(key)
+    local pending=self._reader_typography_pending
+    if type(pending)~="table" then return nil end
+    local current=normalized_reader_file(self:_current_document_path())
+    if pending.file and current and pending.file~=current then return nil end
+    return tonumber(pending[key])
+end
+
+function Plugin:_reader_typography_cancel(reason)
+    local pending=self._reader_typography_pending
+    local guard_mode=type(pending)=="table" and pending.guard_mode or nil
+    if self._reader_typography_apply_task then
+        UIManager:unschedule(self._reader_typography_apply_task)
+        self._reader_typography_apply_task=nil
+    end
+    if type(pending)=="table" then
+        pending.generation=(tonumber(pending.generation) or 0)+1
+        logger.info("[MiuRead][Typography] pending changes cancelled",
+            "reason=",tostring(reason or "cancelled"),"file=",tostring(pending.file or "-"))
+    end
+    self._reader_typography_pending=nil
+    if guard_mode then self:_reader_typography_release_download_guard(guard_mode) end
+    return true
+end
+
+function Plugin:_reader_typography_release_download_guard(mode)
+    local task=self.download_task
+    if not task then return end
+    if mode=="hibernate" then
+        if task:is_hibernated() then
+            self:_schedule_hibernated_download_resume("typography stable")
+            return
+        end
+        -- A hibernate request is cooperative. If the typography operation was
+        -- cancelled while the worker was still checkpointing, keep watching
+        -- until the checkpoint lands and then use the normal low-memory-aware
+        -- resume path instead of leaving the download parked indefinitely.
+        local started=monotonic_wall_time()
+        local watcher
+        watcher=function()
+            if self.download_task~=task then return end
+            if task:is_hibernated() then
+                self:_schedule_hibernated_download_resume("typography stable")
+                return
+            end
+            if monotonic_wall_time()-started<10 and task:busy() then
+                UIManager:scheduleIn(.35,watcher)
+            end
+        end
+        UIManager:scheduleIn(.35,watcher)
+    elseif mode=="pause" then
+        UIManager:scheduleIn(math.max(1.0,tonumber(Config.TYPOGRAPHY_DOWNLOAD_RESUME_DELAY_SECONDS) or 2.2),function()
+            if self.download_task==task then task:resume("heavy_resource") end
+        end)
+    end
+end
+
+function Plugin:_reader_typography_apply_now(generation,guard_mode)
+    local pending=self._reader_typography_pending
+    if type(pending)~="table" then
+        self:_reader_typography_release_download_guard(guard_mode)
+        return false
+    end
+    if generation~=(tonumber(pending.generation) or 0) then return false end
+    self._reader_typography_apply_task=nil
+    local current=normalized_reader_file(self:_current_document_path())
+    if not (self.ui and self.ui.document) or (pending.file and current and pending.file~=current) then
+        self:_reader_typography_cancel("reader changed before apply")
+        return false
+    end
+
+    local font=self.ui and self.ui.font or nil
+    if not font then
+        self:_reader_typography_cancel("font controller unavailable")
+        return false
+    end
+
+    local hint_seconds=math.max(6,tonumber(Config.TYPOGRAPHY_REBUILD_HINT_SECONDS) or 12)
+    self:_reader_native_setting_begin("Typography batch",hint_seconds)
+    self:_mark_reader_busy(math.ceil(hint_seconds),true)
+    if collectgarbage then pcall(collectgarbage,"collect") end
+
+    local started=monotonic_wall_time()
+    local applied=0
+    local errors={}
+    -- Clear the pending queue before invoking KOReader. A synchronous reflow can
+    -- recreate ReaderUI/plugin state; the native-setting hint above survives
+    -- that rebuild globally and keeps CloseDocument out of the real-close path.
+    self._reader_typography_pending=nil
+
+    if pending.font_size~=nil then
+        local target=math.max(12,math.min(72,tonumber(pending.font_size) or 22))
+        local ok,err=false,nil
+        if type(font.onSetFontSize)=="function" then ok,err=pcall(font.onSetFontSize,font,target) end
+        if not ok and self.ui and type(self.ui.handleEvent)=="function" then
+            ok,err=pcall(self.ui.handleEvent,self.ui,Event:new("SetFontSize",target))
+        end
+        if ok then applied=applied+1 else errors[#errors+1]="font_size:"..tostring(err or "unsupported") end
+    end
+    if pending.font_weight~=nil then
+        local target=math.max(-1,math.min(3,tonumber(pending.font_weight) or 0))
+        target=math.floor(target*4+.5)/4
+        local ok,err=false,nil
+        if type(font.onSetFontBaseWeight)=="function" then ok,err=pcall(font.onSetFontBaseWeight,font,target) end
+        if ok then applied=applied+1 else errors[#errors+1]="font_weight:"..tostring(err or "unsupported") end
+    end
+    if pending.line_spacing~=nil then
+        local target=math.max(50,math.min(200,math.floor((tonumber(pending.line_spacing) or 100)+.5)))
+        local ok,err=false,nil
+        if type(font.onSetLineSpace)=="function" then ok,err=pcall(font.onSetLineSpace,font,target) end
+        if ok then applied=applied+1 else errors[#errors+1]="line_spacing:"..tostring(err or "unsupported") end
+    end
+
+    logger.info("[MiuRead][Typography] batch applied",
+        "changes=",tostring(applied),"guard=",tostring(guard_mode or "none"),
+        "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-started)*1000+.5)),
+        "errors=",#errors>0 and table.concat(errors," | ") or "none")
+    self:_reader_typography_release_download_guard(guard_mode)
+    if applied==0 and #errors>0 then self:status_toast("排版调整","本次排版未能应用，请稍后重试",3) end
+    return applied>0
+end
+
+function Plugin:_reader_typography_wait_for_guard(generation,started,mode)
+    local pending=self._reader_typography_pending
+    if type(pending)~="table" or generation~=(tonumber(pending.generation) or 0) then return false end
+    local task=self.download_task
+    if not task or not task:busy() or task:is_hibernated() then
+        return self:_reader_typography_apply_now(generation,mode)
+    end
+    local elapsed=monotonic_wall_time()-started
+    local wait_limit=math.max(2,tonumber(Config.TYPOGRAPHY_HEAVY_WAIT_SECONDS) or 8)
+    if elapsed>=wait_limit then
+        local memory=RuntimePressure.memory_snapshot(true)
+        local available=memory and tonumber(memory.available_kb) or nil
+        local critical=math.max(1,tonumber(Config.TYPOGRAPHY_CRITICAL_MEMORY_KB) or 48*1024)
+        if available and available<critical then
+            logger.warn("[MiuRead][Typography] apply deferred for safety",
+                "reason=low_memory","memory_kb=",tostring(available),"stage=",tostring(task:stage() or "unknown"))
+            self:_reader_typography_cancel("critical low memory")
+            self:status_toast("暂缓排版","当前内存较低，后台下载正在释放资源；稍后再调整可避免阅读器崩溃",4)
+            return false
+        end
+        logger.warn("[MiuRead][Typography] heavy guard timeout; applying after pause",
+            "memory_kb=",tostring(available or "unknown"),"stage=",tostring(task:stage() or "unknown"))
+        return self:_reader_typography_apply_now(generation,mode)
+    end
+    local waiter
+    waiter=function()
+        if self._reader_typography_apply_task~=waiter then return end
+        self._reader_typography_apply_task=nil
+        self:_reader_typography_wait_for_guard(generation,started,mode)
+    end
+    self._reader_typography_apply_task=waiter
+    UIManager:scheduleIn(.18,waiter)
+    return true
+end
+
+function Plugin:_reader_typography_apply(generation)
+    local pending=self._reader_typography_pending
+    if type(pending)~="table" or generation~=(tonumber(pending.generation) or 0) then return false end
+    self._reader_typography_apply_task=nil
+    if not (self.ui and self.ui.document) then return self:_reader_typography_cancel("reader unavailable") end
+
+    local task=self.download_task
+    local existing_guard=tostring(pending.guard_mode or "")
+    if existing_guard=="hibernate" then
+        if task and task:is_hibernated() then
+            return self:_reader_typography_apply_now(generation,"hibernate")
+        end
+        if task and task:busy() then
+            return self:_reader_typography_wait_for_guard(generation,
+                tonumber(pending.guard_started_clock) or monotonic_wall_time(),"hibernate")
+        end
+        pending.guard_mode=nil
+        pending.guard_started_clock=nil
+    elseif existing_guard=="pause" then
+        return self:_reader_typography_apply_now(generation,"pause")
+    end
+
+    local memory=RuntimePressure.memory_snapshot(true)
+    local available=memory and tonumber(memory.available_kb) or nil
+    local critical=math.max(1,tonumber(Config.TYPOGRAPHY_CRITICAL_MEMORY_KB) or 48*1024)
+    if available and available<critical and (not task or not task:busy()) then
+        if collectgarbage then pcall(collectgarbage,"collect") end
+        memory=RuntimePressure.memory_snapshot(true)
+        available=memory and tonumber(memory.available_kb) or available
+        if available and available<critical then
+            logger.warn("[MiuRead][Typography] apply skipped for safety",
+                "reason=critical_low_memory","memory_kb=",tostring(available))
+            self:_reader_typography_cancel("critical low memory without active download")
+            self:status_toast("暂缓排版","当前可用内存过低；已取消这次重排，避免阅读器崩溃",4)
+            return false
+        end
+    end
+
+    if task and task:busy() and not task:is_hibernated() then
+        local hibernate_line=math.max(1,tonumber(Config.TYPOGRAPHY_HIBERNATE_MEMORY_KB) or 72*1024)
+        local stage=tostring(task:stage() or "unknown")
+        if typography_heavy_stage(stage) or (available and available<hibernate_line) then
+            local requested=task:request_hibernate((available and available<hibernate_line)
+                and "typography_low_memory" or "typography_heavy_stage")
+            local mode=requested and "hibernate" or "pause"
+            if not requested then task:pause("heavy_resource") end
+            pending.guard_mode=mode
+            pending.guard_started_clock=monotonic_wall_time()
+            logger.info("[MiuRead][Typography] heavy guard engaged",
+                "mode=",mode,"stage=",stage,"memory_kb=",tostring(available or "unknown"))
+            return self:_reader_typography_wait_for_guard(generation,pending.guard_started_clock,mode)
+        end
+    end
+    return self:_reader_typography_apply_now(generation,nil)
+end
+
+function Plugin:_reader_queue_typography(key,value)
+    if not (self.ui and self.ui.document) then return false end
+    local path=normalized_reader_file(self:_current_document_path())
+    local pending=self._reader_typography_pending
+    if type(pending)~="table" or (pending.file and path and pending.file~=path) then
+        if self._reader_typography_apply_task then UIManager:unschedule(self._reader_typography_apply_task) end
+        pending={file=path,generation=0}
+        self._reader_typography_pending=pending
+    end
+    pending[key]=tonumber(value)
+    pending.generation=(tonumber(pending.generation) or 0)+1
+    local generation=pending.generation
+    if self._reader_typography_apply_task then UIManager:unschedule(self._reader_typography_apply_task) end
+    local apply_task
+    apply_task=function()
+        if self._reader_typography_apply_task~=apply_task then return end
+        self._reader_typography_apply_task=nil
+        self:_reader_typography_apply(generation)
+    end
+    self._reader_typography_apply_task=apply_task
+    UIManager:scheduleIn(math.max(.20,tonumber(Config.TYPOGRAPHY_APPLY_DEBOUNCE_SECONDS) or .42),apply_task)
+    logger.dbg("[MiuRead][Typography] queued",key,"=",tostring(value),"generation=",tostring(generation))
+    return true
+end
+
 function Plugin:_reader_adjust_font_size(delta)
-    local ui=self.ui
-    local font=ui and ui.font
-    local configurable=ui and ui.document and ui.document.configurable or nil
-    local current=font and tonumber(font.font_size)
-        or (ui and ui.rolling and tonumber(ui.rolling.font_size))
-        or (configurable and tonumber(configurable.font_size))
+    local current=self:_reader_font_size_value()
     if not current then
         self:info("当前文档暂时无法直接调整字号")
         return false
     end
     local target=math.max(12,math.min(72,current+(tonumber(delta) or 0)))
-    self:_mark_reader_busy(5)
-    if font and type(font.onSetFontSize)=="function" then
-        local ok=pcall(font.onSetFontSize,font,target)
-        if ok then return true end
-    end
-    if ui and type(ui.handleEvent)=="function" then
-        ui:handleEvent(Event:new("SetFontSize",target))
-        return true
-    end
-    return false
+    self:_mark_reader_busy(4)
+    return self:_reader_queue_typography("font_size",target)
 end
 
 function Plugin:_reader_goto_percent(target)
@@ -11322,6 +11592,8 @@ function Plugin:_show_reader_toc(back_callback)
 end
 
 function Plugin:_reader_line_spacing_value()
+    local pending=self:_reader_typography_pending_value("line_spacing")
+    if pending~=nil then return pending end
     local ui=self.ui
     local font=ui and ui.font or nil
     local configurable=ui and ui.document and ui.document.configurable or nil
@@ -11331,15 +11603,13 @@ function Plugin:_reader_line_spacing_value()
 end
 
 function Plugin:_reader_set_line_spacing(value)
-    local font=self.ui and self.ui.font or nil
-    local target=math.max(50,math.min(200,math.floor((tonumber(value) or 100)+.5)))
-    if font and type(font.onSetLineSpace)=="function" then
-        self:_mark_reader_busy(5)
-        local ok=pcall(font.onSetLineSpace,font,target)
-        if ok then return true end
+    if not (self.ui and self.ui.font) then
+        self:info("当前文档暂时无法直接调整行距")
+        return false
     end
-    self:info("当前文档暂时无法直接调整行距")
-    return false
+    local target=math.max(50,math.min(200,math.floor((tonumber(value) or 100)+.5)))
+    self:_mark_reader_busy(4)
+    return self:_reader_queue_typography("line_spacing",target)
 end
 
 function Plugin:_reader_adjust_line_spacing(delta)
@@ -11347,6 +11617,8 @@ function Plugin:_reader_adjust_line_spacing(delta)
 end
 
 function Plugin:_reader_font_weight_value()
+    local pending=self:_reader_typography_pending_value("font_weight")
+    if pending~=nil then return pending end
     local ui=self.ui
     local font=ui and ui.font or nil
     local configurable=ui and ui.document and ui.document.configurable or nil
@@ -11363,16 +11635,14 @@ function Plugin:_reader_font_weight_label()
 end
 
 function Plugin:_reader_set_font_weight(value)
-    local font=self.ui and self.ui.font or nil
+    if not (self.ui and self.ui.font) then
+        self:info("当前文档暂时无法直接调整字体粗细")
+        return false
+    end
     local target=math.max(-1,math.min(3,tonumber(value) or 0))
     target=math.floor(target*4+.5)/4
-    if font and type(font.onSetFontBaseWeight)=="function" then
-        self:_mark_reader_busy(5)
-        local ok=pcall(font.onSetFontBaseWeight,font,target)
-        if ok then return true end
-    end
-    self:info("当前文档暂时无法直接调整字体粗细")
-    return false
+    self:_mark_reader_busy(4)
+    return self:_reader_queue_typography("font_weight",target)
 end
 
 function Plugin:_reader_adjust_font_weight(delta)
@@ -11592,6 +11862,8 @@ function Plugin:_reader_font_label()
 end
 
 function Plugin:_reader_font_size_value()
+    local pending=self:_reader_typography_pending_value("font_size")
+    if pending~=nil then return pending end
     local ui=self.ui
     local font=ui and ui.font
     local configurable=ui and ui.document and ui.document.configurable or nil
@@ -14100,13 +14372,28 @@ function Plugin:_schedule_hibernated_download_resume(reason)
             or state=="suspended" or state=="opening_reader" or state=="closing_reader" then
             return
         end
+        local hibernate_reason=type(self.download_task.hibernated_reason)=="function"
+            and self.download_task:hibernated_reason() or nil
+        if hibernate_reason=="network_offline" and not self:is_online() then
+            logger.info("[MiuRead][DownloadTask] network-hibernated task remains parked",
+                "reason=offline","navigation=",state)
+            self:_schedule_hibernated_download_resume("network restored")
+            return
+        end
         local ok,err=self.download_task:resume_hibernated(reason or "foreground stable")
         if not ok and err=="low_memory" then
             self:_schedule_hibernated_download_resume(reason or "foreground stable")
+        elseif not ok then
+            logger.warn("[MiuRead][DownloadTask] hibernated resume failed",
+                "reason=",tostring(hibernate_reason or "unknown"),"error=",tostring(err or "unknown"))
         end
     end
     self._hibernated_download_resume_task=task
-    UIManager:scheduleIn(math.max(2.0,tonumber(Config.DOWNLOAD_INTERACTION_RESUME_DELAY) or 2.5),task)
+    local hibernate_reason=type(self.download_task.hibernated_reason)=="function"
+        and self.download_task:hibernated_reason() or nil
+    local delay=hibernate_reason=="network_offline" and 8
+        or math.max(2.0,tonumber(Config.DOWNLOAD_INTERACTION_RESUME_DELAY) or 2.5)
+    UIManager:scheduleIn(delay,task)
     return true
 end
 
@@ -15247,6 +15534,11 @@ function Plugin:_request_reader_close(generation,source)
     logger.info("[MiuRead][ReaderClose] close command",
         "generation=",tostring(generation),"attempt=",tostring(READER_CLOSE.close_attempts),
         "source=",tostring(source or "direct"))
+    local local_session=self:_reader_session_is_local()
+    if local_session then
+        logger.info("[MiuRead][ReaderClose] local close command enter",
+            "generation=",tostring(generation),"file=",tostring(READER_CLOSE.reader_file or "-"))
+    end
     pcall(function() active:handleEvent(Event:new("CloseReaderMenu")) end)
     pcall(function() active:handleEvent(Event:new("CloseConfigMenu")) end)
     local ok_close,err_close=xpcall(function() active:onClose(false) end,debug.traceback)
@@ -15255,6 +15547,10 @@ function Plugin:_request_reader_close(generation,source)
         self:_schedule_reader_return_finish(generation,.18,"close request failed")
         return false
     end
+    if local_session then
+        logger.info("[MiuRead][ReaderClose] local close command returned",
+            "generation=",tostring(generation))
+    end
     self:_schedule_reader_return_finish(generation,.10,"close requested")
     return true
 end
@@ -15262,11 +15558,16 @@ end
 function Plugin:return_to_miuread_home(reason)
     sync_home_session()
     if HOME_EXITING or UIManager._exit_code~=nil then return false end
+    local local_session=self.ui and self.ui.document and self:_reader_session_is_local()
+    if self._reader_typography_pending then self:_reader_typography_cancel("return home") end
+    if local_session then
+        logger.info("[MiuRead][ReaderClose] local home tap",
+            "file=",tostring(self:_current_document_path() or HOME_SESSION.reader_session_file or "-"),
+            "reason=",tostring(reason or "reader surface"))
+    end
     if self.ui and self.ui.document and self:_reader_session_is_weread()
         and self.sync and self.sync.reading_end_finalized~=true then
-        return self:_reading_end_before_action("返回觅阅主页","返回觅阅主页",function()
-            self:return_to_miuread_home(reason)
-        end)
+        self:_reading_end_detach_for_home("返回觅阅主页")
     end
     self:_cancel_native_menu_guard()
     HOME_SESSION_SUPPRESSED=false
@@ -15281,6 +15582,10 @@ function Plugin:return_to_miuread_home(reason)
         local file=self:_reader_file(readerui,HOME_RETURN_FILE)
         local generation,started=self:_begin_reader_return(reason or "explicit return",file,true)
         if not started then return true end
+        if local_session then
+            logger.info("[MiuRead][ReaderClose] local close state created",
+                "generation=",tostring(generation),"session=",tostring(HOME_SESSION.reader_session_generation or 0))
+        end
         -- The transition and its shared download pause are already active before
         -- closing any transient reader widget. This keeps the action independent
         -- from ReaderToolbar:onCloseWidget and gives foreground navigation priority.
@@ -15984,7 +16289,14 @@ function Plugin:_on_download_progress(runtime,state)
     elseif state and state.stage=="restart" then
         self:_update_open_shelf_download_status(runtime.book.bookId,"从断点自动恢复")
     elseif state and state.stage=="hibernated" then
-        self:_update_open_shelf_download_status(runtime.book.bookId,"已安全释放资源 · 稍后继续")
+        if state.hibernate_reason=="network_offline" then
+            self:_update_open_shelf_download_status(runtime.book.bookId,"网络暂停 · 联网后继续")
+            if HOME_SESSION.suspended~=true and self._miuread_suspended~=true then
+                self:_schedule_hibernated_download_resume("network restored")
+            end
+        else
+            self:_update_open_shelf_download_status(runtime.book.bookId,"已安全释放资源 · 稍后继续")
+        end
     elseif state and (state.waiting_network==true or state.stage=="waiting_network") then
         self:_update_open_shelf_download_status(runtime.book.bookId,"等待网络 · 已保存进度")
     end
@@ -16156,7 +16468,9 @@ function Plugin:_recover_download_state()
         book=U.copy(state.book or {bookId=state.book_id,title=state.title}),
         options=U.copy(state.options or {}),
         last_state={stage=state.stage,current=state.current,total=state.total,percent=state.percent,
-            chapter=state.chapter,message=state.message},
+            chapter=state.chapter,message=state.message,waiting_network=state.waiting_network,
+            network_wait_started_at=state.network_wait_started_at,network_wait_seconds=state.network_wait_seconds,
+            hibernate_reason=state.hibernate_reason},
         background=true,dialog=nil,started_at=state.started_at,task=U.copy(state.task),
         open_after=false,done=nil,recovered=true,
     }
@@ -16224,6 +16538,9 @@ function Plugin:_download_status_label()
             return wait>0 and ("后台下载 · 请求受限，"..tostring(wait).."秒后继续") or "后台下载 · 请求受限，等待恢复"
         end
         if state.stage=="restart" then return "后台下载 · 正在从断点恢复" end
+        if state.stage=="hibernated" and state.hibernate_reason=="network_offline" then
+            return "后台下载 · 网络暂停，联网后继续"
+        end
         if state.waiting_network==true or state.stage=="waiting_network" then return "后台下载 · 等待网络，已保存进度" end
         local title=U.utf8_truncate(state.title or "未命名",9)
         return "后台下载：《"..title.."》 "..tostring(self:_download_percent(state)).."%"
@@ -16268,6 +16585,9 @@ function Plugin:_active_download_payload(runtime,state)
         chapter=state and state.chapter or "",
         message=state and state.message or "",
         waiting_network=state and (state.waiting_network==true or state.stage=="waiting_network") or nil,
+        network_wait_started_at=state and state.network_wait_started_at or nil,
+        network_wait_seconds=state and state.network_wait_seconds or nil,
+        hibernate_reason=state and state.hibernate_reason or nil,
         wait_seconds=state and state.wait_seconds or nil,
         rate_limit_code=state and state.rate_limit_code or nil,
         started_at=runtime.started_at,
@@ -16996,22 +17316,8 @@ function Plugin:_recover_failed_reader_open(path,generation,reason)
         self:_set_foreground("home_pending")
         self:_restore_home_after_reader_close(1)
     end
-    self:info("书籍暂时无法打开：\n"..U.first_line(reason or "KOReader 未能进入阅读界面",120))
+    self:info("书籍无法打开：\n"..U.first_line(reason or "KOReader 返回打开失败",120))
     return true
-end
-
-function Plugin:_schedule_reader_open_watchdog(path,generation)
-    UIManager:scheduleIn(2.2,function()
-        if generation~=(tonumber(HOME_SESSION.opening_generation) or 0)
-            or normalized_reader_file(HOME_SESSION.opening_file)~=normalized_reader_file(path) then return end
-        if HOME_SESSION.suspended==true or self._miuread_suspended==true then
-            self:_schedule_reader_open_watchdog(path,generation)
-            return
-        end
-        local lifecycle=self:_reader_lifecycle_state()
-        if lifecycle=="active" then return end
-        self:_recover_failed_reader_open(path,generation,"KOReader 未能进入阅读界面")
-    end)
 end
 
 function Plugin:_open_file_direct(path,session_kind,book_id)
@@ -17066,7 +17372,6 @@ function Plugin:_open_file_direct(path,session_kind,book_id)
         local ok,result=xpcall(function() return self.ui:switchDocument(path) end,debug.traceback)
         if not ok then return fail(result) end
         if result==false then return fail("KOReader 拒绝切换到目标书籍") end
-        self:_schedule_reader_open_watchdog(path,opening_generation)
         return result==nil and true or result
     end
     local ReaderUI=require("apps/reader/readerui")
@@ -17076,7 +17381,6 @@ function Plugin:_open_file_direct(path,session_kind,book_id)
     end,debug.traceback)
     if not ok then return fail(result) end
     if result==false then return fail("KOReader 拒绝打开目标书籍") end
-    self:_schedule_reader_open_watchdog(path,opening_generation)
     return result==nil and true or result
 end
 
@@ -18045,7 +18349,7 @@ function Plugin:_home_sync_summary(force)
     -- counters are cheap; annotation counters come from an asynchronously
     -- refreshed snapshot.
     local sessions=self.store:get("sessions",{}) or {}
-    local progress,time_count,progress_failed=0,0,0
+    local progress,time_count,progress_failed,progress_unconfirmed=0,0,0,0
     local pending_progress_states={
         waiting_network=true,uploading=true,upload_unconfirmed=true,upload_failed=true,
         verifying_upload=true,deferred=true,verification_required=true,remote_jump_unconfirmed=true,
@@ -18054,8 +18358,11 @@ function Plugin:_home_sync_summary(force)
         if type(session)=="table" then
             local state=tostring(session.progress_sync_state or "")
             if pending_progress_states[state] then progress=progress+1 end
-            if state=="upload_failed" or state=="upload_unconfirmed" or state=="remote_jump_unconfirmed" then
+            if state=="upload_failed" then
                 progress_failed=progress_failed+1
+            elseif state=="upload_unconfirmed" or state=="verifying_upload"
+                or state=="remote_jump_unconfirmed" or state=="verification_required" then
+                progress_unconfirmed=progress_unconfirmed+1
             end
             if tonumber(session.pending_report_seconds or 0)>0 then time_count=time_count+1 end
         end
@@ -18077,6 +18384,7 @@ function Plugin:_home_sync_summary(force)
         annotation_upgrade_recheck=tonumber(annotations.upgrade_recheck or 0) or 0,
         annotation_held_local=tonumber(annotations.held_local or 0) or 0,
         annotation_failed=tonumber(annotations.failed or 0) or 0,
+        progress_failed=progress_failed,progress_unconfirmed=progress_unconfirmed,
         failed=progress_failed+(tonumber(annotations.failed or 0) or 0),
         total=total,books=tonumber(annotations.books or 0) or 0,checking=checking,
     }
@@ -18095,10 +18403,145 @@ function Plugin:_home_sync_status_label(force)
         return "批注待确认 "..tostring(summary.annotation_action_required)
     end
     if summary.failed>0 then return "失败 "..tostring(summary.failed) end
+    if (tonumber(summary.progress_unconfirmed or 0) or 0)>0 then
+        return "进度待确认 "..tostring(summary.progress_unconfirmed)
+    end
     if summary.total>0 then return "待同步 "..tostring(summary.total) end
     if self.annotation_async and self.annotation_async:busy() then return "同步中" end
     if summary.checking==true then return "同步检查中" end
     return "已同步"
+end
+
+function Plugin:_progress_sync_issue_items()
+    local sessions=self.store:get("sessions",{}) or {}
+    local items={}
+    local labels={
+        upload_unconfirmed="云端待确认",verifying_upload="云端待确认",
+        waiting_network="等待网络",upload_failed="上传失败",
+        remote_jump_unconfirmed="位置待确认",verification_required="位置待确认",
+        uploading="正在上传",deferred="稍后处理",
+    }
+    local pending={
+        upload_unconfirmed=true,verifying_upload=true,waiting_network=true,upload_failed=true,
+        remote_jump_unconfirmed=true,verification_required=true,uploading=true,deferred=true,
+    }
+    for id,session in pairs(sessions) do
+        if type(session)=="table" then
+            local state=tostring(session.progress_sync_state or "")
+            if pending[state] then
+                local book=self.store:book(id) or {}
+                local title=U.trim(tostring(book.title or book.bookTitle or ""))
+                if title=="" then title="书籍 "..tostring(id) end
+                local reason=tostring(session.progress_sync_message or session.progress_upload_error or "待处理")
+                local pending_progress=type(session.pending_progress)=="table" and U.copy(session.pending_progress) or nil
+                local localp=tonumber(session.progress_local_percent) or tonumber(pending_progress and pending_progress.progress)
+                items[#items+1]={
+                    book_id=tostring(id),title=title,state=state,
+                    state_label=labels[state] or "待处理",reason=reason,
+                    local_percent=localp,
+                    can_verify=(state=="upload_unconfirmed" or state=="verifying_upload") and pending_progress~=nil,
+                    pending_progress=pending_progress,
+                    decided_at=tonumber(session.progress_decided_at or session.progress_upload_pending_at or 0) or 0,
+                }
+            end
+        end
+    end
+    table.sort(items,function(a,b)
+        if a.can_verify~=b.can_verify then return a.can_verify==true end
+        return (tonumber(a.decided_at) or 0)>(tonumber(b.decided_at) or 0)
+    end)
+    return items
+end
+
+function Plugin:_retry_saved_progress_verification(item,callback)
+    callback=type(callback)=="function" and callback or function() end
+    item=type(item)=="table" and item or {}
+    local book_id=tostring(item.book_id or "")
+    local position=type(item.pending_progress)=="table" and U.copy(item.pending_progress) or nil
+    if book_id=="" or not position then callback(false,"缺少已提交的位置记录"); return false end
+    if not self:logged_in() then callback(false,"请先登录微信读书账号"); return false end
+    if not self:is_online() then callback(false,"当前网络不可用"); return false end
+    self:_save_progress_state(book_id,"verifying_upload","正在重新读取云端位置确认",position.progress,nil)
+    local started=self:_verify_progress_submission(book_id,position,{
+        reason="saved_pending_verified",detached=true,first_delay=.15,second_delay=1.2,
+    },function(ok,remote,err)
+        if ok then
+            self:_save_progress_state(book_id,"local_uploaded","此前提交的进度已从云端确认",
+                tonumber(position.progress),remote and remote.percent)
+        else
+            self:_save_progress_state(book_id,"upload_unconfirmed","请求已提交，但云端位置仍未确认",
+                tonumber(position.progress),remote and remote.percent)
+        end
+        self._home_sync_summary_cache=nil
+        self._home_sync_summary_cache_at=nil
+        callback(ok,err,remote)
+    end)
+    if not started then callback(false,"同步任务正在运行") end
+    return started
+end
+
+function Plugin:_retry_all_saved_progress_verifications(items)
+    items=type(items)=="table" and items or self:_progress_sync_issue_items()
+    local queue={}
+    for _,item in ipairs(items) do if item.can_verify then queue[#queue+1]=item end end
+    if #queue==0 then self:toast("当前没有可直接重新确认的进度",2); return false end
+    self:status_toast("阅读进度","正在重新确认 "..tostring(#queue).." 本书的云端位置……",3)
+    local index,verified=1,0
+    local function next_one()
+        if index>#queue then
+            self._home_sync_summary_cache=nil
+            self._home_sync_summary_cache_at=nil
+            if HomeView.is_shown() and not self:_active_reader_ui() then self:_notify_home_data_changed("header") end
+            self:status_toast("阅读进度确认完成","已确认 "..tostring(verified).." / "..tostring(#queue),3)
+            return
+        end
+        local item=queue[index]; index=index+1
+        local advanced=false
+        local started=self:_retry_saved_progress_verification(item,function(ok)
+            if advanced then return end
+            advanced=true
+            if ok then verified=verified+1 end
+            UIManager:scheduleIn(.20,next_one)
+        end)
+        if not started and not advanced then
+            advanced=true
+            UIManager:scheduleIn(.8,next_one)
+        end
+    end
+    next_one()
+    return true
+end
+
+function Plugin:show_progress_sync_issues()
+    local items=self:_progress_sync_issue_items()
+    if #items==0 then self:toast("当前没有待处理的阅读进度",2); return true end
+    local rows={}
+    local verify_count=0
+    for _,item in ipairs(items) do if item.can_verify then verify_count=verify_count+1 end end
+    if verify_count>0 then
+        rows[#rows+1]={text="重新确认已提交的进度",post_text=tostring(verify_count).." 本 · 只读取云端，不重复上传",
+            callback=function() self:_retry_all_saved_progress_verifications(items) end}
+    end
+    for _,item in ipairs(items) do
+        local suffix=item.local_percent and (string.format("%.1f%%",item.local_percent).." · ") or ""
+        rows[#rows+1]={
+            text=U.utf8_truncate(item.title,30,"…"),
+            post_text=suffix..item.state_label.." · "..U.utf8_truncate(item.reason,34,"…"),
+            callback=function()
+                if item.can_verify then
+                    self:status_toast("阅读进度","正在确认《"..U.utf8_truncate(item.title,18,"…").."》……",3)
+                    self:_retry_saved_progress_verification(item,function(ok,err)
+                        if ok then self:status_toast("阅读进度","云端已确认",3)
+                        else self:info("仍未确认：\n"..tostring(err or item.reason)) end
+                    end)
+                else
+                    self:info("《"..item.title.."》\n\n状态："..item.state_label.."\n"..item.reason
+                        .."\n\n这类状态不会自动覆盖云端位置；需要时打开本书后重新同步。")
+                end
+            end,
+        }
+    end
+    return self:list("阅读进度待处理",rows,"当前没有待处理的阅读进度")
 end
 
 function Plugin:_sync_all_pending_annotations(on_done)
@@ -18181,8 +18624,7 @@ function Plugin:_sync_home_pending()
                 return true
             end
             if reading_pending>0 then
-                self:info("批注没有新的待上传任务。\n\n阅读进度仍有 "..tostring(reading_pending).." 项待处理；打开对应书籍后会继续同步。")
-                return true
+                return self:show_progress_sync_issues()
             end
         end
         if not self:logged_in() then self:info("请先登录微信读书账号。") return false end
@@ -18199,7 +18641,8 @@ function Plugin:_sync_home_pending()
             local retryable=math.max(0,failed-hard)
             if ok and failed<=0 then
                 if reading_pending>0 then
-                    self:info("批注已处理 "..tostring(synced).." 条。\n\n阅读进度仍有 "..tostring(reading_pending).." 项待处理；打开对应书籍后会继续同步。")
+                    self:status_toast("批注同步完成","已处理 "..tostring(synced).." 条；阅读进度仍有待确认项目",3)
+                    UIManager:scheduleIn(.15,function() self:show_progress_sync_issues() end)
                 else
                     self:status_toast("同步完成","阅读进度与批注状态已分别确认 · 批注处理 "..tostring(synced).." 条",3)
                 end
@@ -18567,6 +19010,15 @@ function Plugin:_verify_progress_submission(book_id,submitted_position,options,c
     end
     local attempt=0
     local done=false
+    local detached=options.detached==true
+    local current_record=self.sync and self.sync:record() or nil
+    local record_snapshot=type(options.record_snapshot)=="table" and U.copy(options.record_snapshot)
+        or (current_record and tostring(current_record.book and current_record.book.book_id or "")==book_id and U.copy(current_record) or nil)
+    local catalog_snapshot=type(options.catalog_snapshot)=="table" and U.copy(options.catalog_snapshot) or nil
+    if not catalog_snapshot and record_snapshot and self.sync then
+        local catalog=select(1,self.sync:_progress_catalog(record_snapshot))
+        if type(catalog)=="table" then catalog_snapshot=U.copy(catalog) end
+    end
     local function finish(ok,remote,reason,meta)
         if done then return end
         done=true
@@ -18574,7 +19026,7 @@ function Plugin:_verify_progress_submission(book_id,submitted_position,options,c
             local localp=math.floor((tonumber(submitted_position.progress) or 0)+.5)
             local remotep=math.floor((tonumber(remote and remote.percent) or localp)+.5)
             self.sync:mark_verified(book_id,tostring(options.reason or "progress_upload_verified"),
-                localp,remotep,submitted_position)
+                localp,remotep,submitted_position,{detached=detached,record_snapshot=record_snapshot,catalog_snapshot=catalog_snapshot})
             self:_clear_pending_progress(book_id)
             self.store:save_session(book_id,{
                 progress_upload_state="verified",
@@ -18618,7 +19070,7 @@ function Plugin:_verify_progress_submission(book_id,submitted_position,options,c
                 else
                     finish(false,remote,remote_err or (meta and meta.reason) or "cloud_not_confirmed",meta)
                 end
-            end,{force=true,raw_coordinate=true})
+            end,{force=true,raw_coordinate=true,detached=detached,record_snapshot=record_snapshot,catalog_snapshot=catalog_snapshot})
         end)
     end
     verify()
@@ -18874,9 +19326,12 @@ function Plugin:show_sync_status(detail)
             if action>0 then return "需处理 "..tostring(action) end
             return count>0 and ("待同步 "..tostring(count)) or tostring(normal or "已同步")
         end
+        local progress_status=(tonumber(pending.progress_unconfirmed or 0) or 0)>0
+            and ("待确认 "..tostring(pending.progress_unconfirmed))
+            or pending_text(pending.progress,0,self:progress_sync_label())
         local rows={
             {text="总状态",post_text=self:_home_sync_status_label(),enabled=false,bold=true},
-            {text="阅读进度",post_text=pending_text(pending.progress,0,self:progress_sync_label()),enabled=false},
+            {text="阅读进度",post_text=progress_status,enabled=pending.progress>0,callback=pending.progress>0 and function() self:show_progress_sync_issues() end or nil},
             {text="阅读时间",post_text=pending_text(pending.time,0,time_text),enabled=false},
             {text="本地划线",post_text=pending_text(math.max(0,pending.highlight-pending.annotation_action_highlight),pending.annotation_action_highlight,"已同步"),enabled=false},
             {text="本地想法",post_text=pending_text(math.max(0,pending.thought-pending.annotation_action_thought),pending.annotation_action_thought,"已同步"),enabled=false},
@@ -21501,9 +21956,9 @@ function Plugin:_finalize_reader_instance_close(closing_path,session_generation,
         or normalized_reader_file(HOME_READER_FILE)
     session_generation=tonumber(session_generation) or tonumber(HOME_SESSION.reader_session_generation) or 0
 
-    local detached_sync=false
+    local detached_sync=self._reading_end_sync_active==true or self._reading_end_home_detached==true
     if self.sync and self.sync.reading_end_finalized~=true and self.ui and self.ui.document then
-        detached_sync=self:_reading_end_sync(options.reason or "关闭书籍",{show_status=false,timeout=8})==true
+        detached_sync=self:_reading_end_sync(options.reason or "关闭书籍",{show_status=false,timeout=8})==true or detached_sync
     end
     self:_prepare_reader_disappearance(options.reason or "document closed")
     if self.sync and self:_reader_session_is_weread() then
@@ -21749,6 +22204,7 @@ function Plugin:onReaderReady()
     -- reflow, etc.), not a genuine reopen. Only that narrow case may reuse a
     -- freshly verified cloud position; every real book open must re-read WeRead.
     self._reader_session_preserved=preserve_session==true
+    if not preserve_session then self._reading_end_home_detached=false end
     local ready_session=self._reader_session_generation
     self._home_reader_transition=false
     self:_close_reader_recovery_surface()
@@ -21971,7 +22427,10 @@ end
 function Plugin:onScreenResize() return self:onSetDimensions() end
 function Plugin:onRotation() return self:onSetDimensions() end
 function Plugin:onPageUpdate(page)
-    self:_mark_reader_busy(2)
+    local weread=self:_reader_session_is_weread()
+    -- Only WeRead sessions need to signal the independent 60 s report service.
+    -- Ordinary local books keep beta.1's memory-only page-turn path.
+    self:_mark_reader_busy(weread and 3 or 2,weread and "fast" or nil)
     local cache=self:_reader_toolbar_cache()
     local current=tonumber(page)
     if current then cache.page=current end
@@ -21979,7 +22438,7 @@ function Plugin:onPageUpdate(page)
     -- lookup is delayed until the reader has been idle, keeping the flip path
     -- free of optional work.
     self:_schedule_reader_toolbar_state_refresh(current,.55)
-    if self:_reader_session_is_weread() then
+    if weread then
         self.sync:on_page(page)
         self:_schedule_thought_prewarm()
     end
@@ -22042,7 +22501,13 @@ function Plugin:_reading_end_sync(reason,options,callback)
         self.sync.reading_end_finalized=true
     end
 
-    if not online then need_progress=false; need_annotations=false end
+    if not online then
+        if need_progress and book_id~="" then
+            self:_save_progress_state(book_id,"waiting_network","结束阅读时网络不可用；本地位置已保留",nil,nil)
+        end
+        need_progress=false
+        need_annotations=false
+    end
     local tasks=(need_time and 1 or 0)+(need_progress and 1 or 0)+(need_annotations and 1 or 0)
     if tasks<=0 then
         self._reading_end_barrier_active=false
@@ -22130,30 +22595,41 @@ function Plugin:_reading_end_sync(reason,options,callback)
                 local upload_started=self.sync:upload_progress(function(ok,result,submitted)
                     local submitted_position=type(submitted)=="table" and submitted or position
                     if ok~=true then
-                        self:_save_pending_progress(book_id,submitted_position,tostring(result or "submit_failed"))
+                        local current_session=self.store:session(book_id) or {}
+                        local kind=tostring(current_session.last_error_kind or self.sync.last_error_kind or "")
+                        local state=(kind=="transport" or kind=="server" or kind=="unconfirmed" or kind=="authentication")
+                            and "upload_unconfirmed" or "upload_failed"
+                        self:_save_pending_progress(book_id,submitted_position,tostring(result or kind or "submit_failed"))
+                        self:_save_progress_state(book_id,state,"结束阅读进度暂未完成",
+                            tonumber(submitted_position.progress),nil)
                         complete_one(false)
                         return
                     end
-                    -- HTTP/worker acceptance is only a submission result. Always
-                    -- read the cloud coordinate back before declaring progress
-                    -- success, including responses that contain explicit succ=1.
+                    -- The server accepted the final position. Save a crash-safe
+                    -- pending snapshot, release the close barrier, then confirm the
+                    -- cloud coordinate in the background. Book switches are allowed.
+                    self:_save_pending_progress(book_id,submitted_position,"awaiting_cloud_confirmation")
+                    self:_save_progress_state(book_id,"verifying_upload","请求已提交，正在后台确认",
+                        tonumber(submitted_position.progress),nil)
                     self:_verify_progress_submission(book_id,submitted_position,{
                         reason="reading_end_verified", first_delay=.8, second_delay=1.3,
+                        detached=true,record_snapshot=U.copy(current),
                     },function(verified,remote,verify_error)
                         if verified then
                             local localp=math.floor((tonumber(submitted_position.progress) or 0)+.5)
                             self:_save_progress_state(book_id,"local_uploaded","结束阅读进度已上传并确认",
                                 localp,remote and remote.percent)
-                            complete_one(true)
                         else
                             self:_save_progress_state(book_id,"upload_unconfirmed",
                                 "请求已提交，但云端位置尚未确认",
                                 tonumber(submitted_position.progress),remote and remote.percent)
                             logger.warn("[MiuRead][ReadingEnd] progress remains pending",
                                 "book=",book_id,"reason=",tostring(verify_error or "cloud_not_confirmed"))
-                            complete_one(false)
                         end
                     end)
+                    -- Cloud verification is now safely detached; do not keep the
+                    -- reader-close barrier open while waiting for the read-back.
+                    complete_one(true)
                 end,{position_override=position,reading_end=true})
                 if not upload_started then
                     self:_save_pending_progress(book_id,position,"progress_worker_busy")
@@ -22214,6 +22690,186 @@ function Plugin:_reading_end_sync(reason,options,callback)
         end
         UIManager:scheduleIn(.25,poll)
     end
+    return true
+end
+
+function Plugin:_reading_end_detach_for_home(reason)
+    reason=tostring(reason or "返回觅阅主页")
+    if not self:_reader_session_is_weread() then return false end
+    if not self.sync or self.sync.reading_end_finalized==true then return false end
+    if self._reading_end_home_detached==true then return true end
+
+    local current=self.sync:record() or self:_current_book_record()
+    if not (current and current.book) then return false end
+    local record_snapshot=U.copy(current)
+    local book_id=tostring(current.book.book_id or current.book.bookId or "")
+    if book_id=="" then return false end
+    local record_generation=tonumber(self.sync.record_generation or 0) or 0
+    local ratio_snapshot=self.sync:local_ratio()
+    local started_at=monotonic_wall_time()
+
+    -- Foreground close owns only local durability. Network work below is
+    -- detached from ReaderUI so a slow WeRead response can never keep Home
+    -- waiting behind a 10-second finalizer barrier.
+    self._reading_end_home_detached=true
+    self._reading_end_barrier_active=true
+    self._reading_end_barrier_reason=reason..":foreground_capture"
+
+    if self._local_annotation_snapshot_task then
+        UIManager:unschedule(self._local_annotation_snapshot_task)
+        self._local_annotation_snapshot_task=nil
+    end
+    pcall(function() self:_capture_local_annotation_snapshot("reading_end:"..reason) end)
+    if self._reader_checkpoint_dirty==true then
+        pcall(function() self:_flush_reader_checkpoint("reading_end:"..reason,true) end)
+    end
+
+    local mode=self:progress_upload_mode()
+    local need_progress=mode~="manual"
+    local annotation_summary=LocalAnnotationDatabase.summary(self.store,book_id) or {}
+    local annotation_retryable=(tonumber(annotation_summary.pending or 0) or 0)
+        +(tonumber(annotation_summary.delete_pending or 0) or 0)
+    local need_annotations=self:_annotation_close_upload_enabled() and annotation_retryable>0
+    local online=self:logged_in() and self:is_online()
+    local final_elapsed=self.sync:_final_elapsed(true)
+
+    -- stop_fast only tells the already-running lightweight service to perform
+    -- its final short time flush; Home no longer polls that network result.
+    self.sync:stop_fast("reading_end:"..reason,final_elapsed or 0)
+    self.sync.reading_end_finalized=true
+
+    local function refresh_home_sync_state()
+        self._home_sync_summary_cache=nil
+        self._home_sync_summary_cache_at=nil
+        if HomeView.is_shown() and not self:_active_reader_ui() then
+            self:_notify_home_data_changed("header")
+        end
+    end
+
+    if need_progress then
+        if not online then
+            self:_save_progress_state(book_id,"waiting_network",
+                "已保存本机阅读位置；等待网络后继续同步",nil,nil)
+        else
+            local local_percent=ratio_snapshot and math.floor(U.clamp(ratio_snapshot,0,1)*100+.5) or nil
+            self:_save_progress_state(book_id,"deferred",
+                "本机位置已保存；正在后台定位最终云端坐标",local_percent,nil)
+            local resolve_started,resolve_error=self.sync:resolve_local_progress(function(position,position_error,meta)
+                if not position then
+                    self:_save_progress_state(book_id,"verification_required",
+                        "本机阅读位置已保存；最终云端坐标需下次打开本书后确认",local_percent,nil)
+                    logger.warn("[MiuRead][ReadingEnd] detached final position unavailable",
+                        "book=",book_id,"error=",tostring(position_error or (meta and meta.error_kind) or "unknown"))
+                    refresh_home_sync_state()
+                    return
+                end
+                position.captured_at=tonumber(position.captured_at) or os.time()
+                self:_save_pending_progress(book_id,position,"background_upload_queued")
+                self:_save_progress_state(book_id,"uploading","正在后台上传结束阅读进度",
+                    tonumber(position.progress),nil)
+                logger.info("[MiuRead][ReadingEnd] detached final position captured",
+                    "book=",book_id,
+                    "chapter=",tostring(position.chapter_uid or position.chapter_index or "-"),
+                    "offset=",tostring(position.canonical_offset or position.chapter_offset or position.offset or "-"),
+                    "basis=",tostring(position.offset_basis or position.position_basis or "-"),
+                    "progress=",tostring(position.progress or "-"))
+
+                local upload_started=self.sync:upload_progress(function(ok,result,submitted)
+                    local submitted_position=type(submitted)=="table" and submitted or position
+                    if ok~=true then
+                        local session=self.store:session(book_id) or {}
+                        local kind=tostring(session.last_error_kind or self.sync.last_error_kind or "")
+                        local state=(kind=="transport" or kind=="server" or kind=="unconfirmed" or kind=="authentication")
+                            and "upload_unconfirmed" or "upload_failed"
+                        self:_save_pending_progress(book_id,submitted_position,tostring(result or kind or "submit_failed"))
+                        self:_save_progress_state(book_id,state,"后台上传暂未完成",
+                            tonumber(submitted_position.progress),nil)
+                        refresh_home_sync_state()
+                        return
+                    end
+                    self:_save_pending_progress(book_id,submitted_position,"awaiting_cloud_confirmation")
+                    self:_save_progress_state(book_id,"verifying_upload","请求已提交，正在后台确认",
+                        tonumber(submitted_position.progress),nil)
+                    self:_verify_progress_submission(book_id,submitted_position,{
+                        reason="reading_end_background_verified",detached=true,
+                        first_delay=.8,second_delay=1.3,record_snapshot=record_snapshot,
+                    },function(verified,remote,verify_error)
+                        if verified then
+                            local localp=math.floor((tonumber(submitted_position.progress) or 0)+.5)
+                            self:_save_progress_state(book_id,"local_uploaded","结束阅读进度已上传并确认",
+                                localp,remote and remote.percent)
+                        else
+                            self:_save_progress_state(book_id,"upload_unconfirmed",
+                                "请求已提交，但云端位置尚未确认",
+                                tonumber(submitted_position.progress),remote and remote.percent)
+                            logger.warn("[MiuRead][ReadingEnd] detached progress remains pending",
+                                "book=",book_id,"reason=",tostring(verify_error or "cloud_not_confirmed"))
+                        end
+                        refresh_home_sync_state()
+                    end)
+                    refresh_home_sync_state()
+                end,{
+                    position_override=position,reading_end=true,
+                    record_override=record_snapshot,
+                    record_generation_override=record_generation,
+                })
+                if not upload_started then
+                    self:_save_pending_progress(book_id,position,"progress_worker_busy")
+                    self:_save_progress_state(book_id,"deferred",
+                        "最终位置已保存；同步任务繁忙，稍后继续处理",
+                        tonumber(position.progress),nil)
+                    refresh_home_sync_state()
+                end
+            end,{
+                precise=true,
+                prepare_catalog=false,
+                require_cloud_coordinate=true,
+                detached=true,
+                record_snapshot=record_snapshot,
+                record_generation_override=record_generation,
+                ratio_snapshot=ratio_snapshot,
+                defer_seconds=1.8,
+            })
+            if not resolve_started then
+                self:_save_progress_state(book_id,"verification_required",
+                    "本机阅读位置已保存；最终云端坐标需下次打开本书后确认",local_percent,nil)
+                logger.warn("[MiuRead][ReadingEnd] detached resolver unavailable",
+                    "book=",book_id,"error=",tostring(resolve_error or "busy"))
+            end
+        end
+    end
+
+    if need_annotations and online then
+        local prefs=U.copy(self:_annotation_sync_preferences())
+        local book=U.copy(current.book or {})
+        local record=U.copy(current.record or {})
+        local service=self.annotation_sync
+        if self.annotation_async and not self.annotation_async:busy() then
+            local annotation_started=self.annotation_async:run("annotation-reading-end-background",function()
+                return service:sync_book(book,record,{preferences=prefs,limit=200,diagnostic_only=false})
+            end,function(worker_result)
+                local value=worker_result and worker_result.value or nil
+                if not (worker_result and worker_result.ok==true and type(value)=="table" and value.ok~=false) then
+                    logger.warn("[MiuRead][ReadingEnd] detached annotation sync incomplete","book=",book_id)
+                end
+                refresh_home_sync_state()
+            end,25)
+            if not annotation_started then
+                logger.info("[MiuRead][ReadingEnd] annotation background sync deferred","book=",book_id)
+            end
+        end
+    end
+
+    self._reading_end_barrier_active=false
+    self._reading_end_barrier_reason=nil
+    logger.info("[MiuRead][ReadingEnd] foreground released; cloud work detached",
+        "book=",book_id,
+        "progress=",tostring(need_progress),
+        "annotations=",tostring(need_annotations),
+        "time=",tostring(final_elapsed~=nil),
+        "online=",tostring(online),
+        "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-started_at)*1000+.5)))
+    refresh_home_sync_state()
     return true
 end
 
@@ -22668,6 +23324,10 @@ function Plugin:onSuspend()
         UIManager:unschedule(self._home_resume_surface_task)
         self._home_resume_surface_task=nil
     end
+    if self._reader_resume_surface_task then
+        UIManager:unschedule(self._reader_resume_surface_task)
+        self._reader_resume_surface_task=nil
+    end
     local suspend_sync=self.sync
     if self.ui and self.ui.document and not self:_reader_session_is_weread() then suspend_sync=nil end
     if reader_rebuild_active() then
@@ -22745,6 +23405,10 @@ function Plugin:onResume()
         pcall(UIManager.allowStandby,UIManager)
     end
     local previous_power=PowerState.snapshot()
+    if self.download_task and type(self.download_task.on_user_resume_begin)=="function" then
+        local ok,err=pcall(self.download_task.on_user_resume_begin,self.download_task,PowerState.generation())
+        if not ok then logger.warn("[MiuRead][Power] download wake-priority release failed",tostring(err)) end
+    end
     self._miuread_suspended=false
     HOME_SESSION.suspended=false
     StatusToast.set_blocked(false)
@@ -22817,7 +23481,43 @@ function Plugin:onResume()
                 self:_install_reader_quick_panel_zone()
             end
         end)
+        if self._reader_resume_surface_task then UIManager:unschedule(self._reader_resume_surface_task) end
+        -- Kindle may restore its native framebuffer before KOReader repaints.
+        -- Wait only until geometry is stable, then repaint the already-open page
+        -- once; do not reopen the document or rebuild MiuRead.
+        local last_w,last_h,last_rotation,stable,attempts=nil,nil,nil,0,0
+        local repaint_task
+        repaint_task=function()
+            if self._reader_resume_surface_task~=repaint_task then return end
+            if resume_generation~=self._resume_lifecycle_generation
+                or HOME_SESSION.suspended==true or self._miuread_suspended==true then
+                self._reader_resume_surface_task=nil
+                return
+            end
+            attempts=attempts+1
+            local sw,sh=Device.screen:getWidth(),Device.screen:getHeight()
+            local rotation=Device.screen.getRotationMode and Device.screen:getRotationMode() or nil
+            if sw==last_w and sh==last_h and rotation==last_rotation then
+                stable=stable+1
+            else
+                last_w,last_h,last_rotation,stable=sw,sh,rotation,0
+            end
+            local reader=self:_active_reader_ui()
+            if (stable<1 or not (reader and reader.document)) and attempts<7 then
+                UIManager:scheduleIn(.12,repaint_task)
+                return
+            end
+            self._reader_resume_surface_task=nil
+            if reader and reader.document then
+                UIManager:setDirty(reader,"full")
+                logger.info("[MiuRead][Power] reader surface repainted after resume",
+                    "samples=",tostring(attempts))
+            end
+        end
+        self._reader_resume_surface_task=repaint_task
+        UIManager:scheduleIn(.12,repaint_task)
         self:_schedule_download_resume_after_wake(3.5)
+        self:_schedule_hibernated_download_resume("resume into reader")
     end
     if not close_pending and not native_menu_pending and not reader_active and HomeView.is_shown() then
         self:_set_foreground("home")
@@ -22834,6 +23534,7 @@ function Plugin:onResume()
                 self:_resume_pending_post_reader_work("resume home",2.0)
             end
         end)
+        self:_schedule_hibernated_download_resume("resume home")
         return
     end
 
@@ -23080,17 +23781,19 @@ function Plugin:onCloseDocument()
     -- cleanup belongs to _finalize_reader_instance_close() only after a real
     -- close is confirmed. This keeps same-book reloads cheap and invisible.
     local setting_hint=reader_native_setting_active(closing_path)
+    local typography_hint=setting_hint and tostring(READER_NATIVE_SETTING.label or ""):match("^Typography")~=nil
     local tearing_down=self.ui and self.ui.tearing_down==true
     local internal_hint=tearing_down or setting_hint
     logger.info("[MiuRead][Lifecycle] document disappeared","cause=unknown",
         "book=",tostring(closing_path or ""),"session=",tostring(session_generation),
         "tearing_down=",tostring(tearing_down),
-        "native_setting=",tostring(setting_hint),
+        "native_setting=",tostring(setting_hint),"typography=",tostring(typography_hint),
         "setting=",setting_hint and tostring(READER_NATIVE_SETTING.label or "") or "")
     logger.info("[MiuRead][DesktopPerf] reader reload suspected",
         "book=",tostring(closing_path or ""),"internal_hint=",tostring(internal_hint))
     return self:_start_reader_rebuild_candidate(closing_path,session_generation,
-        setting_hint and "KOReader native setting rebuild" or "CloseDocument without explicit return",internal_hint)
+        typography_hint and "Typography internal rebuild"
+            or (setting_hint and "KOReader native setting rebuild" or "CloseDocument without explicit return"),internal_hint)
 end
 
 function Plugin:onFlushSettings()

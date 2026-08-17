@@ -642,7 +642,7 @@ function Sync:local_position(ratio)
     return position
 end
 
-function Sync:_prefer_inverse_cloud_mapping(record, position)
+function Sync:_prefer_inverse_cloud_mapping(record, position, ratio_override)
     if type(position) ~= "table" or position.safe ~= true then return position end
     record = record or self:record()
     if not record or type(record.record) ~= "table" then return position end
@@ -661,7 +661,8 @@ function Sync:_prefer_inverse_cloud_mapping(record, position)
         return position
     end
 
-    local ratio = self:local_ratio()
+    local ratio = tonumber(ratio_override)
+    if ratio == nil then ratio = self:local_ratio() end
     if ratio == nil then
         position.inverse_mapping_used = false
         position.inverse_mapping_reason = "local_global_ratio_missing"
@@ -913,13 +914,17 @@ end
 
 function Sync:resolve_local_progress(callback, options)
     options = options or {}
-    local record = self:record()
+    local detached=options.detached==true
+    local record = type(options.record_snapshot)=="table" and U.copy(options.record_snapshot) or self:record()
     if not record then return false, "position_context_missing" end
     local book_id = tostring(record.book and record.book.book_id or "")
-    local generation = tonumber(self.record_generation or 0) or 0
+    local generation = tonumber(options.record_generation_override or self.record_generation or 0) or 0
     local path = tostring(record.path or "")
+    local ratio_snapshot=tonumber(options.ratio_snapshot)
+    if ratio_snapshot==nil then ratio_snapshot=self:local_ratio() end
 
     local function still_current()
+        if detached then return true end
         local current = self:record()
         return generation == tonumber(self.record_generation or 0)
             and current and tostring(current.book and current.book.book_id or "") == book_id
@@ -935,7 +940,7 @@ function Sync:resolve_local_progress(callback, options)
             if callback then callback(nil, "stale_position_result", {error_kind="context"}) end
             return
         end
-        local ratio = self:local_ratio() or 0
+        local ratio = ratio_snapshot or self:local_ratio() or 0
         local position = options.precise == false and self:local_position(ratio)
             or self:_position_for_report(ratio, true)
         if type(position) == "table" and position.safe == true and position.progress ~= nil
@@ -1026,7 +1031,13 @@ function Sync:resolve_local_progress(callback, options)
             return
         end
         complete_fallback(prepared, err)
-    end)
+    end,{
+        detached=detached,
+        record_snapshot=record,
+        record_generation_override=generation,
+        ratio_snapshot=ratio_snapshot,
+        defer_seconds=options.defer_seconds,
+    })
     if started then return true end
     emit("position_fallback", source_error)
     if options.require_cloud_coordinate==true then
@@ -1037,8 +1048,10 @@ function Sync:resolve_local_progress(callback, options)
     return true
 end
 
-function Sync:_source_position_async(callback)
-    local record = self:record()
+function Sync:_source_position_async(callback, options)
+    options=type(options)=="table" and options or {}
+    local detached=options.detached==true
+    local record = type(options.record_snapshot)=="table" and U.copy(options.record_snapshot) or self:record()
     local ui = self.host and self.host.ui or nil
     if not record or not ui or not ui.document then return false, "position_context_missing" end
     -- The source-coordinate path is intentionally subprocess-only. If this
@@ -1051,9 +1064,11 @@ function Sync:_source_position_async(callback)
         ui, record, self:_precision_catalog(record))
     if not anchor then return false, anchor_error end
 
-    local generation = tonumber(self.record_generation or 0) or 0
+    local generation = tonumber(options.record_generation_override or self.record_generation or 0) or 0
     local book_id = tostring(record.book and record.book.book_id or "")
     local path = tostring(record.path or "")
+    local ratio_snapshot=tonumber(options.ratio_snapshot)
+    if ratio_snapshot==nil then ratio_snapshot=self:local_ratio() end
     local reader = self.reader
     local record_snapshot = {
         book = U.copy(record.book or {}),
@@ -1061,27 +1076,54 @@ function Sync:_source_position_async(callback)
         variant = record.variant,
         path = record.path,
     }
-    local started, run_error = self.async:run("progress_source_position", function()
-        return SourcePosition.locate(reader, record_snapshot, anchor)
-    end, function(result)
+    local function on_result(result)
         local current = self:record()
-        if generation ~= tonumber(self.record_generation or 0)
+        if not detached and (generation ~= tonumber(self.record_generation or 0)
             or not current
             or tostring(current.book and current.book.book_id or "") ~= book_id
-            or tostring(current.path or "") ~= path then
+            or tostring(current.path or "") ~= path) then
             if callback then callback(nil, "stale_position_result") end
             return
         end
         if result and result.ok == true and type(result.value) == "table"
             and result.value.safe == true then
-            local adjusted = self:_prefer_inverse_cloud_mapping(current, result.value)
+            local mapping_record=detached and record_snapshot or current
+            local adjusted = self:_prefer_inverse_cloud_mapping(mapping_record, result.value, ratio_snapshot)
             adjusted.captured_at = os.time()
             if callback then callback(adjusted, nil) end
             return
         end
         if callback then callback(nil, tostring(result and result.error or "source_position_failed")) end
-    end, 40)
-    if not started then return false, run_error end
+    end
+    local function launch()
+        if self.async:busy() then return false,"source_worker_busy" end
+        return self.async:run("progress_source_position", function()
+            return SourcePosition.locate(reader, record_snapshot, anchor)
+        end,on_result,40)
+    end
+    local defer_seconds=math.max(0,tonumber(options.defer_seconds) or 0)
+    if detached and defer_seconds>0 then
+        -- Capture the Reader anchor now, but postpone network/source mapping until
+        -- after the close transition. This keeps the first Home frame ahead of
+        -- PosMap building or a source-chapter fetch on single-core Kindles. A
+        -- quickly opened next book may briefly own the sync worker, so retry a
+        -- few times in the background instead of dropping the old book immediately.
+        local attempts=0
+        local function deferred_launch()
+            attempts=attempts+1
+            local started,run_error=launch()
+            if started then return end
+            if tostring(run_error or "")=="source_worker_busy" and attempts<4 then
+                UIManager:scheduleIn(1.2,deferred_launch)
+                return
+            end
+            if callback then callback(nil,tostring(run_error or "source_worker_unavailable")) end
+        end
+        UIManager:scheduleIn(defer_seconds,deferred_launch)
+        return true
+    end
+    local started,run_error=launch()
+    if not started then return false,run_error end
     return true
 end
 
@@ -1268,23 +1310,38 @@ end
 
 function Sync:remote(book_id, callback, options)
     options=options or {}
+    local detached=options.detached==true
     local generation_snapshot=tonumber(self.record_generation or 0) or 0
     local current_record=self:record()
-    local path_snapshot=current_record and tostring(current_record.path or "") or ""
-    self.state = "fetching_remote"
-    self.last_stage = "读取云端进度"
+    local source_record=type(options.record_snapshot)=="table" and options.record_snapshot or current_record
+    if detached and source_record and tostring(source_record.book and source_record.book.book_id or "")~=tostring(book_id or "") then
+        source_record=nil
+    end
+    local path_snapshot=source_record and tostring(source_record.path or "") or ""
+    if not detached then
+        self.state = "fetching_remote"
+        self.last_stage = "读取云端进度"
+    end
     local threshold=tonumber(self.store:preferences().sync.threshold) or 2
     local auth_snapshot=self.store:auth()
     local account_snapshot=type(auth_snapshot.account)=="table" and auth_snapshot.account or {}
     local login_snapshot=tostring(auth_snapshot.login_session_id or "")
     local vid_snapshot=tostring(account_snapshot.vid or "")
-    local catalog_snapshot=U.copy(self:_remote_catalog(book_id))
+    local catalog_snapshot
+    if type(options.catalog_snapshot)=="table" then
+        catalog_snapshot=U.copy(options.catalog_snapshot)
+    elseif source_record and tostring(source_record.book and source_record.book.book_id or "")==tostring(book_id or "") then
+        local map=select(1,self:_progress_catalog(source_record))
+        catalog_snapshot=type(map)=="table" and U.copy(map) or {}
+    else
+        catalog_snapshot=U.copy(self:_remote_catalog(book_id))
+    end
     local resolve_native_progress=options.raw_coordinate~=true
-    local record_snapshot=current_record and {
-        book=U.copy(current_record.book or {}),
-        record=U.copy(current_record.record or {}),
-        variant=current_record.variant,
-        path=current_record.path,
+    local record_snapshot=source_record and {
+        book=U.copy(source_record.book or {}),
+        record=U.copy(source_record.record or {}),
+        variant=source_record.variant,
+        path=source_record.path,
     } or nil
     local reader_snapshot=self.reader
     local ok, err = self.async:run("remote_progress", function()
@@ -1311,9 +1368,9 @@ function Sync:remote(book_id, callback, options)
         return out
     end, function(result)
         local now_record=self:record()
-        if generation_snapshot~=tonumber(self.record_generation or 0)
+        if not detached and (generation_snapshot~=tonumber(self.record_generation or 0)
             or not now_record or tostring(now_record.book.book_id or "")~=tostring(book_id or "")
-            or tostring(now_record.path or "")~=path_snapshot then
+            or tostring(now_record.path or "")~=path_snapshot) then
             logger.warn("[MiuRead][Sync] stale remote progress ignored after book switch",
                 "book=",tostring(book_id))
             callback(nil,"书籍已切换")
@@ -1328,14 +1385,15 @@ function Sync:remote(book_id, callback, options)
             callback(nil,"登录状态已变化")
             return
         end
-        self.state = self.progress_hold and "progress_sync" or "waiting"
+        if not detached then self.state = self.progress_hold and "progress_sync" or "waiting" end
         if not result.ok or type(result.value)~="table" then
-            self.last_error = result.error or "remote progress unavailable"
-            logger.warn("[MiuRead][Sync] remote progress failed", tostring(self.last_error))
-            if Http.is_auth_error(self.last_error) and self.host.on_auth_required then
-                pcall(self.host.on_auth_required,self.host,"progress",self.last_error)
+            local remote_error=result.error or "remote progress unavailable"
+            if not detached then self.last_error=remote_error end
+            logger.warn("[MiuRead][Sync] remote progress failed", tostring(remote_error))
+            if Http.is_auth_error(remote_error) and self.host.on_auth_required then
+                pcall(self.host.on_auth_required,self.host,"progress",remote_error)
             end
-            callback(nil, self.last_error)
+            callback(nil, remote_error)
             return
         end
         local value=result.value
@@ -1345,14 +1403,15 @@ function Sync:remote(book_id, callback, options)
             sourced_progress(value.agent,book_id,"agent_gateway"),book_id)
         local remote=choose_remote_progress(web,agent,threshold)
         if not remote then
-            self.last_error=tostring(value.web_error or value.agent_error or "remote progress unavailable")
-            if Http.is_auth_error(self.last_error) and self.host.on_auth_required then
-                pcall(self.host.on_auth_required,self.host,"progress",self.last_error)
+            local remote_error=tostring(value.web_error or value.agent_error or "remote progress unavailable")
+            if not detached then self.last_error=remote_error end
+            if Http.is_auth_error(remote_error) and self.host.on_auth_required then
+                pcall(self.host.on_auth_required,self.host,"progress",remote_error)
             end
-            callback(nil,self.last_error)
+            callback(nil,remote_error)
             return
         end
-        self.last_error=nil
+        if not detached then self.last_error=nil end
         if self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,"progress") end
         self.store:save_session(book_id,{
             remote=remote,
@@ -1379,37 +1438,49 @@ function Sync:remote(book_id, callback, options)
     if not ok then callback(nil, err) end
 end
 
-function Sync:mark_verified(book_id, reason, local_percent, remote_percent, position)
+function Sync:mark_verified(book_id, reason, local_percent, remote_percent, position, options)
+    options=type(options)=="table" and options or {}
     book_id = tostring(book_id or "")
     if book_id == "" then return false end
-    self.verified_book_id = book_id
-    self.verified_at = os.time()
-    self.verified_local_percent = tonumber(local_percent)
-    self.verified_remote_percent = tonumber(remote_percent)
-    self.verified_login_session_id = tostring(self.store:auth().login_session_id or "")
-    local core_hash=self:_core_map_hash()
+    local verified_at=os.time()
+    local verified_local=tonumber(local_percent)
+    local verified_remote=tonumber(remote_percent)
+    local verified_login=tostring(self.store:auth().login_session_id or "")
+    local record_snapshot=type(options.record_snapshot)=="table" and options.record_snapshot or self:record()
+    local core_hash=self:_core_map_hash(record_snapshot)
     position=type(position)=="table" and position or nil
-    local catalog=select(1,self:_progress_catalog(self:record()))
+    local catalog=type(options.catalog_snapshot)=="table" and options.catalog_snapshot
+        or select(1,self:_progress_catalog(record_snapshot))
     local catalog_hash=(type(catalog)=="table" and #catalog>0)
         and BookIntegrity.core_map_hash(book_id,catalog,{}) or ""
+    local current=self:record()
+    local current_same=current and tostring(current.book and current.book.book_id or "")==book_id
+    if options.detached~=true or current_same then
+        self.verified_book_id = book_id
+        self.verified_at = verified_at
+        self.verified_local_percent = verified_local
+        self.verified_remote_percent = verified_remote
+        self.verified_login_session_id = verified_login
+    end
     self.store:save_session(book_id, {
-        remote_verified=true, verified_at=self.verified_at,
+        remote_verified=true, verified_at=verified_at,
         verified_reason=tostring(reason or "confirmed"),
-        verified_local_percent=self.verified_local_percent,
-        verified_remote_percent=self.verified_remote_percent,
+        verified_local_percent=verified_local,
+        verified_remote_percent=verified_remote,
         verified_chapter_uid=position and tostring(position.chapter_uid or position.chapterUid or "") or nil,
         verified_chapter_offset=position and tonumber(position.chapter_offset or position.offset) or nil,
-        verification_login_session_id=self.verified_login_session_id,
-        verified_core_map_hash=core_hash,
+        verification_login_session_id=verified_login,
+        verified_core_map_hash=core_hash~="" and core_hash or nil,
         verified_catalog_hash=catalog_hash~="" and catalog_hash or nil,
-        report_core_map_hash=core_hash,
-        progress_local_percent=self.verified_local_percent, pending=false,
+        report_core_map_hash=core_hash~="" and core_hash or nil,
+        progress_local_percent=verified_local, pending=false,
     })
-    self.store:update_cached_progress(book_id, self.verified_local_percent)
+    self.store:update_cached_progress(book_id, verified_local)
     logger.info("[MiuRead][Sync] cloud progress verified",
         "book=", book_id, "reason=", tostring(reason or "confirmed"),
-        "local=", tostring(self.verified_local_percent or "-"),
-        "remote=", tostring(self.verified_remote_percent or "-"),
+        "detached=",tostring(options.detached==true),
+        "local=", tostring(verified_local or "-"),
+        "remote=", tostring(verified_remote or "-"),
         "chapter=",tostring(position and position.chapter_uid or "-"),
         "offset=",tostring(position and (position.chapter_offset or position.offset) or "-"))
     return true
@@ -1859,7 +1930,7 @@ end
 
 function Sync:upload(elapsed, callback, options)
     options = options or {}
-    local record = self:record()
+    local record = type(options.record_override)=="table" and U.copy(options.record_override) or self:record()
     if not record then if callback then callback(false, "未识别到 MiuRead 生成的当前书籍") end; return false end
     if self.progress_hold and not options.progress_only then
         if callback then callback(false, "阅读位置尚未确认") end
@@ -1868,7 +1939,7 @@ function Sync:upload(elapsed, callback, options)
     if self.busy then if callback then callback(false, "同步任务忙") end; return false end
 
     local book_id = tostring(record.book.book_id)
-    local generation_snapshot=tonumber(self.record_generation or 0) or 0
+    local generation_snapshot=tonumber(options.record_generation_override or self.record_generation or 0) or 0
     local path_snapshot=tostring(record.path or "")
     local core_hash=self:_core_map_hash(record)
     local session = self.store:session(book_id) or {}
@@ -1892,7 +1963,9 @@ function Sync:upload(elapsed, callback, options)
         if callback then callback(false,"当前账号登录会话无效，请重新扫码登录") end
         return false
     end
-    local ratio = self:local_ratio() or 0
+    local ratio = type(options.position_override)=="table" and tonumber(options.position_override.progress)
+        and U.clamp((tonumber(options.position_override.progress) or 0)/100,0,1)
+        or self:local_ratio() or 0
     local auth_channel=options.progress_only and "progress" or "read_report"
     local chapters = (record.record and record.record.chapter_map) or record.book.catalog or {}
     -- Keep the old worker's own field names and cached context isolated from
@@ -1952,20 +2025,48 @@ function Sync:upload(elapsed, callback, options)
         }
     end, function(result)
         self.busy = false
-        self.state = self.progress_hold and "verification_required" or "waiting"
         local current_record=self:record()
         local same_book=current_record
             and tostring(current_record.book.book_id or "")==book_id
             and tostring(current_record.path or "")==path_snapshot
         local generation_changed=generation_snapshot~=tonumber(self.record_generation or 0)
         local allow_same_book_generation=options.allow_same_book_generation_change==true and same_book
-        if not same_book or (generation_changed and not allow_same_book_generation) then
+        local allow_detached_result=options.allow_book_switch_result==true
+        local detached_result=allow_detached_result and (not same_book or generation_changed)
+        local previous_state,previous_last_stage=self.state,self.last_stage
+        local previous_last_error,previous_last_error_kind=self.last_error,self.last_error_kind
+        local previous_failures,previous_failure_notified=self.consecutive_failures,self.failure_notified
+        local previous_last_path,previous_response=self.last_path,self.last_response_summary
+        local previous_http_code,previous_http_length=self.last_http_code,self.last_http_length
+        local function restore_detached_state()
+            if not detached_result then return end
+            self.state=previous_state
+            self.last_stage=previous_last_stage
+            self.last_error=previous_last_error
+            self.last_error_kind=previous_last_error_kind
+            self.consecutive_failures=previous_failures
+            self.failure_notified=previous_failure_notified
+            self.last_path=previous_last_path
+            self.last_response_summary=previous_response
+            self.last_http_code=previous_http_code
+            self.last_http_length=previous_http_length
+        end
+        local function emit_callback(...)
+            restore_detached_state()
+            if callback then callback(...) end
+        end
+        if not detached_result then self.state = self.progress_hold and "verification_required" or "waiting" end
+        if (not same_book or (generation_changed and not allow_same_book_generation)) and not allow_detached_result then
             logger.warn("[MiuRead][ReadReport] stale book worker result ignored",
                 "book=",book_id,"generation=",tostring(generation_snapshot))
-            if callback then callback(false,"书籍已切换，本次旧同步结果已忽略") end
+            emit_callback(false,"书籍已切换，本次旧同步结果已忽略")
             return
         end
-        if generation_changed and allow_same_book_generation then
+        if allow_detached_result and (not same_book or generation_changed) then
+            logger.info("[MiuRead][ReadingEnd] detached upload result retained",
+                "book=",book_id,"generation=",tostring(generation_snapshot),
+                "current_generation=",tostring(self.record_generation or 0))
+        elseif generation_changed and allow_same_book_generation then
             logger.info("[MiuRead][ReadingEnd] same-book generation advanced; final result retained",
                 "book=",book_id,"from=",tostring(generation_snapshot),
                 "to=",tostring(self.record_generation or 0))
@@ -1976,7 +2077,7 @@ function Sync:upload(elapsed, callback, options)
         if login_snapshot~=tostring(current_auth.login_session_id or "")
             or vid_snapshot~=tostring(current_account.vid or "") then
             logger.warn("[MiuRead][ReadReport] stale worker result ignored")
-            if callback then callback(false,"登录状态已变化") end
+            emit_callback(false,"登录状态已变化")
             return
         end
         if not result.ok or type(result.value) ~= "table" then
@@ -1989,7 +2090,7 @@ function Sync:upload(elapsed, callback, options)
                 force_repair_required=options.repair==true,
                 suppress_prompt=options.repair==true,
             })
-            if callback then callback(false, self.last_error) end
+            emit_callback(false, self.last_error)
             return
         end
 
@@ -2049,10 +2150,8 @@ function Sync:upload(elapsed, callback, options)
             -- A progress-only request can be safely checked by reading cloud
             -- position. A reading-time interval must not be replayed because it
             -- may already have been accepted server-side.
-            if callback then
-                if options.progress_only then callback(true,value.response or {},position,value)
-                else callback(false,message,position,value) end
-            end
+            if options.progress_only then emit_callback(true,value.response or {},position,value)
+            else emit_callback(false,message,position,value) end
             return
         end
 
@@ -2087,7 +2186,7 @@ function Sync:upload(elapsed, callback, options)
                 force_repair_required=options.repair==true,
                 suppress_prompt=options.repair==true,
             })
-            if callback then callback(false, self.last_error, position, value) end
+            emit_callback(false, self.last_error, position, value)
             return
         end
 
@@ -2146,7 +2245,7 @@ function Sync:upload(elapsed, callback, options)
             self.first_success_notified = true
             if self.host.on_read_report_success then pcall(self.host.on_read_report_success, self.host, value.path) end
         end
-        if callback then callback(true, response, position, value) end
+        emit_callback(true, response, position, value)
     end, 95)
 
     if not ok then
@@ -2166,7 +2265,10 @@ function Sync:upload_progress(callback, options)
         return self:upload(0,callback,{
             silent=true,progress_only=true,
             position_override=options.position_override,
+            record_override=options.record_override,
+            record_generation_override=options.record_generation_override,
             allow_same_book_generation_change=options.reading_end==true,
+            allow_book_switch_result=options.reading_end==true,
         })
     end
     local started, resolve_error = self:resolve_local_progress(function(position, err, meta)
@@ -2178,6 +2280,7 @@ function Sync:upload_progress(callback, options)
             silent=true,progress_only=true,
             position_override=position,
             allow_same_book_generation_change=options.reading_end==true,
+            allow_book_switch_result=options.reading_end==true,
         })
     end,{
         precise=true,
@@ -3593,7 +3696,12 @@ function Sync:on_close(options)
     -- It simply must not emit a second final upload.
     local finalized=self.reading_end_finalized==true
     if finalized then
-        self:_stop_daemon_fast("close",0)
+        -- A Home return may already have queued the final short time flush. Do
+        -- not rewrite the daemon control file with an empty close command before
+        -- the service has consumed that flush.
+        if not (self.daemon and self.daemon.final_flush_pending==true) then
+            self:_stop_daemon_fast("close",0)
+        end
         if options.preserve_async~=true and self.async then self.async:cancel("document_closed") end
     else
         self:stop_fast("close", duplicate and 0 or self:_final_elapsed(true))

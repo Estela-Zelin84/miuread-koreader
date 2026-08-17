@@ -1,16 +1,14 @@
-本包用于将 4.6.1 正式版更新为 4.6.2。
-
-需要替换 9 个现有文件：
-README.md
 CHANGELOG.md
-CHANGED_FILES.txt
+README.md
 miuread.koplugin/_meta.lua
 miuread.koplugin/main.lua
-miuread.koplugin/miuread/bluetooth.lua
+miuread.koplugin/miuread/auth.lua
+miuread.koplugin/miuread/codec.lua
 miuread.koplugin/miuread/config.lua
+miuread.koplugin/miuread/download_task.lua
+miuread.koplugin/miuread/downloader.lua
+miuread.koplugin/miuread/http.lua
+miuread.koplugin/miuread/reader.lua
+miuread.koplugin/miuread/reader_typography_dialog.lua
 miuread.koplugin/miuread/store.lua
-miuread.koplugin/miuread/updater.lua
-
-不需要删除或新增其他文件。
-仓库根目录 update.json 保持原样，不要替换。
-.github/workflows/release.yml 保持正式版现有文件，不使用 Beta 的 release-beta.yml。
+miuread.koplugin/miuread/sync.lua

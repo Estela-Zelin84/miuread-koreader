@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.6.2",
+    VERSION = "4.6.3",
     SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -138,6 +138,14 @@ local C = {
     DOWNLOAD_NETWORK_FAILURE_BREAKER = 3,
     DOWNLOAD_NETWORK_RECOVERY_POLL_SECONDS = 6,
     DOWNLOAD_NETWORK_RECOVERY_MAX_POLL_SECONDS = 15,
+    -- Keep a healthy lock-screen download alive while actively watching the
+    -- Kindle Wi-Fi link during network wait. Prolonged failure releases the
+    -- standby lock and safely hibernates the worker from its chapter checkpoint.
+    DOWNLOAD_NETWORK_GUARD_POLL_SECONDS = 10,
+    DOWNLOAD_NETWORK_RESTORE_COOLDOWN_SECONDS = 25,
+    DOWNLOAD_NETWORK_RESTORE_MAX_ATTEMPTS = 3,
+    DOWNLOAD_NETWORK_LOCK_MAX_SECONDS = 90,
+    DOWNLOAD_NETWORK_HIBERNATE_SECONDS = 120,
     DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS = 12,
     DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS = 300,
 
@@ -168,6 +176,16 @@ local C = {
     HEAVY_NATIVE_HIBERNATE_KB = 96 * 1024,
     HEAVY_NATIVE_CRITICAL_KB = 64 * 1024,
     HEAVY_DOWNLOAD_RESUME_MIN_KB = 72 * 1024,
+
+    -- Coalesce repeated typography taps into one KOReader reflow. If layout
+    -- work overlaps low memory or a heavy download stage, checkpoint/yield the
+    -- download first and resume it after the final layout has settled.
+    TYPOGRAPHY_APPLY_DEBOUNCE_SECONDS = 0.42,
+    TYPOGRAPHY_REBUILD_HINT_SECONDS = 12,
+    TYPOGRAPHY_HIBERNATE_MEMORY_KB = 72 * 1024,
+    TYPOGRAPHY_CRITICAL_MEMORY_KB = 48 * 1024,
+    TYPOGRAPHY_HEAVY_WAIT_SECONDS = 8,
+    TYPOGRAPHY_DOWNLOAD_RESUME_DELAY_SECONDS = 2.2,
     -- Remote cover fetching may coexist with a healthy download. It yields only
     -- when a heavy download stage and real memory pressure overlap.
     DOWNLOAD_COVER_COEXIST_MIN_KB = 80 * 1024,
