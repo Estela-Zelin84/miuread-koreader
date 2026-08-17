@@ -1,19 +1,15 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.6.1",
+    VERSION = "4.6.0-beta.7",
     SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
-    -- 正式版更新清单由 tag 发布流程生成，并作为固定 stable-channel Release
-    -- 资源提供。仓库根目录 update.json 仅作为旧正式版桥接入口；
-    -- 插件自身只读取 stable-channel，避免旧桥接清单参与后续判断。
-    UPDATE_CHANNEL = "stable",
-    UPDATE_CHANNEL_LABEL = "正式通道",
-    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
-    UPDATE_MANIFESTS = {
-        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
-    },
+    -- 内测更新清单由 tag 发布流程生成，并作为固定 beta-channel Release
+    -- 资源提供。main/update-beta.json 仅保留为 beta.27 的一次性旧版桥接。
+    UPDATE_CHANNEL = "beta",
+    UPDATE_CHANNEL_LABEL = "内测通道",
+    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/beta-channel/update-beta.json",
 
     -- 仅作为 GitHub 官方资源访问失败时的回退入口。
     -- 下载后仍会执行大小与 SHA-256 校验，镜像不能改变安装内容。
