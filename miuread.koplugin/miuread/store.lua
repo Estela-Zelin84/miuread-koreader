@@ -1,6 +1,7 @@
 local DataStorage=require("datastorage")
 local lfs=require("libs/libkoreader-lfs")
 local LuaSettings=require("luasettings")
+local dump=require("dump")
 local Config=require("miuread.config")
 local Json=require("miuread.json")
 local DownloadDatabase=require("miuread.download_database")
@@ -155,7 +156,7 @@ function Store:new(options)
     o:migrate()
     -- v1.1.45 intentionally disables automatic legacy EPUB relocation. File
     -- moves must never run during every reader/file-manager transition.
-    o.db:flush()
+    o:flush()
     if not o.isolated then
         local valid=settings_file_valid(o.settings_path)
         if valid then refresh_settings_backup(o.settings_path,o.settings_backup_path) end
@@ -1368,6 +1369,7 @@ function Store:migrate()
             self:save_preferences(current)
         end
         if schema<113 then
+            logger.info("[MiuRead][Migration] schema 112 -> 113 begin","from=",tostring(schema))
             -- 4.6.0-beta.2 separates reading time, in-reading progress and
             -- end-of-reading progress. Existing explicit off choices remain off;
             -- installs that used the old single progress switch move to the new
@@ -1387,6 +1389,7 @@ function Store:migrate()
             local raw_annotations=type(previous.annotation_sync)=="table" and previous.annotation_sync or {}
             if raw_annotations.close_upload_enabled==nil then current.annotation_sync.close_upload_enabled=true end
             self:save_preferences(current)
+            logger.info("[MiuRead][Migration] schema 112 -> 113 done")
         end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
@@ -2174,21 +2177,36 @@ function Store:flush()
         local valid=settings_file_valid(self.settings_path)
         if valid then U.copy_file(self.settings_path,previous_path) end
     end
-    local ok,err=xpcall(function() self.db:flush() end,debug.traceback)
+
+    -- LuaSettings writes directly to the target file. A power/state transition
+    -- during that write can leave a syntactically truncated miuread.lua. Serialize
+    -- completely in memory, validate the Lua chunk, then atomically replace the
+    -- target so readers can only observe the old complete file or the new one.
+    local payload
+    local ok,err=xpcall(function()
+        payload=dump(self.db.data,nil,true)
+        local loader,parse_error=loadstring(payload)
+        if not loader then error("serialized settings invalid: "..tostring(parse_error)) end
+        local written,write_error=U.atomic_write(self.settings_path,payload,true)
+        if not written then error("atomic settings write failed: "..tostring(write_error)) end
+    end,debug.traceback)
     if not ok then
         if not self.isolated then restore_settings_file(self.settings_path,self.settings_backup_path) end
         error(err)
     end
-    if not self.isolated then
-        local valid,reason=settings_file_valid(self.settings_path)
-        if valid then
-            U.copy_file(self.settings_path,self.settings_backup_path)
-            os.remove(previous_path)
-        else
-            logger.warn("[MiuRead][Store] settings flush produced invalid file","reason=",tostring(reason))
+
+    local valid,reason=settings_file_valid(self.settings_path)
+    if not valid then
+        logger.warn("[MiuRead][Store] atomic settings flush produced invalid file","reason=",tostring(reason))
+        if not self.isolated then
             restore_settings_file(self.settings_path,self.settings_backup_path)
             self.db=LuaSettings:open(self.settings_path)
         end
+        return false,reason
+    end
+    if not self.isolated then
+        U.copy_file(self.settings_path,self.settings_backup_path)
+        os.remove(previous_path)
     end
     return true
 end
