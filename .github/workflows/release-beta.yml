@@ -1,25 +1,24 @@
-name: Release stable full package
+name: Release beta full package
 
 on:
   push:
     tags:
-      - "v*.*.*"
-      - "!v*.*.*-beta.*"
+      - "v*.*.*-beta.*"
 
 permissions:
   contents: write
 
 concurrency:
-  group: miuread-stable-release
+  group: miuread-beta-release
   cancel-in-progress: false
 
 jobs:
-  release-stable:
+  release-beta:
     runs-on: ubuntu-latest
     env:
-      RELEASE_CHANNEL: stable
-      CHANNEL_TAG: stable-channel
-      MANIFEST_NAME: update.json
+      RELEASE_CHANNEL: beta
+      CHANNEL_TAG: beta-channel
+      MANIFEST_NAME: update-beta.json
 
     steps:
       - name: Check out tagged source
@@ -28,7 +27,7 @@ jobs:
           ref: ${{ github.ref }}
           fetch-depth: 0
 
-      - name: Read and validate stable identity
+      - name: Read and validate beta identity
         shell: bash
         run: |
           set -euo pipefail
@@ -55,15 +54,15 @@ jobs:
           import sys
 
           tag = os.environ.get("GITHUB_REF_NAME", "")
-          match = re.fullmatch(r"v([0-9]+\.[0-9]+\.[0-9]+)", tag)
+          match = re.fullmatch(r"v([0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+)", tag)
           if not match:
-              print(f"::error::无效的正式 tag：{tag}")
+              print(f"::error::无效的内测 tag：{tag}")
               sys.exit(1)
           version = match.group(1)
 
           config = Path("miuread.koplugin/miuread/config.lua").read_text(encoding="utf-8")
           meta = Path("miuread.koplugin/_meta.lua").read_text(encoding="utf-8")
-          version_pattern = r"[0-9]+\.[0-9]+\.[0-9]+"
+          version_pattern = r"[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+"
           config_version = re.search(
               r'\bVERSION\s*=\s*["\'](' + version_pattern + r')["\']', config
           )
@@ -71,7 +70,7 @@ jobs:
               r'\bversion\s*=\s*["\'](' + version_pattern + r')["\']', meta
           )
           if not config_version or not meta_version:
-              print("::error::无法读取 config.lua 或 _meta.lua 的正式版本号。")
+              print("::error::无法读取 config.lua 或 _meta.lua 的内测版本号。")
               sys.exit(1)
           if config_version.group(1) != version or meta_version.group(1) != version:
               print(
@@ -82,20 +81,20 @@ jobs:
 
           channel = re.search(r'\bUPDATE_CHANNEL\s*=\s*["\']([^"\']+)["\']', config)
           label = re.search(r'\bUPDATE_CHANNEL_LABEL\s*=\s*["\']([^"\']+)["\']', config)
-          if not channel or channel.group(1) != "stable":
-              print("::error::插件不是正式通道。")
+          if not channel or channel.group(1) != "beta":
+              print("::error::插件不是内测通道。")
               sys.exit(1)
-          if not label or label.group(1) != "正式通道":
-              print("::error::正式通道名称配置错误。")
+          if not label or label.group(1) != "内测通道":
+              print("::error::内测通道名称配置错误。")
               sys.exit(1)
 
           expected_manifest = (
               "https://github.com/miumiupy98-art/miuread-koreader/"
-              "releases/download/stable-channel/update.json"
+              "releases/download/beta-channel/update-beta.json"
           )
           manifest = re.search(r'\bUPDATE_MANIFEST\s*=\s*["\']([^"\']+)["\']', config)
           if not manifest or manifest.group(1) != expected_manifest:
-              print("::error::正式更新清单主地址配置错误。")
+              print("::error::内测更新清单主地址配置错误。")
               sys.exit(1)
 
           changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
@@ -183,7 +182,7 @@ jobs:
           sudo apt-get install -y lua5.1
           find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
 
-      - name: Build stable full package and manifest
+      - name: Build beta full package and manifest
         shell: bash
         run: |
           set -euo pipefail
@@ -248,8 +247,8 @@ jobs:
           summary = Path("update-summary.txt").read_text(encoding="utf-8").strip()
           manifest = {
               "version": version,
-              "name": f"觅阅 · 微信读书助手 {version}",
-              "channel": "stable",
+              "name": f"觅阅 · 微信读书助手 {version} 内测版",
+              "channel": "beta",
               "package_type": "full",
               "package_url": official,
               "package_urls": [
@@ -263,13 +262,13 @@ jobs:
               "summary": summary,
               "notes": summary,
           }
-          Path("dist/update.json").write_text(
+          Path("dist/update-beta.json").write_text(
               json.dumps(manifest, ensure_ascii=True, indent=2) + "\n",
               encoding="utf-8",
           )
           PY
 
-      - name: Verify stable package and manifest
+      - name: Verify beta package and manifest
         shell: bash
         run: |
           set -euo pipefail
@@ -284,7 +283,7 @@ jobs:
           import sys
 
           package = Path("dist") / os.environ["PACKAGE_NAME"]
-          manifest = json.loads(Path("dist/update.json").read_text(encoding="utf-8"))
+          manifest = json.loads(Path("dist/update-beta.json").read_text(encoding="utf-8"))
           summary = Path("update-summary.txt").read_text(encoding="utf-8").strip()
           required = {
               "miuread.koplugin/_meta.lua",
@@ -318,7 +317,7 @@ jobs:
                   errors.append(f"不应进入安装包：{name}")
           if manifest.get("version") != os.environ["VERSION"]:
               errors.append("更新清单版本错误")
-          if manifest.get("channel") != "stable":
+          if manifest.get("channel") != "beta":
               errors.append("更新清单通道错误")
           if manifest.get("notes") != summary or manifest.get("summary") != summary:
               errors.append("线上更新摘要错误")
@@ -333,10 +332,10 @@ jobs:
               for error in errors:
                   print(f"::error::{error}")
               sys.exit(1)
-          print(f"正式版安装包检查通过，共 {len(names)} 个条目。")
+          print(f"内测版安装包检查通过，共 {len(names)} 个条目。")
           PY
 
-      - name: Create or update stable release
+      - name: Create or update beta prerelease
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -346,22 +345,94 @@ jobs:
           FILE="dist/$PACKAGE_NAME"
           NOTES_FILE="release-notes.md"
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" \
-              --title "觅阅 · 微信读书助手 $VERSION" \
-              --notes-file "$NOTES_FILE" \
-              --latest
-          else
-            gh release create "$RELEASE_TAG" \
-              --verify-tag \
-              --title "觅阅 · 微信读书助手 $VERSION" \
-              --notes-file "$NOTES_FILE" \
-              --latest
-          fi
+          retry_gh() {
+            local attempt=1
+            local max_attempts=6
+            local delay=3
+            local output
+            local rc
 
-          gh release upload "$RELEASE_TAG" "$FILE" --clobber
+            while true; do
+              set +e
+              output="$("$@" 2>&1)"
+              rc=$?
+              set -e
 
-          COUNT="$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[] | select(.name == env.PACKAGE_NAME)] | length')"
+              if [ "$rc" -eq 0 ]; then
+                if [ -n "$output" ]; then
+                  printf '%s\n' "$output"
+                fi
+                return 0
+              fi
+
+              if [ -n "$output" ]; then
+                printf '%s\n' "$output" >&2
+              fi
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "::error::GitHub API 连续失败 ${max_attempts} 次：$*" >&2
+                return "$rc"
+              fi
+
+              echo "::warning::GitHub API 请求失败（第 ${attempt}/${max_attempts} 次），${delay} 秒后重试：$*" >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          ensure_release() {
+            local attempt=1
+            local max_attempts=6
+            local delay=3
+
+            while [ "$attempt" -le "$max_attempts" ]; do
+              if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+                return 0
+              fi
+
+              if gh release create "$RELEASE_TAG" \
+                  --verify-tag \
+                  --title "觅阅 · 微信读书助手 $VERSION 内测版" \
+                  --notes-file "$NOTES_FILE" \
+                  --prerelease \
+                  --latest=false; then
+                return 0
+              fi
+
+              # Release API 可能已经完成创建，只是客户端收到 502/503。
+              if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+                echo "::warning::Release 已在失败响应后实际创建，继续后续步骤。" >&2
+                return 0
+              fi
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "::error::无法创建或读取 Release：$RELEASE_TAG" >&2
+                return 1
+              fi
+
+              echo "::warning::创建 Release 失败（第 ${attempt}/${max_attempts} 次），${delay} 秒后重试。" >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          # 创建 Release 与上传资产分离，使 502/503 后的再次执行可安全恢复。
+          ensure_release
+
+          retry_gh gh release edit "$RELEASE_TAG" \
+            --title "觅阅 · 微信读书助手 $VERSION 内测版" \
+            --notes-file "$NOTES_FILE" \
+            --prerelease \
+            --latest=false
+
+          # --clobber 直接覆盖同名资产，不再依赖“先删后传”。
+          retry_gh gh release upload "$RELEASE_TAG" "$FILE" --clobber
+
+          COUNT="$(retry_gh gh release view "$RELEASE_TAG" \
+            --json assets \
+            --jq '[.assets[] | select(.name == env.PACKAGE_NAME)] | length')"
           if [ "$COUNT" != "1" ]; then
             echo "::error::Release 中应有且只有一个 $PACKAGE_NAME。"
             exit 1
@@ -373,7 +444,7 @@ jobs:
           set -euo pipefail
 
           URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$PACKAGE_NAME"
-          EXPECTED="$(python3 -c 'import json; print(json.load(open("dist/update.json"))["sha256"])')"
+          EXPECTED="$(python3 -c 'import json; print(json.load(open("dist/update-beta.json"))["sha256"])')"
           success=0
           for attempt in $(seq 1 12); do
             rm -f dist/public-download.zip
@@ -389,32 +460,101 @@ jobs:
             sleep 5
           done
           if [ "$success" != "1" ]; then
-            echo "::error::Release 下载地址尚不可用或校验失败；不会更新正式版清单。"
+            echo "::error::Release 下载地址尚不可用或校验失败；不会更新 Beta 清单。"
             exit 1
           fi
 
-      - name: Publish fixed stable channel manifest
+      - name: Publish fixed beta channel manifest
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          NOTES="Machine-readable update manifest for MiuRead Stable. Do not install this release directly."
-          if gh release view "$CHANNEL_TAG" >/dev/null 2>&1; then
-            gh release edit "$CHANNEL_TAG" \
-              --title "MiuRead Stable Update Channel" \
-              --notes "$NOTES" \
-              --latest=false
-          else
-            gh release create "$CHANNEL_TAG" \
-              --target "$GITHUB_SHA" \
-              --title "MiuRead Stable Update Channel" \
-              --notes "$NOTES" \
-              --latest=false
-          fi
+          CHANNEL_NOTES="Machine-readable update manifest for MiuRead Beta. Do not install this release directly."
 
-          gh release upload "$CHANNEL_TAG" "dist/$MANIFEST_NAME" --clobber
+          retry_gh() {
+            local attempt=1
+            local max_attempts=6
+            local delay=3
+            local output
+            local rc
+
+            while true; do
+              set +e
+              output="$("$@" 2>&1)"
+              rc=$?
+              set -e
+
+              if [ "$rc" -eq 0 ]; then
+                if [ -n "$output" ]; then
+                  printf '%s\n' "$output"
+                fi
+                return 0
+              fi
+
+              if [ -n "$output" ]; then
+                printf '%s\n' "$output" >&2
+              fi
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "::error::GitHub API 连续失败 ${max_attempts} 次：$*" >&2
+                return "$rc"
+              fi
+
+              echo "::warning::GitHub API 请求失败（第 ${attempt}/${max_attempts} 次），${delay} 秒后重试：$*" >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          ensure_channel_release() {
+            local attempt=1
+            local max_attempts=6
+            local delay=3
+
+            while [ "$attempt" -le "$max_attempts" ]; do
+              if gh release view "$CHANNEL_TAG" >/dev/null 2>&1; then
+                return 0
+              fi
+
+              if gh release create "$CHANNEL_TAG" \
+                  --target "$GITHUB_SHA" \
+                  --title "MiuRead Beta Update Channel" \
+                  --notes "$CHANNEL_NOTES" \
+                  --prerelease \
+                  --latest=false; then
+                return 0
+              fi
+
+              # 同样兼容“服务端成功、客户端收到 502/503”的半成功状态。
+              if gh release view "$CHANNEL_TAG" >/dev/null 2>&1; then
+                echo "::warning::Beta channel Release 已在失败响应后实际创建，继续后续步骤。" >&2
+                return 0
+              fi
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "::error::无法创建或读取 Beta channel Release：$CHANNEL_TAG" >&2
+                return 1
+              fi
+
+              echo "::warning::创建 Beta channel Release 失败（第 ${attempt}/${max_attempts} 次），${delay} 秒后重试。" >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          ensure_channel_release
+
+          retry_gh gh release edit "$CHANNEL_TAG" \
+            --title "MiuRead Beta Update Channel" \
+            --notes "$CHANNEL_NOTES" \
+            --prerelease \
+            --latest=false
+
+          retry_gh gh release upload "$CHANNEL_TAG" "dist/$MANIFEST_NAME" --clobber
 
           URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$CHANNEL_TAG/$MANIFEST_NAME"
           success=0
@@ -430,6 +570,6 @@ jobs:
             sleep 5
           done
           if [ "$success" != "1" ]; then
-            echo "::error::固定正式更新清单尚不可用或内容校验失败。"
+            echo "::error::固定 Beta 更新清单尚不可用或内容校验失败。"
             exit 1
           fi

@@ -1,18 +1,33 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.6.6",
+    VERSION = "4.6.7",
     SCHEMA = 114,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
-    -- 正式版更新清单由 tag 发布流程生成，并作为固定 stable-channel Release
-    -- 资源提供。仓库根目录 update.json 仅作为旧正式版桥接入口；
-    -- 插件自身只读取 stable-channel，避免旧桥接清单参与后续判断。
+    -- 安装包自身保持 stable/beta 身份；用户选择的 OTA 通道独立保存。
+    -- 正式版默认仍走 stable，用户可在设置中主动切换到 beta。
     UPDATE_CHANNEL = "stable",
     UPDATE_CHANNEL_LABEL = "正式通道",
     UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
     UPDATE_MANIFESTS = {
         "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+    },
+    UPDATE_CHANNELS = {
+        stable = {
+            label = "正式通道",
+            manifest = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+            manifests = {
+                "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+            },
+        },
+        beta = {
+            label = "内测通道",
+            manifest = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
+            manifests = {
+                "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
+            },
+        },
     },
 
     -- 仅作为 GitHub 官方资源访问失败时的回退入口。
@@ -86,6 +101,13 @@ local C = {
     -- Old taps delayed by a real UI stall are discarded instead of being
     -- replayed against a different book after the screen catches up.
     HOME_STALE_TAP_MS = 1200,
+
+    -- 阅读页继续保留下滑入口，同时允许顶部中央轻点打开觅阅菜单；
+    -- 刚进入阅读页的短暂残留点击会被吞掉，避免触发角落手势。
+    READER_OPEN_GESTURE_GUARD_SECONDS = 0.75,
+    READER_TOP_MENU_X_MIN = 0.25,
+    READER_TOP_MENU_X_MAX = 0.75,
+    READER_TOP_MENU_Y_MAX = 0.10,
     HOME_REMOTE_SHELF_TTL_SECONDS = 30 * 60,
     HOME_LOCAL_SHELF_TTL_SECONDS = 60 * 60,
     HOME_REMOTE_COVER_BATCH = 4,

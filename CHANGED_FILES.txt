@@ -1,6 +1,14 @@
+.github/workflows/release-beta.yml
+.github/workflows/release.yml
 CHANGED_FILES.txt
 CHANGELOG.md
 README.md
 miuread.koplugin/_meta.lua
+miuread.koplugin/main.lua
 miuread.koplugin/miuread/config.lua
-miuread.koplugin/miuread/pseudo_lockscreen.lua
+miuread.koplugin/miuread/download_task.lua
+miuread.koplugin/miuread/downloader.lua
+miuread.koplugin/miuread/home_data.lua
+miuread.koplugin/miuread/http.lua
+miuread.koplugin/miuread/reader.lua
+miuread.koplugin/miuread/updater.lua
