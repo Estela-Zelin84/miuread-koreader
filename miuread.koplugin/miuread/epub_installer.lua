@@ -187,8 +187,19 @@ local function validate_resources(path,entries,opt)
         end
     end
 
+    local documents={}
     for name in pairs(entries) do
-        if name:match("^OEBPS/text/.+%.xhtml$") or name=="OEBPS/style.css" then inspect_document(name) end
+        if name:match("^OEBPS/text/.+%.xhtml$") or name=="OEBPS/style.css" then
+            documents[#documents+1]=name
+        end
+    end
+    table.sort(documents)
+    local total_documents=math.max(1,#documents)
+    for index,name in ipairs(documents) do
+        inspect_document(name)
+        if type(opt and opt.on_progress)=="function" then
+            opt.on_progress({phase="validate",current=index,total=total_documents,entry=name})
+        end
     end
 
     local ref_count=0

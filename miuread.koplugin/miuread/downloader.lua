@@ -830,7 +830,7 @@ local function repair_internal_links(chapters)
     return stats
 end
 
-function Downloader:_save(book, chapters, assets, css, cover, opt, failures, session)
+function Downloader:_save(book, chapters, assets, css, cover, opt, failures, session, progress)
     local kind = opt.annotations and "notes" or "clean"
     local expected_chapter_count = tonumber(opt.expected_chapter_count) or #chapters
     local preview_mode=tostring(opt.preview_mode or "complete")
@@ -966,6 +966,31 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         "chapters=",tostring(#chapters),"assets=",tostring(#assets),
         "memory_kb=",tostring(math.floor(collectgarbage("count"))))
     local now=os.time()
+    local function package_progress(detail)
+        detail=type(detail)=="table" and detail or {}
+        ensure_not_cancelled()
+        local current=math.max(0,tonumber(detail.current) or 0)
+        local total=math.max(1,tonumber(detail.total) or 1)
+        local phase=tostring(detail.phase or "package")
+        local label
+        if phase=="scan" then label="正在生成 EPUB · 校验内容"
+        elseif phase=="write" then label="正在生成 EPUB · 写入内容"
+        elseif phase=="central" then label="正在生成 EPUB · 整理索引"
+        else label="正在生成 EPUB" end
+        if phase~="central" then label=label.." · "..tostring(math.min(current,total)).."/"..tostring(total) end
+        if type(progress)=="function" then
+            progress("package",current,total,book.title,{
+                message=label,
+                activity="epub_"..phase,
+                processed=current,
+                process_total=total,
+                package_fraction=math.min(0.85,(current/total)*0.85),
+                package_entry=detail.entry,
+                package_entry_bytes=detail.entry_bytes,
+                package_entry_size=detail.entry_size,
+            })
+        end
+    end
     local built,build_error=pcall(Epub.build,temp_path,book,chapters,css,assets,cover,{
         schema=8,book_id=book.bookId,title=book.title,author=book.author,
         variant=storage_kind,base_variant=kind,standalone=standalone,chapter_uid=opt.chapter_uid,
@@ -991,11 +1016,34 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         content_transform_version=CONTENT_TRANSFORM_VERSION,
         internal_links={links=link_stats.links or 0,rewritten=link_stats.rewritten or 0,
             unresolved=link_stats.unresolved or 0,critical=link_stats.unresolved_critical or 0},
-    })
+    },package_progress)
     if not built then os.remove(temp_path); error(build_error) end
     ensure_not_cancelled()
+    if type(progress)=="function" then
+        progress("package",1,1,book.title,{
+            message="正在验证 EPUB",activity="epub_validate",processed=1,process_total=1,package_fraction=0.90,
+        })
+    end
     local validation_options={book_id=book.bookId,variant=storage_kind,chapters=map,previous_chapters=previous_chapters,
         image_summary=U.copy(opt.image_summary or {})}
+    local validation_last_report_at=0
+    validation_options.on_progress=function(detail)
+        ensure_not_cancelled()
+        detail=type(detail)=="table" and detail or {}
+        local current=math.max(0,tonumber(detail.current) or 0)
+        local total=math.max(1,tonumber(detail.total) or 1)
+        local report_now=os.time()
+        if current<total and report_now-validation_last_report_at<3 then return end
+        validation_last_report_at=report_now
+        if type(progress)=="function" then
+            progress("package",current,total,book.title,{
+                message="正在验证 EPUB · "..tostring(math.min(current,total)).."/"..tostring(total),
+                activity="epub_validate",processed=current,process_total=total,
+                package_fraction=0.86+0.10*math.min(1,current/total),
+                package_entry=detail.entry,
+            })
+        end
+    end
     local valid,validation_error=EpubInstaller.validate(temp_path,validation_options)
     if not valid then
         logger.warn("[MiuRead][Download] EPUB validation failed",tostring(validation_error))
@@ -1005,6 +1053,11 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     logger.info("[MiuRead][Download] low-memory EPUB package completed",
         "bytes=",tostring(U.file_size(temp_path) or 0),
         "memory_kb=",tostring(math.floor(collectgarbage("count"))))
+    if type(progress)=="function" then
+        progress("package",1,1,book.title,{
+            message="正在安装 EPUB",activity="epub_install",processed=1,process_total=1,package_fraction=0.97,
+        })
+    end
 
     local active_path=tostring(opt.active_document_path or "")
     local defer_install=active_path~="" and active_path==tostring(path) and U.file_exists(path)
@@ -2101,7 +2154,7 @@ function Downloader:book(input, opt, progress)
     opt.preview_mode = preview and preview_mode or nil
     opt.guard_chapter_uid = guard_uid
     opt.checkpointed = true
-    local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session)
+    local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session, progress)
     record.annotation_summary = annotation_summary
     cache.manifest.final_repair_required=nil
     if type(cache.manifest.last_image_repair)=="table" then

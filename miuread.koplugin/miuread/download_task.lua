@@ -1477,9 +1477,12 @@ function DownloadTask:_poll()
                 })
                 pcall(FFIUtil.terminateSubProcess,job.pid)
                 self:_release_awake()
-                if job.stall_terminal==true then
-                    job.fail_open_deadline=now+math.max(4,tonumber(Config.DOWNLOAD_STALL_FAIL_OPEN_SECONDS) or 12)
-                end
+                -- Once a lock-screen worker is unhealthy enough to receive a
+                -- termination request, power-state safety no longer depends on
+                -- that process exiting successfully. Arm fail-open immediately
+                -- on the first recovery attempt; a worker that exits in time is
+                -- still restarted from its checkpoint by the normal path.
+                job.fail_open_deadline=now+math.max(4,tonumber(Config.DOWNLOAD_STALL_FAIL_OPEN_SECONDS) or 12)
                 logger.warn("[MiuRead][DownloadTask] stalled worker termination requested",
                     "pid=",tostring(job.pid),"stage=",current_stage,
                     "idle=",tostring(effective_idle),"terminal=",tostring(job.stall_terminal==true),
@@ -1491,9 +1494,9 @@ function DownloadTask:_poll()
                 -- firmware that delays the first signal while memory is tight.
                 pcall(FFIUtil.terminateSubProcess,job.pid)
             end
-            if job.stall_terminal==true and tonumber(job.fail_open_deadline)
-                and now>=tonumber(job.fail_open_deadline) then
-                self:_fail_open_locked_download(job,"terminal_stall")
+            if tonumber(job.fail_open_deadline) and now>=tonumber(job.fail_open_deadline) then
+                self:_fail_open_locked_download(job,job.stall_terminal==true
+                    and "terminal_stall" or "stall_termination_timeout")
             end
         end
         if idle>=120 and not job.waiting_notified then
@@ -1943,7 +1946,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     detail = detail or {}
                     local percent
                     if stage == "package" then
-                        percent = 0.96
+                        local package_fraction=math.max(0,math.min(1,tonumber(detail.package_fraction) or 0))
+                        percent = 0.96 + 0.03 * package_fraction
                     elseif total and total > 0 then
                         local base = (math.max(1, current) - 1) / total
                         local step = 0
@@ -1980,6 +1984,10 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                         transfer_bytes = detail.transfer_bytes,
                         processed = detail.processed,
                         process_total = detail.process_total,
+                        package_fraction = detail.package_fraction,
+                        package_entry = detail.package_entry,
+                        package_entry_bytes = detail.package_entry_bytes,
+                        package_entry_size = detail.package_entry_size,
                     }
                 end)
                 return {
