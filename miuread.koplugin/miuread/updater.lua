@@ -37,15 +37,53 @@ local function with_github_mirrors(url,out,seen)
     end
 end
 
-function Updater:manifest_urls()
+function Updater:selected_channel()
+    local selected=""
+    if self.store and type(self.store.preferences)=="function" then
+        local ok,prefs=pcall(self.store.preferences,self.store)
+        if ok and type(prefs)=="table" and type(prefs.update)=="table" then
+            selected=tostring(prefs.update.channel or "")
+        end
+    end
+    if selected~="stable" and selected~="beta" then
+        selected=tostring(Config.UPDATE_CHANNEL or "stable")
+    end
+    if selected~="stable" and selected~="beta" then selected="stable" end
+    return selected
+end
+
+function Updater:channel_config(channel)
+    channel=tostring(channel or self:selected_channel())
+    local channels=Config.UPDATE_CHANNELS
+    local cfg=type(channels)=="table" and channels[channel] or nil
+    if type(cfg)=="table" then return cfg end
+    return {
+        label=Config.UPDATE_CHANNEL_LABEL,
+        manifest=Config.UPDATE_MANIFEST,
+        manifests=Config.UPDATE_MANIFESTS,
+    }
+end
+
+function Updater:channel_label(channel)
+    channel=tostring(channel or self:selected_channel())
+    local cfg=self:channel_config(channel)
+    return tostring(cfg.label or (channel=="beta" and "内测通道" or "正式通道"))
+end
+
+function Updater:manifest_urls(channel)
+    channel=tostring(channel or self:selected_channel())
+    local cfg=self:channel_config(channel)
     local out,seen={},{}
-    local configured=Config.UPDATE_MANIFESTS
+    local configured=cfg.manifests
     if type(configured)=="table" then
         for _,url in ipairs(configured) do with_github_mirrors(url,out,seen) end
     else
-        with_github_mirrors(Config.UPDATE_MANIFEST,out,seen)
+        with_github_mirrors(cfg.manifest,out,seen)
     end
-    local preferred=tostring(self.store and self.store:get("update_last_good_manifest_url","") or "")
+    local preferred=tostring(self.store and self.store:get("update_last_good_manifest_url_"..channel,"") or "")
+    if preferred=="" then
+        preferred=tostring(self.store and self.store:get("update_last_good_manifest_url","") or "")
+    end
     if preferred~="" and seen[preferred] then
         for index,url in ipairs(out) do
             if url==preferred then
@@ -58,16 +96,17 @@ function Updater:manifest_urls()
     return out
 end
 
-function Updater:remember_manifest_route(url)
+function Updater:remember_manifest_route(url,channel)
     url=tostring(url or "")
     if not valid_https(url) or not self.store then return false end
-    self.store:set("update_last_good_manifest_url",url)
-    logger.info("[MiuRead][Updater] remembered manifest route",url)
+    channel=tostring(channel or self:selected_channel())
+    self.store:set("update_last_good_manifest_url_"..channel,url)
+    logger.info("[MiuRead][Updater] remembered manifest route",channel,url)
     return true
 end
 
-function Updater:manifest_url()
-    return self:manifest_urls()[1]
+function Updater:manifest_url(channel)
+    return self:manifest_urls(channel)[1]
 end
 
 local function collect_table_urls(value,out,seen)
@@ -177,16 +216,17 @@ local function clean_manifest_text(m)
     return {notes=notes or "",summary=summary or notes or "",name=name}
 end
 
-local function validate_manifest(m)
+local function validate_manifest(m,expected_channel)
     if type(m)~="table" or type(m.version)~="string" or m.version=="" then
         return nil,"更新清单缺少版本号"
     end
-    local expected_channel=tostring(Config.UPDATE_CHANNEL or "stable")
+    expected_channel=tostring(expected_channel or "stable")
     local manifest_channel=tostring(m.channel or "")
     if manifest_channel=="" and expected_channel=="stable" then manifest_channel="stable" end
     if manifest_channel~=expected_channel then
-        return nil,"更新清单通道不匹配：当前为"..expected_channel.."，清单为"..(manifest_channel~="" and manifest_channel or "未标记")
+        return nil,"更新清单通道不匹配：目标为"..expected_channel.."，清单为"..(manifest_channel~="" and manifest_channel or "未标记")
     end
+    m.channel=manifest_channel
     if m.package_type~=nil and tostring(m.package_type)~="full" then
         return nil,"更新清单不是全量包"
     end
@@ -197,12 +237,14 @@ local function validate_manifest(m)
 end
 
 function Updater:check()
-    local urls=self:manifest_urls()
+    local target_channel=self:selected_channel()
+    local channel_cfg=self:channel_config(target_channel)
+    local urls=self:manifest_urls(target_channel)
     if #urls==0 then return nil,"更新地址未配置" end
     local errors={}
     local fallback
     local current_fallback
-    local canonical=tostring(Config.UPDATE_MANIFEST or "")
+    local canonical=tostring(channel_cfg.manifest or "")
     for _,url in ipairs(urls) do
         local ok,m=pcall(function()
             return self.http:get_json(url,{
@@ -216,7 +258,7 @@ function Updater:check()
             })
         end)
         if ok then
-            local valid,reason=validate_manifest(m)
+            local valid,reason=validate_manifest(m,target_channel)
             if valid then
                 local cleaned,text_error=clean_manifest_text(m)
                 if not cleaned then
@@ -239,9 +281,12 @@ function Updater:check()
                         "notes_utf8_valid=true")
                     if U.semver_newer(m.version,self.version) then
                         m._manifest_source_url=url
+                        m._target_channel=target_channel
                         return m
                     end
-                    local current={current=true,version=m.version,name=m.name,notes=m.notes,_manifest_source_url=url}
+                    local current={current=true,ahead=U.semver_compare(self.version,m.version)>0,
+                        version=m.version,name=m.name,notes=m.notes,_manifest_source_url=url,
+                        _target_channel=target_channel}
                     if url==canonical then
                         return current
                     end
@@ -260,10 +305,14 @@ function Updater:check()
         end
     end
     if fallback then
-        if U.semver_newer(fallback.version,self.version) then return fallback end
+        if U.semver_newer(fallback.version,self.version) then
+            fallback._target_channel=target_channel
+            return fallback
+        end
         if not current_fallback or U.semver_newer(fallback.version,current_fallback.version) then
-            current_fallback={current=true,version=fallback.version,name=fallback.name,notes=fallback.notes,
-                _manifest_source_url=fallback._manifest_source_url}
+            current_fallback={current=true,ahead=U.semver_compare(self.version,fallback.version)>0,
+                version=fallback.version,name=fallback.name,notes=fallback.notes,
+                _manifest_source_url=fallback._manifest_source_url,_target_channel=target_channel}
         end
     end
     if current_fallback then return current_fallback end
@@ -370,8 +419,9 @@ function Updater:install(path,manifest)
     if tostring(incoming_version or "")~=tostring(manifest.version or "") then
         return fail("更新包版本与清单不一致")
     end
-    if tostring(incoming_channel)~=tostring(Config.UPDATE_CHANNEL or "stable") then
-        return fail("更新包通道不匹配，已拒绝安装")
+    local target_channel=tostring(manifest.channel or "stable")
+    if tostring(incoming_channel)~=target_channel then
+        return fail("更新包通道与目标通道不匹配，已拒绝安装")
     end
     local roots=U.list(unpacked)
     if #roots~=1 or roots[1]~=incoming then
