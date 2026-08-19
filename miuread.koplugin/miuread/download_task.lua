@@ -34,18 +34,6 @@ local function lower_worker_priority()
     return called
 end
 
-local function signal_worker(pid,signal)
-    pid=tonumber(pid)
-    signal=tonumber(signal) or 15
-    if not pid or pid<=1 then return false,"invalid_pid" end
-    local ok,ffi=pcall(require,"ffi")
-    if not ok or not ffi then return false,"ffi_unavailable" end
-    pcall(ffi.cdef,"int kill(int pid, int sig);")
-    local called,result=pcall(function() return ffi.C.kill(pid,signal) end)
-    if not called then return false,tostring(result) end
-    return tonumber(result)==0,tonumber(result)==0 and "signaled" or "kill_failed"
-end
-
 local function serializable_copy(value, seen)
     local kind = type(value)
     if kind == "string" or kind == "number" or kind == "boolean" or kind == "nil" then return value end
@@ -735,22 +723,26 @@ function DownloadTask:prepare_suspend_lock()
     if not self.keep_awake_enabled then return false,"disabled" end
     self.power_mode="SUSPEND_PENDING"
 
-    -- The pseudo-lock session is the single standby owner. A second "download"
-    -- lease created an independent lifetime and could outlive/fight the visible
-    -- lock state. Keep only the pseudo lease once that session is active.
     local pseudo_owned=PseudoLockscreen.active()==true
     local ok=false
     if pseudo_owned then
         self:_release_awake()
         ok=true
+    elseif device_is("Kindle") then
+        -- Kindle workers are never allowed to create a power owner. The
+        -- background-alive controller must already exist before a locked
+        -- download can continue.
+        self:_release_awake()
+        ok=false
     else
+        -- Kobo keeps its existing lease behavior.
         ok=SuspendWorkLease.acquire("download")==true
         self.standby_held=ok
     end
     self:_capture_lockscreen_network("suspend_pending")
     self:_guard_lockscreen_network(self.job,os.time(),true)
     logger.info("[MiuRead][DownloadTask] suspend lock prepared",
-        "owner=",pseudo_owned and "pseudo_lockscreen" or "download",
+        "owner=",pseudo_owned and "background_controller" or (device_is("Kindle") and "none" or "download"),
         "lease=",tostring(ok),"ssid=",tostring(self.lockscreen_network_ssid or ""))
     return ok,ok and "prepared" or "lease_failed"
 end
@@ -761,14 +753,16 @@ function DownloadTask:_lockscreen_keepalive_allowed()
 end
 
 function DownloadTask:_reset_device_timeout()
-    -- Never reset Kindle's T1 timer on the visible Home/Reader surface. In
-    -- beta.11 it is also refreshed while PSEUDO_LOCKED, where the native sleep
-    -- image is visible but powerd has been returned to ACTIVE for the download.
     if not self:_lockscreen_keepalive_allowed() then return false end
+    if device_is("Kindle") then
+        -- T1 is owned exclusively by the Kindle background-alive controller.
+        -- Worker progress, stalls and process lifetime cannot own device power.
+        return PseudoLockscreen.active() == true
+    end
     local powerd = Device and Device.powerd
     if powerd and type(powerd.resetT1Timeout) == "function" then
         local ok, err = pcall(powerd.resetT1Timeout, powerd)
-        if not ok then logger.warn("[MiuRead][DownloadTask] Kindle T1 reset failed", tostring(err)) end
+        if not ok then logger.warn("[MiuRead][DownloadTask] device timeout reset failed", tostring(err)) end
         return ok
     end
     return false
@@ -798,16 +792,19 @@ function DownloadTask:_hold_awake()
         self:_release_awake()
         return false
     end
+    if device_is("Kindle") and PseudoLockscreen.active()~=true then
+        self:_release_awake()
+        return false
+    end
     if PseudoLockscreen.active()==true then
         local stale=self.standby_held or SuspendWorkLease.has("download")
         self.standby_held=false
         SuspendWorkLease.release("download")
-        local reset=self:_reset_device_timeout()
+        local alive=self:_reset_device_timeout()
         if stale then
-            logger.warn("[MiuRead][SuspendLease][Invariant]",
-                "pseudo=true","download=true","action=release_download")
+            logger.info("[MiuRead][DownloadTask] worker power claim released; controller owns background")
         end
-        return reset==true or SuspendWorkLease.has("pseudo_lockscreen")
+        return alive==true or (not device_is("Kindle") and SuspendWorkLease.has("pseudo_lockscreen"))
     end
     if self.standby_held and SuspendWorkLease.has("download") then return true end
     local ok = SuspendWorkLease.acquire("download")
@@ -986,8 +983,7 @@ function DownloadTask:_heavy_watch(force)
     local progress_at=tonumber(job.last_effective_progress_at or job.last_progress_at or job.started_at) or now
     local snapshot={updated_at=now,owner="download",stage=stage,pid=job.pid,
         memory_kb=memory and memory.available_kb or nil,paused=self:is_paused(),
-        pause_ack=self:worker_pause_acknowledged(),
-        wake_lock=(self.standby_held==true or SuspendWorkLease.has("pseudo_lockscreen")),
+        pause_ack=self:worker_pause_acknowledged(),wake_lock=self.standby_held==true,
         last_progress_age=math.max(0,now-progress_at)}
     U.atomic_write(self.heavy_watch_path,Json.encode(snapshot),true)
     logger.info("[MiuRead][HeavyWatch]",
@@ -1508,46 +1504,25 @@ function DownloadTask:_poll()
                     "effective_idle="..tostring(effective_idle),
                     "terminal="..tostring(job.stall_terminal==true),
                 })
-                local locked=background_lock_mode(self.power_mode) or PseudoLockscreen.active()==true
-                if locked then
-                    -- Power safety is resolved BEFORE touching a sick worker.
-                    -- User wake/cover-open must never depend on process exit.
-                    self:_fail_open_locked_download(job,job.stall_terminal==true
-                        and "terminal_stall" or "stall_detected")
-                else
-                    self:_release_awake()
+                pcall(FFIUtil.terminateSubProcess,job.pid)
+                self:_release_awake()
+                if job.stall_terminal==true then
                     job.fail_open_deadline=now+math.max(4,tonumber(Config.DOWNLOAD_STALL_FAIL_OPEN_SECONDS) or 12)
                 end
-                local signaled,signal_reason=signal_worker(job.pid,15)
-                if not signaled and not locked then
-                    pcall(FFIUtil.terminateSubProcess,job.pid)
-                end
-                logger.warn("[MiuRead][WorkerRecovery]",
+                logger.warn("[MiuRead][DownloadTask] stalled worker termination requested",
                     "pid=",tostring(job.pid),"stage=",current_stage,
-                    "signal=SIGTERM","nonblocking=",tostring(signaled),
-                    "reason=",tostring(signal_reason or ""),
-                    "idle=",tostring(effective_idle),"terminal=",tostring(job.stall_terminal==true))
+                    "idle=",tostring(effective_idle),"terminal=",tostring(job.stall_terminal==true),
+                    "fail_open_deadline=",tostring(job.fail_open_deadline or ""))
                 self:_schedule()
                 return
             elseif now-job.stall_recovery_requested_at>=8 then
-                local locked=job.fail_open_done==true or PseudoLockscreen.active()==true
-                    or background_lock_mode(self.power_mode)
-                local signaled,signal_reason=signal_worker(job.pid,9)
-                if not signaled and not locked then
-                    pcall(FFIUtil.terminateSubProcess,job.pid)
-                end
-                if job.stall_force_signal_logged~=true then
-                    job.stall_force_signal_logged=true
-                    logger.warn("[MiuRead][WorkerRecovery]",
-                        "pid=",tostring(job.pid),"signal=SIGKILL",
-                        "nonblocking=",tostring(signaled),
-                        "reason=",tostring(signal_reason or ""))
-                end
+                -- A second terminate is harmless and avoids waiting forever on
+                -- firmware that delays the first signal while memory is tight.
+                pcall(FFIUtil.terminateSubProcess,job.pid)
             end
-            if job.fail_open_done~=true and tonumber(job.fail_open_deadline)
+            if job.stall_terminal==true and tonumber(job.fail_open_deadline)
                 and now>=tonumber(job.fail_open_deadline) then
-                self:_fail_open_locked_download(job,job.stall_terminal==true
-                    and "terminal_stall" or "stall_termination_timeout")
+                self:_fail_open_locked_download(job,"terminal_stall")
             end
         end
         if idle>=120 and not job.waiting_notified then

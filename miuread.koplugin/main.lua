@@ -23709,6 +23709,8 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
     if not still_suspended then
         self._reading_end_standby_held=false
         SuspendWorkLease.release("reader_finalizer")
+        pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
+        pcall(PseudoLockscreen.background_task_done,"reader_finalizer_user_visible")
         logger.info("[MiuRead][Power] reader finalizer ended after user wake",
             "ok=",tostring(ok==true))
         return true
@@ -23740,12 +23742,8 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
     end
     self._reading_end_standby_held=false
     SuspendWorkLease.release("reader_finalizer")
-    if PseudoLockscreen.active() and not download_continue then
-        -- If the download already finished while reader finalization was still
-        -- running, this is now the last background lease and the pseudo lock
-        -- may safely commit a real suspend.
-        pcall(PseudoLockscreen.background_task_done,"reader_finalizer")
-    end
+    pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
+    pcall(PseudoLockscreen.background_task_done,"reader_finalizer")
     logger.info("[MiuRead][Power] reader finalizer completed",
         "ok=",tostring(ok==true),"to=",tostring(target),
         "generation=",tostring(power.generation),
@@ -23864,16 +23862,28 @@ function Plugin:onSuspend()
         and self.ui and self.ui.document and self:_reader_session_is_weread()
         and self.sync and self.sync.reading_end_finalized~=true
     local pseudo_active=false
-    if download_continue then
-        local ok,entered,reason=pcall(PseudoLockscreen.begin,"download")
+    local power_platform=PseudoLockscreen.device_platform()
+    if power_platform=="kindle" then
+        pcall(PseudoLockscreen.set_download_active,download_continue)
+        if sync_candidate then pcall(PseudoLockscreen.set_task_active,"reader_finalizer",true) end
+    end
+    local wants_background=download_continue or (power_platform=="kindle" and sync_candidate)
+    if wants_background then
+        local ok,entered,reason=pcall(PseudoLockscreen.begin,download_continue and "download_or_sync" or "reader_finalizer")
         pseudo_active=ok and entered==true
-        logger.info("[MiuRead][Power] pseudo lock request",
+        logger.info("[MiuRead][Power] background-alive request",
+            "platform=",tostring(power_platform),
             "active=",tostring(pseudo_active),"reason=",tostring(ok and reason or entered or "error"))
         if not pseudo_active then
-            download_continue=false
-            download_reason="pseudo_lock_failed:"..tostring(ok and reason or entered or "error")
-            logger.warn("[MiuRead][Power] background download disabled for this suspend",
-                "reason=",download_reason)
+            if download_continue then
+                download_continue=false
+                download_reason="background_alive_failed:"..tostring(ok and reason or entered or "error")
+                if power_platform=="kindle" then pcall(PseudoLockscreen.set_download_active,false) end
+            end
+            if power_platform=="kindle" and sync_candidate then
+                sync_candidate=false
+                pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
+            end
         end
     end
     -- Download-only suspend can arm the shared lease and platform network
@@ -23903,6 +23913,8 @@ function Plugin:onSuspend()
         if not sync_continue then
             self._reading_end_standby_held=false
             SuspendWorkLease.release("reader_finalizer")
+            pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
+            pcall(PseudoLockscreen.background_task_done,"reader_finalizer_not_started")
         end
     end
     -- A live download keeps its native/pseudo lock mode even while the reader
@@ -24029,11 +24041,6 @@ function Plugin:onSuspend()
 end
 function Plugin:onResume()
     local pseudo_resume=PseudoLockscreen.on_resume_event()
-    if pseudo_resume=="commit" then
-        logger.info("[MiuRead][Power] pseudo lock commit-phase resume ignored",
-            "generation=",tostring(PowerState.generation()))
-        return
-    end
     if pseudo_resume=="hold" then
         -- Internal Kindle wake: powerd is ACTIVE again, but the user still sees
         -- the retained sleep screen. Keep MiuRead frozen and only re-arm the
