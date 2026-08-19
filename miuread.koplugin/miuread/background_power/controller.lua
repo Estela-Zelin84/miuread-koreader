@@ -1,5 +1,5 @@
 -- Compatibility facade for the background-power subsystem.
--- Kindle uses the clean BACKGROUND_ALIVE backend. Kobo keeps the previously
+-- Kindle uses the SCREEN_SAVER_HOLD backend. Kobo keeps the previously
 -- validated pseudo-lock implementation unchanged and isolated.
 local Device = require("device")
 local Kindle

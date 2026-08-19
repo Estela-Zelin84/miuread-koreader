@@ -14,7 +14,8 @@ local DownloadTask = {}
 DownloadTask.__index = DownloadTask
 
 local function background_lock_mode(mode)
-    return mode == "DOWNLOAD_LOCKED" or mode == "PSEUDO_LOCKED" or mode == "SUSPEND_PENDING"
+    return mode == "DOWNLOAD_LOCKED" or mode == "PSEUDO_LOCKED"
+        or mode == "SCREEN_SAVER_HOLD" or mode == "SUSPEND_PENDING"
 end
 
 local function is_android()
@@ -742,7 +743,7 @@ function DownloadTask:prepare_suspend_lock()
         ok=true
     elseif device_is("Kindle") then
         -- Kindle workers are never allowed to create a power owner. The
-        -- background-alive controller must already exist before a locked
+        -- screen-saver hold controller must already exist before a locked
         -- download can continue.
         self:_release_awake()
         ok=false
@@ -767,8 +768,8 @@ end
 function DownloadTask:_reset_device_timeout()
     if not self:_lockscreen_keepalive_allowed() then return false end
     if device_is("Kindle") then
-        -- T1 is owned exclusively by the Kindle background-alive controller.
-        -- Worker progress, stalls and process lifetime cannot own device power.
+        -- Kindle workers do not touch T1 or powerd. A true result only
+        -- means the screen-saver hold session is still owned by the controller.
         return PseudoLockscreen.active() == true
     end
     local powerd = Device and Device.powerd

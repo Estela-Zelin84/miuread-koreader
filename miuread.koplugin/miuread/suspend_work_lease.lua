@@ -74,8 +74,8 @@ function M.acquire(reason)
     value.changed_at = os.time()
     if not value.held then
         if is_kindle() then
-            -- On Kindle, task leases are registry-only. The single
-            -- background-alive controller owns preventStandby/T1/AutoSuspend.
+            -- On Kindle, task leases are registry-only. Deep-suspend control
+            -- belongs to the screen-saver hold backend, never to a worker.
             -- A download/finalizer can die without owning device power.
             value.held = true
         else
