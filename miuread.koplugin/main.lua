@@ -1946,7 +1946,7 @@ function Plugin:_refresh_shelf_async(on_ready,silent)
             "books=",tostring(#books),"mp=",tostring(#mp))
         local stats=self.library.last_shelf_filter
         if stats and stats.kept==0 and stats.filtered>0 then
-            self:toast("所选书单没有找到书籍，已跳过 "..tostring(stats.filtered).." 本。\n可在“微信书架范围”重新选择，或临时加载全部书架。",5)
+            self:toast("所选分组没有找到书籍，已跳过 "..tostring(stats.filtered).." 本。\n可在“微信书架范围”重新选择，或临时加载全部书架。",5)
         end
         if on_ready then on_ready(books,mp,nil) end
     end
@@ -20859,7 +20859,7 @@ function Plugin:_shelf_filter_label()
     local count=0
     for _ in pairs(filter.archives) do count=count+1 end
     if count==0 then return "全部书架" end
-    return "指定书单 · "..tostring(count).." 个"
+    return "指定分组 · "..tostring(count).." 个"
 end
 
 function Plugin:_shelf_filter_add_name(name)
@@ -20868,15 +20868,15 @@ function Plugin:_shelf_filter_add_name(name)
     local p=self:_shelf_filter_prefs()
     p.shelf_filter.archives[name]=true
     self.store:save_preferences(p)
-    self:toast("已添加书单："..name,2)
+    self:toast("已添加分组："..name,2)
 end
 
 function Plugin:_shelf_filter_input()
     local d
     d=InputDialog:new{
-        title="添加书单名",
+        title="添加分组名",
         input="",
-        input_hint="需与微信读书内书单名完全一致",
+        input_hint="需与微信读书内分组名完全一致",
         buttons={{
             {text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},
             {text="添加",is_enter_default=true,callback=function()
@@ -20901,7 +20901,7 @@ function Plugin:shelf_filter_settings_menu()
         selected=view.archives
     end
     local rows={
-        {text="只显示指定书单",post_text="默认关闭 · 适合超大书架",checked_func=function()
+        {text="只显示指定分组",post_text="默认关闭 · 适合超大书架",checked_func=function()
             return view.enabled==true
         end,keep_menu_open=true,callback=function()
             write(function(f) f.enabled=f.enabled~=true end)
@@ -20918,7 +20918,7 @@ function Plugin:shelf_filter_settings_menu()
                 end
             end,true)
         end},
-        {text="手动添加书单名",post_text="列表中没有时使用",callback=function() self:_shelf_filter_input() end},
+        {text="手动添加分组名",post_text="列表中没有时使用",callback=function() self:_shelf_filter_input() end},
     }
     local cached=self.store:get("shelf_archive_names",{})
     local seen,list={},{}
@@ -20932,7 +20932,7 @@ function Plugin:shelf_filter_settings_menu()
     end
     table.sort(list)
     if #list==0 then
-        rows[#rows+1]={text="暂无可选书单",post_text="刷新一次微信书架后显示",enabled=false}
+        rows[#rows+1]={text="暂无可选分组",post_text="刷新一次微信书架后显示",enabled=false}
     end
     for _,name in ipairs(list) do
         local archive_name=name
