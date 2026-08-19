@@ -23869,6 +23869,12 @@ function Plugin:onSuspend()
         pseudo_active=ok and entered==true
         logger.info("[MiuRead][Power] pseudo lock request",
             "active=",tostring(pseudo_active),"reason=",tostring(ok and reason or entered or "error"))
+        if not pseudo_active then
+            download_continue=false
+            download_reason="pseudo_lock_failed:"..tostring(ok and reason or entered or "error")
+            logger.warn("[MiuRead][Power] background download disabled for this suspend",
+                "reason=",download_reason)
+        end
     end
     -- Download-only suspend can arm the shared lease and platform network
     -- intent immediately. This still runs inside KOReader's real Suspend
@@ -24023,6 +24029,11 @@ function Plugin:onSuspend()
 end
 function Plugin:onResume()
     local pseudo_resume=PseudoLockscreen.on_resume_event()
+    if pseudo_resume=="commit" then
+        logger.info("[MiuRead][Power] pseudo lock commit-phase resume ignored",
+            "generation=",tostring(PowerState.generation()))
+        return
+    end
     if pseudo_resume=="hold" then
         -- Internal Kindle wake: powerd is ACTIVE again, but the user still sees
         -- the retained sleep screen. Keep MiuRead frozen and only re-arm the
