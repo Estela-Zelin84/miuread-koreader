@@ -34,6 +34,18 @@ local function lower_worker_priority()
     return called
 end
 
+local function signal_worker(pid,signal)
+    pid=tonumber(pid)
+    signal=tonumber(signal) or 15
+    if not pid or pid<=1 then return false,"invalid_pid" end
+    local ok,ffi=pcall(require,"ffi")
+    if not ok or not ffi then return false,"ffi_unavailable" end
+    pcall(ffi.cdef,"int kill(int pid, int sig);")
+    local called,result=pcall(function() return ffi.C.kill(pid,signal) end)
+    if not called then return false,tostring(result) end
+    return tonumber(result)==0,tonumber(result)==0 and "signaled" or "kill_failed"
+end
+
 local function serializable_copy(value, seen)
     local kind = type(value)
     if kind == "string" or kind == "number" or kind == "boolean" or kind == "nil" then return value end
@@ -475,6 +487,7 @@ function DownloadTask:can_continue_locked()
         return false, "unsupported_suspend_platform"
     end
     if self.hibernated then return false,"hibernated" end
+    if self.job and self.job.fail_open_done==true then return false,"fail_open" end
     if self.store:preferences().download_keep_awake == false then return false, "disabled" end
     local task = self:_control_descriptor()
     if type(task) ~= "table" then return false, "no_task" end
@@ -720,17 +733,26 @@ function DownloadTask:prepare_suspend_lock()
         return false, "unsupported_suspend_platform"
     end
     if not self.keep_awake_enabled then return false,"disabled" end
-    -- This runs only after KOReader has entered its real Suspend callback, so
-    -- it cannot keep the normal Home surface awake. Arm the lease before the
-    -- rest of MiuRead's suspend work and assert the current network immediately.
     self.power_mode="SUSPEND_PENDING"
-    local ok=SuspendWorkLease.acquire("download")
-    self.standby_held=ok==true
+
+    -- The pseudo-lock session is the single standby owner. A second "download"
+    -- lease created an independent lifetime and could outlive/fight the visible
+    -- lock state. Keep only the pseudo lease once that session is active.
+    local pseudo_owned=PseudoLockscreen.active()==true
+    local ok=false
+    if pseudo_owned then
+        self:_release_awake()
+        ok=true
+    else
+        ok=SuspendWorkLease.acquire("download")==true
+        self.standby_held=ok
+    end
     self:_capture_lockscreen_network("suspend_pending")
     self:_guard_lockscreen_network(self.job,os.time(),true)
     logger.info("[MiuRead][DownloadTask] suspend lock prepared",
-        "lease=",tostring(ok==true),"ssid=",tostring(self.lockscreen_network_ssid or ""))
-    return ok==true,ok==true and "prepared" or "lease_failed"
+        "owner=",pseudo_owned and "pseudo_lockscreen" or "download",
+        "lease=",tostring(ok),"ssid=",tostring(self.lockscreen_network_ssid or ""))
+    return ok,ok and "prepared" or "lease_failed"
 end
 
 function DownloadTask:_lockscreen_keepalive_allowed()
@@ -776,6 +798,17 @@ function DownloadTask:_hold_awake()
         self:_release_awake()
         return false
     end
+    if PseudoLockscreen.active()==true then
+        local stale=self.standby_held or SuspendWorkLease.has("download")
+        self.standby_held=false
+        SuspendWorkLease.release("download")
+        local reset=self:_reset_device_timeout()
+        if stale then
+            logger.warn("[MiuRead][SuspendLease][Invariant]",
+                "pseudo=true","download=true","action=release_download")
+        end
+        return reset==true or SuspendWorkLease.has("pseudo_lockscreen")
+    end
     if self.standby_held and SuspendWorkLease.has("download") then return true end
     local ok = SuspendWorkLease.acquire("download")
     if ok then
@@ -794,6 +827,33 @@ function DownloadTask:_release_awake()
     self.standby_held = false
     SuspendWorkLease.release("download")
     if held then logger.info("[MiuRead][DownloadTask] standby lease released") end
+end
+
+function DownloadTask:_fail_open_locked_download(job,reason)
+    if not job or self.job~=job or job.fail_open_done==true then return false end
+    if not background_lock_mode(self.power_mode) and not PseudoLockscreen.active() then return false end
+    reason=tostring(reason or "unhealthy_worker")
+    job.fail_open_done=true
+    job.fail_open_at=os.time()
+    -- Never reacquire preventStandby after this boundary. The worker may still
+    -- need a moment to die, but the device is no longer allowed to depend on it
+    -- for power-state correctness.
+    self.power_mode="FAIL_OPEN"
+    self:_clear_lockscreen_network("fail_open:"..reason)
+    self:_release_awake()
+    PseudoLockscreen.set_download_active(false)
+    pcall(PseudoLockscreen.background_task_done,"download_fail_open:"..reason)
+    diagnostic_append(job.diagnostic_path,{
+        "time="..tostring(os.date("%Y-%m-%d %H:%M:%S")),
+        "event=lockscreen_fail_open",
+        "pid="..tostring(job.pid or ""),
+        "stage="..tostring((job.last_progress_state or {}).stage or "unknown"),
+        "reason="..reason,
+    })
+    logger.warn("[MiuRead][DownloadTask][FailOpen] lock-screen download released",
+        "pid=",tostring(job.pid or ""),"stage=",tostring((job.last_progress_state or {}).stage or "unknown"),
+        "reason=",reason)
+    return true
 end
 
 function DownloadTask:_network_link_state()
@@ -884,14 +944,20 @@ local HEAVY_STAGES={
     content=true,underlines=true,thoughts=true,footnotes=true,images=true,package=true,
     annotation_batch=true,annotation_apply=true,transform=true,
 }
-local STALL_RECOVERABLE_STAGES={prepare=true,catalog=true,content=true,images=true,resume=true}
+local STALL_RECOVERABLE_STAGES={
+    prepare=true,catalog=true,resume=true,content=true,images=true,
+    underlines=true,thoughts=true,footnotes=true,annotation_batch=true,
+    annotation_apply=true,transform=true,package=true,
+}
 
 local function stall_recovery_seconds(backgrounded,stage)
-    if backgrounded==true then
-        return math.max(60,tonumber(Config.DOWNLOAD_STALL_RECOVERY_SECONDS) or 120)
+    stage=tostring(stage or "")
+    local configured
+    if backgrounded==true and type(Config.DOWNLOAD_BACKGROUND_STALL_SECONDS)=="table" then
+        configured=tonumber(Config.DOWNLOAD_BACKGROUND_STALL_SECONDS[stage])
+    elseif backgrounded~=true and type(Config.DOWNLOAD_FOREGROUND_STALL_SECONDS)=="table" then
+        configured=tonumber(Config.DOWNLOAD_FOREGROUND_STALL_SECONDS[stage])
     end
-    local configured=type(Config.DOWNLOAD_FOREGROUND_STALL_SECONDS)=="table"
-        and tonumber(Config.DOWNLOAD_FOREGROUND_STALL_SECONDS[tostring(stage or "")]) or nil
     if configured then return math.max(30,configured) end
     return math.max(60,tonumber(Config.DOWNLOAD_STALL_RECOVERY_SECONDS) or 120)
 end
@@ -920,7 +986,8 @@ function DownloadTask:_heavy_watch(force)
     local progress_at=tonumber(job.last_effective_progress_at or job.last_progress_at or job.started_at) or now
     local snapshot={updated_at=now,owner="download",stage=stage,pid=job.pid,
         memory_kb=memory and memory.available_kb or nil,paused=self:is_paused(),
-        pause_ack=self:worker_pause_acknowledged(),wake_lock=self.standby_held==true,
+        pause_ack=self:worker_pause_acknowledged(),
+        wake_lock=(self.standby_held==true or SuspendWorkLease.has("pseudo_lockscreen")),
         last_progress_age=math.max(0,now-progress_at)}
     U.atomic_write(self.heavy_watch_path,Json.encode(snapshot),true)
     logger.info("[MiuRead][HeavyWatch]",
@@ -1348,7 +1415,7 @@ function DownloadTask:_poll()
     local waiting_too_long=waiting_since and now-waiting_since>=stall_sleep
         and not lockscreen_network_hold
     local stalled_too_long=effective_idle>=stall_sleep and not network_waiting
-    if not self:is_paused() and not waiting_too_long and not stalled_too_long then
+    if job.fail_open_done~=true and not self:is_paused() and not waiting_too_long and not stalled_too_long then
         local keepalive_gap=self.backgrounded
             and math.max(8,tonumber(Config.DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS) or 12) or 5
         if not job.last_keepalive or now-job.last_keepalive>=keepalive_gap then
@@ -1441,17 +1508,46 @@ function DownloadTask:_poll()
                     "effective_idle="..tostring(effective_idle),
                     "terminal="..tostring(job.stall_terminal==true),
                 })
-                pcall(FFIUtil.terminateSubProcess,job.pid)
-                self:_release_awake()
-                logger.warn("[MiuRead][DownloadTask] stalled worker termination requested",
+                local locked=background_lock_mode(self.power_mode) or PseudoLockscreen.active()==true
+                if locked then
+                    -- Power safety is resolved BEFORE touching a sick worker.
+                    -- User wake/cover-open must never depend on process exit.
+                    self:_fail_open_locked_download(job,job.stall_terminal==true
+                        and "terminal_stall" or "stall_detected")
+                else
+                    self:_release_awake()
+                    job.fail_open_deadline=now+math.max(4,tonumber(Config.DOWNLOAD_STALL_FAIL_OPEN_SECONDS) or 12)
+                end
+                local signaled,signal_reason=signal_worker(job.pid,15)
+                if not signaled and not locked then
+                    pcall(FFIUtil.terminateSubProcess,job.pid)
+                end
+                logger.warn("[MiuRead][WorkerRecovery]",
                     "pid=",tostring(job.pid),"stage=",current_stage,
+                    "signal=SIGTERM","nonblocking=",tostring(signaled),
+                    "reason=",tostring(signal_reason or ""),
                     "idle=",tostring(effective_idle),"terminal=",tostring(job.stall_terminal==true))
                 self:_schedule()
                 return
             elseif now-job.stall_recovery_requested_at>=8 then
-                -- A second terminate is harmless and avoids waiting forever on
-                -- firmware that delays the first signal while memory is tight.
-                pcall(FFIUtil.terminateSubProcess,job.pid)
+                local locked=job.fail_open_done==true or PseudoLockscreen.active()==true
+                    or background_lock_mode(self.power_mode)
+                local signaled,signal_reason=signal_worker(job.pid,9)
+                if not signaled and not locked then
+                    pcall(FFIUtil.terminateSubProcess,job.pid)
+                end
+                if job.stall_force_signal_logged~=true then
+                    job.stall_force_signal_logged=true
+                    logger.warn("[MiuRead][WorkerRecovery]",
+                        "pid=",tostring(job.pid),"signal=SIGKILL",
+                        "nonblocking=",tostring(signaled),
+                        "reason=",tostring(signal_reason or ""))
+                end
+            end
+            if job.fail_open_done~=true and tonumber(job.fail_open_deadline)
+                and now>=tonumber(job.fail_open_deadline) then
+                self:_fail_open_locked_download(job,job.stall_terminal==true
+                    and "terminal_stall" or "stall_termination_timeout")
             end
         end
         if idle>=120 and not job.waiting_notified then
@@ -1732,6 +1828,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         local LoggerChild = require("logger")
         local current_stage="bootstrap"
         local last_emitted_state={}
+        local heartbeat_seq=0
         local network_suggestion_detail
 
         local function write_direct(path,data)
@@ -1810,7 +1907,9 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     state.network_trigger_baseline=tonumber(network_suggestion_detail.trigger_baseline)
                 end
             end
+            heartbeat_seq=heartbeat_seq+1
             state.task_token = task_token
+            state.heartbeat_seq = heartbeat_seq
             state.updated_at = os.time()
             last_emitted_state=serializable_copy(state) or {}
             local wrote,write_error=write_json(progress_path,state,"progress")
@@ -1898,7 +1997,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     detail = detail or {}
                     local percent
                     if stage == "package" then
-                        percent = 0.96
+                        local package_fraction=math.max(0,math.min(1,tonumber(detail.package_fraction) or 0))
+                        percent = 0.96 + 0.03 * package_fraction
                     elseif total and total > 0 then
                         local base = (math.max(1, current) - 1) / total
                         local step = 0
@@ -1931,6 +2031,14 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                         waiting_network = detail.waiting_network==true or stage=="waiting_network" or nil,
                         network_wait_started_at = detail.network_wait_started_at,
                         network_wait_seconds = detail.network_wait_seconds,
+                        activity = detail.activity,
+                        transfer_bytes = detail.transfer_bytes,
+                        processed = detail.processed,
+                        process_total = detail.process_total,
+                        package_fraction = detail.package_fraction,
+                        package_entry = detail.package_entry,
+                        package_entry_bytes = detail.package_entry_bytes,
+                        package_entry_size = detail.package_entry_size,
                     }
                 end)
                 return {
@@ -2042,6 +2150,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         last_effective_progress_at = nil,
         waiting_started_at = nil,
         last_keepalive = 0,
+        fail_open_deadline = nil,
+        fail_open_done = false,
         dead_seen_at = nil,
         stall_recovery_requested_at = nil,
         stall_suspect_notified = false,

@@ -1,17 +1,17 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.6.7",
+    VERSION = "4.8.0-beta.4",
     SCHEMA = 114,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
-    -- 安装包自身保持 stable/beta 身份；用户选择的 OTA 通道独立保存。
-    -- 正式版默认仍走 stable，用户可在设置中主动切换到 beta。
-    UPDATE_CHANNEL = "stable",
-    UPDATE_CHANNEL_LABEL = "正式通道",
-    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+    -- 当前安装包自身仍有 stable/beta 身份；用户选择的 OTA 通道独立保存。
+    -- beta.20 起所有实时更新清单都由统一仓库 miuread-koreader 提供。
+    UPDATE_CHANNEL = "beta",
+    UPDATE_CHANNEL_LABEL = "内测通道",
+    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
     UPDATE_MANIFESTS = {
-        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
     },
     UPDATE_CHANNELS = {
         stable = {
@@ -102,8 +102,11 @@ local C = {
     -- replayed against a different book after the screen catches up.
     HOME_STALE_TAP_MS = 1200,
 
-    -- 阅读页继续保留下滑入口，同时允许顶部中央轻点打开觅阅菜单；
-    -- 刚进入阅读页的短暂残留点击会被吞掉，避免触发角落手势。
+    -- Reader discovery and stale-touch protection. The same MiuRead reader
+    -- toolbar can be opened by the existing downward swipe or by a deliberate
+    -- tap in the top-center band. Short-lived taps carried across the Home ->
+    -- Reader transition are consumed before they can become KOReader corner
+    -- actions (for example an unintended bookmark).
     READER_OPEN_GESTURE_GUARD_SECONDS = 0.75,
     READER_TOP_MENU_X_MIN = 0.25,
     READER_TOP_MENU_X_MAX = 0.75,
@@ -187,15 +190,28 @@ local C = {
     -- image transfers emit heartbeats, so large healthy archives are not
     -- mistaken for a stall.
     DOWNLOAD_STALL_RECOVERY_SECONDS = 120,
-    -- beta.24 keeps normal downloads unrestricted, but a progress dialog that
-    -- is actually visible uses stage-aware health thresholds. Catalog/prep
-    -- stalls recover sooner; healthy content/image transfers get more room.
+    -- beta.18 makes every stage that can keep a lock-screen download alive
+    -- participate in the same health model. Expensive annotation/package
+    -- stages get wider silence windows; any emitted progress heartbeat resets
+    -- the timer, so a large but healthy book is never killed merely for being
+    -- slow.
+    DOWNLOAD_BACKGROUND_STALL_SECONDS = {
+        prepare = 120, catalog = 120, resume = 120, content = 150, images = 180,
+        underlines = 180, thoughts = 180, footnotes = 180,
+        annotation_batch = 180, annotation_apply = 240, transform = 240, package = 300,
+    },
+    -- Foreground notices remain earlier than recovery. Heavy local stages still
+    -- use generous bounds to avoid turning a large comment set into a false
+    -- positive.
     DOWNLOAD_FOREGROUND_STALL_NOTICE_SECONDS = 25,
     DOWNLOAD_FOREGROUND_STALL_SECONDS = {
-        prepare = 50, catalog = 45, resume = 50, content = 75, images = 90,
+        prepare = 50, catalog = 60, resume = 50, content = 90, images = 120,
+        underlines = 150, thoughts = 180, footnotes = 150,
+        annotation_batch = 180, annotation_apply = 240, transform = 240, package = 300,
     },
     DOWNLOAD_CANCEL_FORCE_SECONDS = 4,
     DOWNLOAD_STALL_RESTART_GRACE_SECONDS = 3,
+    DOWNLOAD_STALL_FAIL_OPEN_SECONDS = 12,
     DOWNLOAD_STALL_AUTO_RESTARTS = 1,
     DOWNLOAD_TRANSFER_HEARTBEAT_SECONDS = 3,
     DOWNLOAD_TRANSFER_HEARTBEAT_BYTES = 512 * 1024,

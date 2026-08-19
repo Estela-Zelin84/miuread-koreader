@@ -1946,7 +1946,7 @@ function Plugin:_refresh_shelf_async(on_ready,silent)
             "books=",tostring(#books),"mp=",tostring(#mp))
         local stats=self.library.last_shelf_filter
         if stats and stats.kept==0 and stats.filtered>0 then
-            self:toast("所选书单没有找到书籍，已跳过 "..tostring(stats.filtered).." 本。\n可在“微信书架范围”重新选择，或临时加载全部书架。",5)
+            self:toast("所选分组没有找到书籍，已跳过 "..tostring(stats.filtered).." 本。\n可在“微信书架范围”重新选择，或临时加载全部书架。",5)
         end
         if on_ready then on_ready(books,mp,nil) end
     end
@@ -20859,7 +20859,7 @@ function Plugin:_shelf_filter_label()
     local count=0
     for _ in pairs(filter.archives) do count=count+1 end
     if count==0 then return "全部书架" end
-    return "指定书单 · "..tostring(count).." 个"
+    return "指定分组 · "..tostring(count).." 个"
 end
 
 function Plugin:_shelf_filter_add_name(name)
@@ -20868,15 +20868,15 @@ function Plugin:_shelf_filter_add_name(name)
     local p=self:_shelf_filter_prefs()
     p.shelf_filter.archives[name]=true
     self.store:save_preferences(p)
-    self:toast("已添加书单："..name,2)
+    self:toast("已添加分组："..name,2)
 end
 
 function Plugin:_shelf_filter_input()
     local d
     d=InputDialog:new{
-        title="添加书单名",
+        title="添加分组名",
         input="",
-        input_hint="需与微信读书内书单名完全一致",
+        input_hint="需与微信读书内分组名完全一致",
         buttons={{
             {text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},
             {text="添加",is_enter_default=true,callback=function()
@@ -20901,7 +20901,7 @@ function Plugin:shelf_filter_settings_menu()
         selected=view.archives
     end
     local rows={
-        {text="只显示指定书单",post_text="默认关闭 · 适合超大书架",checked_func=function()
+        {text="只显示指定分组",post_text="默认关闭 · 适合超大书架",checked_func=function()
             return view.enabled==true
         end,keep_menu_open=true,callback=function()
             write(function(f) f.enabled=f.enabled~=true end)
@@ -20918,7 +20918,7 @@ function Plugin:shelf_filter_settings_menu()
                 end
             end,true)
         end},
-        {text="手动添加书单名",post_text="列表中没有时使用",callback=function() self:_shelf_filter_input() end},
+        {text="手动添加分组名",post_text="列表中没有时使用",callback=function() self:_shelf_filter_input() end},
     }
     local cached=self.store:get("shelf_archive_names",{})
     local seen,list={},{}
@@ -20932,7 +20932,7 @@ function Plugin:shelf_filter_settings_menu()
     end
     table.sort(list)
     if #list==0 then
-        rows[#rows+1]={text="暂无可选书单",post_text="刷新一次微信书架后显示",enabled=false}
+        rows[#rows+1]={text="暂无可选分组",post_text="刷新一次微信书架后显示",enabled=false}
     end
     for _,name in ipairs(list) do
         local archive_name=name
@@ -23754,6 +23754,52 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
     return true
 end
 
+local function suspend_lease_names(snapshot)
+    local names={}
+    for reason,enabled in pairs(type(snapshot)=="table" and snapshot.reasons or {}) do
+        if enabled==true then names[#names+1]=tostring(reason) end
+    end
+    table.sort(names)
+    return #names>0 and table.concat(names,",") or "none"
+end
+
+function Plugin:_power_diagnostic(kind,power_state,download_continue,download_reason)
+    local device=HomeData.quick_power_state(true) or {}
+    local leases=SuspendWorkLease.snapshot()
+    local pseudo=PseudoLockscreen.snapshot()
+    local memory=RuntimePressure.memory_snapshot(false)
+    local stage=self.download_task and type(self.download_task.stage)=="function"
+        and self.download_task:stage() or "none"
+    logger.info("[MiuRead]["..tostring(kind or "PowerDiagnostic").."]",
+        "battery=",tostring(device.battery or "unknown"),
+        "charging=",tostring(device.charging==true),
+        "power=",tostring(power_state or PowerState.state()),
+        "download=",tostring(download_continue==true),
+        "download_reason=",tostring(download_reason or "unknown"),
+        "stage=",tostring(stage or "none"),
+        "pseudo_lock=",tostring(pseudo.active==true),
+        "leases=",suspend_lease_names(leases),
+        "memory_kb=",tostring(memory and memory.available_kb or "unknown"),
+        "return_target=",tostring(HOME_SESSION.return_target or "none"))
+    return true
+end
+
+function Plugin:_reconcile_power_leases(context)
+    local power=PowerState.state()
+    if not PseudoLockscreen.active() and SuspendWorkLease.has("pseudo_lockscreen") then
+        logger.warn("[MiuRead][SuspendLease] orphan pseudo lease released",
+            "context=",tostring(context or "unknown"),"power=",tostring(power))
+        SuspendWorkLease.release("pseudo_lockscreen")
+    end
+    if not PseudoLockscreen.active() and SuspendWorkLease.has("download")
+        and power~="PSEUDO_LOCKED" and power~="DOWNLOAD_LOCKED" and power~="SUSPEND_PENDING" then
+        logger.warn("[MiuRead][SuspendLease] orphan download lease released",
+            "context=",tostring(context or "unknown"),"power=",tostring(power))
+        SuspendWorkLease.release("download")
+    end
+    return true
+end
+
 function Plugin:_refresh_home_power_header(reason)
     HomeData.quick_power_state(true)
     if HomeView.is_shown() and not self:_active_reader_ui()
@@ -23805,6 +23851,7 @@ function Plugin:onSuspend()
             "state=",PowerState.state(),"generation=",tostring(PowerState.generation()))
         return
     end
+    self:_reconcile_power_leases("pre_suspend")
     local download_continue,download_reason=false,"no_download"
     if self.download_task and type(self.download_task.can_continue_locked)=="function" then
         local ok,value,reason=pcall(self.download_task.can_continue_locked,self.download_task)
@@ -23822,6 +23869,12 @@ function Plugin:onSuspend()
         pseudo_active=ok and entered==true
         logger.info("[MiuRead][Power] pseudo lock request",
             "active=",tostring(pseudo_active),"reason=",tostring(ok and reason or entered or "error"))
+        if not pseudo_active then
+            download_continue=false
+            download_reason="pseudo_lock_failed:"..tostring(ok and reason or entered or "error")
+            logger.warn("[MiuRead][Power] background download disabled for this suspend",
+                "reason=",download_reason)
+        end
     end
     -- Download-only suspend can arm the shared lease and platform network
     -- intent immediately. This still runs inside KOReader's real Suspend
@@ -23871,6 +23924,7 @@ function Plugin:onSuspend()
         "download_reason=",download_reason,
         "reader_finalizer=",tostring(sync_continue),
         "sleep_origin=",tostring(sleep_origin or "device_or_koreader"))
+    self:_power_diagnostic("SleepDiagnostic",power_target,download_continue,download_reason)
 
     self._miuread_suspended=true
     HOME_SESSION.suspended=true
@@ -23975,6 +24029,11 @@ function Plugin:onSuspend()
 end
 function Plugin:onResume()
     local pseudo_resume=PseudoLockscreen.on_resume_event()
+    if pseudo_resume=="commit" then
+        logger.info("[MiuRead][Power] pseudo lock commit-phase resume ignored",
+            "generation=",tostring(PowerState.generation()))
+        return
+    end
     if pseudo_resume=="hold" then
         -- Internal Kindle wake: powerd is ACTIVE again, but the user still sees
         -- the retained sleep screen. Keep MiuRead frozen and only re-arm the
@@ -24002,6 +24061,7 @@ function Plugin:onResume()
         local ok,err=pcall(self.download_task.on_user_resume_begin,self.download_task,PowerState.generation())
         if not ok then logger.warn("[MiuRead][Power] download wake-priority release failed",tostring(err)) end
     end
+    self:_reconcile_power_leases("user_resume")
     self._miuread_suspended=false
     HOME_SESSION.suspended=false
     StatusToast.set_blocked(false)
@@ -24028,6 +24088,8 @@ function Plugin:onResume()
         "generation=",tostring(power.generation),"slept=",tostring(slept),
         "abnormal_short_resume=",tostring(short_wake),
         "previous_download_continue=",tostring(previous_power.download_continue==true))
+    self:_power_diagnostic("WakeDiagnostic","RESUMING",
+        previous_power.download_continue==true,tostring(previous_power.state or "unknown"))
     UIManager:scheduleIn(.08,function()
         if HOME_SESSION.suspended==true or self._miuread_suspended==true then return end
         HomeData.quick_power_state(true)

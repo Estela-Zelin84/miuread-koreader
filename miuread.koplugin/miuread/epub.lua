@@ -85,13 +85,14 @@ local function visit_source(source, callback)
     return true
 end
 
-local function source_stats(source)
+local function source_stats(source, on_chunk)
     local size = 0
     local crc = 0xffffffff
     local ok, err = visit_source(source, function(chunk)
         size = size + #chunk
         if size >= UINT32 then return false, "EPUB 单个文件超过 ZIP32 限制" end
         crc = crc32_update(crc, chunk)
+        if type(on_chunk) == "function" then on_chunk(#chunk, size) end
         return true
     end)
     if not ok then return nil, nil, err end
@@ -104,7 +105,7 @@ local function checked_write(file, data)
     return true
 end
 
-local function stream_zip(path, entries)
+local function stream_zip(path, entries, on_progress)
     local parent = path:match("^(.*)/[^/]+$")
     if parent then U.mkdir(parent) end
 
@@ -114,13 +115,33 @@ local function stream_zip(path, entries)
     local central = {}
     local offset = 0
     local entry_count = 0
+    local total_entries = #entries
+    local last_progress_at = os.time()
+
+    local function report_progress(phase, index, name, entry_bytes, entry_size, force)
+        if type(on_progress) ~= "function" then return end
+        local now = os.time()
+        if force ~= true and now - last_progress_at < 3 then return end
+        last_progress_at = now
+        on_progress({
+            phase = tostring(phase or "package"),
+            current = math.max(0, tonumber(index) or 0),
+            total = math.max(1, total_entries),
+            entry = tostring(name or ""),
+            entry_bytes = math.max(0, tonumber(entry_bytes) or 0),
+            entry_size = tonumber(entry_size),
+        })
+    end
 
     local ok, err = xpcall(function()
-        for _, entry in ipairs(entries) do
+        for index, entry in ipairs(entries) do
             local name = tostring(entry.name or "")
             if name == "" then error("EPUB ZIP 条目名称为空") end
+            local completed = index - 1
 
-            local crc, size, stat_error = source_stats(entry.source or entry.data or "")
+            local crc, size, stat_error = source_stats(entry.source or entry.data or "", function(_, scanned)
+                report_progress("scan", completed, name, scanned, nil, false)
+            end)
             if not crc then error(stat_error or ("无法读取 ZIP 条目：" .. name)) end
             if offset >= UINT32 then error("EPUB 文件超过 ZIP32 限制") end
 
@@ -132,8 +153,14 @@ local function stream_zip(path, entries)
             local wrote, write_error = checked_write(out, local_header)
             if not wrote then error(write_error) end
 
+            local written_bytes = 0
             local streamed, stream_error = visit_source(entry.source or entry.data or "", function(chunk)
-                return checked_write(out, chunk)
+                local wrote_chunk, chunk_error = checked_write(out, chunk)
+                if wrote_chunk then
+                    written_bytes = written_bytes + #chunk
+                    report_progress("write", completed, name, written_bytes, size, false)
+                end
+                return wrote_chunk, chunk_error
             end)
             if not streamed then error(stream_error or ("无法写入 ZIP 条目：" .. name)) end
 
@@ -146,9 +173,11 @@ local function stream_zip(path, entries)
                 .. u32(offset) .. name
             offset = offset + #local_header + size
             entry_count = entry_count + 1
+            report_progress("entry", entry_count, name, size, size, false)
         end
 
         if entry_count > 65535 then error("EPUB 条目数量超过 ZIP32 限制") end
+        report_progress("central", entry_count, "ZIP central directory", 0, nil, true)
         local central_offset = offset
         local central_size = 0
         for _, item in ipairs(central) do
@@ -202,7 +231,7 @@ local function binary_source(item)
     return tostring(item and item.data or "")
 end
 
-function E.build(path, book, chapters, css, assets, cover, meta)
+function E.build(path, book, chapters, css, assets, cover, meta, on_progress)
     chapters = chapters or {}
     assets = assets or {}
 
@@ -294,7 +323,7 @@ function E.build(path, book, chapters, css, assets, cover, meta)
     }
     entries[#entries + 1] = {name = "OEBPS/miuread.json", source = Json.encode(meta or {})}
 
-    stream_zip(path, entries)
+    stream_zip(path, entries, on_progress)
     return path
 end
 
