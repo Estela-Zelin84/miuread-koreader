@@ -1,5 +1,9 @@
 # Changelog
 
+## 4.9.0-beta.4 - 2026-08-20
+
+- 重构 Kindle 熄屏后台任务为 ScreenSaver Hold
+
 ## 4.9.0-beta.3 - 2026-08-19
 
 - 修复后台任务异常结束后的 Kindle 休眠链路
