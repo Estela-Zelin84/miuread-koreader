@@ -22,11 +22,55 @@ jobs:
       MANIFEST_NAME: update.json
 
     steps:
-      - name: Check out tagged source
+      - name: Check out main branch
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref }}
+          ref: main
           fetch-depth: 0
+
+      - name: Synchronize stable source identity to tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "${GITHUB_REF_TYPE:-}" = "tag"
+          git fetch --force --tags origin
+
+          BRANCH_SHA="$(git rev-parse HEAD)"
+          TAG_SHA="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
+          # 首次运行时 Tag 应指向分支最新提交；若本次发布已自动生成过
+          # 版本同步提交，重新运行 workflow 时允许 Tag 已经指向新的分支 HEAD。
+          if [ "$BRANCH_SHA" != "$GITHUB_SHA" ] && [ "$TAG_SHA" != "$BRANCH_SHA" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME 必须创建在 main 分支最新提交上。"
+            echo "::error::main=$BRANCH_SHA, current_tag=$TAG_SHA, event_source=$GITHUB_SHA"
+            exit 1
+          fi
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 .github/scripts/sync_release_identity.py \
+            --channel stable \
+            --version "$VERSION" \
+            --tag "$GITHUB_REF_NAME"
+
+          if ! git diff --quiet -- \
+              miuread.koplugin/miuread/config.lua \
+              miuread.koplugin/_meta.lua CHANGELOG.md; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add \
+              miuread.koplugin/miuread/config.lua \
+              miuread.koplugin/_meta.lua CHANGELOG.md
+            git commit -m "同步正式版本至 $VERSION" \
+              -m "根据 $GITHUB_REF_NAME 自动同步源码版本、发布通道与版本记录。"
+            git push origin "HEAD:main"
+
+            # 将用户创建的 Tag 移到版本同步后的提交，确保分支、Tag、Release 一致。
+            git tag -f "$GITHUB_REF_NAME" HEAD
+            git push --force origin "refs/tags/$GITHUB_REF_NAME"
+          fi
+
+          RELEASE_SOURCE_SHA="$(git rev-parse HEAD)"
+          echo "RELEASE_SOURCE_SHA=$RELEASE_SOURCE_SHA" >> "$GITHUB_ENV"
 
       - name: Read and validate stable identity
         shell: bash
@@ -408,7 +452,7 @@ jobs:
               --latest=false
           else
             gh release create "$CHANNEL_TAG" \
-              --target "$GITHUB_SHA" \
+              --target "$RELEASE_SOURCE_SHA" \
               --title "MiuRead Stable Update Channel" \
               --notes "$NOTES" \
               --latest=false
@@ -432,4 +476,51 @@ jobs:
           if [ "$success" != "1" ]; then
             echo "::error::固定正式更新清单尚不可用或内容校验失败。"
             exit 1
+          fi
+
+      - name: Sync released main history back to beta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main beta
+          MAIN_SHA="$(git rev-parse origin/main)"
+          BETA_SHA="$(git rev-parse origin/beta)"
+
+          if [ "$MAIN_SHA" != "$RELEASE_SOURCE_SHA" ]; then
+            echo "::warning::main 已在发布过程中继续前进，跳过自动回同步 beta。"
+            exit 0
+          fi
+
+          # 只有在 beta 确实已经被本次 main 吸收时才自动回同步。
+          # 若 beta 在发布期间又有新提交，不强行改写，避免覆盖新开发内容。
+          if ! git merge-base --is-ancestor "$BETA_SHA" "$MAIN_SHA"; then
+            echo "::warning::beta 已有未包含在本次正式版中的新提交，跳过自动回同步。"
+            exit 0
+          fi
+
+          git checkout -B beta-sync "$BETA_SHA"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # main 相对 beta 只应增加正式版身份/记录及可能的正式热修。
+          # 合并历史后恢复 beta 自身的版本号和默认通道，避免下一次 beta -> main
+          # 因发布身份不同产生重复冲突。
+          git merge --no-ff --no-commit "$MAIN_SHA"
+          git restore --source="$BETA_SHA" --staged --worktree -- \
+            miuread.koplugin/miuread/config.lua \
+            miuread.koplugin/_meta.lua
+
+          if git diff --cached --quiet; then
+            git merge --abort || true
+            echo "beta 已包含正式发布历史，无需回同步。"
+            exit 0
+          fi
+
+          git commit -m "同步正式版 $VERSION 发布记录回 beta" \
+            -m "保留 beta 自身版本与内测通道，仅同步 main 的正式发布历史，减少下一次合并冲突。"
+
+          if ! git push origin "HEAD:beta"; then
+            echo "::warning::beta 在回同步期间发生变化，未覆盖新提交；本次正式版发布不受影响。"
+            exit 0
           fi

@@ -21,11 +21,55 @@ jobs:
       MANIFEST_NAME: update-beta.json
 
     steps:
-      - name: Check out tagged source
+      - name: Check out beta branch
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref }}
+          ref: beta
           fetch-depth: 0
+
+      - name: Synchronize beta source identity to tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "${GITHUB_REF_TYPE:-}" = "tag"
+          git fetch --force --tags origin
+
+          BRANCH_SHA="$(git rev-parse HEAD)"
+          TAG_SHA="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
+          # 首次运行时 Tag 应指向分支最新提交；若本次发布已自动生成过
+          # 版本同步提交，重新运行 workflow 时允许 Tag 已经指向新的分支 HEAD。
+          if [ "$BRANCH_SHA" != "$GITHUB_SHA" ] && [ "$TAG_SHA" != "$BRANCH_SHA" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME 必须创建在 beta 分支最新提交上。"
+            echo "::error::beta=$BRANCH_SHA, current_tag=$TAG_SHA, event_source=$GITHUB_SHA"
+            exit 1
+          fi
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 .github/scripts/sync_release_identity.py \
+            --channel beta \
+            --version "$VERSION" \
+            --tag "$GITHUB_REF_NAME"
+
+          if ! git diff --quiet -- \
+              miuread.koplugin/miuread/config.lua \
+              miuread.koplugin/_meta.lua CHANGELOG.md; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add \
+              miuread.koplugin/miuread/config.lua \
+              miuread.koplugin/_meta.lua CHANGELOG.md
+            git commit -m "同步 Beta 版本至 $VERSION" \
+              -m "根据 $GITHUB_REF_NAME 自动同步源码版本、发布通道与版本记录。"
+            git push origin "HEAD:beta"
+
+            # 将用户创建的 Tag 移到版本同步后的提交，确保分支、Tag、Release 一致。
+            git tag -f "$GITHUB_REF_NAME" HEAD
+            git push --force origin "refs/tags/$GITHUB_REF_NAME"
+          fi
+
+          RELEASE_SOURCE_SHA="$(git rev-parse HEAD)"
+          echo "RELEASE_SOURCE_SHA=$RELEASE_SOURCE_SHA" >> "$GITHUB_ENV"
 
       - name: Read and validate beta identity
         shell: bash
@@ -520,7 +564,7 @@ jobs:
               fi
 
               if gh release create "$CHANNEL_TAG" \
-                  --target "$GITHUB_SHA" \
+                  --target "$RELEASE_SOURCE_SHA" \
                   --title "MiuRead Beta Update Channel" \
                   --notes "$CHANNEL_NOTES" \
                   --prerelease \
