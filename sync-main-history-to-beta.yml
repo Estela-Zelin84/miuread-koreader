@@ -1,0 +1,61 @@
+name: One-time sync main history into beta
+
+on:
+  push:
+    branches:
+      - beta
+    paths:
+      - ".github/workflows/sync-main-history-to-beta.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: miuread-sync-main-history-to-beta
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Check out beta
+        uses: actions/checkout@v6
+        with:
+          ref: beta
+          fetch-depth: 0
+
+      - name: Sync main history without changing beta files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main beta --tags
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "beta before: $(git rev-parse HEAD)"
+          echo "main:        $(git rev-parse origin/main)"
+
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "main is already contained in beta; no history merge needed."
+          else
+            # Important: record main as merged, but keep the current beta tree.
+            # Current beta already contains/supersedes the functional changes
+            # from main; this avoids bringing older stable implementations back.
+            git merge -s ours origin/main \
+              -m "同步 main 历史至 beta（保留 beta 内容）" \
+              -m "记录 main 已同步到 beta，保持当前 beta 文件树与内测通道身份不变。"
+          fi
+
+          # This workflow is intentionally one-shot. Remove it before pushing
+          # so beta's final file tree returns to its pre-sync state.
+          git rm -f .github/workflows/sync-main-history-to-beta.yml
+          git commit -m "移除临时分支同步工作流"
+
+          git push origin HEAD:beta
+
+          echo "beta after: $(git rev-parse HEAD)"
+          git merge-base --is-ancestor origin/main HEAD
