@@ -424,9 +424,13 @@ function Http:_jar()
     local jar, changed = Cookies.sanitize(original)
     if changed then
         auth.cookies = jar
-        self.store:save_auth(auth)
-        logger.info("[MiuRead][HTTP] removed temporary cookies from saved login",
-            "names=", table.concat(Cookies.names(jar), ","))
+        local saved,save_error=self.store:save_auth(auth)
+        if saved==true then
+            logger.info("[MiuRead][HTTP] removed temporary cookies from saved login",
+                "names=", table.concat(Cookies.names(jar), ","))
+        else
+            logger.warn("[MiuRead][HTTP] cookie cleanup not persisted",Util.first_line(save_error or "unknown",160))
+        end
     end
     return jar
 end
@@ -441,8 +445,13 @@ function Http:_save_jar(jar, expected_login_session_id)
     local cleaned = Cookies.sanitize(jar or {})
     if not Cookies.same(auth.cookies or {}, cleaned) then
         auth.cookies = cleaned
-        self.store:save_auth(auth)
+        local saved,save_error=self.store:save_auth(auth)
+        if saved~=true then
+            logger.warn("[MiuRead][HTTP] refreshed cookies not persisted",Util.first_line(save_error or "unknown",160))
+            return false,save_error
+        end
     end
+    return true
 end
 
 function Http:_save_response_auth_headers(headers, expected_login_session_id)
@@ -467,7 +476,11 @@ function Http:_save_response_auth_headers(headers, expected_login_session_id)
         changed = true
     end
     if changed then
-        self.store:save_auth(auth)
+        local saved,save_error=self.store:save_auth(auth)
+        if saved~=true then
+            logger.warn("[MiuRead][HTTP] public-account credential not persisted",Util.first_line(save_error or "unknown",160))
+            return false
+        end
         logger.info("[MiuRead][HTTP] public-account credential refreshed",
             "ticket=", tostring(auth.wr_ticket ~= ""), "wrpa=", tostring(auth.wr_wrpa ~= ""))
     end
@@ -497,7 +510,10 @@ function Http:_request_once(opt)
     end
 
     for hop = 0, redirects do
-        local chunks = {}
+        local chunks, preview = {}, {}
+        local preview_bytes, total_bytes = 0, 0
+        local sink_path=tostring(opt.sink_path or "")
+        local stream_file,stream_error
         socketutil:set_timeout((opt.timeout and opt.timeout[1]) or 15, (opt.timeout and opt.timeout[2]) or 35)
         local transport
         if current:match("^https:") then
@@ -510,15 +526,53 @@ function Http:_request_once(opt)
             return nil, nil, nil, current, "HTTP transport unavailable"
         end
         self:_pace(current, opt)
+        if sink_path~="" then
+            local parent=sink_path:match("^(.*)/[^/]+$")
+            if parent and parent~="" then Util.mkdir(parent) end
+            stream_file,stream_error=io.open(sink_path,"wb")
+            if not stream_file then
+                socketutil:reset_timeout()
+                return nil,nil,nil,current,"download sink open failed: "..tostring(stream_error or sink_path)
+            end
+        end
         local first_data_at
+        local request_started=clock_now()
+        local last_chunk_report_at=request_started
+        local last_chunk_report_bytes=0
+        local heartbeat_seconds=math.max(1,tonumber(opt.heartbeat_seconds)
+            or tonumber(Config.DOWNLOAD_TRANSFER_HEARTBEAT_SECONDS) or 3)
+        local heartbeat_bytes=math.max(64*1024,tonumber(opt.heartbeat_bytes)
+            or tonumber(Config.DOWNLOAD_TRANSFER_HEARTBEAT_BYTES) or 512*1024)
         local sink=function(chunk,err)
             if chunk then
                 if not first_data_at then first_data_at=clock_now() end
-                chunks[#chunks+1]=chunk
+                total_bytes=total_bytes+#chunk
+                if stream_file then
+                    local wrote,write_error=stream_file:write(chunk)
+                    if not wrote then
+                        stream_error=write_error or "download sink write failed"
+                        return nil,stream_error
+                    end
+                    if preview_bytes<32768 then
+                        local part=chunk:sub(1,32768-preview_bytes)
+                        preview[#preview+1]=part
+                        preview_bytes=preview_bytes+#part
+                    end
+                else
+                    chunks[#chunks+1]=chunk
+                end
+                if type(opt.on_chunk)=="function" then
+                    local current_time=clock_now()
+                    if total_bytes-last_chunk_report_bytes>=heartbeat_bytes
+                        or current_time-last_chunk_report_at>=heartbeat_seconds then
+                        last_chunk_report_at=current_time
+                        last_chunk_report_bytes=total_bytes
+                        pcall(opt.on_chunk,total_bytes,current)
+                    end
+                end
             end
             return 1
         end
-        local request_started=clock_now()
         local force_ipv4=self.network_policy and self.network_policy:should_force_ipv4() or false
         local called, ok, code, resp_headers, status = self:_transport_request(transport, {
             url = current,
@@ -528,9 +582,19 @@ function Http:_request_once(opt)
             sink = sink,
         }, force_ipv4)
         local request_finished=clock_now()
+        if stream_file then
+            local flushed,flush_error=stream_file:flush()
+            stream_file:close()
+            stream_file=nil
+            if flushed==nil and not stream_error then stream_error=flush_error or "download sink flush failed" end
+        end
+        if type(opt.on_chunk)=="function" and total_bytes>last_chunk_report_bytes then
+            pcall(opt.on_chunk,total_bytes,current)
+        end
         socketutil:reset_timeout()
-        if not called then return nil, nil, nil, current, tostring(ok) end
-        local text = table.concat(chunks)
+        local text = sink_path~="" and table.concat(preview) or table.concat(chunks)
+        if stream_error then return text,nil,resp_headers,current,tostring(stream_error) end
+        if not called then return text, nil, resp_headers, current, tostring(ok) end
         code = tonumber(code)
         if code and self.network_policy then
             local response_delay=(first_data_at or request_finished)-request_started
@@ -611,9 +675,19 @@ function Http:request(opt)
             if not code and attempt > retries then
                 error("network request failed: " .. tostring(err or "unknown"))
             end
+            local retry_delay=math.min(2.5, 0.35 * (2 ^ (attempt - 1)))
+            if type(opt.on_retry)=="function" then
+                local retry_detail={
+                    attempt=attempt, next_attempt=attempt+1, maximum=retries+1,
+                    url=Util.redact_url(url or opt.url), code=tonumber(code),
+                    error=tostring(err or ""), wait_seconds=retry_delay,
+                }
+                local cb_ok,cb_err=pcall(opt.on_retry,retry_detail)
+                if not cb_ok then logger.warn("[MiuRead][HTTP] retry callback failed",tostring(cb_err)) end
+            end
             logger.warn("[MiuRead][HTTP] retry", "attempt=", tostring(attempt), "url=", Util.redact_url(url or opt.url),
                 "status=", tostring(code or err or "network"))
-            pause(math.min(2.5, 0.35 * (2 ^ (attempt - 1))))
+            pause(retry_delay)
         end
 
         if not limited_code then
@@ -784,6 +858,50 @@ function Http:download(url, opt)
     local body, code, headers, final = self:request(opt)
     if code < 200 or code >= 300 then error("download HTTP " .. tostring(code)) end
     return body, headers, final
+end
+
+-- Large chapter image archives must never be assembled as one Lua string on
+-- low-memory Kindles. The normal request path still owns cookies, redirects,
+-- retry pacing and IPv4 compatibility; only the response sink changes.
+function Http:download_to_file(url,path,opt)
+    path=tostring(path or "")
+    if path=="" then error("download target path required") end
+    local request_opt={}
+    for key,value in pairs(opt or {}) do request_opt[key]=value end
+    request_opt.url=url
+    request_opt.method=request_opt.method or "GET"
+    request_opt.sink_path=path
+    if request_opt.retries==nil then request_opt.retries=3 end
+    os.remove(path)
+    local called,preview,code,headers,final=pcall(self.request,self,request_opt)
+    if not called then
+        os.remove(path)
+        error(preview)
+    end
+    if not code or code<200 or code>=300 then
+        os.remove(path)
+        error("download HTTP "..tostring(code))
+    end
+    local size=Util.file_size(path)
+    if not size or size<=0 then
+        os.remove(path)
+        error("download returned empty content")
+    end
+    local expected=tonumber(hget(headers,"content-length") or "")
+    if expected and expected>=0 and size~=expected then
+        os.remove(path)
+        local attempt=math.max(1,tonumber(request_opt._integrity_attempt) or 1)
+        local maximum=math.max(1,tonumber(request_opt.integrity_attempts) or 2)
+        logger.warn("[MiuRead][HTTP] streamed download length mismatch",
+            "url=",Util.redact_url(url),"expected=",tostring(expected),"received=",tostring(size),
+            "attempt=",tostring(attempt),"maximum=",tostring(maximum))
+        if attempt<maximum then
+            request_opt._integrity_attempt=attempt+1
+            return self:download_to_file(url,path,request_opt)
+        end
+        error("download incomplete: expected "..tostring(expected).." bytes, received "..tostring(size))
+    end
+    return path,headers,final,{length=size,expected_length=expected,preview=preview}
 end
 
 Http.auth_error_code = auth_error_code

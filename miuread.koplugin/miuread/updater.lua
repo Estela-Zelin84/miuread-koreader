@@ -3,6 +3,7 @@ local Digests=require("miuread.digests")
 local U=require("miuread.util")
 local logger=require("logger")
 local Updater={}; Updater.__index=Updater
+local BOOT_SESSION_KEY="__MIUREAD_UPDATE_BOOT_SESSION"
 
 function Updater:new(http,store,version,plugin_root)
     return setmetatable({http=http,store=store,version=version,plugin_root=plugin_root},self)
@@ -36,19 +37,76 @@ local function with_github_mirrors(url,out,seen)
     end
 end
 
-function Updater:manifest_urls()
+function Updater:selected_channel()
+    local selected=""
+    if self.store and type(self.store.preferences)=="function" then
+        local ok,prefs=pcall(self.store.preferences,self.store)
+        if ok and type(prefs)=="table" and type(prefs.update)=="table" then
+            selected=tostring(prefs.update.channel or "")
+        end
+    end
+    if selected~="stable" and selected~="beta" then
+        selected=tostring(Config.UPDATE_CHANNEL or "stable")
+    end
+    if selected~="stable" and selected~="beta" then selected="stable" end
+    return selected
+end
+
+function Updater:channel_config(channel)
+    channel=tostring(channel or self:selected_channel())
+    local channels=Config.UPDATE_CHANNELS
+    local cfg=type(channels)=="table" and channels[channel] or nil
+    if type(cfg)=="table" then return cfg end
+    return {
+        label=Config.UPDATE_CHANNEL_LABEL,
+        manifest=Config.UPDATE_MANIFEST,
+        manifests=Config.UPDATE_MANIFESTS,
+    }
+end
+
+function Updater:channel_label(channel)
+    channel=tostring(channel or self:selected_channel())
+    local cfg=self:channel_config(channel)
+    return tostring(cfg.label or (channel=="beta" and "内测通道" or "正式通道"))
+end
+
+function Updater:manifest_urls(channel)
+    channel=tostring(channel or self:selected_channel())
+    local cfg=self:channel_config(channel)
     local out,seen={},{}
-    local configured=Config.UPDATE_MANIFESTS
+    local configured=cfg.manifests
     if type(configured)=="table" then
         for _,url in ipairs(configured) do with_github_mirrors(url,out,seen) end
     else
-        with_github_mirrors(Config.UPDATE_MANIFEST,out,seen)
+        with_github_mirrors(cfg.manifest,out,seen)
+    end
+    local preferred=tostring(self.store and self.store:get("update_last_good_manifest_url_"..channel,"") or "")
+    if preferred=="" then
+        preferred=tostring(self.store and self.store:get("update_last_good_manifest_url","") or "")
+    end
+    if preferred~="" and seen[preferred] then
+        for index,url in ipairs(out) do
+            if url==preferred then
+                table.remove(out,index)
+                table.insert(out,1,preferred)
+                break
+            end
+        end
     end
     return out
 end
 
-function Updater:manifest_url()
-    return self:manifest_urls()[1]
+function Updater:remember_manifest_route(url,channel)
+    url=tostring(url or "")
+    if not valid_https(url) or not self.store then return false end
+    channel=tostring(channel or self:selected_channel())
+    self.store:set("update_last_good_manifest_url_"..channel,url)
+    logger.info("[MiuRead][Updater] remembered manifest route",channel,url)
+    return true
+end
+
+function Updater:manifest_url(channel)
+    return self:manifest_urls(channel)[1]
 end
 
 local function collect_table_urls(value,out,seen)
@@ -158,16 +216,17 @@ local function clean_manifest_text(m)
     return {notes=notes or "",summary=summary or notes or "",name=name}
 end
 
-local function validate_manifest(m)
+local function validate_manifest(m,expected_channel)
     if type(m)~="table" or type(m.version)~="string" or m.version=="" then
         return nil,"更新清单缺少版本号"
     end
-    local expected_channel=tostring(Config.UPDATE_CHANNEL or "stable")
+    expected_channel=tostring(expected_channel or "stable")
     local manifest_channel=tostring(m.channel or "")
     if manifest_channel=="" and expected_channel=="stable" then manifest_channel="stable" end
     if manifest_channel~=expected_channel then
-        return nil,"更新清单通道不匹配：当前为"..expected_channel.."，清单为"..(manifest_channel~="" and manifest_channel or "未标记")
+        return nil,"更新清单通道不匹配：目标为"..expected_channel.."，清单为"..(manifest_channel~="" and manifest_channel or "未标记")
     end
+    m.channel=manifest_channel
     if m.package_type~=nil and tostring(m.package_type)~="full" then
         return nil,"更新清单不是全量包"
     end
@@ -178,23 +237,38 @@ local function validate_manifest(m)
 end
 
 function Updater:check()
-    local urls=self:manifest_urls()
+    local target_channel=self:selected_channel()
+    local channel_cfg=self:channel_config(target_channel)
+    local urls=self:manifest_urls(target_channel)
     if #urls==0 then return nil,"更新地址未配置" end
     local errors={}
     local fallback
+    local current_fallback
+    local canonical=tostring(channel_cfg.manifest or "")
     for _,url in ipairs(urls) do
         local ok,m=pcall(function()
-            return self.http:get_json(url,{auth=false,retries=1,redirects=8,timeout={15,45}})
+            return self.http:get_json(url,{
+                auth=false,
+                retries=tonumber(Config.UPDATE_MANIFEST_RETRIES) or 0,
+                redirects=8,
+                timeout={
+                    tonumber(Config.UPDATE_MANIFEST_CONNECT_TIMEOUT) or 4,
+                    tonumber(Config.UPDATE_MANIFEST_TOTAL_TIMEOUT) or 8,
+                },
+            })
         end)
         if ok then
-            local valid,reason=validate_manifest(m)
+            local valid,reason=validate_manifest(m,target_channel)
             if valid then
                 local cleaned,text_error=clean_manifest_text(m)
                 if not cleaned then
-                    fallback=fallback or U.copy(m)
-                    fallback.notes="更新说明显示异常 可继续下载安装"
-                    fallback.summary=fallback.notes
-                    fallback.name=tostring(m.name or "")
+                    if not fallback or U.semver_newer(m.version,fallback.version) then
+                        fallback=U.copy(m)
+                        fallback._manifest_source_url=url
+                        fallback.notes="更新说明显示异常 可继续下载安装"
+                        fallback.summary=fallback.notes
+                        fallback.name=tostring(m.name or "")
+                    end
                     errors[#errors+1]=text_error
                     logger.warn("[MiuRead][Updater] manifest text rejected",url,
                         "replacement_chars=",tostring(U.replacement_char_count(m.notes or "")),
@@ -205,10 +279,22 @@ function Updater:check()
                     if cleaned.name~=nil then m.name=cleaned.name end
                     logger.info("[MiuRead][Updater] manifest loaded",url,"version=",tostring(m.version),
                         "notes_utf8_valid=true")
-                    if not U.semver_newer(m.version,self.version) then
-                        return {current=true,version=m.version,name=m.name,notes=m.notes}
+                    if U.semver_newer(m.version,self.version) then
+                        m._manifest_source_url=url
+                        m._target_channel=target_channel
+                        return m
                     end
-                    return m
+                    local current={current=true,ahead=U.semver_compare(self.version,m.version)>0,
+                        version=m.version,name=m.name,notes=m.notes,_manifest_source_url=url,
+                        _target_channel=target_channel}
+                    if url==canonical then
+                        return current
+                    end
+                    if not current_fallback or U.semver_newer(m.version,current_fallback.version) then
+                        current_fallback=current
+                    end
+                    logger.warn("[MiuRead][Updater] non-authoritative manifest is not newer; checking canonical route",
+                        url,"version=",tostring(m.version))
                 end
             else
                 errors[#errors+1]=reason
@@ -219,11 +305,17 @@ function Updater:check()
         end
     end
     if fallback then
-        if not U.semver_newer(fallback.version,self.version) then
-            return {current=true,version=fallback.version,name=fallback.name,notes=fallback.notes}
+        if U.semver_newer(fallback.version,self.version) then
+            fallback._target_channel=target_channel
+            return fallback
         end
-        return fallback
+        if not current_fallback or U.semver_newer(fallback.version,current_fallback.version) then
+            current_fallback={current=true,ahead=U.semver_compare(self.version,fallback.version)>0,
+                version=fallback.version,name=fallback.name,notes=fallback.notes,
+                _manifest_source_url=fallback._manifest_source_url,_target_channel=target_channel}
+        end
     end
+    if current_fallback then return current_fallback end
     return nil,errors[#errors] or "无法读取更新清单"
 end
 
@@ -327,8 +419,9 @@ function Updater:install(path,manifest)
     if tostring(incoming_version or "")~=tostring(manifest.version or "") then
         return fail("更新包版本与清单不一致")
     end
-    if tostring(incoming_channel)~=tostring(Config.UPDATE_CHANNEL or "stable") then
-        return fail("更新包通道不匹配，已拒绝安装")
+    local target_channel=tostring(manifest.channel or "stable")
+    if tostring(incoming_channel)~=target_channel then
+        return fail("更新包通道与目标通道不匹配，已拒绝安装")
     end
     local roots=U.list(unpacked)
     if #roots~=1 or roots[1]~=incoming then
@@ -378,6 +471,8 @@ function Updater:install(path,manifest)
         backup=backup,
         package=path,
         installed_at=os.time(),
+        startup_attempts=0,
+        startup_confirmed=false,
     })
     logger.info("[MiuRead][Updater] update installed",
         "version=",tostring(manifest.version),
@@ -386,31 +481,149 @@ function Updater:install(path,manifest)
     return true
 end
 
-function Updater:startup()
-    local s=self.store:update_state()
-    if not s.pending then
-        self:_cleanup_update_artifacts()
-        return nil
+local function valid_plugin_tree(root)
+    root=tostring(root or "")
+    if root=="" then return false end
+    return U.file_exists(root.."/main.lua")
+        and U.file_exists(root.."/_meta.lua")
+        and U.file_exists(root.."/miuread/config.lua")
+end
+
+function Updater:_restore_backup(state,reason)
+    state=type(state)=="table" and state or {}
+    local backup=tostring(state.backup or "")
+    if backup=="" or not path_inside(self.store.updates_dir,backup) or not valid_plugin_tree(backup) then
+        logger.err("[MiuRead][Updater] rollback unavailable",
+            "reason=",tostring(reason or "startup failure"),
+            "backup=",backup~="" and backup or "missing")
+        return nil,"rollback unavailable"
     end
 
-    if tostring(s.expected)==tostring(self.version) then
+    local failed=self.plugin_root..".failed-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
+    U.remove_tree(failed)
+    local live_exists=valid_plugin_tree(self.plugin_root)
+    if live_exists then
+        local parked,park_error=os.rename(self.plugin_root,failed)
+        if not parked then
+            local copied,copy_error=U.copy_tree(self.plugin_root,failed)
+            if not copied then
+                return nil,"unable to preserve failed plugin: "..tostring(copy_error or park_error)
+            end
+            local removed,remove_error=U.remove_tree(self.plugin_root)
+            if not removed then
+                U.remove_tree(failed)
+                return nil,"unable to replace failed plugin: "..tostring(remove_error)
+            end
+        end
+    else
+        U.remove_tree(self.plugin_root)
+    end
+
+    local restored,restore_error=os.rename(backup,self.plugin_root)
+    if not restored then
+        restored,restore_error=U.copy_tree(backup,self.plugin_root)
+    end
+    if not restored or not valid_plugin_tree(self.plugin_root) then
+        U.remove_tree(self.plugin_root)
+        if live_exists and valid_plugin_tree(failed) then os.rename(failed,self.plugin_root) end
+        return nil,"rollback restore failed: "..tostring(restore_error or "invalid backup")
+    end
+
+    U.remove_tree(backup)
+    U.remove_tree(failed)
+    if state.package then self:_remove_download(state.package) end
+    self.store:save_update_state({})
+    self:_cleanup_update_artifacts()
+    logger.warn("[MiuRead][Updater] previous version restored after unconfirmed startup",
+        "expected=",tostring(state.expected),
+        "reason=",tostring(reason or "startup failure"))
+    return true
+end
+
+-- Called immediately after Store:new(), before optional device probes or UI
+-- setup. A freshly installed version gets exactly one trial startup. If KOReader
+-- had to be force-restarted before that trial was confirmed, the next launch
+-- restores the saved plugin tree before any non-essential startup work runs.
+function Updater:begin_startup()
+    local s=self.store:update_state()
+    if not s.pending then return nil end
+
+    local expected=tostring(s.expected or "")
+    local running=tostring(self.version or "")
+    -- FileManager and ReaderUI may instantiate the plugin more than once in the
+    -- same KOReader process. Count a trial only once per process; otherwise a
+    -- fast context switch could look like a failed reboot and trigger rollback.
+    local boot_session=rawget(_G,BOOT_SESSION_KEY)
+    if type(boot_session)=="table"
+        and tostring(boot_session.expected or "")==expected
+        and tostring(boot_session.running or "")==running then
+        return boot_session.state
+    end
+    if expected~=running then
+        -- The user has already put an older plugin tree back in place. Do not
+        -- leave the stale pending marker blocking all future updates. Only the
+        -- updater artifacts are removed; account/library data are untouched.
         if s.backup then U.remove_tree(s.backup) end
         if s.package then self:_remove_download(s.package) end
         self.store:save_update_state({})
         self:_cleanup_update_artifacts()
-        logger.info("[MiuRead][Updater] update confirmed; rollback files removed",
-            "version=",tostring(self.version))
-        return "updated"
+        logger.warn("[MiuRead][Updater] stale pending state cleared after external rollback",
+            "expected=",expected,"running=",running)
+        rawset(_G,BOOT_SESSION_KEY,{expected=expected,running=running,state="recovered"})
+        return "recovered"
     end
 
-    local protected={}
-    if type(s.backup)=="string" and s.backup~="" then protected[s.backup]=true end
-    if type(s.package)=="string" and s.package~="" then protected[s.package]=true end
-    self:_cleanup_update_artifacts(protected)
-    logger.warn("[MiuRead][Updater] update still pending",
-        "expected=",tostring(s.expected),
-        "running=",tostring(self.version))
-    return "mismatch"
+    local attempts=tonumber(s.startup_attempts or 0) or 0
+    if s.startup_confirmed~=true and attempts>=1 then
+        local ok,err=self:_restore_backup(s,"previous startup was not confirmed")
+        if ok then
+            rawset(_G,BOOT_SESSION_KEY,{expected=expected,running=running,state="rolled_back"})
+            return "rolled_back"
+        end
+        logger.err("[MiuRead][Updater] automatic rollback failed",tostring(err))
+        return "rollback_failed"
+    end
+
+    s.startup_attempts=attempts+1
+    s.startup_confirmed=false
+    s.startup_started_at=os.time()
+    self.store:save_update_state(s)
+    logger.info("[MiuRead][Updater] trial startup armed",
+        "version=",running,"attempt=",tostring(s.startup_attempts))
+    rawset(_G,BOOT_SESSION_KEY,{expected=expected,running=running,state="trial"})
+    return "trial"
+end
+
+-- Confirmation is deliberately separate from begin_startup(). main.lua calls
+-- this only after KOReader has returned to its event loop, so a plugin that
+-- hangs during init never loses its rollback copy.
+function Updater:confirm_startup()
+    local s=self.store:update_state()
+    if not s.pending or tostring(s.expected or "")~=tostring(self.version or "") then return nil end
+    s.startup_confirmed=true
+    s.startup_confirmed_at=os.time()
+    self.store:save_update_state(s)
+    if s.backup then U.remove_tree(s.backup) end
+    if s.package then self:_remove_download(s.package) end
+    self.store:save_update_state({})
+    self:_cleanup_update_artifacts()
+    logger.info("[MiuRead][Updater] update confirmed after responsive startup",
+        "version=",tostring(self.version))
+    rawset(_G,BOOT_SESSION_KEY,{expected=tostring(s.expected or ""),running=tostring(self.version or ""),state="updated"})
+    return "updated"
+end
+
+function Updater:cleanup_idle()
+    local s=self.store:update_state()
+    if s.pending then return false end
+    self:_cleanup_update_artifacts()
+    return true
+end
+
+-- Compatibility entry point for callers outside main.lua. It no longer
+-- confirms an update synchronously during Plugin:init().
+function Updater:startup()
+    return self:begin_startup()
 end
 
 return Updater

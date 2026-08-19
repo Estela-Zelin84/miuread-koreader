@@ -1,18 +1,33 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.0",
-    SCHEMA = 112,
+    VERSION = "4.6.7",
+    SCHEMA = 114,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
-    -- 正式版更新清单由 tag 发布流程生成，并作为固定 stable-channel Release
-    -- 资源提供。main/update.json 仅用于把 4.1.2 等旧正式版桥接到 4.3.0；
-    -- 4.3.0 起插件自身只读取 stable-channel，避免旧桥接清单参与后续判断。
+    -- 安装包自身保持 stable/beta 身份；用户选择的 OTA 通道独立保存。
+    -- 正式版默认仍走 stable，用户可在设置中主动切换到 beta。
     UPDATE_CHANNEL = "stable",
     UPDATE_CHANNEL_LABEL = "正式通道",
     UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
     UPDATE_MANIFESTS = {
         "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+    },
+    UPDATE_CHANNELS = {
+        stable = {
+            label = "正式通道",
+            manifest = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+            manifests = {
+                "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+            },
+        },
+        beta = {
+            label = "内测通道",
+            manifest = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
+            manifests = {
+                "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
+            },
+        },
     },
 
     -- 仅作为 GitHub 官方资源访问失败时的回退入口。
@@ -26,7 +41,27 @@ local C = {
     AUTO_UPDATE_INTERVAL = 24 * 60 * 60,
     AUTO_UPDATE_RETRY_INTERVAL = 6 * 60 * 60,
 
+    -- Manifest files are tiny. Fail over quickly between the official route and
+    -- mirrors, while package downloads keep their existing generous timeout.
+    UPDATE_MANIFEST_RETRIES = 0,
+    UPDATE_MANIFEST_CONNECT_TIMEOUT = 4,
+    UPDATE_MANIFEST_TOTAL_TIMEOUT = 8,
+
+    -- Warm only a small number of current-chapter comment groups after the
+    -- reader has been idle. This removes SQLite cold-open latency from taps
+    -- without moving large comment layouts into the foreground.
+    THOUGHT_PREWARM_DELAY = 2.8,
+    THOUGHT_PREWARM_GROUPS = 6,
+
+    -- Failed automatic cover fetches must not restart on every home gesture.
+    -- A manual refresh bypasses the runtime backoff once.
+    COVER_RETRY_DELAYS = {30, 120, 600, 1800},
+
     READ_INTERVAL = 60,
+    -- beta.24 never replays historical/suspend reading-time debt. Normal
+    -- reports stay on the established one-minute cadence and every request is
+    -- independently capped, avoiding burst uploads after reconnect/resume.
+    READ_REPORT_MAX_ELAPSED_SECONDS = 60,
     IDLE_TIMEOUT = 600,
     REMOTE_THRESHOLD = 2,
 
@@ -46,6 +81,40 @@ local C = {
     PERFORMANCE_WINDOW_SECONDS = 10 * 60,
     PERFORMANCE_REPEAT_COUNT = 2,
     PERFORMANCE_PROMPT_COOLDOWN = 7 * 24 * 60 * 60,
+    -- Repeated measured lag enables a temporary UI protection window. In
+    -- beta.26 this no longer throttles an already-running downloader; only a
+    -- manual lightweight choice or real memory pressure is global.
+    PERFORMANCE_AUTO_PROTECT_SECONDS = 10 * 60,
+    PERFORMANCE_MEMORY_PROTECT_SECONDS = 30 * 60,
+
+    -- Automatic home maintenance is serialized on memory-constrained Kindles.
+    -- Soft pressure enables temporary lightweight behavior; critical pressure
+    -- defers optional heavy work until memory becomes available again.
+    BACKGROUND_MEMORY_SOFT_KB = 48 * 1024,
+    BACKGROUND_MEMORY_CRITICAL_KB = 28 * 1024,
+    BACKGROUND_MEMORY_CHECK_SECONDS = 3,
+    BACKGROUND_SERIAL_GAP_SECONDS = 0.35,
+    BACKGROUND_RETRY_SECONDS = 0.9,
+    BACKGROUND_LEASE_TIMEOUT_SECONDS = 300,
+    HOME_FOREGROUND_BARRIER_SECONDS = 0.9,
+    HOME_POST_READER_BARRIER_SECONDS = 1.8,
+    -- Old taps delayed by a real UI stall are discarded instead of being
+    -- replayed against a different book after the screen catches up.
+    HOME_STALE_TAP_MS = 1200,
+
+    -- 阅读页继续保留下滑入口，同时允许顶部中央轻点打开觅阅菜单；
+    -- 刚进入阅读页的短暂残留点击会被吞掉，避免触发角落手势。
+    READER_OPEN_GESTURE_GUARD_SECONDS = 0.75,
+    READER_TOP_MENU_X_MIN = 0.25,
+    READER_TOP_MENU_X_MAX = 0.75,
+    READER_TOP_MENU_Y_MAX = 0.10,
+    HOME_REMOTE_SHELF_TTL_SECONDS = 30 * 60,
+    HOME_LOCAL_SHELF_TTL_SECONDS = 60 * 60,
+    HOME_REMOTE_COVER_BATCH = 4,
+    HOME_REMOTE_COVER_GAP_SECONDS = 0.45,
+    HOME_DERIVATIVE_COVER_BATCH = 2,
+    HOME_DERIVATIVE_COVER_GAP_SECONDS = 0.50,
+    HOME_COVER_THUMB_OVERSAMPLE = 1.22,
 
     -- Different user-visible operations have different normal costs.
     -- Only repeated slow samples of the SAME kind are combined. A single
@@ -59,19 +128,19 @@ local C = {
         reader_home = {slow_ms = 4000, extreme_ms = 8000, repeat_count = 2, single_extreme = true},
     },
 
-    -- Lightweight mode does not disable features. It gives the foreground
-    -- longer quiet windows, refreshes automatic sources less often, and
-    -- processes metadata/covers in smaller batches with wider gaps.
+    -- Lightweight mode does not disable features. Standard mode is faster in
+    -- beta.26 now that Home only works on the visible page; lightweight mode
+    -- keeps smaller cover batches and wider gaps as a fallback.
     LIGHTWEIGHT_HOME_REMOTE_TTL = 30 * 60,
     LIGHTWEIGHT_HOME_LOCAL_TTL = 60 * 60,
     LIGHTWEIGHT_HOME_IDLE_DELAY = 6,
     LIGHTWEIGHT_READER_IDLE_SECONDS = 1.5,
     LIGHTWEIGHT_LOCAL_METADATA_QUEUE = 3,
-    LIGHTWEIGHT_REMOTE_COVER_QUEUE = 4,
+    LIGHTWEIGHT_REMOTE_COVER_QUEUE = 2,
     LIGHTWEIGHT_DERIVATIVE_COVER_QUEUE = 1,
     LIGHTWEIGHT_METADATA_GAP = 0.75,
-    LIGHTWEIGHT_COVER_GAP = 0.65,
-    LIGHTWEIGHT_DERIVATIVE_GAP = 1.0,
+    LIGHTWEIGHT_COVER_GAP = 1.0,
+    LIGHTWEIGHT_DERIVATIVE_GAP = 1.1,
 
     -- Online features are verified by their real request. Renewal is recovery,
     -- never a prerequisite. Diagnostics never include account secrets.
@@ -84,15 +153,89 @@ local C = {
     DOWNLOAD_AUTO_RESTARTS = 2,
     DOWNLOAD_DIAGNOSTIC_KEEP = 3,
 
-    -- beta.3 treats download connectivity as a task-level state instead of
-    -- letting every remaining chapter exhaust its own retry tree. Three
-    -- consecutive chapter-level network failures enter one recovery wait; the
-    -- worker then probes the same host until the route is usable again.
-    DOWNLOAD_NETWORK_FAILURE_BREAKER = 3,
+    -- beta.9 opens the task-level network recovery path after the first full
+    -- chapter request has exhausted HTTP-level retries. Repeating the same
+    -- failing request across several chapters only wastes lock-screen time.
+    DOWNLOAD_NETWORK_FAILURE_BREAKER = 1,
     DOWNLOAD_NETWORK_RECOVERY_POLL_SECONDS = 6,
     DOWNLOAD_NETWORK_RECOVERY_MAX_POLL_SECONDS = 15,
+    -- beta.9 makes the lock-screen lease follow the useful download lifetime.
+    -- Healthy transfers keep Wi-Fi alive until completion. If the association
+    -- is lost, recovery keeps probing without a fixed attempt cap; only a long
+    -- ten-minute offline window (or low battery) gives the device back to deep
+    -- sleep after preserving the chapter checkpoint.
+    DOWNLOAD_NETWORK_GUARD_POLL_SECONDS = 8,
+    -- beta.11 keeps downloads in an ACTIVE pseudo-lock state instead of
+    -- asking Wi-Fi to survive a real system suspend. Kindle still reasserts
+    -- ensureConnection at low cadence; Kobo leaves a healthy association alone
+    -- because its normal pre-suspend Wi-Fi shutdown is bypassed until download
+    -- completion.
+    DOWNLOAD_LOCKSCREEN_LINK_GUARD_SECONDS = 5,
+    DOWNLOAD_KINDLE_ENSURE_REFRESH_SECONDS = 30,
+    DOWNLOAD_KINDLE_ENSURE_RETRY_SECONDS = 5,
+    DOWNLOAD_NETWORK_RESTORE_COOLDOWN_SECONDS = 20,
+    DOWNLOAD_NETWORK_RESTORE_MAX_ATTEMPTS = 0,
+    DOWNLOAD_NETWORK_LOCK_MAX_SECONDS = 600,
+    DOWNLOAD_NETWORK_HIBERNATE_SECONDS = 620,
+    DOWNLOAD_LOCKSCREEN_MIN_BATTERY_PERCENT = 10,
     DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS = 12,
     DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS = 300,
+
+    -- beta.23 keeps the five-minute sleep policy for a genuinely offline book,
+    -- but a worker that is still marked as active and produces no heartbeat is
+    -- recovered much earlier from its on-disk chapter checkpoint. Streaming
+    -- image transfers emit heartbeats, so large healthy archives are not
+    -- mistaken for a stall.
+    DOWNLOAD_STALL_RECOVERY_SECONDS = 120,
+    -- beta.24 keeps normal downloads unrestricted, but a progress dialog that
+    -- is actually visible uses stage-aware health thresholds. Catalog/prep
+    -- stalls recover sooner; healthy content/image transfers get more room.
+    DOWNLOAD_FOREGROUND_STALL_NOTICE_SECONDS = 25,
+    DOWNLOAD_FOREGROUND_STALL_SECONDS = {
+        prepare = 50, catalog = 45, resume = 50, content = 75, images = 90,
+    },
+    DOWNLOAD_CANCEL_FORCE_SECONDS = 4,
+    DOWNLOAD_STALL_RESTART_GRACE_SECONDS = 3,
+    DOWNLOAD_STALL_AUTO_RESTARTS = 1,
+    DOWNLOAD_TRANSFER_HEARTBEAT_SECONDS = 3,
+    DOWNLOAD_TRANSFER_HEARTBEAT_BYTES = 512 * 1024,
+    DOWNLOAD_STREAM_CHUNK_BYTES = 128 * 1024,
+
+    -- beta.19 heavy-resource arbitration. Ordinary background protection keeps
+    -- the beta.16 48/28 MB thresholds; only Native/FileManager transitions use
+    -- the higher guard because a resident download child plus FileManager can
+    -- exhaust old Kindle memory well before the global critical threshold.
+    HEAVY_NATIVE_HIBERNATE_KB = 96 * 1024,
+    HEAVY_NATIVE_CRITICAL_KB = 64 * 1024,
+    HEAVY_DOWNLOAD_RESUME_MIN_KB = 72 * 1024,
+
+    -- beta.4 coalesces repeated typography taps into one KOReader reflow. On a
+    -- low-memory/heavy-download overlap, let the downloader checkpoint first
+    -- instead of stacking layout work until the native renderer crashes.
+    TYPOGRAPHY_APPLY_DEBOUNCE_SECONDS = 0.42,
+    TYPOGRAPHY_REBUILD_HINT_SECONDS = 12,
+    TYPOGRAPHY_HIBERNATE_MEMORY_KB = 72 * 1024,
+    TYPOGRAPHY_CRITICAL_MEMORY_KB = 48 * 1024,
+    TYPOGRAPHY_HEAVY_WAIT_SECONDS = 8,
+    TYPOGRAPHY_DOWNLOAD_RESUME_DELAY_SECONDS = 2.2,
+    -- Remote cover fetching may coexist with a healthy download. It yields only
+    -- when a heavy download stage and real memory pressure overlap.
+    DOWNLOAD_COVER_COEXIST_MIN_KB = 80 * 1024,
+    DOWNLOAD_HIBERNATE_WAIT_SECONDS = 8,
+    DOWNLOAD_INTERACTION_RESUME_DELAY = 1.8,
+    -- beta.21 foreground arbitration: ordinary UI interaction no longer hard-pauses
+    -- the download worker. Heavy local stages yield behind a short absolute
+    -- deadline instead, so a lost UI callback can never strand the task.
+    DOWNLOAD_UI_YIELD_SECONDS = 2,
+    DOWNLOAD_UI_HEAVY_YIELD_MAX_SECONDS = 4,
+    DOWNLOAD_INTERACTION_STALE_SECONDS = 12,
+    DOWNLOAD_TRANSITION_STALE_SECONDS = 60,
+    HEAVY_WATCH_SECONDS = 10,
+
+    -- beta.17 power lifecycle: short resumes are diagnosed but never forced
+    -- back to sleep. Resume keeps optional background work quiet briefly.
+    SHORT_WAKE_SECONDS = 5,
+    POWER_RESUME_QUIET_SECONDS = 1.0,
 
     -- Download networking stays automatic by default. A compatibility prompt
     -- is considered only after several genuinely slow responses, then confirmed
