@@ -438,9 +438,12 @@ function M.on_suspend_while_active()
     end
 
     if s.finish_pending then
-        logger.info("[MiuRead][KindleAlive] real suspend edge held",
+        -- Background work has ended. This edge is initiated through KOReader's
+        -- own UIManager:suspend() path, so hand the lifecycle back to the
+        -- normal suspend bookkeeping instead of holding it inside KindleAlive.
+        logger.info("[MiuRead][KindleAlive] native suspend commit",
             "source=", tostring(ev and ev.name or "unknown"), "session=", tostring(s.session))
-        return "hold"
+        return "commit"
     end
 
     -- AutoSuspend is paused and Kindle T1 is refreshed while active. Therefore
@@ -464,30 +467,62 @@ function M.finish(reason)
     if not s.active or s.finish_pending or has_tasks() then return false end
     s.finish_pending = true
     s.finish_session = s.session
+    -- Do not let the original physical lock edge (which may be only a couple
+    -- seconds old for a short finalizer) get re-used as a fresh user-unlock
+    -- signal when we hand the session back to native suspend.
+    s.last_power_kind = nil
+    s.last_power_source = nil
+    s.last_power_name = nil
+    s.last_power_at = 0
+    s.last_power_self_injected = false
     stop_t1_guard()
     restore_autosuspend("finish")
     release_standby("finish")
     local session = s.session
-    logger.info("[MiuRead][KindleAlive] background complete; requesting native sleep",
+    logger.info("[MiuRead][KindleAlive] background complete; handing back to KOReader suspend",
         "reason=", tostring(reason or "done"), "session=", tostring(session))
-    local issued = power_button("background_complete_real_suspend", "suspend")
-    if not issued then
-        invalidate_session("finish_request_failed", true)
-        restore_visible_surface("finish_request_failed")
-        return false
-    end
-    UIManager:scheduleIn(4.0, function()
+
+    -- Do NOT toggle com.lab126.powerd powerButton here. That bypasses the
+    -- normal KOReader suspend lifecycle and can leave MiuRead/KOReader asleep
+    -- state out of sync with powerd. Ask UIManager to suspend normally; the
+    -- next onSuspend edge returns "commit" above and runs the ordinary
+    -- REAL_SUSPEND bookkeeping before Kindle actually sleeps.
+    UIManager:scheduleIn(0, function()
+        local current = state()
+        if not current.active or current.session ~= session or not current.finish_pending
+            or has_tasks() then return end
+        -- Native Kindle suspend is ultimately routed through powerd.toggleSuspend(),
+        -- which emits the same BUTTON_SUSPEND source (2) as a physical key.
+        -- Arm the existing short-lived self-injected classifier *only* around
+        -- this immediate native request, so the resulting suspend edge is
+        -- committed instead of being mistaken for a user unlock.
+        current.injected_expected_kind = "suspend"
+        current.injected_reason = "background_complete_native_suspend"
+        current.injected_until = os.time() + 3
+        local ok, err = pcall(UIManager.suspend, UIManager)
+        if not ok then
+            current.injected_expected_kind = nil
+            current.injected_reason = nil
+            current.injected_until = 0
+            logger.warn("[MiuRead][KindleAlive] KOReader native suspend request failed",
+                "session=", tostring(session), "error=", tostring(err))
+            current.finish_pending = false
+            invalidate_session("finish_request_failed", true)
+            restore_visible_surface("finish_request_failed")
+        end
+    end)
+
+    -- If KOReader stays runnable but never reaches ReadyToSuspend, fail visible.
+    -- On a successful real suspend this timer will not execute until Resume,
+    -- by which time readyToSuspend has already invalidated this session.
+    UIManager:scheduleIn(6.0, function()
         local current = state()
         if not current.active or current.session ~= session or not current.finish_pending then return end
-        logger.warn("[MiuRead][KindleAlive] real suspend confirmation timeout",
+        logger.warn("[MiuRead][KindleAlive] KOReader native suspend confirmation timeout",
             "session=", tostring(session))
         current.finish_pending = false
-        -- We are still executing, so kernel suspend did not complete. Convert
-        -- the ambiguous sleep-screen state to a visible UI rather than retrying
-        -- an unbounded Suspend/Wake loop.
-        power_button("finish_timeout_visible", "wake")
         invalidate_session("finish_timeout", true)
-        UIManager:scheduleIn(0.4, function() restore_visible_surface("finish_timeout") end)
+        restore_visible_surface("finish_timeout")
     end)
     return true
 end

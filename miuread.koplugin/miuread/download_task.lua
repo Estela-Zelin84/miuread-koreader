@@ -850,8 +850,10 @@ function DownloadTask:_fail_open_locked_download(job,reason)
     self.power_mode="FAIL_OPEN"
     self:_clear_lockscreen_network("fail_open:"..reason)
     self:_release_awake()
+    -- Mark only the download task inactive. The background-power controller
+    -- decides whether any other task still requires keepalive and performs the
+    -- eventual native suspend through KOReader, never through this worker.
     PseudoLockscreen.set_download_active(false)
-    pcall(PseudoLockscreen.background_task_done,"download_fail_open:"..reason)
     diagnostic_append(job.diagnostic_path,{
         "time="..tostring(os.date("%Y-%m-%d %H:%M:%S")),
         "event=lockscreen_fail_open",
