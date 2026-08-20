@@ -277,13 +277,173 @@ function Library:normalize(data)
     return books,mp
 end
 
+local function shelf_rows_by_id(cache)
+    local out={}
+    cache=type(cache)=="table" and cache or {}
+    for _,group in ipairs({cache.books or {},cache.mp or {}}) do
+        for _,row in ipairs(group) do
+            local id=tostring(type(row)=="table" and (row.bookId or row.book_id) or "")
+            if id~="" then out[id]=row end
+        end
+    end
+    return out
+end
+
+local function id_set(values)
+    local out={}
+    for _,value in ipairs(type(values)=="table" and values or {}) do
+        local id=tostring(value or "")
+        if id~="" then out[id]=true end
+    end
+    return out
+end
+
+function Library:_apply_stream_response(data)
+    data=type(data)=="table" and data or {}
+    local stream=type(data._miuread_stream)=="table" and data._miuread_stream or nil
+    if not (stream and stream.enabled==true and type(stream.ids)=="table" and #stream.ids>0) then
+        local books,mp=self:normalize(data)
+        self.store:save_shelf_cache({
+            books=books,mp=mp,updated_at=os.time(),
+            stream={enabled=false,ids={},hydrated_ids={},total=#books+#mp,source=stream and stream.source or "full"},
+        })
+        return books,mp,false
+    end
+
+    local hydrated_books,hydrated_mp=self:normalize(data)
+    local hydrated={}
+    for _,row in ipairs(hydrated_books) do hydrated[tostring(row.bookId or "")]=row end
+    for _,row in ipairs(hydrated_mp) do hydrated[tostring(row.bookId or "")]=row end
+
+    local previous=self.store:shelf_cache()
+    local cached=shelf_rows_by_id(previous)
+    local loaded=id_set(stream.hydrated_ids)
+    local books,mp={},{}
+    for index,value in ipairs(stream.ids) do
+        local id=tostring(value or "")
+        if id~="" then
+            local row=hydrated[id] and U.copy(hydrated[id]) or (cached[id] and U.copy(cached[id]) or nil)
+            if not row then
+                row={
+                    bookId=id,title="正在加载…",author="",cover=nil,progress=0,
+                    _stream_placeholder=true,
+                }
+            else
+                row._stream_placeholder=nil
+            end
+            row.bookId=id
+            row.rawIndex=index
+            row.cloudOrder=index
+            if loaded[id] then row._stream_placeholder=nil end
+            if Protocol.is_mp_account(id) then mp[#mp+1]=row else books[#books+1]=row end
+        end
+    end
+    -- onlyBookid responses are optimized for books and may omit the separate
+    -- public-account directory. Preserve an existing MP cache unless the index
+    -- explicitly supplied MP information; this avoids making the MP tab vanish
+    -- during an otherwise successful streamed book refresh.
+    local stream_has_mp=false
+    for _,id in ipairs(stream.ids or {}) do
+        if Protocol.is_mp_account(tostring(id or "")) then stream_has_mp=true; break end
+    end
+    if not stream_has_mp and data.mp==nil then
+        local existing={}
+        for _,row in ipairs(mp) do existing[tostring(row.bookId or "")]=true end
+        for _,row in ipairs(previous.mp or {}) do
+            local id=tostring(row.bookId or row.book_id or "")
+            if id~="" and not existing[id] then mp[#mp+1]=U.copy(row); existing[id]=true end
+        end
+    end
+    local stream_state={
+        enabled=true,
+        ids=U.copy(stream.ids),
+        hydrated_ids=U.copy(stream.hydrated_ids or {}),
+        total=tonumber(stream.total) or #stream.ids,
+        has_more=stream.has_more==true,
+        source=tostring(stream.source or "web_stream"),
+        updated_at=tonumber(stream.updated_at) or os.time(),
+    }
+    self.store:save_shelf_cache({books=books,mp=mp,updated_at=os.time(),stream=stream_state})
+    logger.info("[MiuRead][ShelfStream] index applied",
+        "total=",tostring(#stream.ids),"hydrated=",tostring(#(stream.hydrated_ids or {})),
+        "cached_reused=",tostring(#stream.ids-#(stream.hydrated_ids or {})))
+    return books,mp,true
+end
+
+function Library:merge_stream_batch(data,requested_ids)
+    local cache=self.store:shelf_cache()
+    local stream=type(cache.stream)=="table" and cache.stream or {}
+    if stream.enabled~=true then return false end
+    local books,mp=self:normalize(type(data)=="table" and data or {})
+    local fresh={}
+    for _,row in ipairs(books) do fresh[tostring(row.bookId or "")]=row end
+    for _,row in ipairs(mp) do fresh[tostring(row.bookId or "")]=row end
+    local groups={cache.books or {},cache.mp or {}}
+    local changed=0
+    for _,group in ipairs(groups) do
+        for index,row in ipairs(group) do
+            local id=tostring(row.bookId or row.book_id or "")
+            if fresh[id] then
+                local replacement=U.copy(fresh[id])
+                replacement.rawIndex=row.rawIndex
+                replacement.cloudOrder=row.cloudOrder
+                replacement._stream_placeholder=nil
+                group[index]=replacement
+                changed=changed+1
+            end
+        end
+    end
+    local loaded=id_set(stream.hydrated_ids)
+    for _,id in ipairs(type(requested_ids)=="table" and requested_ids or {}) do
+        id=tostring(id or "")
+        if id~="" and fresh[id] then loaded[id]=true end
+    end
+    local ordered={}
+    for _,id in ipairs(stream.ids or {}) do
+        id=tostring(id or "")
+        if loaded[id] then ordered[#ordered+1]=id end
+    end
+    stream.hydrated_ids=ordered
+    stream.updated_at=os.time()
+    cache.books,cache.mp=groups[1],groups[2]
+    cache.stream=stream
+    cache.updated_at=os.time()
+    self.store:save_shelf_cache(cache)
+    logger.info("[MiuRead][ShelfStream] batch merged",
+        "requested=",tostring(#(requested_ids or {})),"changed=",tostring(changed),
+        "hydrated=",tostring(#ordered),"total=",tostring(#(stream.ids or {})))
+    return changed>0
+end
+
+function Library:stream_missing(first,last)
+    local cache=self.store:shelf_cache()
+    local stream=type(cache.stream)=="table" and cache.stream or {}
+    if stream.enabled~=true then return {} end
+    local by_id=shelf_rows_by_id(cache)
+    first=math.max(1,tonumber(first) or 1)
+    last=math.min(#(stream.ids or {}),tonumber(last) or first)
+    local out={}
+    for index=first,last do
+        local id=tostring(stream.ids[index] or "")
+        local row=by_id[id]
+        if id~="" and (not row or row._stream_placeholder==true) then out[#out+1]=id end
+    end
+    return out
+end
+
 function Library:refresh(options)
-    local data=self.api:shelf(options)
-    local books,mp=self:normalize(data)
-    self.store:save_shelf_cache({books=books,mp=mp,updated_at=os.time()})
+    options=options or {}
+    local data
+    if options.stream==true and type(self.api.shelf_stream)=="function" then
+        data=self.api:shelf_stream(options)
+    else
+        data=self.api:shelf(options)
+    end
+    local books,mp=self:_apply_stream_response(data)
     return books,mp
 end
 function Library:cached() local c=self.store:shelf_cache(); return c.books or {},c.mp or {},c.updated_at end
+function Library:cached_stream() local c=self.store:shelf_cache(); return type(c.stream)=="table" and c.stream or {} end
 
 local function record_state(row)
     local downloaded=false

@@ -25,7 +25,7 @@ local defaults={
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
  preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",download_dir="",shelf_section="account",account_shelf_kind="books",shelf_filter={enabled=false,archives={}},home_ui={enabled=false,layout_version=23,layout_style="desk",display_size="standard",ui_font_mode="default",ui_font_face="",local_root="",local_roots={},local_browse_version=2,local_library_mode="auto",local_auto_update=true,performance_defaults_version=1,auto_scan=true,local_check_on_open=true,lockscreen_style="frame",page_by_section={},source_order={"account","generated","local","mp"},action_items={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false},action_order={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot"},action_layout_version=3,panel_items={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,koreader_settings=true,return_koreader=true,quit=true,sync=true,miuread_settings=false,downloads=false,restart=false,sleep=false},panel_order={"wifi","bluetooth","rotate","screenshot","full_refresh","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep"},panel_layout_version=3,more_expanded=false,network_metadata_defaults_version=2,network_metadata_user_set=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=false,show_status=false,show_recent=false,recent_actions={},edge_guard_enabled=true,edge_guard_percent=15,quick_layout_version=11,quick_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true},quick_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,library_scan=true,repair_while_reading=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="plugin",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,font="standard",font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0,close_upload_enabled=true},repair={auto_check=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=true,progress_enabled=true,progress_mode="close",success_notice_enabled=false,error_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
- library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
+ library={},sessions={},shelf_cache={books={},mp={},updated_at=0,stream={enabled=false,ids={},hydrated_ids={},total=0,source="",updated_at=0}},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},recent_reads={version=1,items={}},
 }
 local function invalidate_report_contexts_table(sessions)
@@ -1495,6 +1495,7 @@ function Store:clear_auth() return self:set("auth",U.copy(defaults.auth)) end
 function Store:clear_account_shelf_cache()
     local cache=self:shelf_cache()
     cache.books={}; cache.mp={}; cache.updated_at=0
+    cache.stream={enabled=false,ids={},hydrated_ids={},total=0,source="",updated_at=0}
     self:save_shelf_cache(cache)
 end
 function Store:preferences() return U.merge(defaults.preferences,self:get("preferences",{})) end
@@ -2244,7 +2245,86 @@ function Store:mark_read_report_consumed(stamp)
     for index=#ordered,21,-1 do rows[ordered[index].key]=nil end
     self:set("read_report_consumed",rows)
 end
+local PROGRESS_SESSION_FIELDS={
+    "pending_progress","progress_latest_sequence","progress_verified_sequence",
+    "progress_sync_state","progress_sync_message","progress_local_percent","progress_remote_percent","progress_decided_at",
+    "progress_upload_state","progress_upload_error","progress_upload_pending_at","progress_upload_verified_at",
+    "progress_upload_source","progress_upload_at","progress_upload_percent","progress_upload_chapter_uid",
+    "progress_upload_co","progress_upload_remote_co","progress_worker_active","progress_worker_updated_at",
+}
+
+local function progress_session_sequence(row)
+    row=type(row)=="table" and row or {}
+    local pending=type(row.pending_progress)=="table" and row.pending_progress or {}
+    return math.max(
+        tonumber(row.progress_latest_sequence or 0) or 0,
+        tonumber(row.progress_verified_sequence or 0) or 0,
+        tonumber(pending.progress_sequence or 0) or 0
+    )
+end
+
+local function progress_session_stamp(row)
+    row=type(row)=="table" and row or {}
+    return math.max(
+        tonumber(row.progress_decided_at or 0) or 0,
+        tonumber(row.progress_upload_verified_at or 0) or 0,
+        tonumber(row.progress_upload_pending_at or 0) or 0,
+        tonumber(row.progress_worker_updated_at or 0) or 0
+    )
+end
+
+local function progress_session_rank(row)
+    row=type(row)=="table" and row or {}
+    local pending=type(row.pending_progress)=="table" and row.pending_progress or nil
+    local pending_seq=pending and (tonumber(pending.progress_sequence or 0) or 0) or 0
+    local verified_seq=tonumber(row.progress_verified_sequence or 0) or 0
+    -- For the same sequence, a verified state is terminal and must always beat
+    -- an older Home copy that still says pending/uploading, even if that stale
+    -- copy happened to save another preference a few seconds later.
+    if verified_seq>0 and verified_seq>=pending_seq then return 3 end
+    if pending_seq>verified_seq then return 2 end
+    return 1
+end
+
+local function merge_newer_progress_sessions(memory_sessions,disk_sessions)
+    memory_sessions=type(memory_sessions)=="table" and memory_sessions or {}
+    disk_sessions=type(disk_sessions)=="table" and disk_sessions or {}
+    for id,disk_row in pairs(disk_sessions) do
+        if type(disk_row)=="table" then
+            local memory_row=type(memory_sessions[id])=="table" and memory_sessions[id] or nil
+            if memory_row then
+                local disk_seq=progress_session_sequence(disk_row)
+                local memory_seq=progress_session_sequence(memory_row)
+                local disk_rank=progress_session_rank(disk_row)
+                local memory_rank=progress_session_rank(memory_row)
+                local disk_stamp=progress_session_stamp(disk_row)
+                local memory_stamp=progress_session_stamp(memory_row)
+                -- Reader and Home can own separate Store instances. Never let
+                -- a stale Home flush resurrect an older pending progress state
+                -- after the Reader (or a detached worker) already verified a
+                -- newer/equally-new sequence on disk.
+                if disk_seq>memory_seq
+                    or (disk_seq==memory_seq and disk_rank>memory_rank)
+                    or (disk_seq==memory_seq and disk_rank==memory_rank and disk_stamp>memory_stamp) then
+                    for _,field in ipairs(PROGRESS_SESSION_FIELDS) do
+                        memory_row[field]=U.copy(disk_row[field])
+                    end
+                end
+            elseif progress_session_sequence(disk_row)>0 then
+                memory_sessions[id]=U.copy(disk_row)
+            end
+        end
+    end
+    return memory_sessions
+end
+
 function Store:flush()
+    if not self.isolated then
+        local disk_data=settings_file_data(self.settings_path)
+        if type(disk_data)=="table" then
+            self.db.data.sessions=merge_newer_progress_sessions(self.db.data.sessions,disk_data.sessions)
+        end
+    end
     local previous_path=self.settings_path..".previous"
     if not self.isolated then
         local valid=settings_file_valid(self.settings_path)

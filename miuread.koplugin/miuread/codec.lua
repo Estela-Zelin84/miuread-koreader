@@ -77,10 +77,248 @@ function Codec.shard_body(raw)
     local sum,body=raw:sub(1,32),raw:sub(33); if D.md5(body):upper()~=sum:upper() then error("chapter checksum mismatch") end
     return body
 end
+local function lua_decode_parts(parts)
+    local body={}
+    for _,v in ipairs(parts or {}) do body[#body+1]=Codec.shard_body(v) end
+    local s=table.concat(body)
+    if s=="" then return "" end
+    s=s:sub(2)
+    return Codec.b64decode(unswap(s,positions(s)))
+end
+
+-- Native decoding is an optional accelerator only. The existing Lua path
+-- remains authoritative and is used whenever the current device/library is
+-- unsupported, unavailable, or fails at runtime.
+local native_state={checked=false,ffi=nil,lib=nil,platform=nil,reason="not checked"}
+local native_logger
+
+local function native_log(level,...)
+    if native_logger==false then return end
+    if native_logger==nil then
+        local ok,value=pcall(require,"logger")
+        native_logger=ok and value or false
+    end
+    local fn=native_logger and native_logger[level]
+    if type(fn)=="function" then pcall(fn,"[MiuRead][CodecNative]",...) end
+end
+
+local function device_flag(Device,name)
+    local value=Device and Device[name]
+    if type(value)=="function" then
+        local ok,result=pcall(value,Device)
+        return ok and result==true
+    end
+    return value==true
+end
+
+local function kindle_platform(Device)
+    local ota
+    if type(Device.ota_model)=="string" and Device.ota_model~="" then
+        ota=Device.ota_model
+    elseif type(Device.otaModel)=="function" then
+        local ok,value=pcall(Device.otaModel,Device)
+        if ok then ota=value end
+    end
+    local by_ota={
+        ["kindle-legacy"]="kindle",
+        ["kindle"]="kindle5",
+        ["kindlepw2"]="kindlepw2",
+        ["kindlehf"]="kindlehf",
+    }
+    if by_ota[ota] then return by_ota[ota] end
+
+    -- Only use model fallbacks that are unambiguous. Unknown/new models stay
+    -- on Lua rather than guessing an ABI.
+    local model=tostring(Device.model or "")
+    if model=="Kindle2" or model=="KindleDXG" or model=="Kindle3" then return "kindle" end
+    if model=="Kindle4" or model=="KindleTouch" or model=="KindlePaperWhite" then return "kindle5" end
+    if model=="KindlePaperWhite2" then return "kindlepw2" end
+    return nil
+end
+
+local function native_platform(ffi)
+    local os_name=(jit and jit.os) or ffi.os or ""
+    if os_name=="OSX" then return "osx" end
+
+    local ok,Device=pcall(require,"device")
+    if not ok or not Device then return nil,"device module unavailable" end
+    if device_flag(Device,"isSDL") then return nil,"desktop platform unsupported" end
+    if device_flag(Device,"isKobo") then return "kobo" end
+    if device_flag(Device,"isCervantes") then return "cervantes" end
+    if device_flag(Device,"isKindle") then
+        local platform=kindle_platform(Device)
+        if platform then return platform end
+        return nil,"kindle ABI could not be identified safely"
+    end
+    return nil,"native decoder not provided for this platform"
+end
+
+local function plugin_dir_from_source()
+    local info=debug.getinfo(1,"S")
+    local source=tostring(info and info.source or "")
+    if source:sub(1,1)=="@" then source=source:sub(2) end
+    return source:match("^(.-)/miuread/codec%.lua$")
+end
+
+local function disable_native(reason)
+    native_state.lib=nil
+    native_state.reason=tostring(reason or "native disabled")
+    native_log("warn",native_state.reason)
+end
+
+local function ensure_native()
+    if native_state.checked then return native_state.lib end
+    native_state.checked=true
+
+    local ok_ffi,ffi=pcall(require,"ffi")
+    if not ok_ffi or not ffi then
+        native_state.reason="ffi unavailable; using Lua"
+        native_log("info",native_state.reason)
+        return nil
+    end
+    native_state.ffi=ffi
+
+    local ok_cdef,cdef_error=pcall(function()
+        ffi.cdef[[
+            char* miucodec_shard_body(const char* raw, int raw_len, int* out_len);
+            char* miucodec_b64decode(const char* input, int input_len, int* out_len);
+            void  miucodec_free(void* ptr);
+        ]]
+    end)
+    if not ok_cdef then
+        native_state.reason="ffi declarations unavailable: "..tostring(cdef_error)
+        native_log("warn",native_state.reason)
+        return nil
+    end
+
+    local platform,platform_reason=native_platform(ffi)
+    native_state.platform=platform
+    if not platform then
+        native_state.reason=platform_reason or "unsupported platform"
+        native_log("info",native_state.reason)
+        return nil
+    end
+
+    local plugin_dir=plugin_dir_from_source()
+    if not plugin_dir or plugin_dir=="" then
+        native_state.reason="plugin directory unavailable; using Lua"
+        native_log("warn",native_state.reason)
+        return nil
+    end
+    local extension=platform=="osx" and "dylib" or "so"
+    local path=plugin_dir.."/libs/"..platform.."/libmiucodec."..extension
+    local probe=io.open(path,"rb")
+    if not probe then
+        native_state.reason="native library missing for "..platform.."; using Lua"
+        native_log("info",native_state.reason)
+        return nil
+    end
+    probe:close()
+
+    local ok_load,lib=pcall(ffi.load,path)
+    if not ok_load or not lib then
+        native_state.reason="native library failed to load for "..platform..": "..tostring(lib)
+        native_log("warn",native_state.reason)
+        return nil
+    end
+    native_state.lib=lib
+    native_state.reason="loaded"
+    native_log("info","enabled",platform)
+    return lib
+end
+
+local function native_decode_parts(parts)
+    local ffi=native_state.ffi
+    local lib=native_state.lib
+    local body={}
+
+    -- Keep checksum handling identical to the established Lua path, but do the
+    -- expensive MD5 work in the native library. A failed native validation is
+    -- handed back to Lua so the existing `chapter checksum mismatch` behavior
+    -- remains unchanged.
+    for i=1,#parts do
+        local raw=tostring(parts[i] or "")
+        if #raw<=32 then
+            body[#body+1]=""
+        else
+            local out_len=ffi.new("int[1]")
+            local ptr=lib.miucodec_shard_body(raw,#raw,out_len)
+            if ptr==nil then error("native shard validation returned null") end
+            local length=tonumber(out_len[0]) or 0
+            if length<=0 then
+                lib.miucodec_free(ptr)
+                return nil,"invalid-shard"
+            end
+            body[#body+1]=ffi.string(ptr,length)
+            lib.miucodec_free(ptr)
+        end
+    end
+
+    local s=table.concat(body)
+    if s=="" then return "" end
+    s=s:sub(2)
+
+    -- Reproduce the original Lua swap order exactly in a mutable FFI buffer.
+    -- The PR's combined C++ decode routine has a boundary difference in its
+    -- position loop, so it is intentionally not called here.
+    local length=#s
+    local buffer=ffi.new("char[?]",math.max(1,length))
+    if length>0 then ffi.copy(buffer,s,length) end
+    local p=positions(s)
+    for i=#p,1,-2 do
+        local a=p[i]+1
+        local b=p[i-1]+1
+        local tmp=buffer[a]
+        buffer[a]=buffer[b]
+        buffer[b]=tmp
+        a=a-1
+        b=b-1
+        tmp=buffer[a]
+        buffer[a]=buffer[b]
+        buffer[b]=tmp
+    end
+
+    local decoded_len=ffi.new("int[1]")
+    local decoded=lib.miucodec_b64decode(buffer,length,decoded_len)
+    if decoded==nil then error("native base64 decode returned null") end
+    local decoded_length=tonumber(decoded_len[0]) or 0
+    if decoded_length<0 then
+        lib.miucodec_free(decoded)
+        error("native base64 decode returned invalid length")
+    end
+    local result=ffi.string(decoded,decoded_length)
+    lib.miucodec_free(decoded)
+    return result
+end
+
+function Codec.native_status()
+    return {
+        checked=native_state.checked,
+        available=native_state.lib~=nil,
+        platform=native_state.platform,
+        reason=native_state.reason,
+    }
+end
+
 function Codec.decode_parts(parts)
-    local body={}; for _,v in ipairs(parts or {}) do body[#body+1]=Codec.shard_body(v) end
-    local s=table.concat(body); if s=="" then return "" end
-    s=s:sub(2); return Codec.b64decode(unswap(s,positions(s)))
+    parts=parts or {}
+    if not ensure_native() then return lua_decode_parts(parts) end
+
+    local ok,result,detail=pcall(native_decode_parts,parts)
+    if not ok then
+        disable_native("runtime failure; using Lua: "..tostring(result))
+        return lua_decode_parts(parts)
+    end
+    if result==nil and detail=="invalid-shard" then
+        -- Let the existing Lua implementation make the final decision and
+        -- preserve the established `chapter checksum mismatch` behavior.
+        return lua_decode_parts(parts)
+    end
+    if result==nil then
+        disable_native("native decode returned no result; using Lua")
+        return lua_decode_parts(parts)
+    end
+    return result
 end
 function Codec.text_xhtml(text)
     local out={}
