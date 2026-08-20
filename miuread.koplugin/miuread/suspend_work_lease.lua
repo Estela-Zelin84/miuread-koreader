@@ -17,6 +17,13 @@ local function special_suspend_supported()
     return kindle ~= kobo and (kindle or kobo)
 end
 
+local function is_kindle()
+    local fn = Device and Device.isKindle
+    if type(fn) ~= "function" then return false end
+    local ok, yes = pcall(fn, Device)
+    return ok and yes == true
+end
+
 function M.supported()
     return special_suspend_supported()
 end
@@ -66,16 +73,23 @@ function M.acquire(reason)
     value.generation = value.generation + 1
     value.changed_at = os.time()
     if not value.held then
-        local ok, result = pcall(UIManager.preventStandby, UIManager)
-        if not ok or result == false then
-            value.reasons[reason] = nil
-            value.generation = value.generation + 1
-            value.changed_at = os.time()
-            logger.warn("[MiuRead][SuspendLease] standby acquire failed",
-                "reason=", reason, "error=", tostring(ok and result or "call_failed"))
-            return false, M.snapshot()
+        if is_kindle() then
+            -- On Kindle, task leases are registry-only. Deep-suspend control
+            -- belongs to the screen-saver hold backend, never to a worker.
+            -- A download/finalizer can die without owning device power.
+            value.held = true
+        else
+            local ok, result = pcall(UIManager.preventStandby, UIManager)
+            if not ok or result == false then
+                value.reasons[reason] = nil
+                value.generation = value.generation + 1
+                value.changed_at = os.time()
+                logger.warn("[MiuRead][SuspendLease] standby acquire failed",
+                    "reason=", reason, "error=", tostring(ok and result or "call_failed"))
+                return false, M.snapshot()
+            end
+            value.held = true
         end
-        value.held = true
     end
     logger.info("[MiuRead][SuspendLease] acquired",
         "reason=", reason, "count=", tostring(reason_count(value)))
@@ -93,7 +107,7 @@ function M.release(reason)
     end
     if reason_count(value) == 0 and value.held then
         value.held = false
-        pcall(UIManager.allowStandby, UIManager)
+        if not is_kindle() then pcall(UIManager.allowStandby, UIManager) end
     end
     if existed then
         logger.info("[MiuRead][SuspendLease] released",
@@ -130,7 +144,7 @@ function M.clear(reason)
     value.changed_at = os.time()
     if value.held then
         value.held = false
-        pcall(UIManager.allowStandby, UIManager)
+        if not is_kindle() then pcall(UIManager.allowStandby, UIManager) end
     end
     logger.info("[MiuRead][SuspendLease] cleared",
         "reason=", tostring(reason or "clear"), "count=", tostring(count))

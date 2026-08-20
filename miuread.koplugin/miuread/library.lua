@@ -66,7 +66,7 @@ local function build_archive_map(data)
             ids=parsed
         end
         if type(ids)=="table" then
-            local archive_name=tostring(archive.name or archive.title or archive.archiveName or "书单")
+            local archive_name=tostring(archive.name or archive.title or archive.archiveName or "分组")
             for item_index,item in ipairs(ids) do
                 local id
                 if type(item)=="table" then
@@ -205,7 +205,7 @@ end
 function Library:_shelf_filter_selection(data)
     local names={}
     for _,archive in ipairs(archive_entries(data or {})) do
-        local name=tostring(archive.name or archive.title or archive.archiveName or "书单")
+        local name=tostring(archive.name or archive.title or archive.archiveName or "分组")
         if name~="" then names[#names+1]=name end
     end
     if self.store and self.store.set_deferred and #names>0 then

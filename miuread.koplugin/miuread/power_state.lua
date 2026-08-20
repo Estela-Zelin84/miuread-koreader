@@ -7,6 +7,7 @@ local VALID = {
     NORMAL = true,
     DOWNLOAD_LOCKED = true,
     PSEUDO_LOCKED = true,
+    SCREEN_SAVER_HOLD = true,
     BACKGROUND_LOCKED = true,
     REAL_SUSPEND = true,
     RESUMING = true,
