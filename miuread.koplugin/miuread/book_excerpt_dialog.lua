@@ -219,8 +219,9 @@ local function show_transfer(host, context, path)
     local dialog
     dialog = ButtonDialog:new{
         title = "手机扫码保存\n\n"
-            .. "请让手机和阅读器连接同一个路由器后再扫码。\n\n"
-            .. "同一路由器的 2.4G / 5G 均可；访客网络可能无法使用。\n\n"
+            .. "手机和阅读器需要处于同一局域网。\n\n"
+            .. "可以连接同一个 Wi-Fi（2.4G / 5G 均可），也可以让阅读器连接手机热点。\n\n"
+            .. "访客 Wi-Fi 如果开启设备隔离，可能无法使用。\n\n"
             .. "阅读器地址：" .. tostring(details.ip or "") .. ":" .. tostring(details.port or ""),
         title_align = "center",
         close_callback = function()

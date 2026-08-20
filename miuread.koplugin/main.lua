@@ -504,10 +504,17 @@ local function install_home_screensaver_patch()
                 or (reader_ui.document.getFilePath and reader_ui.document:getFilePath()) or nil)
             if reader_file and (not source_file or reader_file~=source_file) then
                 -- The reader changed books without rebuilding the parked Home.
-                -- Never show stale sources from the previous book; use the
-                -- current Reader document as this suspend's authoritative cover.
+                -- Drop stale sources first, then rebuild only from the current
+                -- Reader file/book identity so the previous book can never leak.
                 sources={}
                 source_file=reader_file
+                local owner=home_owner()
+                if owner and type(owner._home_lockscreen_sources_for_reader)=="function" then
+                    local ok_sources,current_sources=pcall(owner._home_lockscreen_sources_for_reader,owner,reader_file)
+                    if ok_sources and type(current_sources)=="table" then sources=current_sources end
+                end
+                logger.info("[MiuRead][Lockscreen] reader target rebuilt",
+                    "book=",tostring(reader_file),"sources=",tostring(#sources))
             end
         end
 
@@ -538,6 +545,9 @@ local function install_home_screensaver_patch()
                     "reason=",enabled and "miuread_cover_unavailable" or "feature_disabled",
                     "mode=",tostring(manager.screensaver_type or ""),
                     "host=",host and "filemanager" or "none")
+                if enabled and tostring(manager.screensaver_type or "")=="disable" then
+                    emergency_native_fallback(manager,current,host,"home_cover_unavailable_disable")
+                end
                 return unpack_args(native_result,2,#native_result)
             end
             emergency_native_fallback(manager,current,host,
@@ -554,6 +564,14 @@ local function install_home_screensaver_patch()
             if not apply_direct_cover(manager,sources,style,source_file) then
                 logger.info("[MiuRead][Lockscreen] takeover=false fallback=koreader",
                     "reason=miuread_cover_unavailable","mode=",tostring(manager.screensaver_type or ""))
+                -- With screensaver_type=disable KOReader intentionally keeps the
+                -- current framebuffer. In Reader that exposes the last text page
+                -- as the lock screen, which is never an acceptable fallback when
+                -- MiuRead lockscreen cover is enabled. Show KOReader's neutral
+                -- image instead; other native modes remain untouched.
+                if tostring(manager.screensaver_type or "")=="disable" then
+                    emergency_native_fallback(manager,reader_ui or current,nil,"reader_cover_unavailable_disable")
+                end
             end
         end
         return unpack_args(native_result,2,#native_result)
@@ -4953,12 +4971,43 @@ function Plugin:_home_lockscreen_sources(book)
     if type(book.local_record)=="table" then add(book.local_record.cover_path) end
     local id=tostring(book.bookId or book.book_id or "")
     if id~="" then
+        -- Reader snapshots do not always carry cover_path even though Home has
+        -- already cached the cover. cover_index is the durable bookId -> file
+        -- mapping, so use it before falling back to older book/variant records.
+        if type(self._cover_index_pending)=="table" then add(self._cover_index_pending[id]) end
+        local cover_index=self.store and self.store:get("cover_index",{}) or {}
+        if type(cover_index)=="table" then add(cover_index[id]) end
         local stored=self.store:book(id)
         if type(stored)=="table" then add(stored.cover_path) end
         local record=self:_preferred_record(id)
         if type(record)=="table" then add(record.cover_path) end
     end
     return out
+end
+
+function Plugin:_home_lockscreen_sources_for_reader(path)
+    path=normalized_reader_file(path)
+    if not path then return {} end
+    local book_id=""
+    local session_file=normalized_reader_file(HOME_SESSION.reader_session_file)
+    if session_file==path then
+        book_id=tostring(HOME_SESSION.reader_session_book_id or "")
+    end
+    local snapshot=HOME_SESSION.recent_read_snapshot
+    if book_id=="" and type(snapshot)=="table"
+        and normalized_reader_file(snapshot.file)==path then
+        book_id=tostring(snapshot.bookId or snapshot.book_id or "")
+    end
+    -- If ReaderReady has not yet populated the shared session, use only the
+    -- store's fast local identity lookup. Never borrow another book's id.
+    if book_id=="" and self.store and type(self.store.file_record_fast)=="function" then
+        local ok,book,record=pcall(self.store.file_record_fast,self.store,path,false)
+        if ok then
+            book_id=tostring((type(book)=="table" and (book.book_id or book.bookId))
+                or (type(record)=="table" and (record.book_id or record.bookId)) or "")
+        end
+    end
+    return self:_home_lockscreen_sources{file=path,bookId=book_id,book_id=book_id}
 end
 
 function Plugin:_home_prepare_lockscreen_cover(book)
