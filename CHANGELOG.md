@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.9.0-beta.5 - 2026-08-20
+
+- 同步正式版本至 4.6.8
+- 微信书架改为按需流式加载
+
 ## 4.6.8 - 2026-08-20
 
 - Unify beta and stable release channels in a single repository

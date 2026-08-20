@@ -1935,15 +1935,22 @@ function Plugin:_refresh_shelf_async(on_ready,silent)
         return fail("书架正在刷新，请稍后重试。")
     end
 
+    local shelf_prefs=self.store:preferences()
+    local shelf_filter=type(shelf_prefs.shelf_filter)=="table" and shelf_prefs.shelf_filter or {}
+    local selected_archives=type(shelf_filter.archives)=="table" and shelf_filter.archives or {}
+    -- Archive filtering needs the complete archive map. Keep that explicit mode
+    -- on the proven full-shelf path; ordinary Home refreshes use streaming.
+    local use_stream=not (shelf_filter.enabled==true and next(selected_archives)~=nil)
+        and self.library.load_all_once~=true
+
     self._shelf_refresh_generation=(tonumber(self._shelf_refresh_generation) or 0)+1
     local generation=self._shelf_refresh_generation
     local function succeed(data,mode)
         if generation~=self._shelf_refresh_generation then return end
         self:_mark_auth_channel_ok("shelf")
-        local books,mp=self.library:normalize(data or {})
-        self.store:save_shelf_cache({books=books,mp=mp,updated_at=os.time()})
+        local books,mp,streamed=self.library:_apply_stream_response(data or {})
         logger.info("[MiuRead][Shelf] refresh completed","mode=",tostring(mode),
-            "books=",tostring(#books),"mp=",tostring(#mp))
+            "books=",tostring(#books),"mp=",tostring(#mp),"streamed=",tostring(streamed==true))
         local stats=self.library.last_shelf_filter
         if stats and stats.kept==0 and stats.filtered>0 then
             self:toast("所选分组没有找到书籍，已跳过 "..tostring(stats.filtered).." 本。\n可在“微信书架范围”重新选择，或临时加载全部书架。",5)
@@ -1962,7 +1969,8 @@ function Plugin:_refresh_shelf_async(on_ready,silent)
         UIManager:scheduleIn(.05,function()
             local handled,unexpected=xpcall(function()
                 if generation~=self._shelf_refresh_generation then return end
-                local ok,data=pcall(self.api.shelf,self.api,{retries=0,timeout={7,12}})
+                local method=use_stream and self.api.shelf_stream or self.api.shelf
+                local ok,data=pcall(method,self.api,{retries=0,timeout={7,12},stream=use_stream,count=16})
                 if not ok then error(tostring(data)) end
                 if loading then pcall(function() UIManager:close(loading) end); loading=nil end
                 succeed(data,"direct")
@@ -1984,7 +1992,11 @@ function Plugin:_refresh_shelf_async(on_ready,silent)
             auth=function() return UtilChild.copy(auth) end,
             save_auth=function() end,
         }
-        return ApiChild:new(HttpChild:new(child_store),child_store):shelf({retries=1,timeout={10,18}})
+        local api=ApiChild:new(HttpChild:new(child_store),child_store)
+        if use_stream then
+            return api:shelf_stream({retries=1,timeout={10,18},stream=true,count=16})
+        end
+        return api:shelf({retries=1,timeout={10,18}})
     end,function(result)
         if generation~=self._shelf_refresh_generation then return end
         if result and result.ok==true then
@@ -4711,6 +4723,97 @@ function Plugin:_home_cancel_visible_page_work(reason)
     return self._home_visible_page_generation
 end
 
+function Plugin:_home_stream_prefetch_page(section,page)
+    if section~="account" or self:_active_reader_ui() then return false end
+    local selected=self._home_sections and self._home_sections[section]
+    if not selected then return false end
+    local stream=self.library.cached_stream and self.library:cached_stream() or {}
+    if stream.enabled~=true then return false end
+    local limit=self:_home_page_limit()
+    page=math.max(1,tonumber(page) or 1)
+    -- Hydrate the visible page plus one page ahead.  Do not walk the rest of
+    -- the index in the background: the next request is caused by navigation.
+    local first=(page-1)*limit+1
+    local last=math.min(#(selected.rows or {}),(page+1)*limit)
+    local ids={}
+    for index=first,last do
+        local row=selected.rows[index]
+        if type(row)=="table" and row._stream_placeholder==true then
+            local id=tostring(row.bookId or row.book_id or "")
+            if id~="" then ids[#ids+1]=id end
+        end
+    end
+    if #ids==0 then return false end
+
+    if self._home_stream_prefetching then
+        self._home_stream_pending_page=math.max(tonumber(self._home_stream_pending_page) or 0,page)
+        return true
+    end
+    if not self:is_online() or not self:logged_in() then return false end
+
+    self._home_stream_prefetching=true
+    local requested=U.copy(ids)
+    local function finish(data,err)
+        self._home_stream_prefetching=false
+        if not err and type(data)=="table" then
+            self.library:merge_stream_batch(data,requested)
+            if HomeView.is_shown() and not self:_active_reader_ui() then
+                self:_home_apply_remote_cache_snapshot()
+            end
+        elseif err then
+            logger.warn("[MiuRead][ShelfStream] page hydration failed",U.first_line(tostring(err),160))
+        end
+        local pending=tonumber(self._home_stream_pending_page) or 0
+        self._home_stream_pending_page=nil
+        if pending>0 and HomeView.is_shown() and not self:_active_reader_ui() then
+            UIManager:scheduleIn(.15,function() self:_home_stream_prefetch_page("account",pending) end)
+        end
+    end
+
+    local async_available=self.shelf_async and self.shelf_async:available()
+    if async_available and self.shelf_async:busy() then
+        self._home_stream_prefetching=false
+        self._home_stream_pending_page=math.max(tonumber(self._home_stream_pending_page) or 0,page)
+        UIManager:scheduleIn(.45,function()
+            local pending=tonumber(self._home_stream_pending_page) or page
+            self._home_stream_pending_page=nil
+            self:_home_stream_prefetch_page("account",pending)
+        end)
+        return true
+    end
+    if async_available then
+        local auth=U.copy(self.store:auth())
+        local started,err=self.shelf_async:run("shelf_stream_page",function()
+            local HttpChild=require("miuread.http")
+            local ApiChild=require("miuread.api")
+            local UtilChild=require("miuread.util")
+            local child_store={
+                auth=function() return UtilChild.copy(auth) end,
+                save_auth=function() end,
+            }
+            return ApiChild:new(HttpChild:new(child_store),child_store):web_shelf_sync_books(requested,{retries=0,timeout={8,15}})
+        end,function(result)
+            if result and result.ok==true then finish(result.value or {},nil)
+            else finish(nil,result and result.error or "unknown") end
+        end,24)
+        if started then
+            logger.info("[MiuRead][ShelfStream] page hydration started","page=",tostring(page),"books=",tostring(#requested),"mode=subprocess")
+            return true
+        end
+        logger.warn("[MiuRead][ShelfStream] subprocess unavailable",tostring(err))
+    end
+
+    -- Small syncBook batches are the fallback on platforms without subprocess
+    -- support.  They are scheduled after the current paint, never during page
+    -- construction, so the page itself appears before network work begins.
+    UIManager:scheduleIn(.05,function()
+        local ok,data=pcall(self.api.web_shelf_sync_books,self.api,requested,{retries=0,timeout={8,15}})
+        finish(ok and data or nil,ok and nil or data)
+    end)
+    logger.info("[MiuRead][ShelfStream] page hydration started","page=",tostring(page),"books=",tostring(#requested),"mode=direct")
+    return true
+end
+
 function Plugin:_home_change_page(delta)
     local section=self._home_active_section or "account"
     local selected=self._home_sections and self._home_sections[section]
@@ -4779,6 +4882,9 @@ function Plugin:_home_apply_section(section)
     logger.info("[MiuRead][HomeSwitch] applied",
         "section=",tostring(section),"page=",tostring(page),
         "ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
+    if section=="account" then
+        UIManager:scheduleIn(.05,function() self:_home_stream_prefetch_page(section,page) end)
+    end
     return updated
 end
 
