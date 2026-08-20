@@ -7552,24 +7552,99 @@ function Plugin:_home_source_text(book)
 end
 
 function Plugin:_show_home_book_open_popup(book,anchor)
-    local id=tostring(book and (book.bookId or book.book_id) or "")
-    local target=U.copy(book or {})
-    local state=self:_download_state()
-    local same_failed=state.status=="failed" and tostring(state.book_id or state.bookId or "")==id
-    local partial=id~="" and self.store:book_has_partial_cache(id)==true
-    local label=(same_failed or partial) and "继续下载 / 修复" or "下载并阅读"
-    ActionSheet.show{
-        anchor=anchor,preferred_direction="above",width_ratio=.62,
-        title=tostring(target.title or "书籍"),
-        subtitle=(same_failed or partial) and "下载尚未完整" or "这本书尚未下载",
-        actions={
-            {icon="⇩",label=label,detail=(same_failed or partial) and "继续现有任务，必要时重新生成" or "加入下载任务",callback=function()
-                self:choose_download(target,nil,false)
-            end},
-            {icon="i",label="查看详情",detail="书籍简介和出版信息",callback=function() self:book_details(target) end},
-        },
-    }
+    -- beta.10: do not collapse every cache/failed state into a generic
+    -- “继续下载 / 修复”. The normal book menu already knows which concrete
+    -- variant (clean/notes/chapter) is installed or resumable. Reuse it here
+    -- so a complete readable version is never presented as a broken book just
+    -- because another cache directory still exists.
+    return self:_home_hold_book(U.copy(book or {}),anchor)
+end
+
+function Plugin:_home_download_is_whole_book(options)
+    options=type(options)=="table" and options or {}
+    if options.chapter_uid~=nil then return false end
+    if options.range_start_index~=nil or options.range_end_index~=nil then return false end
     return true
+end
+
+function Plugin:_home_download_task_options(state)
+    state=type(state)=="table" and state or {}
+    if state.status=="active" and type(self._download_runtime)=="table"
+        and type(self._download_runtime.options)=="table" then
+        return U.copy(self._download_runtime.options)
+    end
+    if type(state.options)=="table" then return U.copy(state.options) end
+    return nil
+end
+
+function Plugin:_home_variant_download_context(book_id,annotations,state,repairs)
+    book_id=tostring(book_id or "")
+    local kind=annotations==true and "notes" or "clean"
+    local context={
+        kind=kind,
+        installed=self:_variant_exists(book_id,kind),
+        task=nil,
+        repair=nil,
+    }
+    if book_id=="" then return context end
+
+    state=type(state)=="table" and state or self:_download_state()
+    repairs=type(repairs)=="table" and repairs or (BookIntegrity.partial_repairs(self.store,book_id) or {})
+    local same_book=tostring(state.book_id or state.bookId or "")==book_id
+    local status=tostring(state.status or "")
+    if same_book and (status=="active" or status=="failed" or status=="interrupted" or status=="annotation_pending") then
+        local options=self:_home_download_task_options(state)
+        if options and self:_home_download_is_whole_book(options) and (options.annotations==true)==(annotations==true) then
+            context.task={state=state,options=options,status=status}
+        end
+    end
+
+    -- A .miuread-partial-* directory is not automatically an unfinished
+    -- download. Notes downloads intentionally keep a completed cache for later
+    -- reuse. BookIntegrity.partial_repairs() only returns caches that still have
+    -- real unfinished work, and also preserves the exact download options.
+    for _,repair in ipairs(repairs) do
+        local options=type(repair.options)=="table" and repair.options or nil
+        if options and self:_home_download_is_whole_book(options)
+            and (options.annotations==true)==(annotations==true) then
+            context.repair=repair
+            break
+        end
+    end
+    return context
+end
+
+function Plugin:_home_variant_download_action(target,annotations,context)
+    context=context or self:_home_variant_download_context(target and (target.bookId or target.book_id),annotations)
+    local variant_name=annotations==true and "划线与想法版" or "纯净版"
+    local installed=context.installed~=nil
+    local task=context.task
+    local repair=context.repair
+    local label,detail,callback
+
+    if task and task.status=="active" then
+        local percent=self:_download_percent(task.state)
+        label=(installed and ("更新"..variant_name.."中 ") or (variant_name.."下载中 "))..tostring(percent).."%"
+        detail="点击查看当前下载进度"
+        callback=function() self:show_downloads() end
+    elseif task or repair then
+        label=(installed and "继续更新" or "继续下载")..variant_name
+        detail="上次任务未完成，已保留可恢复断点"
+        local options=U.copy((task and task.options) or (repair and repair.options) or {annotations=annotations==true})
+        options.annotations=annotations==true
+        callback=function() self:choose_download_mode(target,options,false) end
+    else
+        label=(installed and "更新" or "下载")..variant_name
+        detail=annotations==true
+            and (installed and "重新获取正文、划线与想法" or "生成包含微信读书划线与想法的完整版本")
+            or (installed and "重新生成完整纯净版" or "生成不含划线与想法的完整版本")
+        callback=function() self:choose_download_mode(target,{annotations=annotations==true},false) end
+    end
+
+    return {
+        icon=annotations==true and "highlight" or "⇩",
+        label=label,detail=detail,callback=callback,
+    }
 end
 
 function Plugin:_home_open_book(book,anchor,ges,direct_read)
@@ -8814,7 +8889,8 @@ function Plugin:_home_book_delete_state(book)
         variants=variants,
         current_kind=current_kind,
         chapter_count=tonumber(chapter_count) or 0,
-        has_partial=self.store:book_has_partial_cache(book_id)==true,
+        has_partial=#(BookIntegrity.partial_repairs(self.store,book_id) or {})>0,
+        has_cache=self.store:book_has_partial_cache(book_id)==true,
     }
 end
 
@@ -8828,7 +8904,8 @@ function Plugin:_show_home_delete_book_popup(book,anchor)
     local installed={}
     for _,row in ipairs(state.variants or {}) do installed[#installed+1]=row.label end
     if state.chapter_count>0 then installed[#installed+1]="单章文件" end
-    if state.has_partial then installed[#installed+1]="未完成缓存" end
+    if state.has_partial then installed[#installed+1]="未完成断点" end
+    if #installed==0 and state.has_cache then installed[#installed+1]="下载缓存" end
     if #installed==0 then self:info("这本书没有可删除的本地版本") return false end
     local subtitle="ⓘ 当前版本："..current_label
     if #installed>1 then subtitle=subtitle.." · 本地共 "..tostring(#installed).." 类文件" end
@@ -8968,47 +9045,39 @@ function Plugin:_home_hold_book(book,anchor)
     self:_home_attach_local_record(target)
     local record=id~="" and self:_preferred_record(id) or nil
     local available=record and record.file and U.file_exists(record.file)
-    local clean=self:_variant_exists(id,"clean")
-    local notes=self:_variant_exists(id,"notes")
-    local download_state=self:_download_state()
-    local download_book_id=tostring(download_state.book_id or download_state.bookId or "")
-    local same_download=download_book_id~="" and download_book_id==id
-    local same_active=same_download and download_state.status=="active"
-    local same_failed=same_download and (download_state.status=="failed" or download_state.status=="interrupted")
-    local partial=id~="" and self.store:book_has_partial_cache(id)==true
+    local raw_cache=id~="" and self.store:book_has_partial_cache(id)==true
     local actions={}
 
-    if same_active then
-        actions[#actions+1]={icon="⇩",label="查看下载",detail="查看当前进度与下载任务",callback=function() self:show_downloads() end}
-        if available then
-            actions[#actions+1]={icon="book",label="阅读已有版本",detail="下载继续在后台进行",callback=function() self:_home_open_book(target,nil,nil,true) end}
-        end
-        actions[#actions+1]={icon="i",label="书籍详情",detail="简介、作者与出版信息",callback=function() self:book_details(target) end}
-        actions[#actions+1]={icon="!",label="取消下载",detail="停止当前这本书的下载任务",danger=true,callback=function()
-            if self.download_task and self.download_task:busy() then self.download_task:cancel()
-            else self:show_downloads() end
-        end}
-        ActionSheet.show{
-            anchor=anchor,preferred_direction="above",width_ratio=.66,
-            title=tostring(target.title or "书籍"),subtitle="正在下载",
-            actions=actions,wide_last=(#actions%2==1),
-        }
-        return true
-    elseif same_failed or partial then
-        actions[#actions+1]={icon="warning",label="继续下载 / 修复下载",detail="恢复未完成内容，必要时重新生成",callback=function() self:choose_download(target,nil,false) end}
-    end
     if available then
         actions[#actions+1]={icon="book",label="阅读",detail="打开最近使用的本地版本",callback=function() self:_home_open_book(target,nil,nil,true) end}
     end
-    actions[#actions+1]={icon="⇩",label=clean and "更新纯净版" or "下载纯净版",detail=clean and "重新生成完整纯净版" or "生成不含划线与想法的完整版本",callback=function()
-        self:choose_download_mode(target,{annotations=false},false)
-    end}
-    actions[#actions+1]={icon="highlight",label=notes and "更新划线与想法版" or "下载划线与想法版",detail=notes and "重新获取正文、划线与想法" or "生成包含微信读书划线与想法的完整版本",callback=function()
-        self:choose_download_mode(target,{annotations=true},false)
-    end}
-    actions[#actions+1]={icon="▤",label="按章节下载",detail="选择单章、连续章节或指定范围",callback=function() self:chapters(target) end}
+
+    -- Whole-book variants own their own state. A failed clean download must not
+    -- make an already readable notes version look damaged, and vice versa.
+    local download_state=self:_download_state()
+    local repairs=id~="" and (BookIntegrity.partial_repairs(self.store,id) or {}) or {}
+    local clean_context=self:_home_variant_download_context(id,false,download_state,repairs)
+    local notes_context=self:_home_variant_download_context(id,true,download_state,repairs)
+    actions[#actions+1]=self:_home_variant_download_action(target,false,clean_context)
+    actions[#actions+1]=self:_home_variant_download_action(target,true,notes_context)
+
+    local same_download=tostring(download_state.book_id or download_state.bookId or "")==id
+    local task_options=same_download and self:_home_download_task_options(download_state) or nil
+    local chapter_task=same_download and task_options~=nil and not self:_home_download_is_whole_book(task_options)
+    local chapter_label="按章节下载"
+    local chapter_detail="选择单章、连续章节或指定范围"
+    local chapter_callback=function() self:chapters(target) end
+    if chapter_task and tostring(download_state.status or "")=="active" then
+        chapter_label="章节下载中 "..tostring(self:_download_percent(download_state)).."%"
+        chapter_detail="点击查看当前章节下载任务"
+        chapter_callback=function() self:show_downloads() end
+    end
+    actions[#actions+1]={icon="▤",label=chapter_label,detail=chapter_detail,callback=chapter_callback}
     actions[#actions+1]={icon="i",label="书籍详情",detail="简介、作者与出版信息",callback=function() self:book_details(target) end}
-    if available or self:_book_has_cache(id) or partial then
+
+    -- Keep raw caches manageable, but never call them a broken download unless
+    -- BookIntegrity has identified real unfinished work for a concrete variant.
+    if available or self:_book_has_cache(id) or raw_cache then
         actions[#actions+1]={icon="⌫",label="删除下载",detail="选择删除当前或全部本地版本",danger=true,callback=function()
             self:_show_home_delete_book_popup(target,anchor)
         end}
@@ -18201,7 +18270,7 @@ function Plugin:_download_book_labels(b)
     if chapter_count>0 then
         labels[#labels+1]="单章 "..tostring(chapter_count)
     end
-    if self.store:book_has_partial_cache(b.book_id) then labels[#labels+1]="未完成缓存" end
+    if #(BookIntegrity.partial_repairs(self.store,b.book_id) or {})>0 then labels[#labels+1]="未完成断点" end
     return labels,chapter_count
 end
 
@@ -18398,21 +18467,21 @@ function Plugin:downloaded_book_menu(book_ref)
         end
     end
     local _,chapter_count=self:_download_book_labels(U.merge(b,{book_id=book_id}))
-    local has_partial=self.store:book_has_partial_cache(book_id)
-    if chapter_count>0 or has_partial then
-        items[#items+1]={text="单章与断点",enabled=false}
+    local has_cache=self.store:book_has_partial_cache(book_id)
+    local repairable=#(BookIntegrity.partial_repairs(self.store,book_id) or {})
+    if chapter_count>0 or has_cache then
+        items[#items+1]={text=repairable>0 and "单章与断点" or "单章与缓存",enabled=false}
         if chapter_count>0 then
             items[#items+1]={text="单章文件",post_text=tostring(chapter_count).." 个",callback=function() self:downloaded_chapters_menu(book_id) end}
         end
-        if has_partial then
-            local repairable=#BookIntegrity.partial_repairs(self.store,book_id)
+        if has_cache then
             if repairable>0 then
-                items[#items+1]={text="修复未完成下载",post_text=tostring(repairable).." 个断点",callback=function() self:_repair_downloaded_book(book_id) end}
+                items[#items+1]={text="继续未完成下载",post_text=tostring(repairable).." 个可恢复断点",callback=function() self:_repair_downloaded_book(book_id) end}
             end
-            items[#items+1]={text="清理未完成下载缓存",post_text="保留已生成 EPUB",callback=function() self:_confirm_clear_partial_cache(book_id,b.title) end}
+            items[#items+1]={text=repairable>0 and "清理下载断点与缓存" or "清理下载缓存",post_text="保留已生成 EPUB",callback=function() self:_confirm_clear_partial_cache(book_id,b.title) end}
         end
     end
-    if #variants>0 or chapter_count>0 or has_partial then
+    if #variants>0 or chapter_count>0 or has_cache then
         items[#items+1]={text="本书管理",enabled=false}
         items[#items+1]={text="删除这本书",post_text="同时删除本机想法、评论与记录",callback=function() self:_confirm_delete_book_downloads(book_id,b.title) end}
     end
