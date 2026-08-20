@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.8.0-beta.4",
+    VERSION = "4.9.0-beta.4",
     SCHEMA = 114,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -197,7 +197,7 @@ local C = {
     -- slow.
     DOWNLOAD_BACKGROUND_STALL_SECONDS = {
         prepare = 120, catalog = 120, resume = 120, content = 150, images = 180,
-        underlines = 180, thoughts = 180, footnotes = 180,
+        underlines = 240, thoughts = 600, footnotes = 240,
         annotation_batch = 180, annotation_apply = 240, transform = 240, package = 300,
     },
     -- Foreground notices remain earlier than recovery. Heavy local stages still
@@ -206,7 +206,7 @@ local C = {
     DOWNLOAD_FOREGROUND_STALL_NOTICE_SECONDS = 25,
     DOWNLOAD_FOREGROUND_STALL_SECONDS = {
         prepare = 50, catalog = 60, resume = 50, content = 90, images = 120,
-        underlines = 150, thoughts = 180, footnotes = 150,
+        underlines = 240, thoughts = 600, footnotes = 240,
         annotation_batch = 180, annotation_apply = 240, transform = 240, package = 300,
     },
     DOWNLOAD_CANCEL_FORCE_SECONDS = 4,

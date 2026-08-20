@@ -14,7 +14,8 @@ local DownloadTask = {}
 DownloadTask.__index = DownloadTask
 
 local function background_lock_mode(mode)
-    return mode == "DOWNLOAD_LOCKED" or mode == "PSEUDO_LOCKED" or mode == "SUSPEND_PENDING"
+    return mode == "DOWNLOAD_LOCKED" or mode == "PSEUDO_LOCKED"
+        or mode == "SCREEN_SAVER_HOLD" or mode == "SUSPEND_PENDING"
 end
 
 local function is_android()
@@ -735,22 +736,26 @@ function DownloadTask:prepare_suspend_lock()
     if not self.keep_awake_enabled then return false,"disabled" end
     self.power_mode="SUSPEND_PENDING"
 
-    -- The pseudo-lock session is the single standby owner. A second "download"
-    -- lease created an independent lifetime and could outlive/fight the visible
-    -- lock state. Keep only the pseudo lease once that session is active.
     local pseudo_owned=PseudoLockscreen.active()==true
     local ok=false
     if pseudo_owned then
         self:_release_awake()
         ok=true
+    elseif device_is("Kindle") then
+        -- Kindle workers are never allowed to create a power owner. The
+        -- screen-saver hold controller must already exist before a locked
+        -- download can continue.
+        self:_release_awake()
+        ok=false
     else
+        -- Kobo keeps its existing lease behavior.
         ok=SuspendWorkLease.acquire("download")==true
         self.standby_held=ok
     end
     self:_capture_lockscreen_network("suspend_pending")
     self:_guard_lockscreen_network(self.job,os.time(),true)
     logger.info("[MiuRead][DownloadTask] suspend lock prepared",
-        "owner=",pseudo_owned and "pseudo_lockscreen" or "download",
+        "owner=",pseudo_owned and "background_controller" or (device_is("Kindle") and "none" or "download"),
         "lease=",tostring(ok),"ssid=",tostring(self.lockscreen_network_ssid or ""))
     return ok,ok and "prepared" or "lease_failed"
 end
@@ -761,14 +766,16 @@ function DownloadTask:_lockscreen_keepalive_allowed()
 end
 
 function DownloadTask:_reset_device_timeout()
-    -- Never reset Kindle's T1 timer on the visible Home/Reader surface. In
-    -- beta.11 it is also refreshed while PSEUDO_LOCKED, where the native sleep
-    -- image is visible but powerd has been returned to ACTIVE for the download.
     if not self:_lockscreen_keepalive_allowed() then return false end
+    if device_is("Kindle") then
+        -- Kindle workers do not touch T1 or powerd. A true result only
+        -- means the screen-saver hold session is still owned by the controller.
+        return PseudoLockscreen.active() == true
+    end
     local powerd = Device and Device.powerd
     if powerd and type(powerd.resetT1Timeout) == "function" then
         local ok, err = pcall(powerd.resetT1Timeout, powerd)
-        if not ok then logger.warn("[MiuRead][DownloadTask] Kindle T1 reset failed", tostring(err)) end
+        if not ok then logger.warn("[MiuRead][DownloadTask] device timeout reset failed", tostring(err)) end
         return ok
     end
     return false
@@ -798,16 +805,19 @@ function DownloadTask:_hold_awake()
         self:_release_awake()
         return false
     end
+    if device_is("Kindle") and PseudoLockscreen.active()~=true then
+        self:_release_awake()
+        return false
+    end
     if PseudoLockscreen.active()==true then
         local stale=self.standby_held or SuspendWorkLease.has("download")
         self.standby_held=false
         SuspendWorkLease.release("download")
-        local reset=self:_reset_device_timeout()
+        local alive=self:_reset_device_timeout()
         if stale then
-            logger.warn("[MiuRead][SuspendLease][Invariant]",
-                "pseudo=true","download=true","action=release_download")
+            logger.info("[MiuRead][DownloadTask] worker power claim released; controller owns background")
         end
-        return reset==true or SuspendWorkLease.has("pseudo_lockscreen")
+        return alive==true or (not device_is("Kindle") and SuspendWorkLease.has("pseudo_lockscreen"))
     end
     if self.standby_held and SuspendWorkLease.has("download") then return true end
     local ok = SuspendWorkLease.acquire("download")
@@ -841,8 +851,10 @@ function DownloadTask:_fail_open_locked_download(job,reason)
     self.power_mode="FAIL_OPEN"
     self:_clear_lockscreen_network("fail_open:"..reason)
     self:_release_awake()
+    -- Mark only the download task inactive. The background-power controller
+    -- decides whether any other task still requires keepalive and performs the
+    -- eventual native suspend through KOReader, never through this worker.
     PseudoLockscreen.set_download_active(false)
-    pcall(PseudoLockscreen.background_task_done,"download_fail_open:"..reason)
     diagnostic_append(job.diagnostic_path,{
         "time="..tostring(os.date("%Y-%m-%d %H:%M:%S")),
         "event=lockscreen_fail_open",
