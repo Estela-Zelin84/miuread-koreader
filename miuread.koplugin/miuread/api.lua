@@ -136,6 +136,120 @@ function Api:shelf(options)
         timeout=options.timeout or {10,18},
     })
 end
+
+-- The official Agent shelf endpoint is intentionally full-shelf only.  For Home
+-- we prefer the Web reader's two-stage shelf API: first request only ids, then
+-- hydrate a small visible batch via /web/shelf/syncBook.  This genuinely keeps
+-- bookInfo off the wire until a page is needed instead of slicing a full response
+-- after download.  Any incompatibility falls back to Api:shelf().
+local function shelf_index_ids(data)
+    data=type(data)=="table" and data or {}
+    local source=data.bookIds or data.bookids or data.books or data.updated or {}
+    if type(source)~="table" then return {} end
+    local out,seen={},{}
+    local function add(value)
+        if type(value)=="table" then
+            value=value.bookId or value.book_id or value.id or value.book
+            if type(value)=="table" then value=value.bookId or value.book_id or value.id end
+        end
+        value=tostring(value or "")
+        if value~="" and not seen[value] then seen[value]=true; out[#out+1]=value end
+    end
+    if source[1]~=nil then
+        for _,value in ipairs(source) do add(value) end
+    else
+        for key,value in pairs(source) do
+            if type(value)=="boolean" or tonumber(value)~=nil then
+                if value==true or tonumber(value)==1 then add(key) end
+            else
+                add(value)
+            end
+        end
+    end
+    return out
+end
+
+function Api:web_shelf_index(options)
+    options=options or {}
+    local auth=self.store:auth()
+    local account=type(auth.account)=="table" and auth.account or {}
+    local cookies=type(auth.cookies)=="table" and auth.cookies or {}
+    local vid=tostring(account.vid or cookies.wr_vid or "")
+    local url="https://weread.qq.com/web/shelf/sync?onlyBookid=1&cbcount=1"
+    if vid~="" then url=url.."&userVid="..Protocol.escape(vid) end
+    local data=self.http:get_json(url,{
+        auth=true,
+        retries=options.retries==nil and 0 or options.retries,
+        timeout=options.timeout or {7,12},
+        headers={Accept="application/json, text/plain, */*",Referer="https://weread.qq.com/web/shelf"},
+    })
+    local ids=shelf_index_ids(data)
+    if #ids==0 then error("web shelf index returned no book ids") end
+    return data,ids
+end
+
+function Api:web_shelf_sync_books(book_ids,options)
+    options=options or {}
+    local ids={}
+    local seen={}
+    for _,value in ipairs(type(book_ids)=="table" and book_ids or {}) do
+        local id=tostring(value or "")
+        if id~="" and not seen[id] then seen[id]=true; ids[#ids+1]=id end
+    end
+    if #ids==0 then return {books={}} end
+    return self.http:post_json("https://weread.qq.com/web/shelf/syncBook",{bookIds=ids},{
+        auth=true,
+        retries=options.retries==nil and 0 or options.retries,
+        timeout=options.timeout or {8,15},
+        pacing_scope="shelf-stream",
+        shared_pacing=true,
+        min_interval=0.35,
+        headers={
+            Accept="application/json, text/plain, */*",
+            Origin="https://weread.qq.com",
+            Referer="https://weread.qq.com/web/shelf",
+        },
+    })
+end
+
+function Api:shelf_stream(options)
+    options=options or {}
+    local first_count=math.max(8,math.min(32,tonumber(options.count) or 16))
+    local ok_index,index,ids=pcall(self.web_shelf_index,self,{
+        retries=0,timeout=options.index_timeout or {7,12},
+    })
+    if not ok_index then
+        logger.warn("[MiuRead][ShelfStream] index unavailable; falling back to full shelf",tostring(index))
+        local full=self:shelf(options)
+        if type(full)=="table" then full._miuread_stream={enabled=false,fallback=true,reason="index_failed"} end
+        return full
+    end
+
+    local batch_ids={}
+    for i=1,math.min(first_count,#ids) do batch_ids[#batch_ids+1]=ids[i] end
+    local ok_batch,batch=pcall(self.web_shelf_sync_books,self,batch_ids,{retries=0,timeout={8,15}})
+    if not ok_batch or type(batch)~="table" then
+        logger.warn("[MiuRead][ShelfStream] first batch unavailable; falling back to full shelf",tostring(batch))
+        local full=self:shelf(options)
+        if type(full)=="table" then full._miuread_stream={enabled=false,fallback=true,reason="batch_failed"} end
+        return full
+    end
+
+    -- Preserve lightweight grouping/MP metadata when the index happens to expose it.
+    if batch.archive==nil and type(index.archive)=="table" then batch.archive=index.archive end
+    if batch.mp==nil and type(index.mp)=="table" then batch.mp=index.mp end
+    batch._miuread_stream={
+        enabled=true,
+        ids=ids,
+        hydrated_ids=batch_ids,
+        total=#ids,
+        first_count=#batch_ids,
+        has_more=#batch_ids<#ids,
+        source="web_onlyBookid+syncBook",
+        updated_at=os.time(),
+    }
+    return batch
+end
 function Api:notebooks(count, last_sort)
     local params={count=tonumber(count) or 100}
     if tonumber(last_sort or 0) and tonumber(last_sort or 0)~=0 then
