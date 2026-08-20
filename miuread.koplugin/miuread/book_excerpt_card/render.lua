@@ -184,8 +184,9 @@ local function renderBB(opts)
         end
     end
     local content_lines, content_line_is_end = wrapText(text, content_face, content_w, false, false)
+    local content_truncated = #content_lines > template.content_max_lines
     -- 正文行数上限（同步截断段末标记；被截断的最后一行视为段末，避免拉伸）
-    if #content_lines > template.content_max_lines then
+    if content_truncated then
         local kept = {}
         local kept_end = {}
         for i = 1, template.content_max_lines do
@@ -834,7 +835,7 @@ local function renderBB(opts)
         end
     end
 
-    return bb, { w = W, h = H }
+    return bb, { w = W, h = H, truncated = content_truncated == true, rendered_lines = #content_lines }
 end
 
 --- 渲染书摘卡片并写 PNG（内部调 renderBB + writePNG）。

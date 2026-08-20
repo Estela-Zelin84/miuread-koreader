@@ -98,6 +98,7 @@ local DataMigration=require("miuread.data_migration")
 local MigrationProgress=require("miuread.migration_progress")
 local DownloadDatabase=require("miuread.download_database")
 local StatusToast=require("miuread.status_toast")
+local BookExcerptDialog=require("miuread.book_excerpt_dialog")
 local ReaderTransitionGuard=require("miuread.reader_transition_guard")
 local PluginMenu=require("miuread.plugin_menu")
 local PluginSettings=require("miuread.plugin_settings")
@@ -12445,6 +12446,132 @@ function Plugin:_reader_annotation_index(item)
     return nil
 end
 
+local function book_excerpt_author_text(value)
+    if type(value)=="table" then
+        local out={}
+        for _,part in ipairs(value) do
+            part=U.trim(tostring(part or ""))
+            if part~="" then out[#out+1]=part end
+        end
+        return table.concat(out," · ")
+    end
+    return U.trim(tostring(value or ""))
+end
+
+function Plugin:_book_excerpt_context(text)
+    local path=normalized_reader_file(self:_current_document_path()) or self:_current_document_path()
+    local title,author,book_id="","",""
+
+    -- WeRead-generated files already have a durable book record. Prefer it so
+    -- the exported card keeps the official title/author instead of a cache file
+    -- name. Ordinary local books fall through to KOReader document metadata.
+    if path and self.store then
+        local book,record
+        if type(self.store.file_record_fast)=="function" then
+            local ok,b,r=pcall(self.store.file_record_fast,self.store,path,false)
+            if ok then book,record=b,r end
+        end
+        if not book and self:_reader_session_is_weread() and type(self.store.identify_file)=="function" then
+            local ok,b,r=pcall(self.store.identify_file,self.store,path,false)
+            if ok then book,record=b,r end
+        end
+        local info=type(book)=="table" and (book.bookInfo or book.book or book) or nil
+        if type(info)=="table" then
+            title=U.trim(tostring(info.title or book.title or ""))
+            author=book_excerpt_author_text(info.author or info.authors or book.author)
+            book_id=tostring(info.bookId or info.book_id or book.bookId or book.book_id or "")
+        elseif type(record)=="table" then
+            title=U.trim(tostring(record.title or ""))
+            author=book_excerpt_author_text(record.author or record.authors)
+            book_id=tostring(record.book_id or record.bookId or "")
+        end
+    end
+
+    local doc=self.ui and self.ui.document or nil
+    local props
+    if doc and type(doc.getProps)=="function" then
+        local ok,value=pcall(doc.getProps,doc)
+        if ok and type(value)=="table" then props=value end
+    end
+    props=props or (doc and type(doc.info)=="table" and doc.info or nil)
+    if type(props)=="table" then
+        if title=="" then title=U.trim(tostring(props.title or props.display_title or "")) end
+        if author=="" then author=book_excerpt_author_text(props.authors or props.author) end
+    end
+    if title=="" and path then
+        local name=tostring(path):match("([^/]+)$") or tostring(path)
+        title=name:gsub("%.[^%.]+$","")
+    end
+    if title=="" then title="未命名" end
+    if book_id=="" then
+        local fallback_id=tostring(path or "")
+        fallback_id=fallback_id:match("([^/]+)$") or fallback_id
+        fallback_id=fallback_id:match("([^\\]+)$") or fallback_id
+        fallback_id=fallback_id:gsub("%.[^%.]+$",""):gsub("[^%w_%-]","_"):sub(1,48)
+        if fallback_id=="" or fallback_id:match("^_+$") then fallback_id="book" end
+        book_id=fallback_id
+    end
+
+    local font_face=""
+    if _G.G_reader_settings and type(G_reader_settings.readSetting)=="function" then
+        local ok,value=pcall(G_reader_settings.readSetting,G_reader_settings,"cre_font")
+        if ok then font_face=U.trim(tostring(value or "")) end
+    end
+    return {
+        text=U.trim(tostring(text or "")),
+        book_title=title,
+        book_author=author,
+        book_id=book_id,
+        font_face=font_face,
+        source_path=path,
+        temp_dir=self.store and self.store.temp_dir or nil,
+    }
+end
+
+function Plugin:_show_book_excerpt(text)
+    local context=self:_book_excerpt_context(text)
+    if context.text=="" then self:info("没有可生成书摘的文字"); return false end
+    local ok,result=pcall(BookExcerptDialog.show,self,context)
+    if not ok then
+        logger.warn("[MiuRead][BookExcerpt] dialog failed",U.first_line(result,180))
+        self:info("书摘卡片暂时无法打开：\n"..U.first_line(result,120))
+        return false
+    end
+    return result~=false
+end
+
+function Plugin:_install_book_excerpt_highlight_action()
+    local highlight=self.ui and self.ui.highlight or nil
+    if not (highlight and type(highlight.addToHighlightDialog)=="function") then return false end
+    if highlight._miuread_book_excerpt_registered==true then return true end
+    local host=self
+    local ok,err=pcall(highlight.addToHighlightDialog,highlight,"04_miuread_book_excerpt",function(this)
+        return {
+            text="书摘卡片",
+            show_in_highlight_dialog_func=function()
+                return this.selected_text and U.trim(tostring(this.selected_text.text or ""))~=""
+            end,
+            callback=function()
+                local selected=this.selected_text and U.trim(tostring(this.selected_text.text or "")) or ""
+                this:onClose()
+                if selected=="" then return end
+                UIManager:scheduleIn(.04,function()
+                    if host.ui and host.ui.document and not reader_close_active() then
+                        host:_show_book_excerpt(selected)
+                    end
+                end)
+            end,
+        }
+    end)
+    if not ok then
+        logger.warn("[MiuRead][BookExcerpt] highlight action install failed",tostring(err))
+        return false
+    end
+    highlight._miuread_book_excerpt_registered=true
+    logger.info("[MiuRead][BookExcerpt] highlight action installed")
+    return true
+end
+
 function Plugin:_reader_annotation_changed(reason,refresh_callback)
     -- The KOReader mutation is authoritative. Refresh the local mirror only
     -- after it has changed so the existing upload/delete state machine sees
@@ -12544,6 +12671,10 @@ function Plugin:_show_reader_annotation_actions(item,kind,anchor,refresh_callbac
         actions[#actions+1]={icon="thought",label="添加想法",detail="保留当前划线并写下想法",callback=function()
             self:_reader_edit_annotation_note(item,true,refresh_callback)
         end}
+        actions[#actions+1]={icon="highlight",label="书摘卡片",detail="把这段划线生成分享卡片",callback=function()
+            local selected=self:_reader_annotation_selection_context(item,"highlight")
+            self:_show_book_excerpt(selected)
+        end}
         actions[#actions+1]={icon="!",label="删除划线",detail="从本书移除这条划线",danger=true,callback=function()
             self:_reader_confirm_annotation_action("删除这条划线？","删除划线",function()
                 self:_reader_delete_annotation_item(item,refresh_callback)
@@ -12552,6 +12683,10 @@ function Plugin:_show_reader_annotation_actions(item,kind,anchor,refresh_callbac
     elseif kind=="thought" then
         actions[#actions+1]={icon="thought",label="修改想法",detail="编辑当前想法内容",callback=function()
             self:_reader_edit_annotation_note(item,false,refresh_callback)
+        end}
+        actions[#actions+1]={icon="highlight",label="书摘卡片",detail="用想法对应的原划线生成卡片",callback=function()
+            local selected=self:_reader_annotation_selection_context(item,"thought")
+            self:_show_book_excerpt(selected)
         end}
         actions[#actions+1]={icon="×",label="删除想法",detail="只删除想法，保留原划线",danger=true,callback=function()
             self:_reader_confirm_annotation_action("删除这条想法？\n\n原划线会继续保留。","删除想法",function()
@@ -12589,6 +12724,10 @@ function Plugin:_reader_record_inline_actions(item,kind,back_callback)
         actions[#actions+1]={label="添加想法",callback=function()
             self:_reader_edit_annotation_note(item,true,refresh_records)
         end}
+        actions[#actions+1]={label="书摘卡片",callback=function()
+            local selected=self:_reader_annotation_selection_context(item,"highlight")
+            self:_show_book_excerpt(selected)
+        end}
         actions[#actions+1]={label="删除划线",danger=true,callback=function()
             self:_reader_confirm_annotation_action("删除这条划线？","删除划线",function()
                 self:_reader_delete_annotation_item(item,refresh_records)
@@ -12597,6 +12736,10 @@ function Plugin:_reader_record_inline_actions(item,kind,back_callback)
     elseif kind=="thought" then
         actions[#actions+1]={label="修改想法",callback=function()
             self:_reader_edit_annotation_note(item,false,refresh_records)
+        end}
+        actions[#actions+1]={label="书摘卡片",callback=function()
+            local selected=self:_reader_annotation_selection_context(item,"thought")
+            self:_show_book_excerpt(selected)
         end}
         actions[#actions+1]={label="删除想法",danger=true,callback=function()
             self:_reader_confirm_annotation_action("删除这条想法？\n\n原划线会继续保留。","删除想法",function()
@@ -21855,6 +21998,7 @@ function Plugin:show_about()
         .."\n\n非官方社区项目，与微信读书及 KOReader 无官方隶属或合作关系。")
 end
 function Plugin:onExit()
+    BookExcerptDialog.close("exit")
     self:_cancel_interactive_network("exit")
     if not HOME_EXITING then self:_begin_koreader_exit("external exit") end
     return false
@@ -22811,6 +22955,7 @@ function Plugin:onReaderReady()
         if not (self.ui and self.ui.document)
             or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session
             or reader_close_active() then return end
+        self:_install_book_excerpt_highlight_action()
         self:_install_reader_menu_bridge()
         self:_install_reader_quick_panel_zone()
         HOME_SESSION.opening_file=nil
@@ -23929,6 +24074,9 @@ function Plugin:onNotCharging()
 end
 
 function Plugin:onSuspend()
+    -- 书摘局域网传输只属于前台交互。任何 Suspend 边沿都先关闭它，
+    -- 不申请下载/同步的后台保活，也不会在 Resume 后自动恢复。
+    BookExcerptDialog.close("suspend")
     -- A backend may receive duplicate Suspend edges while its visual lock is
     -- already active. Kindle beta.4 never synthesizes Wake; deep-suspend hold
     -- is handled only at powerd ReadyToSuspend. Kobo keeps its legacy path.
@@ -24536,6 +24684,7 @@ function Plugin:_schedule_post_reader_work(reason,delay,phase)
 end
 
 function Plugin:onCloseDocument()
+    BookExcerptDialog.close("document close")
     local closing_path=normalized_reader_file(self:_current_document_path())
         or normalized_reader_file(HOME_SESSION.reader_session_file)
         or normalized_reader_file(HOME_READER_FILE)
