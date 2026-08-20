@@ -2260,14 +2260,15 @@ function Sync:upload_progress(callback, options)
     options = options or {}
     self.state = "progress_locating"
     self.last_stage = "正在定位当前阅读位置"
+    local detached=options.detached==true or options.reading_end==true
     if type(options.position_override) == "table" then
         return self:upload(0,callback,{
             silent=true,progress_only=true,
             position_override=options.position_override,
             record_override=options.record_override,
             record_generation_override=options.record_generation_override,
-            allow_same_book_generation_change=options.reading_end==true,
-            allow_book_switch_result=options.reading_end==true,
+            allow_same_book_generation_change=detached,
+            allow_book_switch_result=detached,
         })
     end
     local started, resolve_error = self:resolve_local_progress(function(position, err, meta)
@@ -2278,8 +2279,8 @@ function Sync:upload_progress(callback, options)
         self:upload(0,callback,{
             silent=true,progress_only=true,
             position_override=position,
-            allow_same_book_generation_change=options.reading_end==true,
-            allow_book_switch_result=options.reading_end==true,
+            allow_same_book_generation_change=detached,
+            allow_book_switch_result=detached,
         })
     end,{
         precise=true,

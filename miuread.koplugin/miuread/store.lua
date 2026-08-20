@@ -2245,7 +2245,86 @@ function Store:mark_read_report_consumed(stamp)
     for index=#ordered,21,-1 do rows[ordered[index].key]=nil end
     self:set("read_report_consumed",rows)
 end
+local PROGRESS_SESSION_FIELDS={
+    "pending_progress","progress_latest_sequence","progress_verified_sequence",
+    "progress_sync_state","progress_sync_message","progress_local_percent","progress_remote_percent","progress_decided_at",
+    "progress_upload_state","progress_upload_error","progress_upload_pending_at","progress_upload_verified_at",
+    "progress_upload_source","progress_upload_at","progress_upload_percent","progress_upload_chapter_uid",
+    "progress_upload_co","progress_upload_remote_co","progress_worker_active","progress_worker_updated_at",
+}
+
+local function progress_session_sequence(row)
+    row=type(row)=="table" and row or {}
+    local pending=type(row.pending_progress)=="table" and row.pending_progress or {}
+    return math.max(
+        tonumber(row.progress_latest_sequence or 0) or 0,
+        tonumber(row.progress_verified_sequence or 0) or 0,
+        tonumber(pending.progress_sequence or 0) or 0
+    )
+end
+
+local function progress_session_stamp(row)
+    row=type(row)=="table" and row or {}
+    return math.max(
+        tonumber(row.progress_decided_at or 0) or 0,
+        tonumber(row.progress_upload_verified_at or 0) or 0,
+        tonumber(row.progress_upload_pending_at or 0) or 0,
+        tonumber(row.progress_worker_updated_at or 0) or 0
+    )
+end
+
+local function progress_session_rank(row)
+    row=type(row)=="table" and row or {}
+    local pending=type(row.pending_progress)=="table" and row.pending_progress or nil
+    local pending_seq=pending and (tonumber(pending.progress_sequence or 0) or 0) or 0
+    local verified_seq=tonumber(row.progress_verified_sequence or 0) or 0
+    -- For the same sequence, a verified state is terminal and must always beat
+    -- an older Home copy that still says pending/uploading, even if that stale
+    -- copy happened to save another preference a few seconds later.
+    if verified_seq>0 and verified_seq>=pending_seq then return 3 end
+    if pending_seq>verified_seq then return 2 end
+    return 1
+end
+
+local function merge_newer_progress_sessions(memory_sessions,disk_sessions)
+    memory_sessions=type(memory_sessions)=="table" and memory_sessions or {}
+    disk_sessions=type(disk_sessions)=="table" and disk_sessions or {}
+    for id,disk_row in pairs(disk_sessions) do
+        if type(disk_row)=="table" then
+            local memory_row=type(memory_sessions[id])=="table" and memory_sessions[id] or nil
+            if memory_row then
+                local disk_seq=progress_session_sequence(disk_row)
+                local memory_seq=progress_session_sequence(memory_row)
+                local disk_rank=progress_session_rank(disk_row)
+                local memory_rank=progress_session_rank(memory_row)
+                local disk_stamp=progress_session_stamp(disk_row)
+                local memory_stamp=progress_session_stamp(memory_row)
+                -- Reader and Home can own separate Store instances. Never let
+                -- a stale Home flush resurrect an older pending progress state
+                -- after the Reader (or a detached worker) already verified a
+                -- newer/equally-new sequence on disk.
+                if disk_seq>memory_seq
+                    or (disk_seq==memory_seq and disk_rank>memory_rank)
+                    or (disk_seq==memory_seq and disk_rank==memory_rank and disk_stamp>memory_stamp) then
+                    for _,field in ipairs(PROGRESS_SESSION_FIELDS) do
+                        memory_row[field]=U.copy(disk_row[field])
+                    end
+                end
+            elseif progress_session_sequence(disk_row)>0 then
+                memory_sessions[id]=U.copy(disk_row)
+            end
+        end
+    end
+    return memory_sessions
+end
+
 function Store:flush()
+    if not self.isolated then
+        local disk_data=settings_file_data(self.settings_path)
+        if type(disk_data)=="table" then
+            self.db.data.sessions=merge_newer_progress_sessions(self.db.data.sessions,disk_data.sessions)
+        end
+    end
     local previous_path=self.settings_path..".previous"
     if not self.isolated then
         local valid=settings_file_valid(self.settings_path)
