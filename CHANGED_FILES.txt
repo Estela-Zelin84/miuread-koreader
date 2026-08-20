@@ -3,5 +3,5 @@ CHANGELOG.md
 miuread.koplugin/_meta.lua
 miuread.koplugin/main.lua
 miuread.koplugin/miuread/config.lua
-miuread.koplugin/miuread/store.lua
-miuread.koplugin/miuread/sync.lua
+miuread.koplugin/miuread/book_excerpt_dialog.lua
+miuread.koplugin/miuread/highlight_menu.lua

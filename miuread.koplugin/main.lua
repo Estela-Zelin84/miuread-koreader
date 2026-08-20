@@ -99,6 +99,7 @@ local MigrationProgress=require("miuread.migration_progress")
 local DownloadDatabase=require("miuread.download_database")
 local StatusToast=require("miuread.status_toast")
 local BookExcerptDialog=require("miuread.book_excerpt_dialog")
+local HighlightMenu=require("miuread.highlight_menu")
 local ReaderTransitionGuard=require("miuread.reader_transition_guard")
 local PluginMenu=require("miuread.plugin_menu")
 local PluginSettings=require("miuread.plugin_settings")
@@ -23262,6 +23263,13 @@ function Plugin:onReaderReady()
             or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session
             or reader_close_active() then return end
         self:_install_book_excerpt_highlight_action()
+        local highlight=self.ui and self.ui.highlight or nil
+        if highlight then
+            local ok,installed,reason=pcall(HighlightMenu.install,highlight)
+            if not ok or installed~=true then
+                logger.warn("[MiuRead][HighlightMenu] install failed",tostring(ok and reason or installed))
+            end
+        end
         self:_install_reader_menu_bridge()
         self:_install_reader_quick_panel_zone()
         HOME_SESSION.opening_file=nil
@@ -23506,17 +23514,31 @@ function Plugin:_reading_end_sync(reason,options,callback)
     end
     local current=self:_current_book_record()
     if not (current and current.book) then return false end
+    -- Suspend must be visually immediate: keep only local/barrier setup on the
+    -- Suspend callback, then start position/network work after KOReader/powerd
+    -- has had a chance to paint the lock screen. The record/ratio snapshots
+    -- bind that later work to the book that initiated the suspend.
+    local defer_background_start=options.defer_background_start==true
+    local deferred_delay=math.max(.08,tonumber(options.defer_background_delay) or .30)
+    local record_snapshot=U.copy(current)
+    local record_generation_snapshot=self.sync and tonumber(self.sync.record_generation or 0) or 0
+    local ratio_snapshot=self.sync and self.sync:local_ratio() or nil
 
     self._reading_end_barrier_active=true
     self._reading_end_barrier_reason=reason
-    if self._local_annotation_snapshot_task then
-        UIManager:unschedule(self._local_annotation_snapshot_task)
-        self._local_annotation_snapshot_task=nil
+    local function capture_local_close_state()
+        if self._local_annotation_snapshot_task then
+            UIManager:unschedule(self._local_annotation_snapshot_task)
+            self._local_annotation_snapshot_task=nil
+        end
+        pcall(function() self:_capture_local_annotation_snapshot("reading_end:"..reason) end)
+        if self._reader_checkpoint_dirty==true then
+            pcall(function() self:_flush_reader_checkpoint("reading_end:"..reason,true) end)
+        end
     end
-    pcall(function() self:_capture_local_annotation_snapshot("reading_end:"..reason) end)
-    if self._reader_checkpoint_dirty==true then
-        pcall(function() self:_flush_reader_checkpoint("reading_end:"..reason,true) end)
-    end
+    -- Local-only state is committed before suspend; this is bounded disk work
+    -- and guarantees that deferring network work never weakens crash safety.
+    capture_local_close_state()
 
     local book_id=tostring(current.book.book_id or current.book.bookId or "")
     local need_progress=self:progress_upload_mode()~="manual"
@@ -23547,8 +23569,8 @@ function Plugin:_reading_end_sync(reason,options,callback)
     local function start_annotations_detached()
         if not need_annotations then return false end
         local prefs=U.copy(self:_annotation_sync_preferences())
-        local book=U.copy(current.book or {})
-        local record=U.copy(current.record or {})
+        local book=U.copy(record_snapshot.book or {})
+        local record=U.copy(record_snapshot.record or {})
         local service=self.annotation_sync
         if self.annotation_async and self.annotation_async:busy() then
             logger.info("[MiuRead][ReadingEnd] annotation close sync already busy; local queue retained",
@@ -23671,7 +23693,10 @@ function Plugin:_reading_end_sync(reason,options,callback)
                     if finished then return end
                     local upload_started=self:_submit_progress_snapshot(book_id,snapshot,{
                         reason="reading_end_verified",retry_count=1,reading_end=true,
-                        record_snapshot=U.copy(current),
+                        detached=defer_background_start,
+                        record_snapshot=U.copy(record_snapshot),
+                        record_override=U.copy(record_snapshot),
+                        record_generation_override=record_generation_snapshot,
                         pending_reason="final_upload_queued",
                         uploading_message="正在上传结束阅读进度",
                         verifying_message="结束阅读进度已提交，正在确认云端位置",
@@ -23697,6 +23722,10 @@ function Plugin:_reading_end_sync(reason,options,callback)
                 submit_final_progress()
             end,{
                 precise=true,prepare_catalog=true,require_cloud_coordinate=true,
+                detached=defer_background_start,
+                record_snapshot=defer_background_start and U.copy(record_snapshot) or nil,
+                record_generation_override=defer_background_start and record_generation_snapshot or nil,
+                ratio_snapshot=defer_background_start and ratio_snapshot or nil,
                 on_stage=function(stage,detail)
                     if stage=="position_fallback" then
                         logger.info("[MiuRead][ReadingEnd] exact source position fallback rejected",
@@ -23713,10 +23742,25 @@ function Plugin:_reading_end_sync(reason,options,callback)
                 end
             end
         end
-        resolve_final_position()
+        if defer_background_start then
+            UIManager:scheduleIn(deferred_delay,function()
+                if finished then return end
+                logger.info("[MiuRead][ReadingEnd] deferred suspend progress start",
+                    "book=",book_id,"delay=",tostring(deferred_delay))
+                resolve_final_position()
+            end)
+        else
+            resolve_final_position()
+        end
     end
 
-    start_annotations_detached()
+    if defer_background_start then
+        UIManager:scheduleIn(deferred_delay+.06,function()
+            if not finished then start_annotations_detached() end
+        end)
+    else
+        start_annotations_detached()
+    end
     return true
 end
 
@@ -24464,7 +24508,13 @@ function Plugin:onSuspend()
         -- jobs continue behind the already-painted lock screen.
         local lease_ok=SuspendWorkLease.acquire("reader_finalizer")
         self._reading_end_standby_held=lease_ok==true
-        sync_continue=self:_reading_end_sync("休眠",{show_status=false,timeout=18},function(ok)
+        sync_continue=self:_reading_end_sync("休眠",{
+            show_status=false,timeout=18,
+            -- Acquire the reader_finalizer lease and arm the reading-time
+            -- barrier now, but postpone the costly exact-position/network
+            -- phase until after the visual lock transition returns.
+            defer_background_start=true,defer_background_delay=.30,
+        },function(ok)
             self:_finish_suspend_reader_finalizer(ok)
             if ok then
                 logger.info("[MiuRead][ReadingEnd] suspend sync completed")
