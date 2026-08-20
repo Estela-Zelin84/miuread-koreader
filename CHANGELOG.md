@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.6.8 - 2026-08-20
+
+- Unify beta and stable release channels in a single repository
+- 修复熄屏后台下载在 EPUB 最终生成阶段可能卡死，并完善 Kindle 唤醒保护。
+- feat: 新增书摘卡片图片合成基座 (miuread/book_excerpt_card)
+- 修正“书单”相关表述，统一改为“分组”
+- 重构后台锁屏下载的唤醒与异常恢复逻辑
+- 重构 Kindle 熄屏后台任务与唤醒逻辑
+- 重构 Kindle 熄屏后台任务与唤醒架构
+- 修复后台任务异常结束后的 Kindle 休眠链路
+- 重构 Kindle 熄屏后台任务为 ScreenSaver Hold
+
 ## 4.9.0-beta.4 - 2026-08-20
 
 - 重构 Kindle 熄屏后台任务为 ScreenSaver Hold
