@@ -437,8 +437,9 @@ function Sync:_usable_record(book,record,variant,path)
     if not book then return nil end
     local content_type=tostring((type(record)=="table" and record.content_type)
         or (type(book)=="table" and book.content_type) or "")
+    local partial_range=type(record)=="table" and record.partial_range==true
     if content_type=="mp_collection" or tostring(variant or "")=="mp_collection"
-        or (type(record)=="table" and record.sync_enabled==false) then return nil end
+        or (type(record)=="table" and record.sync_enabled==false and not partial_range) then return nil end
     if type(record)=="table" and tostring(record.preview_mode or "")=="info" then return nil end
     return {book=book,record=record,variant=variant,path=path}
 end
@@ -452,6 +453,14 @@ function Sync:record()
     local book,record,variant=finder(self.store,path,true)
     local current=self:_usable_record(book,record,variant,path)
     if current then self.current=current; return current end
+end
+
+function Sync:_read_report_allowed(record)
+    record=record or self:record()
+    local row=record and record.record or nil
+    if type(row)~="table" then return false end
+    if row.partial_range==true then return false end
+    return row.read_report_enabled~=false
 end
 
 function Sync:local_ratio()
@@ -1164,8 +1173,68 @@ function Sync:jump_remote(remote)
     local record = self:record()
     if not record then return false, "未识别到当前觅阅书籍" end
     local mode, standalone_uid = self:_record_mode(record)
+    local row=type(record.record)=="table" and record.record or {}
+    local partial_range=row.partial_range==true
     local ok, err
-    if mode ~= "standalone" or not standalone_uid then
+
+    local function within_chapter_ratio(selected_words)
+        local ratio=tonumber(remote.chapter_ratio)
+        if ratio~=nil then return U.clamp(ratio,0,1) end
+        local source_word_offset=tonumber(remote.source_word_offset)
+        if source_word_offset~=nil and selected_words>0 then
+            return U.clamp(source_word_offset/selected_words,0,1)
+        end
+        -- Old/non-native records may still use word-space offsets. Native WR
+        -- `co` must never be divided by wordCount.
+        if remote.native_offset~=true and tonumber(remote.offset)~=nil and selected_words>0 then
+            return U.clamp(tonumber(remote.offset)/selected_words,0,1)
+        end
+        return nil
+    end
+
+    if partial_range then
+        local local_map=type(row.chapter_map)=="table" and row.chapter_map or {}
+        local remote_uid=tostring(remote.chapter_uid or "")
+        if remote_uid=="" then return false,"云端位置缺少章节信息" end
+        local selected,local_before,local_total=nil,0,0
+        for _,chapter in ipairs(local_map) do
+            local words=chapter_words(chapter)
+            if not selected and tostring(chapter_uid(chapter) or "")==remote_uid then
+                selected=chapter
+            elseif not selected then
+                local_before=local_before+words
+            end
+            local_total=local_total+words
+        end
+        if not selected then return false,"云端位置不在当前章节版范围内" end
+        local words=chapter_words(selected)
+        if words<=0 or local_total<=0 then return false,"章节版位置信息不完整" end
+        local within=within_chapter_ratio(words)
+        if within==nil then
+            local catalog=select(1,self:_progress_catalog(record))
+            local target=tonumber(remote.percent)
+            if type(catalog)=="table" and #catalog>0 and target~=nil then
+                local before,total=0,0
+                local full_selected
+                for _,chapter in ipairs(catalog) do
+                    local cw=chapter_words(chapter)
+                    if not full_selected and tostring(chapter_uid(chapter) or "")==remote_uid then
+                        full_selected={before=before,words=cw}
+                    end
+                    total=total+cw
+                    if not full_selected then before=before+cw end
+                end
+                if full_selected and full_selected.words>0 and total>0 then
+                    local target_words=U.clamp(target,0,100)/100*total
+                    within=U.clamp((target_words-full_selected.before)/full_selected.words,0,1)
+                end
+            end
+        end
+        if within==nil then return false,"云端位置缺少可换算的章节内坐标" end
+        local local_ratio=U.clamp((local_before+words*within)/local_total,0,1)
+        ok=self:jump(local_ratio*100)
+        err=ok and nil or "无法跳转到云端阅读位置"
+    elseif mode ~= "standalone" or not standalone_uid then
         ok = self:jump(remote.percent)
         err = ok and nil or "无法跳转到云端阅读位置"
     else
@@ -1190,10 +1259,8 @@ function Sync:jump_remote(remote)
         if not selected then return false, "暂时无法换算当前章节位置" end
 
         local words = chapter_words(selected)
-        local local_ratio
-        if tonumber(remote.offset) then
-            local_ratio = tonumber(remote.offset) / words
-        elseif tonumber(remote.percent) and total > 0 then
+        local local_ratio=within_chapter_ratio(words)
+        if local_ratio==nil and tonumber(remote.percent) and total > 0 and words>0 then
             local target = U.clamp(tonumber(remote.percent), 0, 100) / 100 * total
             local_ratio = (target - before) / words
         end
@@ -2304,6 +2371,10 @@ end
 function Sync:test_upload(callback)
     local record=self:record()
     if not record then if callback then callback(false,"未识别到 MiuRead 生成的当前书籍") end; return false end
+    if not self:_read_report_allowed(record) then
+        if callback then callback(false,"当前章节版仅同步阅读进度，不上传阅读时间") end
+        return false
+    end
     if self.busy or (self.async and self.async:busy()) then
         if callback then callback(false,"同步任务忙") end
         return false
@@ -3042,6 +3113,11 @@ function Sync:_start_daemon(reason)
         self.state = "stopped"
         return false, "未识别到 MiuRead 书籍"
     end
+    if not self:_read_report_allowed(record) then
+        self.state = "stopped"
+        self.last_stage = "章节版仅同步阅读进度"
+        return false, "当前章节版不上传阅读时间"
+    end
     local book_id = tostring(record.book.book_id or "")
     local core_hash=self:_core_map_hash(record)
     local time_only=not self:periodic_progress_enabled()
@@ -3367,7 +3443,8 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
 end
 
 function Sync:_final_elapsed(skip_status_import)
-    if not self.store:preferences().sync.time_enabled or not self:record() then return nil end
+    local record=self:record()
+    if not self.store:preferences().sync.time_enabled or not record or not self:_read_report_allowed(record) then return nil end
     if skip_status_import ~= true then self:_import_daemon_status(true) end
     local now = os.time()
     local started = tonumber(self.session_started_at or 0) or 0
@@ -3424,6 +3501,14 @@ function Sync:start(reason)
         self.last_stage = "未识别当前觅阅书籍"
         logger.info("[MiuRead][ReadReport] start deferred", "reason=", tostring(reason), "record=not_found")
         return false, "未识别到 MiuRead 书籍"
+    end
+    if not self:_read_report_allowed(record) then
+        self.progress_hold=false
+        self.state="stopped"
+        self.last_stage="章节版仅同步阅读进度"
+        logger.info("[MiuRead][ReadReport] disabled for progress-only range",
+            "book=",tostring(record.book and record.book.book_id or ""))
+        return false,"当前章节版不上传阅读时间"
     end
     if enabled and self:periodic_progress_enabled() and not self:is_verified(record.book.book_id) then
         self.progress_hold = true

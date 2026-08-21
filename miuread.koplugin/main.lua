@@ -11424,6 +11424,53 @@ function Plugin:_reader_jump_percent(delta)
     return true
 end
 
+function Plugin:_reader_progress_display_state()
+    local document_percent=self:_reader_progress_percent()
+        or self:_reader_toolbar_cached_percent() or 0
+    local state={
+        percent=document_percent, whole_percent=nil, chapter_percent=nil,
+        progress_scope="document",
+    }
+    local sync=self.sync
+    local record=sync and sync:record() or nil
+    if not record then return state end
+
+    local row=type(record.record)=="table" and record.record or {}
+    local mode=sync:_record_mode(record)
+    local partial_range=row.partial_range==true
+    local ratio=sync:local_ratio()
+    local position
+    local ok,value=pcall(sync._position_for_report,sync,ratio,true)
+    if ok and type(value)=="table" then position=value end
+
+    if partial_range then
+        state.progress_scope="range"
+    elseif mode=="standalone" then
+        state.progress_scope="chapter"
+    else
+        state.progress_scope="whole"
+    end
+
+    if type(position)=="table" then
+        if position.safe==true and tonumber(position.progress)~=nil then
+            state.whole_percent=math.max(0,math.min(100,tonumber(position.progress)))
+        end
+        local chapter_ratio=tonumber(position.chapter_ratio)
+        if chapter_ratio~=nil then
+            state.chapter_percent=math.max(0,math.min(100,chapter_ratio*100))
+        elseif tonumber(position.chapter_percent)~=nil then
+            state.chapter_percent=math.max(0,math.min(100,tonumber(position.chapter_percent)))
+        end
+    end
+
+    -- A complete EPUB's local document percentage is itself a valid whole-book
+    -- display fallback. Partial/standalone EPUBs must never use it as whole-book progress.
+    if state.progress_scope=="whole" and state.whole_percent==nil then
+        state.whole_percent=document_percent
+    end
+    return state
+end
+
 local function typography_heavy_stage(stage)
     stage=tostring(stage or "")
     return stage=="transform" or stage=="package"
@@ -11706,8 +11753,12 @@ end
 function Plugin:_show_reader_progress_control(back_callback)
     if not (self.ui and self.ui.document) then return false end
     self:_mark_reader_busy(8)
+    local display=self:_reader_progress_display_state()
     ReaderProgressDialog.show{
-        percent=self:_reader_progress_percent() or 0,
+        percent=display.percent or 0,
+        whole_percent=display.whole_percent,
+        chapter_percent=display.chapter_percent,
+        progress_scope=display.progress_scope,
         on_goto_percent=function(target) self:_reader_goto_percent(target) end,
         on_adjust=function(delta) self:_reader_jump_percent(delta) end,
         on_jump=function() self:_show_reader_position_jump() end,

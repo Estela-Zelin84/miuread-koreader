@@ -12,6 +12,7 @@ local DownloadPlan = require("miuread.download_plan")
 local DownloadDatabase = require("miuread.download_database")
 local EpubInstaller = require("miuread.epub_installer")
 local BookIntegrity = require("miuread.book_integrity")
+local SourcePosition = require("miuread.source_position")
 local U = require("miuread.util")
 local logger = require("logger")
 local ok_socket, socket = pcall(require, "socket")
@@ -997,7 +998,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         partial_range=partial_range,range_start_index=tonumber(opt.range_start_index),
         range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
         range_end_title=opt.range_end_title,content_type="book",
-        sync_enabled=not partial_range,read_report_enabled=not partial_range,
+        sync_enabled=true,progress_sync_enabled=true,read_report_enabled=not partial_range,
         chapters=map,generated_at=now,complete=true,task_id=opt.download_run_id,
         title_transform_version=tonumber(opt.title_transform_version) or TITLE_TRANSFORM_VERSION,
         access_scope=access_scope,catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
@@ -1080,7 +1081,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
         file=path, directory=dir, variant=storage_kind, base_variant=kind, downloaded_at=now,
         content_type="book",
-        sync_enabled=not partial_range,
+        sync_enabled=true,
+        progress_sync_enabled=true,
         read_report_enabled=not partial_range,
         partial_range=partial_range,range_start_index=tonumber(opt.range_start_index),
         range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
@@ -1837,6 +1839,12 @@ function Downloader:book(input, opt, progress)
             -- ranges are interpreted only against this immutable chapter body.
             coord_body = type(state) == "table" and tostring(state.coord_html or "") or ""
             if coord_body == "" then coord_body = AnnotationCoord.fromDownloadedXhtml(downloaded) end
+            local cached_source, cache_error = SourcePosition.cacheChapter(
+                self.reader, book.bookId, uid, book.version or 0, coord_body)
+            if not cached_source then
+                logger.warn("[MiuRead][ProgressSource] download cache seed failed",
+                    "book=",tostring(book.bookId),"chapter=",uid,"reason=",tostring(cache_error or "unknown"))
+            end
             local body_count
             body,body_count = Codec.body_fragment(downloaded)
             local body_valid,body_error=validate_body_fragment(body)

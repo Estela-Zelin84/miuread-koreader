@@ -61,6 +61,9 @@ local Dialog = InputContainer:extend{
     covers_fullscreen = true,
     stop_events_propagation = true,
     percent = 0,
+    whole_percent = nil,
+    chapter_percent = nil,
+    progress_scope = "document",
     on_goto_percent = nil,
     on_adjust = nil,
     on_jump = nil,
@@ -117,7 +120,7 @@ function Dialog:init()
     local panel_w = sw - outer_margin * 2
     local content_w = panel_w - pad * 2
     local header_h = math.max(Skin.dp(40, 34, 53), math.floor(sh * .04))
-    local value_h = math.max(Skin.dp(38, 32, 52), math.floor(sh * (portrait and .036 or .052)))
+    local value_h = math.max(Skin.dp(58, 48, 74), math.floor(sh * (portrait and .055 or .078)))
     local value_track_gap = Skin.dp(8, 6, 12)
     local track_h = math.max(Skin.dp(24, 20, 34), math.floor(sh * (portrait and .024 or .035)))
     local progress_h = value_h + value_track_gap + track_h
@@ -173,13 +176,43 @@ function Dialog:init()
     root[#root + 1] = OffsetContainer:new{x_off = outer_margin + pad, y_off = y, header}
     y = y + header_h
 
+    local function pct_text(value)
+        value=math.max(0,math.min(100,tonumber(value) or 0))
+        return string.format("%.2f%%",value)
+    end
+    local document_percent=math.max(0,math.min(100,tonumber(self.percent) or 0))
+    local whole_percent=tonumber(self.whole_percent)
+    local chapter_percent=tonumber(self.chapter_percent)
+    local scope=tostring(self.progress_scope or "document")
+    local primary,secondary
+    if scope=="chapter" then
+        primary=whole_percent~=nil and ("整书进度  "..pct_text(whole_percent)) or "整书进度  暂无法换算"
+        secondary="本章位置  "..pct_text(chapter_percent~=nil and chapter_percent or document_percent)
+    elseif scope=="range" then
+        primary=whole_percent~=nil and ("整书进度  "..pct_text(whole_percent)) or "整书进度  暂无法换算"
+        local chapter=chapter_percent~=nil and ("本章 "..pct_text(chapter_percent).."  ·  ") or ""
+        secondary=chapter.."章节版位置 "..pct_text(document_percent)
+    elseif scope=="whole" then
+        primary="整书进度  "..pct_text(whole_percent~=nil and whole_percent or document_percent)
+        secondary=chapter_percent~=nil and ("本章位置  "..pct_text(chapter_percent)) or ""
+    else
+        primary="当前文档  "..pct_text(document_percent)
+        secondary=""
+    end
+    local primary_h=math.floor(value_h*.58)
     root[#root + 1] = OffsetContainer:new{
         x_off = outer_margin + pad,
         y_off = y,
-        Ui.textbox(tostring(math.floor((tonumber(self.percent) or 0) + .5)) .. "%",
-            content_w, value_h, Skin.face("cfont", 22, 28, 18.5), {
-                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
-            }),
+        Ui.textbox(primary, content_w, primary_h, Skin.face("cfont", 18.5, 24, 15.5), {
+            bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+        }),
+    }
+    root[#root + 1] = OffsetContainer:new{
+        x_off = outer_margin + pad,
+        y_off = y + primary_h,
+        Ui.textbox(secondary, content_w, math.max(1,value_h-primary_h), Skin.face("cfont", 11.4, 15.0, 9.6), {
+            alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        }),
     }
 
     local bar_w = math.max(1, content_w - math.floor(content_w * .04))
@@ -308,6 +341,9 @@ function M.show(opts)
     M.close()
     local ok, dialog = pcall(Dialog.new, Dialog, {
         percent = opts.percent,
+        whole_percent = opts.whole_percent,
+        chapter_percent = opts.chapter_percent,
+        progress_scope = opts.progress_scope,
         on_goto_percent = opts.on_goto_percent,
         on_adjust = opts.on_adjust,
         on_jump = opts.on_jump,

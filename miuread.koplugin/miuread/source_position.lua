@@ -27,21 +27,34 @@ local function chapter_words(chapter)
     return math.max(0, tonumber(chapter.wordCount or chapter.word_count or 0) or 0)
 end
 
-local function cache_root(reader)
+local function cache_paths(reader, book_id, uid, version)
     local store = reader and reader.store or nil
-    local root = store and tostring(store.temp_dir or "") or ""
-    if root == "" then return nil end
-    return root .. "/progress-source-position"
-end
-
-local function cache_path(reader, book_id, uid, version)
-    local root = cache_root(reader)
-    if not root then return nil end
-    local dir = root .. "/" .. U.id_name(tostring(book_id or "unknown"))
-    U.mkdir(root)
-    U.mkdir(dir)
-    return dir .. "/" .. U.id_name(tostring(uid or "unknown"))
+    local name = U.id_name(tostring(uid or "unknown"))
         .. "-v" .. U.id_name(tostring(version or 0)) .. ".xhtml"
+    local paths = {}
+
+    -- beta.14: keep coordinate source beside the book cache so downloaded
+    -- chapters remain precisely mappable after restart and while offline.
+    if store and type(store.book_dir) == "function" and tostring(book_id or "") ~= "" then
+        local ok, book_root = pcall(store.book_dir, store, tostring(book_id))
+        if ok and tostring(book_root or "") ~= "" then
+            local root = tostring(book_root) .. "/progress-source-position"
+            U.mkdir(root)
+            paths[#paths + 1] = root .. "/" .. name
+        end
+    end
+
+    -- Read the old beta.13 temp cache as a compatibility fallback. New writes
+    -- prefer the persistent per-book path above.
+    local temp_root = store and tostring(store.temp_dir or "") or ""
+    if temp_root ~= "" then
+        local root = temp_root .. "/progress-source-position"
+        local dir = root .. "/" .. U.id_name(tostring(book_id or "unknown"))
+        U.mkdir(root)
+        U.mkdir(dir)
+        paths[#paths + 1] = dir .. "/" .. name
+    end
+    return paths
 end
 
 local function read_cached(path)
@@ -64,9 +77,11 @@ local function fetch_coord_html(reader, record, anchor)
 
     local version = tonumber(anchor.book_version or book.version or book.bookVersion
         or (record.record and (record.record.book_version or record.record.bookVersion))) or 0
-    local path = cache_path(reader, book.book_id or book.bookId, uid, version)
-    local cached = read_cached(path)
-    if cached then return cached, true end
+    local paths = cache_paths(reader, book.book_id or book.bookId, uid, version)
+    for _, path in ipairs(paths) do
+        local cached = read_cached(path)
+        if cached then return cached, true end
+    end
 
     local chapter = {
         uid = uid,
@@ -92,8 +107,21 @@ local function fetch_coord_html(reader, record, anchor)
     if coord_html == "" then return nil, nil, "coord_html_missing" end
     if #coord_html > MAX_SOURCE_BYTES then return nil, nil, "coord_html_too_large" end
 
-    if path then pcall(U.atomic_write, path, coord_html, true) end
+    local write_path = paths[1]
+    if write_path then pcall(U.atomic_write, write_path, coord_html, true) end
     return coord_html, false
+end
+
+function M.cacheChapter(reader, book_id, uid, version, coord_html)
+    coord_html = tostring(coord_html or "")
+    if coord_html == "" then return false, "coord_html_missing" end
+    if #coord_html > MAX_SOURCE_BYTES then return false, "coord_html_too_large" end
+    local paths = cache_paths(reader, book_id, uid, version)
+    local path = paths[1]
+    if not path then return false, "source_cache_unavailable" end
+    local ok, err = U.atomic_write(path, coord_html, true)
+    if not ok then return false, tostring(err or "source_cache_write_failed") end
+    return true, path
 end
 
 local function norm_count_before(map, text_boundary)
