@@ -67,7 +67,10 @@ local TapBox = InputContainer:extend{
 }
 function TapBox:init()
     self.dimen = self.dimen or Geom:new{w = 1, h = 1}
-    self.ges_events = {TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}}}
+    self.ges_events = {TapSelect = {
+        GestureRange:new{ges = "tap", range = self.dimen},
+        GestureRange:new{ges = "touch", range = self.dimen},
+    }}
 end
 function TapBox:getSize() return Geom:new{w = self.dimen.w, h = self.dimen.h} end
 function TapBox:paintTo(bb, x, y)
@@ -78,7 +81,6 @@ function TapBox:onTapSelect()
     if self.enabled ~= false and self.callback then self.callback() end
     return true
 end
-function TapBox:handleEvent(event) return GestureBridge.handle(InputContainer, self, event) end
 
 local M = {}
 local active_dialog
@@ -575,11 +577,11 @@ function Editor:_build()
     local close_sz = close_body:getSize()
     self.close_w = close_sz.w
     self.close_h = close_sz.h
-    self.close_btn = TapBox:new{
-        dimen = Geom:new{w = self.close_w, h = self.close_h},
-        callback = function() self:_close() end,
+    -- dimen 宽度包含 _margin，使 tap 区域延伸到 frame 右边缘
+    self.close_btn = InputContainer:new{
+        dimen = Geom:new{w = self.close_w + self._margin, h = self.close_h},
+        [1] = close_body,
     }
-    self.close_btn[1] = close_body
 
     local two_col = h_c > w_c -- 长条卡片→左右两栏；矮宽卡片→上下分栏
     self.two_col = two_col
@@ -658,7 +660,10 @@ function Editor:_build()
     self[2] = self.close_btn
     self.dimen = Geom:new{w = sw, h = sh} -- 全屏占位（点框外关闭）；frame 由 align/vertical_align 居中
     self.ges_events = {
-        TapClose = {GestureRange:new{ges = "tap", range = self.dimen}},
+        TapClose = {
+            GestureRange:new{ges = "tap", range = self.dimen},
+            GestureRange:new{ges = "touch", range = self.dimen},
+        },
     }
     UIManager:setDirty("all", "full")
 end
@@ -698,9 +703,15 @@ end
 
 function Editor:onTapClose(arg, ges)
     if not ges or not ges.pos or not self.frame or not self.frame.dimen then return end
-    -- 点框外关闭；点框内交给子控件（返回 false 让事件继续传播）
-    if not ges.pos:intersectWith(self.frame.dimen) then
-        self:_close()
+    local should_close = not ges.pos:intersectWith(self.frame.dimen)
+        or (self.close_btn and self.close_btn.dimen and self.close_btn.dimen:contains(ges.pos))
+    if should_close then
+        -- touch 事件只消费不关闭，等 tap 事件到达时再关闭，
+        -- 避免 Editor 提前移除导致 tap 泄漏到 reader 触发手势
+        if ges.ges == "tap" then
+            self:_close()
+        end
+        return true
     end
 end
 
