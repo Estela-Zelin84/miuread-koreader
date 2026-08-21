@@ -1,42 +1,50 @@
 --[[--
-书摘卡片交互层：实时预览、本地保存与局域网扫码取图。
+书摘卡片编辑器：实时预览、本地保存与局域网扫码取图。
 
-beta.9 起不再使用“参数表 -> 查看预览”的多层弹窗：
-  * 打开即渲染实时预览；
-  * 宽屏使用左预览 + 右样式，窄屏自动改为上下布局；
-  * 样式/配色/静影背景在同一编辑器内切换并立即刷新预览；
-  * 扫码前先关闭编辑器，再单独显示二维码，避免方框叠加。
+编辑器布局（色块网格 + ✕ 关闭 + 按图高自动收缩 + 两栏自适应）：
+  * 打开即渲染实时预览（renderBB -> BlitBuffer -> ImageWidget，绕开文件缓存，
+    配色切换宽高不变时不会命中旧图）；
+  * 配色/静影背景为色块网格（4 列方阵，选中加粗黑边），模板为 ✓ 前缀按钮；
+  * 切换样式/配色即时刷新预览（同步渲染 + 延迟更新条），无「渲染中」弹窗；
+  * 弹窗按预览图高度自动收缩，避免大面积空白；长条卡片左右两栏，矮宽卡片上下分栏；
+  * ✕ 叠在框右上角 / 点框外 / 返回键 关闭；
+  * 保存 PNG（阅读器默认目录）/ 手机扫码保存（局域网）/ 复制文字。
 
+扫码前先关闭编辑器，再单独显示二维码，避免方框叠加。
 渲染由 book_excerpt_card 负责；局域网传输由 book_excerpt_transfer 负责。
 --]]--
 
-local Blitbuffer = require("ffi/blitbuffer")
+local BlitBuffer = require("ffi/blitbuffer")
+local ButtonTable = require("ui/widget/buttontable")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
+local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local ImageWidget = require("ui/widget/imagewidget")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local OverlapGroup = require("ui/widget/overlapgroup")
 local RawQRMessage = require("ui/widget/qrmessage")
+local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
-local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local Font = require("ui/font")
+local Size = require("ui/size")
 
 local GestureBridge = require("miuread.gesture_bridge")
 local Card = require("miuread.book_excerpt_card")
 local Transfer = require("miuread.book_excerpt_transfer")
 local U = require("miuread.util")
-local Skin = require("miuread.reader_skin")
-local Ui = require("miuread.ui_components")
 local logger = require("logger")
 local util = require("util")
 local ffiutil = require("ffi/util")
 local DataStorage = require("datastorage")
+
+local Screen = Device.screen
+local label_face = Font:getFace("cfont", 10)
 
 local function gesture_aware_class(base, attrs)
     local class = base:extend(attrs or {})
@@ -51,12 +59,7 @@ local QRMessage = gesture_aware_class(RawQRMessage, {
     _miuread_modal_surface = true,
 })
 
-local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
-function OffsetContainer:getSize() return self[1]:getSize() end
-function OffsetContainer:paintTo(bb, x, y)
-    if self[1] then self[1]:paintTo(bb, x + self.x_off, y + self.y_off) end
-end
-
+-- 可点占位容器：dimen 即命中区，[1] 为展示内容，回调由 onTapSelect 触发。
 local TapBox = InputContainer:extend{
     dimen = nil,
     callback = nil,
@@ -64,7 +67,10 @@ local TapBox = InputContainer:extend{
 }
 function TapBox:init()
     self.dimen = self.dimen or Geom:new{w = 1, h = 1}
-    self.ges_events = {TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}}}
+    self.ges_events = {TapSelect = {
+        GestureRange:new{ges = "tap", range = self.dimen},
+        GestureRange:new{ges = "touch", range = self.dimen},
+    }}
 end
 function TapBox:getSize() return Geom:new{w = self.dimen.w, h = self.dimen.h} end
 function TapBox:paintTo(bb, x, y)
@@ -75,7 +81,6 @@ function TapBox:onTapSelect()
     if self.enabled ~= false and self.callback then self.callback() end
     return true
 end
-function TapBox:handleEvent(event) return GestureBridge.handle(InputContainer, self, event) end
 
 local M = {}
 local active_dialog
@@ -202,28 +207,56 @@ local function render_card(host, context, selection, preview)
     return path, dimen
 end
 
-local function cycle_index(current, delta, list)
-    local count = #list
-    if count <= 0 then return 1 end
-    local n = (tonumber(current) or 1) + (tonumber(delta) or 0)
-    while n < 1 do n = n + count end
-    while n > count do n = n - count end
-    return n
+-- 由已渲染 BlitBuffer 直接构造预览图（复用首次渲染，避免二次渲染）
+local function make_preview_image(bb, dimen, avail_w, avail_h)
+    if not bb or not dimen or dimen.w <= 0 or dimen.h <= 0 then
+        if bb then bb:free() end
+        return nil
+    end
+    local scale = math.min(avail_w / dimen.w, avail_h / dimen.h)
+    local img_w = math.max(1, math.floor(dimen.w * scale))
+    local img_h = math.max(1, math.floor(dimen.h * scale))
+    return ImageWidget:new{
+        image = bb,
+        image_disposable = true, -- ImageWidget free 时释放 bb
+        width = img_w,
+        height = img_h,
+    }, img_h
 end
 
 local Editor = InputContainer:extend{
     name = "miuread_book_excerpt_editor",
     _miuread_transient = true,
     _miuread_modal_surface = true,
-    covers_fullscreen = true,
+    covers_fullscreen = false, -- 非全屏居中框：reader 画在后面，点框外关闭
     stop_events_propagation = true,
+    align = "center",           -- InputContainer:paintTo 据此居中 [1]=frame
+    vertical_align = "center",
     host = nil,
     context = nil,
     selection = nil,
     closed = false,
     pending_action = nil,
-    frame_dimen = nil,
     preview_image = nil,
+    -- 布局产物（_build 赋值，_refresh_preview / _rebuild 复用）
+    frame = nil,
+    close_btn = nil,
+    close_w = 0,
+    close_h = 0,
+    preview_container = nil,
+    controls = nil,
+    template_strip = nil,
+    color_strip = nil,
+    export_buttons = nil,
+    pv_avail_w = 0,
+    pv_avail_h = 0,
+    main = nil,
+    controls_center = nil,
+    right_col = nil,
+    frame_content = nil,
+    ctrl_width = 0,
+    ctrl_w = 0,
+    two_col = false,
 }
 function Editor:handleEvent(event) return GestureBridge.handle(InputContainer, self, event) end
 
@@ -235,357 +268,490 @@ function Editor:_close(action)
     return true
 end
 
-function Editor:_button(text, width, height, callback, opts)
-    opts = opts or {}
-    local enabled = opts.enabled ~= false
-    local selected = opts.selected == true
-    local fg = selected and Blitbuffer.COLOR_WHITE or (enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY)
-    local bg = selected and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
-    local border = Skin.line("thin")
-    local tap = TapBox:new{
-        dimen = Geom:new{w = width, h = height},
-        enabled = enabled,
-        callback = callback,
-    }
-    tap[1] = Skin.frame(width, height, {
-        bordersize = border,
-        padding = 0,
-        radius = Skin.radius(4, 2, 7),
-        background = bg,
-        color = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
-    }, Ui.text(tostring(text or ""), math.max(1, width - border * 2), math.max(1, height - border * 2),
-        Skin.face("cfont", opts.small and 9.2 or 10.4, opts.small and 12.8 or 14.4, 8.2), {
-            bold = selected or opts.bold == true,
-            fgcolor = fg,
-        }))
-    return tap
+function Editor:_current_template()
+    return Card.TEMPLATES[self.selection.template_idx]
 end
 
-function Editor:_set_template(index)
-    if self.closed then return end
-    index = clamp_index(index, Card.TEMPLATES, 1)
-    if index == self.selection.template_idx then return end
-    self.selection.template_idx = index
-    settings_write(SETTING_TEMPLATE, index)
-    self:_rebuild()
+function Editor:_is_stillness()
+    local t = self:_current_template()
+    return t and t.id == "stillness" or false
 end
 
-function Editor:_cycle_color(delta)
-    if self.closed then return end
-    self.selection.color_idx = cycle_index(self.selection.color_idx, delta, Card.COLORS)
-    settings_write(SETTING_COLOR, self.selection.color_idx)
-    self:_rebuild()
-end
-
-function Editor:_cycle_background(delta)
-    if self.closed then return end
-    self.selection.background_idx = cycle_index(self.selection.background_idx, delta, Card.BACKGROUND_IMAGES)
-    settings_write(SETTING_BACKGROUND, self.selection.background_idx)
-    self:_rebuild()
-end
-
-function Editor:_preview_widget(width, height)
-    local path, _, err = render_card(self.host, self.context, self.selection, true)
-    if not path then
-        return Skin.frame(width, height, {bordersize = Skin.line("thin"), background = Blitbuffer.COLOR_WHITE},
-            Ui.textbox("书摘卡片生成失败\n" .. tostring(err or "unknown"),
-                math.max(1, width - Skin.dp(16, 10, 22)), math.max(1, height - Skin.dp(16, 10, 22)),
-                Skin.face("cfont", 10.5, 14.5, 8.5), {alignment = "center", halign = "center"}))
+-- 渲染卡片到 BlitBuffer 并按可用宽高缩放为 ImageWidget
+function Editor:_new_preview(avail_w, avail_h)
+    local bb, dimen = Card.renderBB(render_options(self.context, self.selection, false))
+    if not bb or not dimen or dimen.w <= 0 or dimen.h <= 0 then
+        if bb then bb:free() end
+        logger.warn("[MiuRead][BookExcerpt] preview render failed")
+        return nil
     end
-    local image
-    local ok, image_err = pcall(function()
-        image = ImageWidget:new{
-            file = path,
-            width = math.max(1, width - Skin.dp(12, 8, 18)),
-            height = math.max(1, height - Skin.dp(12, 8, 18)),
-            scale_factor = 0,
-            file_do_cache = false,
-        }
-        image:getSize() -- force decode before the old preview file is retired
+    local scale = math.min(avail_w / dimen.w, avail_h / dimen.h)
+    local img_w = math.max(1, math.floor(dimen.w * scale))
+    local img_h = math.max(1, math.floor(dimen.h * scale))
+    return ImageWidget:new{
+        image = bb,
+        image_disposable = true,
+        width = img_w,
+        height = img_h,
+    }, img_h
+end
+
+-- 据图片高度收缩弹窗：更新 preview_container/controls_center 尺寸并清掉
+-- VG/HG 缓存的 _size，使帧随内容收缩、InputContainer 重心居中。
+function Editor:_apply_auto_shrink(image_h)
+    if not image_h or not self.preview_container then return end
+    local new_h = image_h
+    if self.controls_center then -- 双栏：控件居中于整列高，列随 new_h 收缩
+        local ctrl_natural = self.controls and self.controls:getSize().h or 0
+        if ctrl_natural > new_h then new_h = ctrl_natural end
+        self.controls_center.dimen = Geom:new{w = self.ctrl_width, h = new_h}
+        if self.right_col then self.right_col:resetLayout() end
+    end
+    self.preview_container.dimen = Geom:new{w = self.pv_avail_w, h = new_h}
+    if self.main then self.main:resetLayout() end
+    if self.frame_content then self.frame_content:resetLayout() end
+end
+
+-- 应用预览图到容器：clear() 会释放旧子控件（含 ImageWidget 及其 bb），
+-- 故不再单独 free，避免 bb 双重释放。换入新图后触发全屏重绘。
+function Editor:_apply_preview_img(img)
+    if not img or not self.preview_container then return end
+    self.preview_container:clear()
+    self.preview_container[1] = img
+    self.preview_image = img
+    -- 收缩后旧帧暴露区须重绘 reader 才不残留；editor 不 cover_fullscreen，reader 在重绘栈内
+    UIManager:setDirty("all", "full")
+end
+
+function Editor:_do_render_preview()
+    local img, image_h = self:_new_preview(self.pv_avail_w, self.pv_avail_h)
+    self:_apply_auto_shrink(image_h)
+    self:_apply_preview_img(img)
+end
+
+-- after_render：渲染完回调——把色块/模板条的 setDirty 推迟到渲染之后，与预览同帧 paint。
+function Editor:_refresh_preview(after_render)
+    self:_do_render_preview()
+    if after_render then after_render() end
+end
+
+function Editor:_on_select_template(i)
+    self.selection.template_idx = clamp_index(i, Card.TEMPLATES, 1)
+    self:_refresh_preview(function()
+        settings_write(SETTING_TEMPLATE, self.selection.template_idx)
+        self:_update_template_strip()
+        self:_update_color_strip()
     end)
-    if not ok or not image then
-        logger.warn("[MiuRead][BookExcerpt] preview image failed", tostring(image_err))
-        return Ui.text("预览暂时无法显示", width, height, Skin.face("cfont", 10.5, 14.5, 8.5), {})
-    end
-    self._next_preview_image = image
-    return Skin.frame(width, height, {
-        bordersize = Skin.line("thin"),
-        padding = Skin.dp(5, 3, 8),
-        radius = Skin.radius(5, 3, 8),
-        background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_DARK_GRAY,
-    }, CenterContainer:new{dimen = Geom:new{
-        w = math.max(1, width - Skin.dp(18, 12, 26)),
-        h = math.max(1, height - Skin.dp(18, 12, 26)),
-    }, image})
 end
 
-function Editor:_template_stack(width, height, vertical_grid)
-    local gap = Skin.dp(6, 4, 9)
-    local count = #Card.TEMPLATES
-    local root = vertical_grid and VerticalGroup:new{align = "left"} or VerticalGroup:new{align = "left"}
-    if vertical_grid then
-        local cols = 3
-        local rows = math.ceil(count / cols)
-        local row_h = math.max(1, math.floor((height - gap * math.max(0, rows - 1)) / math.max(1, rows)))
-        local button_w = math.max(1, math.floor((width - gap * (cols - 1)) / cols))
-        for r = 1, rows do
-            local row = HorizontalGroup:new{align = "center"}
-            for c = 1, cols do
-                local index = (r - 1) * cols + c
-                if index <= count then
-                    local item = Card.TEMPLATES[index]
-                    row[#row + 1] = self:_button(item.name or tostring(index), button_w, row_h,
-                        function() self:_set_template(index) end,
-                        {selected = index == self.selection.template_idx})
-                else
-                    row[#row + 1] = Widget:new{dimen = Geom:new{w = button_w, h = row_h}}
-                end
-                if c < cols then row[#row + 1] = HorizontalSpan:new{width = gap} end
-            end
-            root[#root + 1] = row
-            if r < rows then root[#root + 1] = VerticalSpan:new{height = gap} end
+function Editor:_on_select_color(i)
+    local persist_key, persist_value
+    if self:_is_stillness() then
+        self.selection.background_idx = clamp_index(i, Card.BACKGROUND_IMAGES, 1)
+        persist_key, persist_value = SETTING_BACKGROUND, self.selection.background_idx
+        -- 背景图只使用随插件打包的资产；缺失时渲染回退纯色（见 render.lua）
+        if not Card.backgroundImagePath(self.selection.background_idx) then
+            logger.warn("[MiuRead][BookExcerpt] background image asset missing:", self.selection.background_idx)
         end
-        return root
+    else
+        self.selection.color_idx = clamp_index(i, Card.COLORS, 1)
+        persist_key, persist_value = SETTING_COLOR, self.selection.color_idx
     end
-
-    local row_h = math.max(1, math.floor((height - gap * math.max(0, count - 1)) / math.max(1, count)))
-    for index, item in ipairs(Card.TEMPLATES) do
-        root[#root + 1] = self:_button(item.name or tostring(index), width, row_h,
-            function() self:_set_template(index) end,
-            {selected = index == self.selection.template_idx})
-        if index < count then root[#root + 1] = VerticalSpan:new{height = gap} end
-    end
-    return root
+    self:_refresh_preview(function()
+        settings_write(persist_key, persist_value)
+        self:_update_color_strip()
+    end)
 end
 
-function Editor:_cycle_row(label, value, width, height, callback_prev, callback_next, enabled)
-    local gap = Skin.dp(5, 3, 8)
-    local arrow_w = math.max(Skin.dp(38, 30, 52), math.floor(width * .18))
-    local middle_w = math.max(1, width - arrow_w * 2 - gap * 2)
-    local row = HorizontalGroup:new{align = "center"}
-    row[#row + 1] = self:_button("‹", arrow_w, height, callback_prev, {enabled = enabled, bold = true})
-    row[#row + 1] = HorizontalSpan:new{width = gap}
-    row[#row + 1] = self:_button(tostring(label) .. "：" .. tostring(value), middle_w, height, nil,
-        {enabled = false, small = true})
-    row[#row + 1] = HorizontalSpan:new{width = gap}
-    row[#row + 1] = self:_button("›", arrow_w, height, callback_next, {enabled = enabled, bold = true})
-    return row
+-- 单个配色/背景图色块 cell：无字色块规避 Button 黑字在深色背景不可读的问题。
+-- 纯色块必须有占位子 widget，否则空 FrameContainer 在 getSize 时 index nil 崩溃。
+function Editor:_make_swatch_cell(i, cell, selected)
+    local b = selected and 3 or 0
+    local inner = math.max(1, cell - 2 * b)
+    local content, bg, name
+    if self:_is_stillness() then
+        local p = Card.backgroundImagePath(i)
+        if p then content = ImageWidget:new{file = p, width = inner, height = inner} end
+        local bi = Card.BACKGROUND_IMAGES[i]
+        name = bi and bi.name or ""
+    end
+    if not content then
+        local c = Card.COLORS[i] or {bg = "FAFAFA"}
+        bg = Card.Draw.hexToColor(c.bg)
+        content = WidgetContainer:new{dimen = Geom:new{w = inner, h = inner}}
+        name = c.name or ""
+    end
+    local box = FrameContainer:new{
+        background = bg, -- 缩略图时为 nil（不填底，透明）
+        bordersize = b,
+        color = BlitBuffer.COLOR_BLACK,
+        padding = 0, margin = 0, radius = 0,
+        content,
+    }
+    -- 色块 + 下方名称小字（VG align=center 横向居中）
+    local label = TextWidget:new{text = name, face = label_face}
+    local body = VerticalGroup:new{
+        align = "center",
+        box,
+        VerticalSpan:new{width = Screen:scaleBySize(2)},
+        label,
+    }
+    local cw = TapBox:new{
+        dimen = Geom:new{w = cell, h = body:getSize().h},
+        callback = function() self:_on_select_color(i) end,
+    }
+    cw[1] = body
+    return cw
 end
 
-function Editor:_action_row(width, height)
-    local gap = Skin.dp(8, 5, 11)
-    local button_w = math.max(1, math.floor((width - gap * 2) / 3))
-    local scan_w = button_w
-    local save_w = button_w
-    local close_w = math.max(1, width - scan_w - save_w - gap * 2)
-    return HorizontalGroup:new{align = "center",
-        self:_button("手机扫码保存", scan_w, height, function()
-            local host, context, selection = self.host, self.context, copy_selection(self.selection)
-            self:_close(function() M._show_qr_transfer(host, context, selection) end)
-        end, {bold = true}),
-        HorizontalSpan:new{width = gap},
-        self:_button("保存到阅读器", save_w, height, function()
-            local path, _, err = render_card(self.host, self.context, self.selection, false)
-            if not path then
-                info(self.host, "保存书摘卡片失败：\n" .. tostring(err or "unknown"))
-                return
+-- 配色/背景图行：4 列方阵（cell 由列宽推导并封顶 max_cell，n=10 时 3 行×4，末行 4,4,2）
+function Editor:_make_color_strip(width)
+    local still = self:_is_stillness()
+    local items = still and Card.BACKGROUND_IMAGES or Card.COLORS
+    local sel_idx = still and self.selection.background_idx or self.selection.color_idx
+    local n = #items
+    local cols = 4
+    local rows = math.ceil(n / cols)
+    local span = Screen:scaleBySize(4)
+    local cell = math.floor((width - (cols - 1) * span) / cols)
+    local max_cell = Screen:scaleBySize(42)
+    if cell > max_cell then cell = max_cell end
+    local vg = VerticalGroup:new{width = width, align = "center"}
+    local idx = 0
+    for r = 1, rows do
+        local hg = HorizontalGroup:new{align = "center"}
+        -- 仅放置实际存在的色块；末行不足时由 VerticalGroup align=center 居中
+        local placed = 0
+        for c = 1, cols do
+            idx = idx + 1
+            if idx <= n then
+                placed = placed + 1
+                if placed > 1 then
+                    hg[#hg + 1] = HorizontalSpan:new{width = span}
+                end
+                hg[#hg + 1] = self:_make_swatch_cell(idx, cell, idx == sel_idx)
             end
-            local host = self.host
-            self:_close(function() toast(host, "书摘卡片已保存到阅读器\n" .. tostring(path), 4) end)
-        end, {bold = true}),
-        HorizontalSpan:new{width = gap},
-        self:_button("关闭", close_w, height, function() self:_close() end, {}),
+        end
+        vg[#vg + 1] = hg
+        if r < rows then
+            vg[#vg + 1] = VerticalSpan:new{width = span}
+        end
+    end
+    return vg
+end
+
+-- 模板芯片：选中项 "✓ " 前缀。两栏布局控件列窄→分两行(每行2)，单栏宽→单行(每行6)
+function Editor:_make_template_strip(width, two_col)
+    local btns = {}
+    for i, t in ipairs(Card.TEMPLATES) do
+        btns[#btns + 1] = {
+            id = "btn_tpl_" .. i,
+            text = (i == self.selection.template_idx and "✓ " or "") .. t.name,
+            callback = function() self:_on_select_template(i) end,
+        }
+    end
+    local cols = two_col and 2 or 6
+    local rows = {}
+    for i = 1, #btns, cols do
+        local row = {}
+        for j = 0, cols - 1 do
+            if btns[i + j] then row[#row + 1] = btns[i + j] end
+        end
+        rows[#rows + 1] = row
+    end
+    return ButtonTable:new{width = width, buttons = rows}
+end
+
+-- 重建色块行（模板切换致 items 变化；选择变化也统一重建，简单且正确）
+function Editor:_update_color_strip()
+    if not self.controls or not self.ctrl_w then return end
+    self.color_strip = self:_make_color_strip(self.ctrl_w)
+    -- controls 结构：[1]template_strip [2]vspan [3]color_strip [4]vspan [5]export_buttons
+    self.controls[3] = self.color_strip
+    if self.dimen then
+        UIManager:setDirty(self, "full", self.dimen)
+    else
+        UIManager:setDirty(self, "full")
+    end
+end
+
+-- 模板行就地更新选中标记（setText 不重建，避免行高抖动）
+function Editor:_update_template_strip()
+    if not self.template_strip then return end
+    for i, t in ipairs(Card.TEMPLATES) do
+        local b = self.template_strip:getButtonById("btn_tpl_" .. i)
+        if b and b.setText then
+            b:setText((i == self.selection.template_idx and "✓ " or "") .. t.name, b.width)
+        end
+    end
+    if self.dimen then
+        UIManager:setDirty(self, "full", self.dimen)
+    else
+        UIManager:setDirty(self, "full")
+    end
+end
+
+function Editor:_save_png()
+    -- 正式保存：默认目录 + 时间戳文件名（render_card preview=false 走 Card 默认输出）
+    local path, _, err = render_card(self.host, self.context, self.selection, false)
+    if not path then
+        info(self.host, "书摘卡片生成失败：\n" .. tostring(err or "unknown"))
+        return
+    end
+    toast(self.host, "书摘卡片已保存到阅读器\n" .. tostring(path), 4)
+end
+
+function Editor:_qr_transfer()
+    -- 先关编辑器再开二维码，避免方框叠加；编辑器 onCloseWidget 跑 pending_action 复活二维码
+    local host, context, selection = self.host, self.context, copy_selection(self.selection)
+    self:_close(function() M._show_qr_transfer(host, context, selection) end)
+end
+
+function Editor:_copy_text()
+    if Device and Device.input and Device.input.setClipboardText then
+        pcall(Device.input.setClipboardText, Device.input, clean_text(self.context.text))
+        toast(self.host, "选中文字已复制到剪贴板", 2.5)
+    end
+end
+
+-- 导出按钮（纵向单列，各占满列宽）
+function Editor:_make_export_buttons(width)
+    return ButtonTable:new{
+        width = width,
+        buttons = {
+            {{text = "保存 PNG", callback = function() self:_save_png() end}},
+            {{text = "手机扫码保存", callback = function() self:_qr_transfer() end}},
+            {{text = "复制文字", callback = function() self:_copy_text() end}},
+        },
     }
 end
 
-function Editor:_build_content()
-    local sw, sh = Device.screen:getWidth(), Device.screen:getHeight()
-    self.dimen = Geom:new{w = sw, h = sh}
-    local margin = math.max(12, math.floor(math.min(sw, sh) * .025))
-    local dialog_w = math.max(1, math.min(sw - margin * 2, math.floor(sw * .94)))
-    local dialog_h = math.max(1, math.min(sh - margin * 2, math.floor(sh * .88)))
-    local dialog_x = math.floor((sw - dialog_w) / 2)
-    local dialog_y = math.floor((sh - dialog_h) / 2)
-    local border = Skin.line("thick")
-    local pad = math.max(Skin.dp(12, 8, 18), math.floor(math.min(dialog_w, dialog_h) * .018))
-    local gap = math.max(Skin.dp(10, 7, 15), math.floor(dialog_w * .012))
-    local header_h = math.max(Skin.dp(42, 34, 58), math.floor(dialog_h * .065))
-    local footer_h = math.max(Skin.dp(50, 42, 68), math.floor(dialog_h * .075))
-    local inner_x, inner_y = dialog_x + border + pad, dialog_y + border + pad
-    local inner_w = math.max(1, dialog_w - (border + pad) * 2)
-    local inner_h = math.max(1, dialog_h - (border + pad) * 2)
-    local content_y = inner_y + header_h + gap
-    local content_h = math.max(1, inner_h - header_h - footer_h - gap * 2)
-    local footer_y = dialog_y + dialog_h - border - pad - footer_h
-
-    self.frame_dimen = Geom:new{x = dialog_x, y = dialog_y, w = dialog_w, h = dialog_h}
-    local root = OverlapGroup:new{dimen = Geom:new{w = sw, h = sh}, allow_mirroring = false}
-    root[#root + 1] = OffsetContainer:new{x_off = dialog_x, y_off = dialog_y,
-        Skin.frame(dialog_w, dialog_h, {
-            bordersize = border,
-            padding = 0,
-            radius = Skin.radius(8, 5, 12),
-            background = Blitbuffer.COLOR_WHITE,
-            color = Blitbuffer.COLOR_BLACK,
-        }, Widget:new{dimen = Geom:new{w = 1, h = 1}})}
-
-    local template = Card.TEMPLATES[self.selection.template_idx] or Card.TEMPLATES[1]
-    local color = Card.COLORS[self.selection.color_idx] or Card.COLORS[1]
-    local background = Card.BACKGROUND_IMAGES[self.selection.background_idx] or Card.BACKGROUND_IMAGES[1]
-    local summary = tostring(template.name or "经典") .. " · " .. tostring(color.name or "配色")
-    if template.id == "stillness" then summary = summary .. " · " .. tostring(background.name or "背景") end
-
-    root[#root + 1] = OffsetContainer:new{x_off = inner_x, y_off = inner_y,
-        HorizontalGroup:new{align = "center",
-            Ui.text("书摘卡片", math.floor(inner_w * .45), header_h, Skin.face("cfont", 13.0, 18.0, 10.5), {bold = true, halign = "left"}),
-            Ui.text(summary, math.max(1, inner_w - math.floor(inner_w * .45)), header_h,
-                Skin.face("smallinfofont", 9.2, 12.8, 7.8), {halign = "right", fgcolor = Blitbuffer.COLOR_DARK_GRAY}),
-        }}
-
-    -- One layout owner computes every rectangle before widgets are created.
-    -- No child gets an independent screen-relative x/y. Side-by-side mode is
-    -- enabled only when all six template buttons + option rows fit at their
-    -- minimum touch height; otherwise we deliberately fall back to vertical
-    -- composition instead of allowing children to spill into the footer.
-    local template_count=#Card.TEMPLATES
-    local side_button_min=Skin.dp(34,28,46)
-    local side_button_gap=Skin.dp(6,4,9)
-    local side_label_min=Skin.dp(26,22,36)
-    local side_cycle_min=Skin.dp(38,32,52)
-    local side_controls_gap=Skin.dp(7,5,10)
-    local side_cycle_rows=template.id=="stillness" and 2 or 1
-    local side_control_gaps=template.id=="stillness" and 4 or 3
-    local side_min_h=side_label_min
-        + template_count*side_button_min + math.max(0,template_count-1)*side_button_gap
-        + side_cycle_rows*side_cycle_min + side_control_gaps*side_controls_gap
-    local side_layout = inner_w >= 700 and content_h >= side_min_h
-    if side_layout then
-        local options_w = math.max(210, math.floor(inner_w * .34))
-        local preview_w = math.max(1, inner_w - options_w - gap)
-        local preview_h = content_h
-        root[#root + 1] = OffsetContainer:new{x_off = inner_x, y_off = content_y,
-            self:_preview_widget(preview_w, preview_h)}
-
-        local options_x = inner_x + preview_w + gap
-        local label_h = math.max(Skin.dp(26, 22, 36), math.floor(content_h * .055))
-        local cycle_h = math.max(Skin.dp(38, 32, 52), math.floor(content_h * .085))
-        local background_h = template.id == "stillness" and cycle_h or 0
-        local controls_gap = Skin.dp(7, 5, 10)
-        local template_h = math.max(1, content_h - label_h - cycle_h - background_h
-            - controls_gap * (template.id == "stillness" and 4 or 3))
-        local controls = VerticalGroup:new{align = "left"}
-        controls[#controls + 1] = Ui.text("样式", options_w, label_h,
-            Skin.face("cfont", 10.5, 14.5, 8.5), {bold = true, halign = "left"})
-        controls[#controls + 1] = VerticalSpan:new{height = controls_gap}
-        controls[#controls + 1] = self:_template_stack(options_w, template_h, false)
-        controls[#controls + 1] = VerticalSpan:new{height = controls_gap}
-        controls[#controls + 1] = self:_cycle_row("配色", color.name or self.selection.color_idx,
-            options_w, cycle_h,
-            function() self:_cycle_color(-1) end,
-            function() self:_cycle_color(1) end,
-            #Card.COLORS > 1)
-        if template.id == "stillness" then
-            controls[#controls + 1] = VerticalSpan:new{height = controls_gap}
-            controls[#controls + 1] = self:_cycle_row("背景", background.name or self.selection.background_idx,
-                options_w, cycle_h,
-                function() self:_cycle_background(-1) end,
-                function() self:_cycle_background(1) end,
-                #Card.BACKGROUND_IMAGES > 1)
-        end
-        root[#root + 1] = OffsetContainer:new{x_off = options_x, y_off = content_y, controls}
-    else
-        -- Compact devices use a vertical composition instead of squeezing two
-        -- columns until they overlap. Templates become a 3 x 2 grid below the
-        -- preview; the footer stays in its own reserved rectangle.
-        local controls_gap = Skin.dp(6, 4, 9)
-        local extra_rows = template.id == "stillness" and 2 or 1
-        local template_rows=math.max(1,math.ceil(#Card.TEMPLATES/3))
-        local template_button_min=Skin.dp(36,30,48)
-        local cycle_min=Skin.dp(34,28,46)
-        local controls_min=template_rows*template_button_min
-            + math.max(0,template_rows-1)*controls_gap
-            + extra_rows*cycle_min + extra_rows*controls_gap
-        -- Reserve the controls rectangle first. On short panels the preview
-        -- yields height, never the controls/footer. This is the hard anti-
-        -- overlap path for older/smaller e-ink screens.
-        local target_preview=math.floor(content_h*.58)
-        local preview_floor=math.min(Skin.dp(120,96,160),math.max(1,content_h-gap-controls_min))
-        local preview_cap=math.max(1,content_h-gap-controls_min)
-        local preview_h=math.max(1,math.min(target_preview,preview_cap))
-        if preview_cap>=preview_floor then preview_h=math.max(preview_floor,preview_h) end
-        local controls_y = content_y + preview_h + gap
-        local controls_h = math.max(1, content_h - preview_h - gap)
-        root[#root + 1] = OffsetContainer:new{x_off = inner_x, y_off = content_y,
-            self:_preview_widget(inner_w, preview_h)}
-        local cycle_h = math.max(cycle_min, math.floor(controls_h * .22))
-        -- A very short screen may still leave less than the preferred cycle
-        -- height. Clamp cycle rows back down before computing template space.
-        local cycle_budget=math.max(1,controls_h
-            - (template_rows*template_button_min + math.max(0,template_rows-1)*controls_gap)
-            - extra_rows*controls_gap)
-        cycle_h=math.max(1,math.min(cycle_h,math.floor(cycle_budget/extra_rows)))
-        local template_h = math.max(1, controls_h - cycle_h * extra_rows - controls_gap * extra_rows)
-        local controls = VerticalGroup:new{align = "left"}
-        controls[#controls + 1] = self:_template_stack(inner_w, template_h, true)
-        controls[#controls + 1] = VerticalSpan:new{height = controls_gap}
-        controls[#controls + 1] = self:_cycle_row("配色", color.name or self.selection.color_idx,
-            inner_w, cycle_h,
-            function() self:_cycle_color(-1) end,
-            function() self:_cycle_color(1) end,
-            #Card.COLORS > 1)
-        if template.id == "stillness" then
-            controls[#controls + 1] = VerticalSpan:new{height = controls_gap}
-            controls[#controls + 1] = self:_cycle_row("背景", background.name or self.selection.background_idx,
-                inner_w, cycle_h,
-                function() self:_cycle_background(-1) end,
-                function() self:_cycle_background(1) end,
-                #Card.BACKGROUND_IMAGES > 1)
-        end
-        root[#root + 1] = OffsetContainer:new{x_off = inner_x, y_off = controls_y, controls}
-    end
-
-    root[#root + 1] = OffsetContainer:new{x_off = inner_x, y_off = footer_y,
-        self:_action_row(inner_w, footer_h)}
-    return root
+-- 控件列：模板行 + 配色行 + 导出按钮（纵向堆叠）
+function Editor:_build_controls(width, two_col)
+    local gap = Screen:scaleBySize(8)
+    self.ctrl_w = width
+    self.template_strip = self:_make_template_strip(width, two_col)
+    self.color_strip = self:_make_color_strip(width)
+    self.export_buttons = self:_make_export_buttons(width)
+    return VerticalGroup:new{
+        width = width, align = "center",
+        self.template_strip,
+        VerticalSpan:new{width = gap},
+        self.color_strip,
+        VerticalSpan:new{width = gap},
+        self.export_buttons,
+    }
 end
 
-function Editor:_rebuild()
-    if self.closed then return false end
-    local old_image = self.preview_image
-    self._next_preview_image = nil
-    local old_region = self.frame_dimen and self.frame_dimen:copy() or nil
-    self[1] = self:_build_content()
-    self.preview_image = self._next_preview_image
-    self._next_preview_image = nil
-    if old_image and old_image ~= self.preview_image and type(old_image.free) == "function" then
-        pcall(old_image.free, old_image)
+-- 初始渲染 + 自适应布局 + 构建（同步，不再弹「渲染中」提示）
+function Editor:_build()
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    local margin = Screen:scaleBySize(10)
+    local border = Size.border.window
+    self._border = border
+    self._margin = margin
+    local gap = Screen:scaleBySize(8)
+    local dialog_w = math.floor(sw * 0.92)
+    local dialog_h = math.floor(sh * 0.90)
+    local content_w = dialog_w - 2 * (border + margin)
+    local content_h = dialog_h - 2 * (border + margin)
+
+    -- 首帧渲染（renderBB -> BlitBuffer，复用进首张预览图，避免二次渲染）
+    local bb, dimen = Card.renderBB(render_options(self.context, self.selection, false))
+    if not bb or not dimen or dimen.w <= 0 or dimen.h <= 0 then
+        if bb then bb:free() end
+        logger.warn("[MiuRead][BookExcerpt] preview render failed")
+        dimen = {w = 1, h = 2} -- 占位 dimen 强制走单栏，避免除零
     end
-    local dirty = self.frame_dimen and self.frame_dimen:copy() or old_region
-    UIManager:setDirty(self, function() return "ui", dirty end)
-    return true
+    local w_c, h_c = dimen.w, dimen.h
+
+    -- 右上角关闭按钮：不进内容布局，由 Editor:paintTo 叠在 frame 右上角
+    local close_body = FrameContainer:new{
+        bordersize = 0,
+        padding = Screen:scaleBySize(2),
+        margin = 0,
+        radius = 0,
+        background = BlitBuffer.COLOR_WHITE,
+        TextWidget:new{text = "✕", face = Font:getFace("cfont", 18)},
+    }
+    local close_sz = close_body:getSize()
+    self.close_w = close_sz.w
+    self.close_h = close_sz.h
+    -- dimen 宽度包含 _margin，使 tap 区域延伸到 frame 右边缘
+    self.close_btn = InputContainer:new{
+        dimen = Geom:new{w = self.close_w + self._margin, h = self.close_h},
+        [1] = close_body,
+    }
+
+    local two_col = h_c > w_c -- 长条卡片→左右两栏；矮宽卡片→上下分栏
+    self.two_col = two_col
+    local open_img_h -- 首帧图片高度：构建后据其收缩弹窗
+    if two_col then
+        -- 预览列只取卡片所需宽度，剩余全给控件列
+        local scale = content_h / h_c
+        local pv_w = math.floor(w_c * scale)
+        local min_ctrl = math.floor(content_w * 0.30)
+        if pv_w > content_w - min_ctrl then
+            pv_w = content_w - min_ctrl
+        end
+        self.pv_avail_w = pv_w
+        self.pv_avail_h = content_h
+        self.ctrl_width = content_w - pv_w - gap
+        self.controls = self:_build_controls(self.ctrl_width, true)
+        -- 控件列：控件居中于整列高（✕ 由 Editor 叠在 frame 右上角，不占列高）
+        self.controls_center = CenterContainer:new{
+            dimen = Geom:new{w = self.ctrl_width, h = content_h},
+            self.controls,
+        }
+        self.right_col = VerticalGroup:new{align = "center", self.controls_center}
+        local first_img
+        first_img, open_img_h = make_preview_image(bb, dimen, pv_w, content_h)
+        self.preview_container = CenterContainer:new{
+            dimen = Geom:new{w = pv_w, h = content_h},
+        }
+        self.preview_container[1] = first_img or WidgetContainer:new{
+            dimen = Geom:new{w = 1, h = 1},
+        }
+        self.preview_image = first_img
+        self.main = HorizontalGroup:new{
+            align = "center",
+            self.preview_container,
+            HorizontalSpan:new{width = gap},
+            self.right_col,
+        }
+    else
+        -- 上下分栏：先建控件量高，再算预览可用高
+        self.controls = self:_build_controls(content_w, false)
+        local ctrl_h = self.controls:getSize().h
+        local pv_h_avail = content_h - ctrl_h - gap
+        if pv_h_avail < Screen:scaleBySize(200) then
+            pv_h_avail = Screen:scaleBySize(200)
+        end
+        self.pv_avail_w = content_w
+        self.pv_avail_h = pv_h_avail
+        local first_img
+        first_img, open_img_h = make_preview_image(bb, dimen, content_w, pv_h_avail)
+        self.preview_container = CenterContainer:new{
+            dimen = Geom:new{w = content_w, h = pv_h_avail},
+        }
+        self.preview_container[1] = first_img or WidgetContainer:new{
+            dimen = Geom:new{w = 1, h = 1},
+        }
+        self.preview_image = first_img
+        self.main = VerticalGroup:new{
+            align = "center",
+            self.preview_container,
+            VerticalSpan:new{width = gap},
+            self.controls,
+        }
+    end
+    self:_apply_auto_shrink(open_img_h)
+    self.frame_content = VerticalGroup:new{self.main}
+    self.frame = FrameContainer:new{
+        background = BlitBuffer.COLOR_WHITE,
+        color = BlitBuffer.COLOR_DARK_GRAY,
+        radius = Size.radius.window,
+        bordersize = border,
+        padding = margin,
+        margin = 0,
+        self.frame_content,
+    }
+    self[1] = self.frame
+    self[2] = self.close_btn
+    self.dimen = Geom:new{w = sw, h = sh} -- 全屏占位（点框外关闭）；frame 由 align/vertical_align 居中
+    self.ges_events = {
+        TapClose = {
+            GestureRange:new{ges = "tap", range = self.dimen},
+            GestureRange:new{ges = "touch", range = self.dimen},
+        },
+    }
+    UIManager:setDirty("all", "full")
+end
+
+-- 屏幕旋转/尺寸变化后整体重建布局
+function Editor:_rebuild()
+    if self.preview_image and self.preview_image.free then
+        pcall(self.preview_image.free, self.preview_image)
+    end
+    self.preview_image = nil
+    self:_build()
+    if self.dimen then
+        UIManager:setDirty(self, "full", self.dimen)
+    else
+        UIManager:setDirty(self, "full")
+    end
 end
 
 function Editor:init()
     self.selection = copy_selection(self.selection)
-    self[1] = self:_build_content()
-    self.preview_image = self._next_preview_image
-    self._next_preview_image = nil
+    self:_build()
 end
 
-function Editor:onBack() return self:_close() end
-function Editor:onScreenResize()
-    if self.closed then return true end
-    return self:_rebuild()
+-- base 居中绘制 frame 后，把 ✕ 叠到 frame 右上角
+function Editor:paintTo(pbb, x, y)
+    InputContainer.paintTo(self, pbb, x, y)
+    if self.close_btn and self.frame and self.frame.dimen then
+        local fd = self.frame.dimen
+        local pad = Screen:scaleBySize(2)
+        local cx = fd.x + fd.w - self._margin - self.close_w
+        local cy = fd.y + pad
+        self.close_btn.dimen.x = cx
+        self.close_btn.dimen.y = cy
+        self.close_btn:paintTo(pbb, cx, cy)
+    end
 end
-function Editor:onRotation() return self:onScreenResize() end
+
+function Editor:onTapClose(arg, ges)
+    if not ges or not ges.pos or not self.frame or not self.frame.dimen then return end
+    local should_close = not ges.pos:intersectWith(self.frame.dimen)
+        or (self.close_btn and self.close_btn.dimen and self.close_btn.dimen:contains(ges.pos))
+    if should_close then
+        -- touch 事件只消费不关闭，等 tap 事件到达时再关闭，
+        -- 避免 Editor 提前移除导致 tap 泄漏到 reader 触发手势
+        if ges.ges == "tap" then
+            self:_close()
+        end
+        return true
+    end
+end
+
+function Editor:onBack()
+    self:_close()
+    return true
+end
+
+function Editor:onClose()
+    self:_close()
+    return true
+end
+
+function Editor:onShow()
+    -- "all"+"full"：启动即重绘 reader 并全屏闪，清掉静影头图区残留的 reader 拋影
+    UIManager:setDirty("all", "full")
+end
+
 function Editor:onCloseWidget()
     if active_dialog == self then active_dialog = nil end
-    if self.preview_image and type(self.preview_image.free) == "function" then pcall(self.preview_image.free, self.preview_image) end
+    if self.preview_image and self.preview_image.free then
+        pcall(self.preview_image.free, self.preview_image)
+    end
     self.preview_image = nil
+    -- 释放静影头图缓存（改动前可能不存在该 API，pcall 兜底）
+    pcall(Card.clearStillnessHeadCache)
+    UIManager:setDirty(nil, "flashui")
     local action = self.pending_action
     self.pending_action = nil
     if action then UIManager:nextTick(action) end
+    return true
+end
+
+function Editor:onScreenResize()
+    self:_rebuild()
+    return true
+end
+
+function Editor:onRotation()
+    self:_rebuild()
     return true
 end
 
@@ -637,10 +803,10 @@ function M._show_qr_transfer(host, context, selection)
         reopen(host, context, selection, generation)
         return false
     end
-    toast(host, "手机与阅读器需连接同一局域网；扫码后可在手机保存原图", 4)
     -- Single-surface rule: the editor is already closed; QR is the only main
     -- overlay. Dismissing it stops the temporary LAN server and restores editor.
     show_qr(url, host, context, selection, generation)
+    toast(host, "手机与阅读器需连接同一局域网；扫码后可在手机保存原图", 4)
     return true
 end
 
