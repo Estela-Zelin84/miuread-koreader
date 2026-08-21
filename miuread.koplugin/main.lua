@@ -6700,29 +6700,149 @@ function Plugin:_reader_open_native_page(label,opener,return_callback)
     return true
 end
 
+function Plugin:_wifi_state_snapshot(NetworkMgr)
+    if not NetworkMgr then
+        local ok_nm,value=pcall(require,"ui/network/manager")
+        if not ok_nm then return nil,nil end
+        NetworkMgr=value
+    end
+    if type(NetworkMgr.queryNetworkState)=="function" then pcall(NetworkMgr.queryNetworkState,NetworkMgr) end
+    local wifi_on,connected=nil,nil
+    if type(NetworkMgr.isWifiOn)=="function" then
+        local ok,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
+        if ok then wifi_on=value==true end
+    end
+    if wifi_on==false then
+        connected=false
+    elseif type(NetworkMgr.isConnected)=="function" then
+        local ok,value=pcall(NetworkMgr.isConnected,NetworkMgr)
+        if ok then connected=value==true end
+    end
+    return wifi_on,connected
+end
+
+function Plugin:_wifi_refresh_state(source)
+    HomeData.invalidate_device_state()
+    local state=HomeData.quick_device_state(true) or {}
+    ReaderToolbar.invalidate()
+    if HomeView.is_shown() and not self:_active_reader_ui() then
+        self:_home_refresh_header_now(false,false)
+    end
+    logger.info("[MiuRead][WiFi] state refreshed",
+        "source=",tostring(source or "unknown"),
+        "radio=",tostring(state.wifi_on),
+        "connected=",tostring(state.connected),
+        "online=",tostring(state.online),
+        "ssid=",tostring(state.wifi_name or ""))
+    return state
+end
+
+function Plugin:_wifi_schedule_reconcile(source,want_on)
+    self._wifi_reconcile_generation=(tonumber(self._wifi_reconcile_generation) or 0)+1
+    local generation=self._wifi_reconcile_generation
+    local function schedule(delay)
+        UIManager:scheduleIn(delay,function()
+            if generation~=self._wifi_reconcile_generation then return end
+            local state=self:_wifi_refresh_state(tostring(source or "toggle").."+"..tostring(delay))
+            local linked=state.connected==true or (state.connected==nil and state.online==true)
+            if (want_on==true and linked) or (want_on~=true and state.wifi_on==false) then
+                self._wifi_reconcile_generation=generation+1
+            end
+        end)
+    end
+    schedule(.8)
+    schedule(3)
+    schedule(6)
+end
+
+function Plugin:_wifi_start(NetworkMgr,source)
+    local completed=false
+    local function complete()
+        if completed then return end
+        completed=true
+        self:_wifi_refresh_state(tostring(source or "toggle")..":connected")
+    end
+
+    -- Kindle's native Wi-Fi service may need several seconds to reconnect a saved
+    -- profile. Avoid an immediate scan here: on KPW5 that scan can finish before
+    -- wifid has associated, causing NetworkMgr to report a false failure.
+    local is_kindle=false
+    if type(Device.isKindle)=="function" then
+        local ok,value=pcall(Device.isKindle,Device)
+        is_kindle=ok and value==true
+    end
+    local ok=false
+    if is_kindle and type(NetworkMgr.restoreWifiAsync)=="function"
+        and type(NetworkMgr.scheduleConnectivityCheck)=="function" then
+        if NetworkMgr.pending_connectivity_check==true and type(NetworkMgr.unscheduleConnectivityCheck)=="function" then
+            pcall(NetworkMgr.unscheduleConnectivityCheck,NetworkMgr)
+        end
+        if UIManager and Event then pcall(UIManager.broadcastEvent,UIManager,Event:new("NetworkConnecting")) end
+        local ok_restore,err=pcall(NetworkMgr.restoreWifiAsync,NetworkMgr)
+        if ok_restore then
+            local ok_check,check_err=pcall(NetworkMgr.scheduleConnectivityCheck,NetworkMgr,complete)
+            ok=ok_check==true
+            if not ok_check then logger.warn("[MiuRead][WiFi] Kindle connectivity check failed",tostring(check_err)) end
+        else
+            logger.warn("[MiuRead][WiFi] Kindle restore failed",tostring(err))
+        end
+        if ok then logger.info("[MiuRead][WiFi] Kindle saved-network restore requested","source=",tostring(source or "toggle")) end
+    elseif type(NetworkMgr.toggleWifiOn)=="function" then
+        -- This is a direct user action. Passing interactive=true prevents
+        -- KOReader from treating a still-connecting radio as a background failure.
+        ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,complete,false,true)
+    elseif type(NetworkMgr.turnOnWifi)=="function" then
+        ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr,complete,true)
+    end
+    if ok then
+        HomeData.invalidate_device_state()
+        self:_wifi_schedule_reconcile(source,true)
+    end
+    return ok==true
+end
+
+function Plugin:_wifi_stop(NetworkMgr,source)
+    self._wifi_reconcile_generation=(tonumber(self._wifi_reconcile_generation) or 0)+1
+    local completed=false
+    local function complete()
+        if completed then return end
+        completed=true
+        self:_wifi_refresh_state(tostring(source or "toggle")..":disconnected")
+    end
+    local ok=false
+    if type(NetworkMgr.toggleWifiOff)=="function" then
+        -- interactive=true records that the user explicitly turned Wi-Fi off,
+        -- so KOReader will not immediately auto-restore it later.
+        ok=pcall(NetworkMgr.toggleWifiOff,NetworkMgr,complete,true)
+    elseif type(NetworkMgr.turnOffWifi)=="function" then
+        ok=pcall(NetworkMgr.turnOffWifi,NetworkMgr,complete)
+    end
+    if ok then
+        HomeData.invalidate_device_state()
+        self:_wifi_schedule_reconcile(source,false)
+    end
+    return ok==true
+end
+
 function Plugin:_reader_wifi_state()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
-    if not ok_nm or not NetworkMgr or type(NetworkMgr.isWifiOn)~="function" then return nil end
-    local ok,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
-    if ok then return value==true end
-    return nil
+    if not ok_nm or not NetworkMgr then return nil end
+    local wifi_on=self:_wifi_state_snapshot(NetworkMgr)
+    return wifi_on
 end
 
 function Plugin:_reader_wifi_toggle()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
-    local on=self:_reader_wifi_state()==true
-    local ok=false
+    local on=self:_wifi_state_snapshot(NetworkMgr)==true
+    local ok
     if on then
-        if type(NetworkMgr.toggleWifiOff)=="function" then ok=pcall(NetworkMgr.toggleWifiOff,NetworkMgr)
-        elseif type(NetworkMgr.turnOffWifi)=="function" then ok=pcall(NetworkMgr.turnOffWifi,NetworkMgr) end
-        if ok then self:toast("Wi-Fi 已关闭",1.5) end
+        ok=self:_wifi_stop(NetworkMgr,"reader")
+        if ok then self:toast("正在关闭 Wi-Fi",1.5) end
     else
-        if type(NetworkMgr.toggleWifiOn)=="function" then ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr)
-        elseif type(NetworkMgr.turnOnWifi)=="function" then ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr) end
-        if ok then self:toast("正在开启 Wi-Fi",1.5) end
+        ok=self:_wifi_start(NetworkMgr,"reader")
+        if ok then self:toast("正在连接 Wi-Fi",1.5) end
     end
-    if ok then HomeData.invalidate_device_state() end
     return ok==true
 end
 
@@ -6789,9 +6909,10 @@ function Plugin:_home_wifi_text()
     local state=HomeData.cached_device_state() or HomeData.quick_device_state() or {}
     if state.wifi_on==false then return "已关闭" end
     if state.wifi_on==true then
+        local linked=state.connected==true or (state.connected==nil and state.online==true)
         local ssid=U.trim(tostring(state.wifi_name or ""))
-        if ssid~="" then return U.utf8_truncate(ssid,13,"…") end
-        return state.online==true and "已连接" or "未连接"
+        if linked and ssid~="" then return U.utf8_truncate(ssid,13,"…") end
+        return linked and "已连接" or "未连接"
     end
     return "Wi-Fi"
 end
@@ -10675,21 +10796,15 @@ end
 function Plugin:_home_wifi_toggle()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
-    local on=false
-    local ok_state,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
-    if ok_state then on=value==true end
+    local on=self:_wifi_state_snapshot(NetworkMgr)==true
     local ok
     if on then
-        if type(NetworkMgr.toggleWifiOff)=="function" then ok=pcall(NetworkMgr.toggleWifiOff,NetworkMgr)
-        elseif type(NetworkMgr.turnOffWifi)=="function" then ok=pcall(NetworkMgr.turnOffWifi,NetworkMgr) end
-        if ok then self:toast("Wi-Fi 已关闭",1.5) end
+        ok=self:_wifi_stop(NetworkMgr,"home")
+        if ok then self:toast("正在关闭 Wi-Fi",1.5) end
     else
-        if type(NetworkMgr.toggleWifiOn)=="function" then ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr)
-        elseif type(NetworkMgr.turnOnWifi)=="function" then ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr) end
-        if ok then self:toast("正在开启 Wi-Fi",1.5) end
+        ok=self:_wifi_start(NetworkMgr,"home")
+        if ok then self:toast("正在连接 Wi-Fi",1.5) end
     end
-    if ok then HomeData.invalidate_device_state() end
-    UIManager:scheduleIn(1,function() self:_refresh_home_view(nil,"header") end)
     return ok==true
 end
 
@@ -11071,12 +11186,13 @@ function Plugin:show_home_quick_panel(more_expanded)
     -- storage. The home surface already has a recent device snapshot.
     local state=HomeData.cached_device_state() or {}
     local wifi_on=state.wifi_on
+    local wifi_linked=state.connected==true or (state.connected==nil and state.online==true)
     local wifi_name=U.trim(tostring(state.wifi_name or ""))
     local wifi_detail
     if wifi_on==nil then wifi_detail="状态未知"
     elseif wifi_on~=true then wifi_detail="已关闭"
-    elseif wifi_name~="" then wifi_detail=U.utf8_truncate(wifi_name,11,"…")
-    elseif state.online==true then wifi_detail="已连接"
+    elseif wifi_linked and wifi_name~="" then wifi_detail=U.utf8_truncate(wifi_name,11,"…")
+    elseif wifi_linked then wifi_detail="已连接"
     else wifi_detail="未连接" end
     local download_detail=tostring(self._home_panel_download_detail or "")
     local sync_label=self:_home_sync_status_label()
@@ -11084,7 +11200,7 @@ function Plugin:show_home_quick_panel(more_expanded)
     local definitions={
         wifi={
             icon="Wi-Fi",
-            icon_path=ROOT.."/resources/"..(wifi_on==false and "wifi-off.svg" or (state.online==true and "wifi-connected.svg" or "wifi-disconnected.svg")),
+            icon_path=ROOT.."/resources/"..(wifi_on==false and "wifi-off.svg" or (wifi_linked and "wifi-connected.svg" or "wifi-disconnected.svg")),
             label="Wi-Fi",detail=wifi_detail,
             callback=function() self:_home_wifi_toggle() end,
             hold_callback=function() self:_home_wifi_settings() end
@@ -12190,9 +12306,10 @@ function Plugin:_reader_wifi_summary()
     local state=HomeData.cached_device_state() or {}
     if state.wifi_on==false then return "Wi-Fi关",false end
     if state.wifi_on==nil then return "Wi-Fi",true end
+    local linked=state.connected==true or (state.connected==nil and state.online==true)
     local ssid=U.trim(tostring(state.wifi_name or ""))
-    if ssid~="" then return ssid,false end
-    if state.online==true then return "已连接",false end
+    if linked and ssid~="" then return ssid,false end
+    if linked then return "已连接",false end
     return "Wi-Fi!",true
 end
 

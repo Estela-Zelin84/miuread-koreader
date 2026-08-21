@@ -127,21 +127,30 @@ function HomeData.quick_device_state(force)
     if not force and device_cache and now - device_cache.at < 60 then
         return device_cache.value
     end
-    local state = {online = nil, wifi_on = nil, wifi_name = nil, battery = nil, charging = false}
+    local state = {online = nil, wifi_on = nil, connected = nil, wifi_name = nil, battery = nil, charging = false}
     local power=read_power_state()
     state.battery=power.battery
     state.charging=power.charging==true
     local ok_network, network = pcall(require, "ui/network/manager")
     if ok_network and network then
+        if type(network.queryNetworkState) == "function" then pcall(network.queryNetworkState, network) end
         if type(network.isWifiOn) == "function" then
             local ok, value = pcall(network.isWifiOn, network)
             if ok then state.wifi_on = value == true end
         end
-        if type(network.isOnline) == "function" then
+        if state.wifi_on == false then
+            state.connected = false
+        elseif type(network.isConnected) == "function" then
+            local ok, value = pcall(network.isConnected, network)
+            if ok then state.connected = value == true end
+        end
+        if state.connected ~= false and type(network.isOnline) == "function" then
             local ok, online = pcall(network.isOnline, network)
             if ok then state.online = online == true end
+        elseif state.connected == false then
+            state.online = false
         end
-        if state.wifi_on == true and type(network.getCurrentNetwork) == "function" then
+        if state.wifi_on == true and state.connected ~= false and type(network.getCurrentNetwork) == "function" then
             local ok, current = pcall(network.getCurrentNetwork, network)
             if ok and type(current) == "table" then
                 local ssid = tostring(current.ssid or current.name or ""):gsub("^%s+", ""):gsub("%s+$", "")
