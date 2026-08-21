@@ -2,8 +2,5 @@ CHANGED_FILES.txt
 CHANGELOG.md
 miuread.koplugin/_meta.lua
 miuread.koplugin/main.lua
-miuread.koplugin/miuread/api.lua
 miuread.koplugin/miuread/config.lua
-miuread.koplugin/miuread/home_data.lua
-miuread.koplugin/miuread/home_view.lua
-miuread.koplugin/miuread/reading_stats_dialog.lua
+miuread.koplugin/miuread/store.lua

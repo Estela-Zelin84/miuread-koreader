@@ -902,6 +902,9 @@ function Plugin:init()
     self._download_book_menu=nil
     self._cache_cleanup_dialog=nil
     self._download_runtime=nil
+    self._chapter_prefetch_task=nil
+    self._chapter_prefetch_generation=0
+    self._chapter_prefetch_last_key=nil
     self._download_state_last_write=0
     self._download_state_last_stage=nil
     self._auth_notice_dialog=nil
@@ -14362,6 +14365,15 @@ function Plugin:_reader_control_categories()
         {icon="highlight",label="批注",value=self:_reader_annotation_summary_label(),callback=function() self:_show_reader_annotation_panel(back_to("reading")) end},
     }
     if self:_reader_session_is_weread() then
+        local next_context=self:_chapter_prefetch_context()
+        if next_context then
+            table.insert(reading_items,3,{
+                icon="chevron-right",label="下一章",
+                value=U.utf8_truncate(next_context.next_title,18,"…").." · "..tostring(self:_chapter_prefetch_status(next_context) or ""),
+                value_bold=next_context.existing~=nil,
+                callback=function() self:_open_next_single_chapter() end,
+            })
+        end
         reading_items[#reading_items+1]={icon="comment",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_settings(back_to("reading")) end}
     end
 
@@ -16924,12 +16936,13 @@ function Plugin:_download_dialog_is_shown(runtime)
 end
 function Plugin:_on_download_progress(runtime,state)
     if self._download_runtime~=runtime then return end
+    local is_prefetch=type(runtime.options)=="table" and runtime.options.prefetch==true
     runtime.last_state=U.copy(state or {})
     runtime.task=self.download_task and self.download_task:descriptor() or runtime.task
     if self:_download_dialog_is_shown(runtime) then
         runtime.dialog:set_state(state)
     end
-    if state and state.network_ipv4_suggested==true
+    if not is_prefetch and state and state.network_ipv4_suggested==true
         and state.stage~="package" and state.stage~="done" and state.stage~="error"
         and state.stage~="cancelled" then
         self:_show_download_ipv4_suggestion(runtime,state)
@@ -16941,25 +16954,27 @@ function Plugin:_on_download_progress(runtime,state)
         runtime.home_progress_mark=home_mark
         self:_home_update_download_card(runtime,state)
     end
-    if state and state.stage=="rate_limit" then
-        local wait=tonumber(state.wait_seconds) or 0
-        self:_update_open_shelf_download_status(runtime.book.bookId,
-            wait>0 and ("请求受限 · "..tostring(wait).."秒") or "请求受限 · 等待恢复")
-    elseif state and state.stage=="restart" then
-        self:_update_open_shelf_download_status(runtime.book.bookId,"从断点自动恢复")
-    elseif state and state.stage=="hibernated" then
-        if state.hibernate_reason=="network_offline" then
-            self:_update_open_shelf_download_status(runtime.book.bookId,"网络暂停 · 联网后继续")
-            if HOME_SESSION.suspended~=true and self._miuread_suspended~=true then
-                self:_schedule_hibernated_download_resume("network restored")
+    if not is_prefetch then
+        if state and state.stage=="rate_limit" then
+            local wait=tonumber(state.wait_seconds) or 0
+            self:_update_open_shelf_download_status(runtime.book.bookId,
+                wait>0 and ("请求受限 · "..tostring(wait).."秒") or "请求受限 · 等待恢复")
+        elseif state and state.stage=="restart" then
+            self:_update_open_shelf_download_status(runtime.book.bookId,"从断点自动恢复")
+        elseif state and state.stage=="hibernated" then
+            if state.hibernate_reason=="network_offline" then
+                self:_update_open_shelf_download_status(runtime.book.bookId,"网络暂停 · 联网后继续")
+                if HOME_SESSION.suspended~=true and self._miuread_suspended~=true then
+                    self:_schedule_hibernated_download_resume("network restored")
+                end
+            else
+                self:_update_open_shelf_download_status(runtime.book.bookId,"已安全释放资源 · 稍后继续")
             end
-        else
-            self:_update_open_shelf_download_status(runtime.book.bookId,"已安全释放资源 · 稍后继续")
+        elseif state and (state.waiting_network==true or state.stage=="waiting_network") then
+            self:_update_open_shelf_download_status(runtime.book.bookId,"等待网络 · 已保存进度")
         end
-    elseif state and (state.waiting_network==true or state.stage=="waiting_network") then
-        self:_update_open_shelf_download_status(runtime.book.bookId,"等待网络 · 已保存进度")
     end
-    if runtime.background and self.store:preferences().download_notice_enabled~=false then
+    if not is_prefetch and runtime.background and self.store:preferences().download_notice_enabled~=false then
         runtime.notified_milestones=runtime.notified_milestones or {}
         local percent=self:_download_percent(state)
         for _,mark in ipairs({25,50,75}) do
@@ -16983,6 +16998,14 @@ function Plugin:_finish_download_runtime(runtime,result)
     self._download_runtime=nil
     if not result or result.ok~=true then
         local err=result and result.error or "未知下载错误"
+        if opt.prefetch==true then
+            logger.warn("[MiuRead][Prefetch] stopped",tostring(err))
+            self.store:clear_download_state()
+            self:_notify_home_data_changed("content")
+            if done then pcall(done,nil,was_background) end
+            self:_start_next_queued_download()
+            return
+        end
         logger.warn("[MiuRead][Download] failed",tostring(err))
         if tostring(err)=="下载已取消" then
             self.store:clear_download_state()
@@ -17085,6 +17108,32 @@ function Plugin:_finish_download_runtime(runtime,result)
         local refreshed=opt.chapter_uid and self.store:chapter_variant(b.bookId,opt.chapter_uid,kind)
             or self.store:variant(b.bookId,kind)
         if refreshed then rec=U.copy(refreshed) end
+    end
+    if opt.prefetch==true then
+        local kind=tostring(rec.variant or (opt.annotations and "notes" or "clean"))
+        if opt.chapter_uid and (kind=="clean" or kind=="notes") then
+            rec=U.copy(rec)
+            rec.prefetch=true
+            rec.prefetch_origin="auto_next"
+            rec.prefetch_at=os.time()
+            rec.prefetch_source_uid=tostring(opt.prefetch_source_uid or "")
+            rec.prefetch_target_title=tostring(opt.prefetch_target_title or rec.title or "")
+            self.store:save_chapter_variant(b.bookId,opt.chapter_uid,kind,rec)
+        end
+        self.store:clear_download_state()
+        self:_refresh_local_files()
+        self:_notify_home_data_changed("content")
+        logger.info("[MiuRead][Prefetch] completed","book=",tostring(b.bookId or ""),
+            "chapter=",tostring(opt.chapter_uid or ""),"file=",tostring(rec.file or ""))
+        if done then pcall(done,rec,was_background) end
+        local should_open=runtime.prefetch_open_after==true and rec.file and U.file_exists(rec.file)
+        self:_start_next_queued_download()
+        if should_open then
+            UIManager:scheduleIn(.10,function()
+                if self.ui and self.ui.document and not reader_close_active() then self:open_file(rec.file) end
+            end)
+        end
+        return
     end
     self:_refresh_local_files()
     local pending=rec.pending_install==true and rec.pending_file and U.file_exists(rec.pending_file)
@@ -17632,7 +17681,9 @@ function Plugin:_queue_download(book,opt,open_after,extra)
     local book_id=tostring(book and (book.bookId or book.book_id) or "")
     local runtime=self._download_runtime
     local runtime_id=tostring(runtime and runtime.book and (runtime.book.bookId or runtime.book.book_id) or "")
-    if runtime and ((book_id~="" and runtime_id==book_id) or self:_download_job_key(runtime.book,runtime.options)==key) then
+    local runtime_prefetch=runtime and type(runtime.options)=="table" and runtime.options.prefetch==true
+    if runtime and not runtime_prefetch
+        and ((book_id~="" and runtime_id==book_id) or self:_download_job_key(runtime.book,runtime.options)==key) then
         self:info("这本书已经在下载中。\n\n请在下载管理中查看当前状态。")
         return false
     end
@@ -17713,9 +17764,15 @@ function Plugin:show_waiting_downloads()
 end
 
 function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
-    if not self:require_login() then return end
-    if not self:is_online() then self:info(_("Network unavailable")); return end
     opt=U.copy(opt or {})
+    local is_prefetch=opt.prefetch==true
+    if is_prefetch then
+        if not self:logged_in() or not self:is_online() then return false end
+        if #(self.store:download_queue() or {})>0 then return false end
+    else
+        if not self:require_login() then return end
+        if not self:is_online() then self:info(_("Network unavailable")); return end
+    end
     local requested_id=tostring(b and (b.bookId or b.book_id) or "")
     if from_queue~=true and requested_id~="" then
         for _,job in ipairs(self.store:download_queue()) do
@@ -17727,6 +17784,18 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
         end
     end
     if self.download_task and self.download_task:busy() then
+        local active=self._download_runtime
+        local active_prefetch=active and type(active.options)=="table" and active.options.prefetch==true
+        if is_prefetch then return false end
+        if active_prefetch then
+            local queued=self:_queue_download(b,opt,open_after,{reason="用户下载优先"})
+            if queued then
+                logger.info("[MiuRead][Prefetch] yielding to user download",
+                    "book=",tostring(active.book and active.book.bookId or ""))
+                self.download_task:cancel()
+            end
+            return queued
+        end
         if from_queue then
             self:_queue_download(b,opt,open_after)
             return false
@@ -17735,13 +17804,24 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
     end
     local stored=self.store:download_state()
     if stored.status=="active" and self:_recover_download_state() then
+        local active=self._download_runtime
+        local active_prefetch=active and type(active.options)=="table" and active.options.prefetch==true
+        if is_prefetch then return false end
+        if active_prefetch and self.download_task and self.download_task:busy() then
+            local queued=self:_queue_download(b,opt,open_after,{reason="用户下载优先"})
+            if queued then self.download_task:cancel() end
+            return queued
+        end
         if from_queue then
             self:_queue_download(b,opt,open_after)
             return false
         end
         return self:_queue_download(b,opt,open_after)
     end
-    if self.cache_cleanup_task and self.cache_cleanup_task:busy() then self:info("缓存正在清理，完成后再开始下载。"); return end
+    if self.cache_cleanup_task and self.cache_cleanup_task:busy() then
+        if is_prefetch then return false end
+        self:info("缓存正在清理，完成后再开始下载。"); return
+    end
     if b and b.bookId and tostring(b.bookId)~="" then
         self.store:save_book(b.bookId,{book_id=tostring(b.bookId),title=b.title,author=b.author,
             content_type=b.content_type,updated_at=os.time()})
@@ -17762,16 +17842,22 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
         self.store:clear_download_state()
         self:_notify_home_data_changed("content")
         if from_queue then self:_queue_download(b,opt,open_after) end
-        self:info("无法启动下载任务：\n"..tostring(err))
+        if is_prefetch then
+            logger.warn("[MiuRead][Prefetch] unable to start",tostring(err))
+        else
+            self:info("无法启动下载任务：\n"..tostring(err))
+        end
         return false
     end
     runtime.task=self.download_task:descriptor()
     self:_write_download_state("active",self:_active_download_payload(runtime,runtime.last_state),true)
     if runtime.background then
         self.download_task:set_backgrounded(true)
-        self:_update_open_shelf_download_status(b.bookId,"生成中 0%")
-        if self.store:preferences().download_notice_enabled~=false then
-            self:status_toast("觅阅",tostring(b.title or "未命名").."已转入后台下载",3)
+        if not is_prefetch then
+            self:_update_open_shelf_download_status(b.bookId,"生成中 0%")
+            if self.store:preferences().download_notice_enabled~=false then
+                self:status_toast("觅阅",tostring(b.title or "未命名").."已转入后台下载",3)
+            end
         end
     else
         self:_show_active_download_dialog()
@@ -17951,12 +18037,225 @@ function Plugin:chapter_menu(b,ch)
         local record=entry.record
         if record then
             local label=DownloadResult.variant_label(entry.label,record)
+            if record.prefetch==true then label=label.." · 预下载" end
             items[#items+1]={text="阅读"..label,callback=function() self:open_file(record.file) end}
         end
     end
     items[#items+1]={text=(clean or notes) and "更新本章" or "下载本章",callback=function() self:choose_download(b,nil,true,uid) end}
     if clean or notes then items[#items+1]={text="删除本章文件",callback=function() self:_confirm_delete_chapter_cache(b.bookId,uid,ch.title or uid) end} end
     self:list(ch.title or uid,items)
+end
+
+local function chapter_uid_value(chapter)
+    return tostring(chapter and (chapter.uid or chapter.chapterUid or chapter.chapter_uid) or "")
+end
+
+function Plugin:_chapter_prefetch_context()
+    if not (self.ui and self.ui.document) or not self:_reader_session_is_weread() then return nil,"not_weread" end
+    local path=self:_current_document_path()
+    if not path then return nil,"no_path" end
+    local book,record,kind=self.store:file_record_fast(path,false)
+    if not book then book,record,kind=self.store:identify_file(path,false) end
+    if type(book)~="table" or type(record)~="table" then return nil,"unidentified" end
+    local current_uid=tostring(record.chapter_uid or "")
+    if current_uid=="" or record.partial_range==true then return nil,"not_single_chapter" end
+    kind=tostring(kind or record.variant or "")
+    if kind~="clean" and kind~="notes" then return nil,"unsupported_variant" end
+    local catalog=type(book.catalog)=="table" and book.catalog or {}
+    if #catalog==0 then return nil,"catalog_missing" end
+    local current_index
+    for index,chapter in ipairs(catalog) do
+        if chapter_uid_value(chapter)==current_uid then current_index=index; break end
+    end
+    if not current_index then return nil,"chapter_missing" end
+    local next_index,next_chapter
+    for index=current_index+1,#catalog do
+        local candidate=catalog[index]
+        if chapter_uid_value(candidate)~="" and candidate.structural~=true then
+            next_index,next_chapter=index,candidate
+            break
+        end
+    end
+    if not next_chapter then return nil,"last_chapter" end
+    local book_id=tostring(book.book_id or book.bookId or "")
+    if book_id=="" then return nil,"book_id_missing" end
+    local next_uid=chapter_uid_value(next_chapter)
+    local existing=self.store:chapter_variant(book_id,next_uid,kind)
+    if not (existing and existing.file and U.file_exists(existing.file)) then existing=nil end
+    return {
+        book={bookId=book_id,title=book.title,author=book.author,cover=book.cover,version=book.version,content_type=book.content_type},
+        book_id=book_id,book_record=book,record=record,kind=kind,current_uid=current_uid,
+        current_index=current_index,next_index=next_index,next_uid=next_uid,
+        next_title=tostring(next_chapter.title or ("第 "..tostring(next_index).." 章")),
+        next_chapter=next_chapter,existing=existing,path=path,
+    }
+end
+
+function Plugin:_chapter_prefetch_status(context)
+    local ctx=context or self:_chapter_prefetch_context()
+    if not ctx then return nil end
+    if ctx.existing then return "已准备" end
+    local runtime=self._download_runtime
+    if runtime and type(runtime.options)=="table" and runtime.options.prefetch==true
+        and tostring(runtime.book and (runtime.book.bookId or runtime.book.book_id) or "")==ctx.book_id
+        and tostring(runtime.options.chapter_uid or "")==ctx.next_uid then
+        return "正在准备"
+    end
+    return "点击下载并打开"
+end
+
+function Plugin:_consume_opened_prefetch(path,book,record,kind)
+    if type(record)~="table" or record.prefetch~=true then return false end
+    local book_id=tostring(book and (book.book_id or book.bookId) or "")
+    local uid=tostring(record.chapter_uid or "")
+    kind=tostring(kind or record.variant or "")
+    if book_id=="" or uid=="" or (kind~="clean" and kind~="notes") then return false end
+    local consumed=self.store:mark_chapter_prefetch_consumed(book_id,uid,kind)
+    if consumed then
+        logger.info("[MiuRead][Prefetch] consumed","book=",book_id,"chapter=",uid,"file=",tostring(path or ""))
+    end
+    return consumed
+end
+
+function Plugin:_cancel_chapter_prefetch(reason)
+    self._chapter_prefetch_generation=(tonumber(self._chapter_prefetch_generation) or 0)+1
+    if self._chapter_prefetch_task then
+        pcall(UIManager.unschedule,UIManager,self._chapter_prefetch_task)
+        self._chapter_prefetch_task=nil
+    end
+    if reason then logger.dbg("[MiuRead][Prefetch] timer cancelled",tostring(reason)) end
+    return true
+end
+
+function Plugin:_schedule_chapter_prefetch(session,delay)
+    self:_cancel_chapter_prefetch("reschedule")
+    if self.store:preferences().chapter_prefetch_enabled~=true then return false end
+    if not self:_reader_session_is_weread() then return false end
+    session=tonumber(session) or tonumber(HOME_SESSION.reader_session_generation or 0) or 0
+    self._chapter_prefetch_generation=(tonumber(self._chapter_prefetch_generation) or 0)+1
+    local generation=self._chapter_prefetch_generation
+    local attempts=0
+    local task
+    task=function()
+        if self._chapter_prefetch_task~=task or generation~=self._chapter_prefetch_generation then return end
+        if self._miuread_suspended==true or HOME_SESSION.suspended==true
+            or reader_close_active() or not (self.ui and self.ui.document)
+            or tonumber(HOME_SESSION.reader_session_generation or 0)~=session then
+            self._chapter_prefetch_task=nil
+            return
+        end
+        if self.store:preferences().chapter_prefetch_enabled~=true then
+            self._chapter_prefetch_task=nil
+            return
+        end
+        if not self:_reader_background_idle() then
+            UIManager:scheduleIn(1.2,task)
+            return
+        end
+        local ctx,reason=self:_chapter_prefetch_context()
+        if not ctx then
+            self._chapter_prefetch_task=nil
+            logger.dbg("[MiuRead][Prefetch] skipped",tostring(reason or "no_context"))
+            return
+        end
+        local key=ctx.book_id.."|"..ctx.current_uid.."|"..ctx.next_uid.."|"..ctx.kind
+        self._chapter_prefetch_last_key=key
+        if ctx.existing then
+            self._chapter_prefetch_task=nil
+            logger.dbg("[MiuRead][Prefetch] next chapter already available",key)
+            return
+        end
+        local state=HomeData.cached_device_state() or {}
+        local battery=tonumber(state.battery)
+        if state.wifi_on==false or state.connected==false then
+            self._chapter_prefetch_task=nil
+            logger.info("[MiuRead][Prefetch] skipped without Wi-Fi",key)
+            return
+        end
+        if battery and battery<15 and state.charging~=true then
+            self._chapter_prefetch_task=nil
+            logger.info("[MiuRead][Prefetch] skipped for low battery","battery=",tostring(battery))
+            return
+        end
+        if not self:is_online() or not self:logged_in() then
+            self._chapter_prefetch_task=nil
+            logger.info("[MiuRead][Prefetch] skipped while offline or logged out",key)
+            return
+        end
+        if (self.download_task and self.download_task:busy()) or self._download_runtime
+            or #(self.store:download_queue() or {})>0
+            or (self.cache_cleanup_task and self.cache_cleanup_task:busy())
+            or (self.annotation_async and self.annotation_async:busy())
+            or (self.sync_summary_async and self.sync_summary_async:busy())
+            or (self.interactive_network_async and self.interactive_network_async:busy())
+            or self._progress_check_running==true or self._reading_end_sync_active==true then
+            attempts=attempts+1
+            if attempts<=6 then
+                UIManager:scheduleIn(10,task)
+            else
+                self._chapter_prefetch_task=nil
+                logger.info("[MiuRead][Prefetch] yielded to foreground work",key)
+            end
+            return
+        end
+        self._chapter_prefetch_task=nil
+        logger.info("[MiuRead][Prefetch] starting","book=",ctx.book_id,
+            "current=",ctx.current_uid,"next=",ctx.next_uid,"variant=",ctx.kind)
+        self:download(ctx.book,{
+            annotations=ctx.kind=="notes",chapter_uid=ctx.next_uid,prefetch=true,
+            prefetch_source_uid=ctx.current_uid,prefetch_target_title=ctx.next_title,
+        },false,function(rec)
+            if rec and rec.file then
+                logger.info("[MiuRead][Prefetch] ready","book=",ctx.book_id,"chapter=",ctx.next_uid)
+            end
+        end,true)
+    end
+    self._chapter_prefetch_task=task
+    UIManager:scheduleIn(math.max(1,tonumber(delay) or tonumber(Config.CHAPTER_PREFETCH_DELAY) or 30),task)
+    return true
+end
+
+function Plugin:_open_next_single_chapter()
+    local ctx,reason=self:_chapter_prefetch_context()
+    if not ctx then
+        self:toast(reason=="last_chapter" and "已经是最后一章" or "当前暂时无法确定下一章",2)
+        return false
+    end
+    if ctx.existing then
+        self:open_file(ctx.existing.file)
+        return true
+    end
+    local runtime=self._download_runtime
+    if runtime and type(runtime.options)=="table" and runtime.options.prefetch==true
+        and tostring(runtime.book and (runtime.book.bookId or runtime.book.book_id) or "")==ctx.book_id
+        and tostring(runtime.options.chapter_uid or "")==ctx.next_uid then
+        runtime.prefetch_open_after=true
+        self:status_toast("下一章",ctx.next_title.."正在准备，完成后自动打开",3)
+        return true
+    end
+    self:download(ctx.book,{annotations=ctx.kind=="notes",chapter_uid=ctx.next_uid},true,nil,false)
+    return true
+end
+
+function Plugin:_toggle_chapter_prefetch()
+    local prefs=self.store:preferences()
+    prefs.chapter_prefetch_enabled=prefs.chapter_prefetch_enabled~=true
+    self.store:save_preferences(prefs)
+    if prefs.chapter_prefetch_enabled then
+        self:toast("已开启自动准备下一章")
+        if self.ui and self.ui.document and self:_reader_session_is_weread() then
+            self:_schedule_chapter_prefetch(HOME_SESSION.reader_session_generation,2)
+        end
+    else
+        self:_cancel_chapter_prefetch("disabled")
+        local runtime=self._download_runtime
+        if runtime and type(runtime.options)=="table" and runtime.options.prefetch==true
+            and self.download_task and self.download_task:busy() then
+            self.download_task:cancel()
+        end
+        self:toast("已关闭自动准备下一章")
+    end
+    return true
 end
 
 function Plugin:_recover_failed_reader_open(path,generation,reason)
@@ -18258,6 +18557,13 @@ function Plugin:_confirm_delete_chapter_cache(book_id,uid,title)
     if self:_cache_action_blocked() then return end
     local paths=self.store:chapter_paths(book_id,uid)
     if #paths==0 then self.store:forget_chapter_all(book_id,uid); self:toast("本章文件已经不存在"); return end
+    local current=normalized_reader_file(self:_current_document_path())
+    for _,path in ipairs(paths) do
+        if current and current==normalized_reader_file(path) then
+            self:info("当前章节正在阅读中，请先退出或切换到其他章节再删除。")
+            return
+        end
+    end
     UIManager:show(ConfirmBox:new{
         text="删除“"..tostring(title or uid).."”的全部单章文件？",
         ok_callback=function()
@@ -18377,7 +18683,7 @@ function Plugin:_confirm_delete_book_downloads(book_id,title)
         end
     end
     UIManager:show(ConfirmBox:new{
-        text="删除《"..tostring(title or book_id).."》？\n\n将删除本机中的全部版本、单章文件、下载断点、封面、想法与评论缓存、阅读记录和本书设置。删除后无法恢复，重新阅读需要再次下载。\n\n微信读书云端书架、进度、划线和想法不会受到影响。",
+        text="删除《"..tostring(title or book_id).."》？\n\n将删除本机中的全部版本、单章文件（包括自动预下载）、下载断点、封面、想法与评论缓存、阅读记录和本书设置。删除后无法恢复，重新阅读需要再次下载。\n\n微信读书云端书架、进度、划线和想法不会受到影响。",
         ok_text="删除全部",
         cancel_text="取消",
         ok_callback=function()
@@ -18414,19 +18720,22 @@ function Plugin:_download_book_labels(b)
             labels[#labels+1]=DownloadResult.variant_label(self:_variant_label(kind),r)
         end
     end
-    local chapter_count=0
+    local chapter_count,prefetch_count=0,0
     for _,row in pairs(b.chapters or {}) do
         for _,r in pairs(row or {}) do
             if r.file and U.file_exists(r.file) then
                 chapter_count=chapter_count+1
+                if r.prefetch==true then prefetch_count=prefetch_count+1 end
             end
         end
     end
     if chapter_count>0 then
-        labels[#labels+1]="单章 "..tostring(chapter_count)
+        local chapter_label="单章 "..tostring(chapter_count)
+        if prefetch_count>0 then chapter_label=chapter_label.."（预下载 "..tostring(prefetch_count).."）" end
+        labels[#labels+1]=chapter_label
     end
     if #(BookIntegrity.partial_repairs(self.store,b.book_id) or {})>0 then labels[#labels+1]="未完成断点" end
-    return labels,chapter_count
+    return labels,chapter_count,prefetch_count
 end
 
 function Plugin:show_storage_usage()
@@ -18476,6 +18785,54 @@ function Plugin:_clear_cover_cache()
         end})
     end})
 end
+function Plugin:_prefetch_cleanup_candidates(book_id)
+    local current=normalized_reader_file(self:_current_document_path())
+    local entries,paths,kept={}, {},0
+    for _,entry in ipairs(self.store:prefetched_chapters(book_id)) do
+        local path=normalized_reader_file(entry.file)
+        if current and path and current==path then
+            kept=kept+1
+        else
+            entries[#entries+1]=entry
+            if entry.file and U.file_exists(entry.file) then paths[#paths+1]=entry.file end
+        end
+    end
+    return entries,paths,kept
+end
+
+function Plugin:_clear_prefetched_chapters(book_id,title)
+    if self:_cache_action_blocked() then return end
+    self.store:reload(); self.store:prune_missing_files()
+    local entries,paths,kept=self:_prefetch_cleanup_candidates(book_id)
+    if #entries==0 then
+        self:toast(kept>0 and "当前正在阅读的预下载章节已保留" or "没有可清理的预下载章节")
+        return
+    end
+    local scope=book_id and ("《"..tostring(title or book_id).."》") or "全部书籍"
+    local extra=kept>0 and "\n\n当前正在阅读的章节会自动保留。" or ""
+    UIManager:show(ConfirmBox:new{
+        text="清理"..scope.."的自动预下载章节？\n\n只删除系统自动准备、尚未实际打开的单章 EPUB；用户主动下载和已经读过的章节会保留。"..extra,
+        ok_text="清理",
+        cancel_text="取消",
+        ok_callback=function()
+            self:_run_cache_cleanup(paths,{
+                progress_text="正在清理预下载章节……",
+                done_text="预下载章节已清理",
+                commit=function()
+                    for _,entry in ipairs(entries) do
+                        local record=self.store:chapter_variant(entry.book_id,entry.uid,entry.kind)
+                        if type(record)=="table" and record.prefetch==true then
+                            self.store:forget_chapter(entry.book_id,entry.uid,entry.kind)
+                        end
+                    end
+                    self.store:prune_missing_files()
+                end,
+                policy={mode="chapter_delete"},operation="清理预下载章节",
+            })
+        end,
+    })
+end
+
 function Plugin:show_download_cleanup_dialog()
     if self:_cache_action_blocked() then return end
     if HomeView.is_shown() and not self:_active_reader_ui() then
@@ -18484,6 +18841,7 @@ function Plugin:show_download_cleanup_dialog()
             subtitle="不会删除书籍 划线 想法 阅读记录或已完成下载",
             actions={
                 {icon="⌫",label="下载临时文件",detail="清理断点和失败任务残留",callback=function() self:_clear_download_residue() end},
+                {icon="⇥",label="自动预下载章节",detail=tostring(self.store:prefetched_chapter_count()).." 个 · 只清理尚未打开的章节",callback=function() self:_clear_prefetched_chapters() end},
                 {icon="▧",label="失效封面缓存",detail="需要时会自动重新生成",callback=function() self:_clear_cover_cache() end},
             },
             footer_action={label="取消",callback=function() end},
@@ -18492,6 +18850,7 @@ function Plugin:show_download_cleanup_dialog()
     local dialog
     dialog=ButtonDialog:new{title="清理下载与缓存",title_align="center",buttons={
         {{text="清理下载断点与临时文件",callback=function() UIManager:close(dialog); self:_clear_download_residue() end}},
+        {{text="清理自动预下载章节（"..tostring(self.store:prefetched_chapter_count()).."）",callback=function() UIManager:close(dialog); self:_clear_prefetched_chapters() end}},
         {{text="清理封面缓存",callback=function() UIManager:close(dialog); self:_clear_cover_cache() end}},
         {{text="取消",callback=function() UIManager:close(dialog) end}},
     }}
@@ -18578,7 +18937,9 @@ function Plugin:downloaded_chapters_menu(book_id)
         for _,kind in ipairs({"clean","notes","range_clean","range_notes","preview_clean","preview_notes"}) do
             local r=row and row[kind]
             if r and r.file and U.file_exists(r.file) then
-                labels[#labels+1]=DownloadResult.variant_label(self:_variant_label(kind),r)
+                local variant_label=DownloadResult.variant_label(self:_variant_label(kind),r)
+                if r.prefetch==true then variant_label=variant_label.." · 预下载" end
+                labels[#labels+1]=variant_label
                 title=title or r.title
             end
         end
@@ -18621,13 +18982,18 @@ function Plugin:downloaded_book_menu(book_ref)
             items[#items+1]={text="删除"..label,post_text="仅删除该版本",callback=function() self:_confirm_delete_variant(book_id,kind_key,b.title) end}
         end
     end
-    local _,chapter_count=self:_download_book_labels(U.merge(b,{book_id=book_id}))
+    local _,chapter_count,prefetch_count=self:_download_book_labels(U.merge(b,{book_id=book_id}))
     local has_cache=self.store:book_has_partial_cache(book_id)
     local repairable=#(BookIntegrity.partial_repairs(self.store,book_id) or {})
     if chapter_count>0 or has_cache then
         items[#items+1]={text=repairable>0 and "单章与断点" or "单章与缓存",enabled=false}
         if chapter_count>0 then
-            items[#items+1]={text="单章文件",post_text=tostring(chapter_count).." 个",callback=function() self:downloaded_chapters_menu(book_id) end}
+            local chapter_post=tostring(chapter_count).." 个"
+            if prefetch_count>0 then chapter_post=chapter_post.." · 预下载 "..tostring(prefetch_count) end
+            items[#items+1]={text="单章文件",post_text=chapter_post,callback=function() self:downloaded_chapters_menu(book_id) end}
+            if prefetch_count>0 then
+                items[#items+1]={text="清理本书预下载",post_text=tostring(prefetch_count).." 个",callback=function() self:_clear_prefetched_chapters(book_id,b.title) end}
+            end
         end
         if has_cache then
             if repairable>0 then
@@ -21965,12 +22331,14 @@ function Plugin:download_settings_menu()
     local policy_label=policy=="allow" and "允许后台下载" or (policy=="after_reading" and "退出阅读后下载" or "每次询问")
     local items={
         {text="阅读时下载策略",post_text=policy_label,sub_item_table_func=function() return self:download_reader_policy_menu() end},
+        {text="自动准备下一章",post_text="仅单章节阅读",checked_func=function() return self.store:preferences().chapter_prefetch_enabled==true end,keep_menu_open=true,callback=function() self:_toggle_chapter_prefetch() end},
         {text="下载网络",post_text=self:_download_network_mode_label(),sub_item_table_func=function() return self:download_network_mode_menu() end},
         {text="下载关键进度提示",checked_func=function() return self.store:preferences().download_notice_enabled~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_notice_enabled") end},
         {text="下载完成提醒",checked_func=function() return self.store:preferences().download_complete_notice~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_complete_notice") end},
     }
     items[#items+1]={text="下载目录",post_text=self:_download_dir_label(),callback=function() self:directory_dialog() end}
-    items[#items+1]={text="存储清理",post_text="临时文件与失效封面",callback=function() self:show_download_cleanup_dialog() end}
+    items[#items+1]={text="清理预下载章节",post_text=tostring(self.store:prefetched_chapter_count()).." 个",callback=function() self:_clear_prefetched_chapters() end}
+    items[#items+1]={text="存储清理",post_text="临时文件、预下载与失效封面",callback=function() self:show_download_cleanup_dialog() end}
     return items
 end
 function Plugin:mp_settings_menu()
@@ -23206,6 +23574,7 @@ function Plugin:_reader_rebuild_cancel(reason,clear_shared)
 end
 
 function Plugin:_prepare_reader_disappearance(reason)
+    self:_cancel_chapter_prefetch(reason or "reader disappeared")
     if self.ui and self.ui.document and self:_reader_session_is_weread() then
         pcall(function() self:_capture_local_annotation_snapshot("final:"..tostring(reason or "reader_disappeared")) end)
     end
@@ -23543,6 +23912,7 @@ function Plugin:onReaderReady()
             if self:_reader_session_is_weread() then
                 book,record,variant=self.store:file_record_fast(path,false)
                 if not book then book,record,variant=self.store:identify_file(path,false) end
+                if record then self:_consume_opened_prefetch(path,book,record,variant) end
             end
             self:_record_recent_read(path,book,record)
         end
@@ -23588,6 +23958,9 @@ function Plugin:onReaderReady()
     self:_reset_reader_toolbar_state_cache()
     self:_schedule_reader_toolbar_state_refresh(nil,.35)
     self:_schedule_reader_toolbar_prewarm(ready_session,1.1)
+    if self:_reader_session_is_weread() and not preserve_session then
+        self:_schedule_chapter_prefetch(ready_session)
+    end
     self:_teardown_thought_tap()
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
