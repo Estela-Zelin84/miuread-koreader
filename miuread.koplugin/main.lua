@@ -741,11 +741,8 @@ function Plugin:init()
     self._home_visible_cover_targets={}
     self._reader_quick_panel_pending=false
     self._reader_gesture_guard_until=0
-    self._reader_toolbar_state_cache={session=0,page=nil,total=nil,chapter="",chapter_percent=nil,chapter_percent_quality=nil,
-        whole_percent=nil,whole_percent_quality=nil,estimated_whole_percent=nil,exact_page=nil,
-        exact_whole_percent=nil,exact_chapter_percent=nil,exact_quality=nil,chapter_ordinal=nil,updated_at=0}
+    self._reader_toolbar_state_cache={session=0,page=nil,total=nil,chapter="",chapter_percent=nil,whole_percent=nil,chapter_ordinal=nil,updated_at=0}
     self._reader_toolbar_state_task=nil
-    self._reader_exact_progress_task=nil
     self._reader_toolbar_prewarm_task=nil
     self._reader_toolbar_header_perf=nil
     self._reader_toolbar_options_perf=nil
@@ -2897,7 +2894,7 @@ function Plugin:_schedule_bluetooth_startup_probe(delay)
             local state=Bluetooth.adopt(result.value)
             self:_bluetooth_migrate_panel(state)
             if HomeView.is_shown() and not self:_active_reader_ui() then
-                HomeView.update_header{bluetooth_text=self:_home_bluetooth_text()}
+                HomeView.update_header{bluetooth_visible=state.supported==true,bluetooth_text=self:_home_bluetooth_text()}
             end
             logger.info("[MiuRead][Bluetooth] deferred probe complete",
                 "supported=",tostring(state.supported==true),
@@ -3866,6 +3863,7 @@ function Plugin:_home_refresh_header_now(force_device,force_sync)
     return HomeView.update_header{
         account_name=self:_home_account_name(),
         wifi_text=self:_home_wifi_text(),
+        bluetooth_visible=self:_bluetooth_supported(),
         bluetooth_text=self:_home_bluetooth_text(),
         sync_text=self:_home_sync_status_label(force_sync==true),
         battery_text=self:_home_battery_text(),
@@ -10469,7 +10467,9 @@ function Plugin:_home_weread_stats_cache()
     local value=self.store:get("home_weread_stats_cache",{})
     value=type(value)=="table" and value or {}
     local account_key=self:_home_weread_stats_account_key()
-    if tostring(value.account_key or "")~=account_key then return {account_key=account_key} end
+    if tostring(value.account_key or "")~=account_key or tonumber(value.schema_version)~=2 then
+        return {account_key=account_key,schema_version=2}
+    end
     return value
 end
 
@@ -10480,8 +10480,23 @@ function Plugin:_home_weread_stats_data(cache)
     local data=U.copy(weekly)
     data.week_seconds=tonumber(weekly.total_seconds)
     data.month_seconds=tonumber(monthly.total_seconds)
-    data.daily=type(weekly.daily)=="table" and U.copy(weekly.daily) or {}
+    data.daily=HomeData.week_rows(weekly.daily,os.time())
     return data
+end
+
+local HOME_WEEKDAY_SHORT={ ["1"]="一",["2"]="二",["3"]="三",["4"]="四",["5"]="五",["6"]="六",["0"]="日" }
+
+function Plugin:_home_week_check_lines(rows, threshold)
+    rows=HomeData.week_rows(rows,os.time())
+    threshold=math.max(0,tonumber(threshold) or 1)
+    local marks,days={},{}
+    for _,row in ipairs(rows) do
+        if row.future==true then marks[#marks+1]="·"
+        elseif (tonumber(row.seconds) or 0)>=threshold then marks[#marks+1]="✓"
+        else marks[#marks+1]="—" end
+        days[#days+1]=HOME_WEEKDAY_SHORT[tostring(row.weekday or "")] or "·"
+    end
+    return table.concat(marks,"  "),table.concat(days,"  ")
 end
 
 function Plugin:_home_weread_stats_text(cache)
@@ -10489,27 +10504,188 @@ function Plugin:_home_weread_stats_text(cache)
     if data.week_seconds==nil and data.today_seconds==nil then
         return self:logged_in() and "正在获取阅读数据…" or "登录后显示阅读数据"
     end
-    return "今日 "..self:_home_short_duration(data.today_seconds or 0).."\n本周 "..self:_home_short_duration(data.week_seconds or 0)
+    local marks,days=self:_home_week_check_lines(data.daily,60)
+    return "本周 "..self:_home_short_duration(data.week_seconds or 0).." · 今日 "..self:_home_short_duration(data.today_seconds or 0)
+        .." · 日均 "..self:_home_short_duration(data.day_average_seconds or 0).."\n"..marks.."\n"..days
 end
 
 function Plugin:_home_local_stats_text(data)
     data=type(data)=="table" and data or nil
     if not data then return "暂无本地阅读数据" end
-    return "今日 "..self:_home_short_duration(data.today_seconds or 0).."\n本周 "..self:_home_short_duration(data.week_seconds or 0)
+    local marks,days=self:_home_week_check_lines(data.daily,1)
+    return "本周 "..self:_home_short_duration(data.week_seconds or 0).." · 今日 "..self:_home_short_duration(data.today_seconds or 0)
+        .."\n"..marks.."\n"..days
+end
+
+local function shifted_stats_base(mode,base_time,delta)
+    delta=tonumber(delta) or 0
+    if delta==0 then return 0 end
+    local anchor=tonumber(base_time) or 0
+    if anchor<=0 then anchor=os.time() end
+    if mode=="weekly" then return anchor+delta*7*86400 end
+    local d=os.date("*t",anchor)
+    if mode=="monthly" then
+        return os.time{year=d.year,month=d.month+delta,day=15,hour=12,min=0,sec=0}
+    elseif mode=="annually" then
+        return os.time{year=d.year+delta,month=6,day=15,hour=12,min=0,sec=0}
+    end
+    return 0
 end
 
 function Plugin:_show_home_weread_stats()
     local cache=self:_home_weread_stats_cache()
+    local data_source={
+        weekly=cache.weekly,
+        monthly=cache.monthly,
+        annually=cache.annually,
+        overall=cache.overall,
+        _history={},
+    }
+    local dialog
+    dialog=require("miuread.reading_stats_dialog").show("weread",function() return data_source end,{
+        on_shift_period=function(mode,delta)
+            self:_show_home_weread_stats_period(data_source,dialog,mode,delta)
+        end,
+    })
     self:_schedule_home_weread_stats_refresh(false)
-    return require("miuread.reading_stats_dialog").show("weread",self:_home_weread_stats_data(cache))
+    self:_schedule_home_weread_stats_detail_refresh(data_source,dialog)
+    return dialog
+end
+
+function Plugin:_show_home_weread_stats_period(data_source,dialog,mode,delta,retry,target_override,previous_override)
+    mode=tostring(mode or "")
+    if mode~="weekly" and mode~="monthly" and mode~="annually" then return false end
+    if dialog and dialog.closed then return false end
+    data_source=type(data_source)=="table" and data_source or {}
+    local current=type(data_source[mode])=="table" and data_source[mode] or {}
+    if tonumber(delta)==0 and not target_override then
+        local cache=self:_home_weread_stats_cache()
+        if type(cache[mode])=="table" then
+            data_source[mode]=cache[mode]
+            if dialog and not dialog.closed and type(dialog._rebuild)=="function" then dialog:_rebuild() end
+            return true
+        end
+    end
+    local target=tonumber(target_override) or shifted_stats_base(mode,current.base_time,delta)
+    -- The API normalizes baseTime; timestamps in the current natural period are
+    -- safe and are treated as the current period by weread_summary.
+    if target>os.time() then target=0 end
+    data_source._history=type(data_source._history)=="table" and data_source._history or {}
+    data_source._history[mode]=type(data_source._history[mode])=="table" and data_source._history[mode] or {}
+    local cache_key=tostring(target)
+    if type(data_source._history[mode][cache_key])=="table" then
+        data_source[mode]=data_source._history[mode][cache_key]
+        if dialog and not dialog.closed and type(dialog._rebuild)=="function" then dialog:_rebuild() end
+        return true
+    end
+    local previous=type(previous_override)=="table" and previous_override or current
+    retry=tonumber(retry) or 0
+    if not self.reading_stats_async or not self.reading_stats_async:available() then return false end
+    if self.reading_stats_async:busy() then
+        if retry<12 then UIManager:scheduleIn(.55,function()
+            self:_show_home_weread_stats_period(data_source,dialog,mode,delta,retry+1,target,previous)
+        end) end
+        return false
+    end
+    local state=HomeData.cached_device_state()
+    if type(state)=="table" and state.online==false then
+        self:toast("当前网络不可用，无法读取历史阅读统计",2)
+        return false
+    end
+    local target_label=mode=="weekly" and os.date("%m-%d",target)
+        or (mode=="monthly" and os.date("%Y-%m",target) or os.date("%Y",target).." 年")
+    data_source[mode]={loading=true,label=target_label,base_time=target,is_current=false}
+    if dialog and not dialog.closed and type(dialog._rebuild)=="function" then dialog:_rebuild() end
+    local started,err=self.reading_stats_async:run("reading-stats-history-"..mode,function()
+        return HomeData.weread_summary(self.api:reading_stats(mode,target,{no_auth_recovery=true}),os.time(),mode)
+    end,function(result)
+        if not result or result.ok~=true or type(result.value)~="table" then
+            data_source[mode]=previous
+            if dialog and not dialog.closed and type(dialog._rebuild)=="function" then dialog:_rebuild() end
+            self:toast("历史阅读统计暂时无法获取",2)
+            return
+        end
+        data_source._history[mode][cache_key]=result.value
+        data_source[mode]=result.value
+        if dialog and not dialog.closed and type(dialog._rebuild)=="function" then dialog:_rebuild() end
+    end,20)
+    if not started then
+        data_source[mode]=previous
+        logger.warn("[MiuRead][HomeStats] history worker not started",tostring(err))
+        return false
+    end
+    return true
 end
 
 function Plugin:_show_home_local_stats()
-    local data=HomeData.reading_stats(true) or {}
+    local data=HomeData.reading_stats(true,true) or {periods={}}
+    data.periods=type(data.periods)=="table" and data.periods or {}
+    local dialog
+    dialog=require("miuread.reading_stats_dialog").show("local",data,{
+        on_shift_period=function(mode,delta)
+            local current=type(data.periods[mode])=="table" and data.periods[mode] or {}
+            local target=tonumber(delta)==0 and 0 or shifted_stats_base(mode,current.base_time,delta)
+            if target>os.time() then target=0 end
+            local period=HomeData.reading_stats_period(mode,target)
+            if period then data.periods[mode]=period end
+        end,
+    })
     if HomeView.is_shown() then
         HomeView.update_dashboard{local_stats_text=self:_home_local_stats_text(data)}
     end
-    return require("miuread.reading_stats_dialog").show("local",data)
+    return dialog
+end
+
+function Plugin:_schedule_home_weread_stats_detail_refresh(data_source,dialog,retry)
+    if not self:logged_in() or not self.reading_stats_async or not self.reading_stats_async:available() then return false end
+    retry=tonumber(retry) or 0
+    if self.reading_stats_async:busy() then
+        if retry<12 then
+            UIManager:scheduleIn(.65,function()
+                if dialog and dialog.closed then return end
+                self:_schedule_home_weread_stats_detail_refresh(data_source,dialog,retry+1)
+            end)
+        end
+        return false
+    end
+    local cache=self:_home_weread_stats_cache()
+    local now=os.time()
+    local annual=type(cache.annually)=="table" and cache.annually or nil
+    local overall=type(cache.overall)=="table" and cache.overall or nil
+    local need_annual=not annual or now-(tonumber(annual.fetched_at) or 0)>=6*60*60
+    local need_overall=not overall or now-(tonumber(overall.fetched_at) or 0)>=12*60*60
+    if not need_annual and not need_overall then
+        if type(data_source)=="table" then data_source.annually=annual; data_source.overall=overall end
+        if dialog and not dialog.closed and type(dialog._rebuild)=="function" then dialog:_rebuild() end
+        return false
+    end
+    local state=HomeData.cached_device_state()
+    if type(state)=="table" and state.online==false then return false end
+    local started,err=self.reading_stats_async:run("reading-stats-detail",function()
+        local out={}
+        if need_annual then out.annually=HomeData.weread_summary(self.api:reading_stats("annually",0,{no_auth_recovery=true}),os.time(),"annually") end
+        if need_overall then out.overall=HomeData.weread_summary(self.api:reading_stats("overall",0,{no_auth_recovery=true}),os.time(),"overall") end
+        return out
+    end,function(result)
+        if not result or result.ok~=true or type(result.value)~="table" then
+            logger.warn("[MiuRead][HomeStats] detail refresh failed",tostring(result and result.error or "no result"))
+            return
+        end
+        local current=self:_home_weread_stats_cache()
+        current.account_key=self:_home_weread_stats_account_key()
+        current.schema_version=2
+        if type(result.value.annually)=="table" then current.annually=result.value.annually end
+        if type(result.value.overall)=="table" then current.overall=result.value.overall end
+        current.updated_at=os.time()
+        self.store:set("home_weread_stats_cache",current)
+        if type(data_source)=="table" then
+            if type(current.annually)=="table" then data_source.annually=current.annually end
+            if type(current.overall)=="table" then data_source.overall=current.overall end
+        end
+        if dialog and not dialog.closed and type(dialog._rebuild)=="function" then dialog:_rebuild() end
+    end,24)
+    if not started then logger.warn("[MiuRead][HomeStats] detail worker not started",tostring(err)) end
+    return started==true
 end
 
 function Plugin:_schedule_home_weread_stats_refresh(force)
@@ -10530,10 +10706,10 @@ function Plugin:_schedule_home_weread_stats_refresh(force)
     local started,err=self.reading_stats_async:run("home-reading-stats",function()
         local out={fetched_at=os.time()}
         if need_weekly then
-            out.weekly=HomeData.weread_summary(self.api:reading_stats("weekly",0,{no_auth_recovery=true}),os.time())
+            out.weekly=HomeData.weread_summary(self.api:reading_stats("weekly",0,{no_auth_recovery=true}),os.time(),"weekly")
         end
         if need_monthly then
-            out.monthly=HomeData.weread_summary(self.api:reading_stats("monthly",0,{no_auth_recovery=true}),os.time())
+            out.monthly=HomeData.weread_summary(self.api:reading_stats("monthly",0,{no_auth_recovery=true}),os.time(),"monthly")
         end
         return out
     end,function(result)
@@ -10543,6 +10719,7 @@ function Plugin:_schedule_home_weread_stats_refresh(force)
         end
         local current=self:_home_weread_stats_cache()
         current.account_key=self:_home_weread_stats_account_key()
+        current.schema_version=2
         if type(result.value.weekly)=="table" then current.weekly=result.value.weekly end
         if type(result.value.monthly)=="table" then current.monthly=result.value.monthly end
         current.updated_at=os.time()
@@ -11447,9 +11624,7 @@ function Plugin:_reader_toolbar_cache()
     local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
     local cache=self._reader_toolbar_state_cache
     if type(cache)~="table" or tonumber(cache.session or -1)~=session then
-        cache={session=session,page=nil,total=nil,chapter="",chapter_percent=nil,chapter_percent_quality=nil,
-            whole_percent=nil,whole_percent_quality=nil,estimated_whole_percent=nil,exact_page=nil,
-            exact_whole_percent=nil,exact_chapter_percent=nil,exact_quality=nil,chapter_ordinal=nil,updated_at=0}
+        cache={session=session,page=nil,total=nil,chapter="",chapter_percent=nil,whole_percent=nil,chapter_ordinal=nil,updated_at=0}
         self._reader_toolbar_state_cache=cache
     end
     return cache
@@ -11460,16 +11635,9 @@ function Plugin:_reset_reader_toolbar_state_cache()
         UIManager:unschedule(self._reader_toolbar_state_task)
         self._reader_toolbar_state_task=nil
     end
-    if self._reader_exact_progress_task then
-        UIManager:unschedule(self._reader_exact_progress_task)
-        self._reader_exact_progress_task=nil
-    end
     self._reader_toolbar_state_cache={
         session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0,
-        page=nil,total=nil,chapter="",chapter_percent=nil,chapter_percent_quality=nil,
-        whole_percent=nil,whole_percent_quality=nil,estimated_whole_percent=nil,
-        exact_page=nil,exact_whole_percent=nil,exact_chapter_percent=nil,exact_quality=nil,
-        chapter_ordinal=nil,updated_at=0,
+        page=nil,total=nil,chapter="",chapter_percent=nil,whole_percent=nil,chapter_ordinal=nil,updated_at=0,
     }
 end
 
@@ -11494,20 +11662,10 @@ function Plugin:_refresh_reader_toolbar_state_cache(page)
 
     local page_total=tonumber(cache.total)
     cache.chapter_percent=nil
-    cache.chapter_percent_quality=nil
     cache.chapter_ordinal=nil
     cache.whole_percent=nil
-    cache.whole_percent_quality=nil
-    cache.estimated_whole_percent=nil
     if current and page_total and page_total>0 then
-        cache.estimated_whole_percent=math.max(0,math.min(100,current/page_total*100))
-        -- Ordinary local books may use document pagination as their visible
-        -- progress. WeRead books must not label this cheap estimate as exact
-        -- whole-book progress.
-        if not self:_reader_session_is_weread() then
-            cache.whole_percent=cache.estimated_whole_percent
-            cache.whole_percent_quality="document_page_ratio"
-        end
+        cache.whole_percent=math.max(0,math.min(100,current/page_total*100))
     end
 
     local chapter_started=os.clock()
@@ -11532,7 +11690,6 @@ function Plugin:_refresh_reader_toolbar_state_cache(page)
                     local finish_page=(next_page and next_page>start_page) and (next_page-1) or page_total
                     if finish_page and finish_page>=start_page then
                         cache.chapter_percent=math.max(0,math.min(100,(current-start_page+1)/math.max(1,finish_page-start_page+1)*100))
-                        cache.chapter_percent_quality="estimated_page_range"
                     end
                 end
             end
@@ -11546,26 +11703,21 @@ function Plugin:_refresh_reader_toolbar_state_cache(page)
     if type(nav)=="table" and normalized_reader_file(nav.path)==path then
         cache.chapter_ordinal=tonumber(nav.current_ordinal)
         if U.trim(tostring(nav.current_title or ""))~="" then cache.chapter=U.trim(tostring(nav.current_title)) end
-        if page_total and current then
-            cache.chapter_percent=math.max(0,math.min(100,current/page_total*100))
-            cache.chapter_percent_quality="estimated_page_ratio"
-        end
+        if page_total and current then cache.chapter_percent=math.max(0,math.min(100,current/page_total*100)) end
     end
 
-    -- beta.18: page-turn refresh is estimate-only. Never call local_position()
-    -- here and never promote current-page/page-count to "whole-book progress".
-    -- A cache-only source-coordinate worker updates exact_* after the reader has
-    -- been idle; until then the UI either keeps the exact value for this page or
-    -- explicitly marks the chapter estimate with ≈.
-    if self:_reader_session_is_weread() and current
-        and tonumber(cache.exact_page)==tonumber(current) then
-        if tonumber(cache.exact_whole_percent)~=nil then
-            cache.whole_percent=math.max(0,math.min(100,tonumber(cache.exact_whole_percent)))
-            cache.whole_percent_quality=tostring(cache.exact_quality or "precise_source_mapped")
-        end
-        if tonumber(cache.exact_chapter_percent)~=nil then
-            cache.chapter_percent=math.max(0,math.min(100,tonumber(cache.exact_chapter_percent)))
-            cache.chapter_percent_quality=tostring(cache.exact_quality or "precise_source_mapped")
+    -- Whole-book WeRead progress shown in the toolbar is a cheap map lookup. It
+    -- deliberately does not invoke the precise source-text locator.
+    if self:_reader_session_is_weread() and self.sync and type(self.sync.local_position)=="function"
+        and current and page_total and page_total>0 then
+        local ok,position=pcall(self.sync.local_position,self.sync,current/page_total)
+        if ok and type(position)=="table" then
+            if position.safe==true and tonumber(position.progress) then
+                cache.whole_percent=math.max(0,math.min(100,tonumber(position.progress)))
+            end
+            if tonumber(position.chapter_percent) then
+                cache.chapter_percent=math.max(0,math.min(100,tonumber(position.chapter_percent)))
+            end
         end
     end
     cache.updated_at=os.time()
@@ -11601,87 +11753,6 @@ function Plugin:_schedule_reader_toolbar_state_refresh(page,delay)
     end
     self._reader_toolbar_state_task=task
     UIManager:scheduleIn(tonumber(delay) or .05,task)
-    return true
-end
-
-function Plugin:_apply_reader_exact_progress_position(position,page_token)
-    if type(position)~="table" or position.safe~=true then return false end
-    local cache=self:_reader_toolbar_cache()
-    local current=self:_reader_current_page()
-    local requested=tonumber(page_token)
-    if requested and current and requested~=current then return false end
-    local whole=tonumber(position.display_progress or position.progress)
-    local chapter_ratio=tonumber(position.chapter_ratio)
-    local chapter=chapter_ratio and chapter_ratio*100 or tonumber(position.chapter_percent)
-    local quality=tostring(position.display_progress_quality or position.precision_level or "precise_source_mapped")
-    cache.exact_page=current or requested
-    cache.exact_whole_percent=whole
-    cache.exact_chapter_percent=chapter
-    cache.exact_quality=quality
-    cache.exact_captured_at=tonumber(position.captured_at) or os.time()
-    if whole~=nil then
-        cache.whole_percent=math.max(0,math.min(100,whole))
-        cache.whole_percent_quality=quality
-    end
-    if chapter~=nil then
-        cache.chapter_percent=math.max(0,math.min(100,chapter))
-        cache.chapter_percent_quality=quality
-    end
-    cache.updated_at=os.time()
-    logger.dbg("[MiuRead][ReaderExactProgress] adopted",
-        "page=",tostring(cache.exact_page or "-"),
-        "chapter=",chapter and string.format("%.3f",chapter) or "-",
-        "whole=",whole and string.format("%.3f",whole) or "-",
-        "quality=",quality)
-    return true
-end
-
-function Plugin:_schedule_reader_exact_progress_refresh(page,delay)
-    if self._reader_exact_progress_task then UIManager:unschedule(self._reader_exact_progress_task) end
-    if not self:_reader_session_is_weread() or not (self.sync and type(self.sync.resolve_display_position)=="function") then
-        self._reader_exact_progress_task=nil
-        return false
-    end
-    local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
-    local requested=tonumber(page)
-    local attempts=0
-    local task
-    task=function()
-        if self._reader_exact_progress_task~=task then return end
-        attempts=attempts+1
-        if self._miuread_suspended==true or HOME_SESSION.suspended==true or reader_close_active()
-            or not (self.ui and self.ui.document)
-            or tonumber(HOME_SESSION.reader_session_generation or 0)~=session then
-            self._reader_exact_progress_task=nil
-            return
-        end
-        local now_page=self:_reader_current_page()
-        if requested and now_page and requested~=now_page then
-            self._reader_exact_progress_task=nil
-            return
-        end
-        if not self:_reader_background_idle() or self._progress_check_running==true
-            or self._reading_end_sync_active==true or (self.sync.async and self.sync.async:busy()) then
-            if attempts<8 then UIManager:scheduleIn(.45,task) else self._reader_exact_progress_task=nil end
-            return
-        end
-        self._reader_exact_progress_task=nil
-        local page_token=now_page or requested
-        local started,err=self.sync:resolve_display_position(function(position,position_error)
-            if position and self.ui and self.ui.document
-                and tonumber(HOME_SESSION.reader_session_generation or 0)==session then
-                self:_apply_reader_exact_progress_position(position,page_token)
-            elseif position_error and position_error~="coord_cache_missing" then
-                logger.dbg("[MiuRead][ReaderExactProgress] unavailable",tostring(position_error))
-            end
-        end,{page_token=page_token,ratio_snapshot=self.sync:local_ratio()})
-        if not started and tostring(err or "")=="source_worker_busy" and attempts<8 then
-            self._reader_exact_progress_task=task
-            UIManager:scheduleIn(.6,task)
-        end
-    end
-    self._reader_exact_progress_task=task
-    UIManager:scheduleIn(math.max(.3,tonumber(delay) or 1.2),task)
     return true
 end
 
@@ -11726,7 +11797,6 @@ function Plugin:_reader_progress_display_state()
         or self:_reader_toolbar_cached_percent() or 0
     local state={
         percent=document_percent, whole_percent=nil, chapter_percent=nil,
-        whole_percent_quality=nil,chapter_percent_quality=nil,
         progress_scope="document",
     }
     local sync=self.sync
@@ -11736,6 +11806,11 @@ function Plugin:_reader_progress_display_state()
     local row=type(record.record)=="table" and record.record or {}
     local mode=sync:_record_mode(record)
     local partial_range=row.partial_range==true
+    local ratio=sync:local_ratio()
+    local position
+    local ok,value=pcall(sync._position_for_report,sync,ratio,true)
+    if ok and type(value)=="table" then position=value end
+
     if partial_range then
         state.progress_scope="range"
     elseif mode=="standalone" then
@@ -11744,30 +11819,22 @@ function Plugin:_reader_progress_display_state()
         state.progress_scope="whole"
     end
 
-    -- beta.18: opening this dialog must not synchronously scan a chapter or
-    -- rebuild a position map. Reuse the cache-only source-coordinate result for
-    -- the current page. If it is not ready yet, show an explicit estimate/pending
-    -- state and let the idle worker populate it for the next paint/open.
-    local toolbar_cache=self:_reader_toolbar_cache()
-    local current_page=self:_reader_current_page()
-    if tonumber(toolbar_cache.exact_page)==tonumber(current_page) then
-        if tonumber(toolbar_cache.exact_whole_percent)~=nil then
-            state.whole_percent=math.max(0,math.min(100,tonumber(toolbar_cache.exact_whole_percent)))
-            state.whole_percent_quality=tostring(toolbar_cache.exact_quality or "precise_source_mapped")
+    if type(position)=="table" then
+        if position.safe==true and tonumber(position.progress)~=nil then
+            state.whole_percent=math.max(0,math.min(100,tonumber(position.progress)))
         end
-        if tonumber(toolbar_cache.exact_chapter_percent)~=nil then
-            state.chapter_percent=math.max(0,math.min(100,tonumber(toolbar_cache.exact_chapter_percent)))
-            state.chapter_percent_quality=tostring(toolbar_cache.exact_quality or "precise_source_mapped")
+        local chapter_ratio=tonumber(position.chapter_ratio)
+        if chapter_ratio~=nil then
+            state.chapter_percent=math.max(0,math.min(100,chapter_ratio*100))
+        elseif tonumber(position.chapter_percent)~=nil then
+            state.chapter_percent=math.max(0,math.min(100,tonumber(position.chapter_percent)))
         end
     end
 
+    -- A complete EPUB's local document percentage is itself a valid whole-book
+    -- display fallback. Partial/standalone EPUBs must never use it as whole-book progress.
     if state.progress_scope=="whole" and state.whole_percent==nil then
         state.whole_percent=document_percent
-        state.whole_percent_quality="estimated_document_ratio"
-    elseif (state.progress_scope=="chapter" or state.progress_scope=="range")
-        and state.chapter_percent==nil then
-        state.chapter_percent=document_percent
-        state.chapter_percent_quality="estimated_document_ratio"
     end
     return state
 end
@@ -12059,8 +12126,6 @@ function Plugin:_show_reader_progress_control(back_callback)
         percent=display.percent or 0,
         whole_percent=display.whole_percent,
         chapter_percent=display.chapter_percent,
-        whole_percent_quality=display.whole_percent_quality,
-        chapter_percent_quality=display.chapter_percent_quality,
         progress_scope=display.progress_scope,
         on_goto_percent=function(target) self:_reader_goto_percent(target) end,
         on_adjust=function(delta) self:_reader_jump_percent(delta) end,
@@ -12554,30 +12619,12 @@ function Plugin:_reader_toolbar_header(title)
         chapter="第"..tostring(math.floor(ordinal+.5)).."章 · "..chapter
     end
     local chapter_percent=tonumber(cache.chapter_percent)
-    local chapter_quality=tostring(cache.chapter_percent_quality or "")
     local location_text=chapter
     if chapter_percent then
-        if chapter_quality:match("^exact") or chapter_quality:match("^precise") then
-            location_text=location_text.." · 本章 "..string.format("%.2f",chapter_percent).."%"
-        else
-            location_text=location_text.." · 本章 ≈"..tostring(math.floor(chapter_percent+.5)).."%"
-        end
+        location_text=location_text.." · 本章 "..tostring(math.floor(chapter_percent+.5)).."%"
     end
-    local whole_percent=tonumber(cache.whole_percent)
-    local whole_quality=tostring(cache.whole_percent_quality or "")
-    local progress_text
-    if whole_percent then
-        if whole_quality:match("^exact") or whole_quality:match("^precise") then
-            progress_text="全书 "..string.format("%.2f",whole_percent).."%"
-        else
-            progress_text="全书 ≈"..tostring(math.floor(whole_percent+.5)).."%"
-        end
-    elseif self:_reader_session_is_weread() then
-        progress_text="全书 待换算"
-    else
-        local document_percent=self:_reader_toolbar_cached_percent()
-        progress_text=document_percent and ("进度 "..tostring(math.floor(document_percent+.5)).."%") or "阅读进度"
-    end
+    local whole_percent=tonumber(cache.whole_percent) or self:_reader_toolbar_cached_percent()
+    local progress_text=whole_percent and ("全书 "..string.format("%.1f",whole_percent).."%") or "阅读进度"
     local state_ms=math.floor((os.clock()-state_started)*1000+.5)
     self._reader_toolbar_header_perf={
         device_ms=device_ms,
@@ -15802,6 +15849,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local view,err=HomeView.show({
         title="觅阅",
         wifi_text=self:_home_wifi_text(),
+        bluetooth_visible=self:_bluetooth_supported(),
         bluetooth_text=self:_home_bluetooth_text(),
         sync_text=self:_home_sync_status_label(),
         battery_text=self:_home_battery_text(),
@@ -15828,6 +15876,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         screensaver_file=screensaver_file,
         screensaver_book_file=normalized_reader_file(hero and hero.file or nil),
         on_quick_panel=function() self:show_home_quick_panel() end,
+        on_bluetooth=function() self:_bluetooth_toggle() end,
         on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
         on_account=function() self:_home_leave_and_run("account status",function() self:show_account_status() end) end,
         on_weread_stats=function() self:_show_home_weread_stats() end,
@@ -20555,8 +20604,6 @@ function Plugin:ensure_read_report_progress(reason,automatic)
 
     local started,resolve_error=self.sync:resolve_local_progress(function(local_position,local_err,meta)
         if not local_position then local_failed(local_err,meta); return end
-        self.sync:_save_local_snapshot(id,local_position)
-        self:_apply_reader_exact_progress_position(local_position,self:_reader_current_page())
         local localp=math.floor((tonumber(local_position.progress) or 0)+.5)
         self:_save_progress_state(id,"checking","正在读取云端位置",localp,nil)
         self.sync:remote(id,function(remote,remote_err)
@@ -20867,29 +20914,8 @@ function Plugin:_verify_progress_submission(book_id,submitted_position,options,c
                     "remote_basis=",tostring(remote and remote.position_basis or "-"),
                     "co_delta=",tostring(meta and meta.co_delta or "-"),
                     "matched=",tostring(matched==true))
-                local target_uid=tostring(submitted_position.chapter_uid or submitted_position.chapterUid or "")
-                local remote_uid=tostring(remote and (remote.chapter_uid or remote.chapterUid) or "")
-                local target_co=tonumber(submitted_position.canonical_offset or submitted_position.chapter_offset or submitted_position.offset)
-                local remote_co=tonumber(remote and (remote.canonical_offset or remote.offset or remote.chapter_offset))
-                local propagation_pending=not matched and target_uid~="" and remote_uid==target_uid
-                    and target_co~=nil and target_co>32 and remote_co==0
-                if propagation_pending then
-                    meta=type(meta)=="table" and meta or {}
-                    meta.propagation_pending=true
-                    meta.reason="cloud_propagation_pending"
-                end
                 if matched then
                     finish(true,remote,nil,{actual=actual,source=source,match=meta})
-                elseif propagation_pending and attempt<2 then
-                    -- WeRead can expose the target chapter before its native co
-                    -- has propagated. Wait once instead of immediately replaying
-                    -- the same upload and competing with reader/home work.
-                    options.second_delay=math.max(tonumber(options.second_delay) or 0,4.5)
-                    logger.info("[MiuRead][ProgressVerify] cloud coordinate propagation pending",
-                        "book=",book_id,"chapter=",target_uid,"submitted_co=",tostring(target_co))
-                    verify()
-                elseif propagation_pending then
-                    finish(false,remote,"cloud_propagation_pending",meta)
                 elseif attempt<2 then
                     verify()
                 else
@@ -20953,18 +20979,6 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
                     options.success_message or "阅读进度已上传并确认",
                     tonumber(snapshot.progress),remote and remote.percent,seq)
                 finish(true,remote,nil,verify_meta)
-                return
-            end
-            if verify_error=="cloud_propagation_pending" then
-                self:_save_pending_progress(book_id,snapshot,"cloud_propagation_pending")
-                self:_save_progress_state(book_id,"verifying_upload",
-                    "请求已提交；微信读书章节内位置仍在更新，稍后自动确认",
-                    tonumber(snapshot.progress),remote and remote.percent,seq)
-                logger.info("[MiuRead][ProgressVerify] replay suppressed during cloud propagation",
-                    "book=",book_id,"seq=",tostring(seq),
-                    "chapter=",tostring(snapshot.chapter_uid or "-"),
-                    "co=",tostring(snapshot.canonical_offset or snapshot.chapter_offset or snapshot.offset or "-"))
-                finish(false,remote,verify_error,verify_meta)
                 return
             end
             if submit_attempt<=retries then
@@ -24436,7 +24450,6 @@ function Plugin:onReaderReady()
     self:_schedule_reader_toolbar_state_refresh(nil,.35)
     self:_schedule_reader_toolbar_prewarm(ready_session,1.1)
     if self:_reader_session_is_weread() then
-        self:_schedule_reader_exact_progress_refresh(nil,1.35)
         -- Catalog lookup waits for reader idle and is cached once for this
         -- chapter. Prefetch remains delayed until the normal 30 s quiet point.
         self:_schedule_chapter_navigation_context(ready_session,1.8)
@@ -24599,10 +24612,6 @@ function Plugin:onPageUpdate(page)
     -- free of optional work.
     self:_schedule_reader_toolbar_state_refresh(current,.55)
     if weread then
-        -- Exact progress is resolved once after the page settles, from the
-        -- persistent coordinate cache in a subprocess. Rapid page turns
-        -- coalesce into the last request and never run source mapping per flip.
-        self:_schedule_reader_exact_progress_refresh(current,1.25)
         self.sync:on_page(page)
         self:_schedule_thought_prewarm()
     end

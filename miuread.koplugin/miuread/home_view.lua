@@ -328,8 +328,9 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
         or UiScale.dp(compact and 44 or 54, compact and 40 or 48, compact and 64 or 76)
     local line_h = mini and UiScale.dp(24, 21, 32) or UiScale.dp(27, 23, 36)
     local progress_value = math.max(0, math.min(100, tonumber(book.progress) or 0))
+    local progress_number = string.format("%.1f", progress_value):gsub("%.0$", "")
     local progress_text = progress_value > 0
-        and ("阅读至 " .. tostring(math.floor(progress_value + .5)) .. "%")
+        and ("阅读至 " .. progress_number .. "%")
         or "尚未开始"
     if book.last_read_text and tostring(book.last_read_text) ~= "" then
         progress_text = progress_text .. " · " .. tostring(book.last_read_text)
@@ -341,11 +342,11 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
     local published_date = U.trim(tostring(book.published_date or book.publish_date or ""))
     published_date = published_date:match("^(%d%d%d%d)") or published_date
     local meta = {}
-    for _, value in ipairs(mini and {author} or {author, category}) do
+    for _, value in ipairs({author}) do
         if value ~= "" then meta[#meta + 1] = value end
     end
     local source_meta = {}
-    for _, value in ipairs(mini and {source} or {source, publisher, published_date}) do
+    for _, value in ipairs({source}) do
         if value ~= "" then source_meta[#source_meta + 1] = value end
     end
     local description = U.trim(tostring(book.description or book.intro or book.summary or ""))
@@ -389,8 +390,19 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
         width = text_w, height = line_h, height_adjust = false,
         height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_DARK_GRAY,
     })
+    local progress_slot_h=UiScale.dp(12,10,17)
+    local progress_track_h=math.max(UiScale.line("thick"),UiScale.dp(3,2,5))
+    local progress_fill=math.max(0,math.min(text_w,math.floor(text_w*progress_value/100+.5)))
+    local progress_bar=OverlapGroup:new{dimen=Geom:new{w=text_w,h=progress_slot_h},allow_mirroring=false}
+    progress_bar[#progress_bar+1]=OffsetContainer:new{x_off=0,y_off=math.floor((progress_slot_h-progress_track_h)/2),LineWidget:new{
+        background=Blitbuffer.COLOR_LIGHT_GRAY,dimen=Geom:new{w=text_w,h=progress_track_h},
+    }}
+    if progress_fill>0 then progress_bar[#progress_bar+1]=OffsetContainer:new{x_off=0,y_off=math.floor((progress_slot_h-progress_track_h)/2),LineWidget:new{
+        background=Blitbuffer.COLOR_BLACK,dimen=Geom:new{w=progress_fill,h=progress_track_h},
+    }} end
+    table.insert(text,progress_bar)
     if mini then
-        local continue_h = math.max(UiScale.dp(24, 21, 34), inner_h - heading_h - title_h - line_h * 3)
+        local continue_h = math.max(UiScale.dp(24, 21, 34), inner_h - heading_h - title_h - line_h * 3 - progress_slot_h)
         table.insert(text, TextBoxWidget:new{
             text = "继续阅读  ›",
             face = face("smallinfofont", 10.2, 14), bold = true,
@@ -398,7 +410,7 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
             height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
         })
     else
-        local description_h = math.max(UiScale.dp(52, 44, 78), inner_h - heading_h - title_h - line_h * 3)
+        local description_h = math.max(UiScale.dp(52, 44, 78), inner_h - heading_h - title_h - line_h * 3 - progress_slot_h)
         table.insert(text, TextBoxWidget:new{
             text = description,
             face = face("smallinfofont", 11.5, 17),
@@ -892,139 +904,103 @@ function HomeWidget:onHomeShelfSwipe(_,ges)
 end
 
 function HomeWidget:_build_header(children, m)
-    -- The clock moved into the dashboard, so the status strip can use stable
-    -- positions for account / Wi-Fi / Bluetooth / sync / battery / menu.
-    local gap = math.max(UiScale.dp(2, 2, 4), math.floor(m.content_w * .003))
-    local title_w = math.max(UiScale.dp(64, 56, 84), math.floor(m.content_w * .09))
-    local account_w = math.max(UiScale.dp(112, 98, 148), math.floor(m.content_w * .17))
-    local remaining = math.max(1, m.content_w - title_w - account_w - gap * 6)
-    local wifi_w = math.max(UiScale.dp(112, 98, 150), math.floor(remaining * .24))
-    local bluetooth_w = math.max(UiScale.dp(86, 75, 116), math.floor(remaining * .19))
-    local sync_w = math.max(UiScale.dp(92, 80, 122), math.floor(remaining * .20))
-    local battery_w = math.max(UiScale.dp(78, 69, 102), math.floor(remaining * .18))
-    local menu_w = math.max(UiScale.dp(62, 55, 82), remaining - wifi_w - bluetooth_w - sync_w - battery_w)
-    local used = title_w + account_w + wifi_w + bluetooth_w + sync_w + battery_w + menu_w + gap * 6
-    if used > m.content_w then
-        wifi_w = math.max(UiScale.dp(94, 82, 126), wifi_w - (used - m.content_w))
-    end
+    -- Match the reader toolbar: only render capabilities that really exist,
+    -- and keep a visible safe inset on both ends of the status strip.
+    local edge_pad=math.max(UiScale.dp(7,6,12),math.floor(m.content_w*.010))
+    local header_x=m.margin+edge_pad
+    local header_w=math.max(1,m.content_w-edge_pad*2)
+    local gap=math.max(UiScale.dp(2,2,4),math.floor(header_w*.004))
+    local has_bluetooth=self.opts.bluetooth_visible==true
+    local status_count=has_bluetooth and 5 or 4 -- wifi, [bt], sync, battery, more
+    local title_w=math.max(UiScale.dp(62,54,82),math.floor(header_w*.085))
+    local account_w=math.max(UiScale.dp(112,96,150),math.floor(header_w*.205))
+    local available=math.max(1,header_w-title_w-account_w-gap*(status_count+1))
+    local status_w=math.max(1,math.floor(available/status_count))
+    local last_w=math.max(1,available-status_w*(status_count-1))
 
     local account_text=tostring(self.opts.account_name or "")
     if account_text=="" then account_text="未登录" end
     local wifi_text=tostring(self.opts.wifi_text or "")
     if wifi_text=="" then wifi_text="Wi-Fi" end
     local bluetooth_text=tostring(self.opts.bluetooth_text or "")
-    if bluetooth_text=="" then bluetooth_text="蓝牙 --" end
+    if bluetooth_text=="" then bluetooth_text="蓝牙" end
     local sync_text=tostring(self.opts.sync_text or "已同步")
 
-    local account_cell=Ui.textbox(account_text,
-        account_w, m.header_h, face("smallinfofont", 10.8, 14.8), {
-            bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
-            height_overflow_show_ellipsis = true,
-        })
-    local wifi_value_cell=Ui.textbox(wifi_text,math.max(1,wifi_w-UiScale.dp(24,21,33)),m.header_h,
-        face("smallinfofont",10.2,14.2),{
-            bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
-            height_overflow_show_ellipsis=true,
-        })
-    local bluetooth_value_cell=Ui.textbox(bluetooth_text,math.max(1,bluetooth_w-UiScale.dp(22,19,30)),m.header_h,
-        face("smallinfofont",9.8,13.6),{
-            bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
-            height_overflow_show_ellipsis=true,
-        })
-    local sync_value_cell=Ui.textbox(sync_text,math.max(1,sync_w-UiScale.dp(22,19,30)),m.header_h,
-        face("smallinfofont",10.0,13.8),{
-            bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
-            height_overflow_show_ellipsis=true,
-        })
-    local battery_value_cell=Ui.textbox(tostring(self.opts.battery_text or "--%"),math.max(1,battery_w-UiScale.dp(24,21,33)),m.header_h,
-        face("smallinfofont",10.5,14.5),{
-            bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
-        })
+    local account_cell=Ui.textbox(account_text,account_w,m.header_h,face("smallinfofont",10.8,14.8),{
+        bold=true,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,height_overflow_show_ellipsis=true,
+    })
+    local function status_text(text,width,icon_space,size)
+        return Ui.textbox(text,math.max(1,width-UiScale.dp(icon_space or 22,19,31)),m.header_h,
+            face("smallinfofont",size or 10.1,(size or 10.1)+4),{
+                bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,height_overflow_show_ellipsis=true,
+            })
+    end
+    local wifi_value_cell=status_text(wifi_text,status_w,24,10.2)
+    local bluetooth_value_cell=has_bluetooth and status_text(bluetooth_text,status_w,22,9.8) or nil
+    local sync_value_cell=status_text(sync_text,status_w,22,10.0)
+    local battery_target_w=has_bluetooth and status_w or status_w
+    local battery_value_cell=status_text(tostring(self.opts.battery_text or "--%"),battery_target_w,24,10.5)
 
-    local header = HorizontalGroup:new{
-        align = "center",
-        LeftContainer:new{dimen = Geom:new{w = title_w, h = m.header_h}, TextWidget:new{
-            text = self.opts.title or "觅阅",
-            face = face("cfont", 16.8, 21),
-            bold = true,
-        }},
-        HorizontalSpan:new{width = gap},
-        tappable(account_w, m.header_h, account_cell, self.opts.on_account),
-        HorizontalSpan:new{width = gap},
-        tappable(wifi_w, m.header_h, LeftContainer:new{
-            dimen=Geom:new{w=wifi_w,h=m.header_h},
-            HorizontalGroup:new{
-                align="center",
-                Ui.icon("wifi",UiScale.dp(22,19,29),m.header_h,UiScale.dp(18,16,24),{icon_key="wifi"}),
-                HorizontalSpan:new{width=UiScale.dp(2,2,4)},
-                wifi_value_cell,
-            },
-        }, self.opts.on_quick_panel),
-        HorizontalSpan:new{width = gap},
-        LeftContainer:new{
-            dimen=Geom:new{w=bluetooth_w,h=m.header_h},
-            HorizontalGroup:new{
-                align="center",
-                Ui.icon("bluetooth",UiScale.dp(20,18,27),m.header_h,UiScale.dp(16,14,21),{icon_key="bluetooth"}),
-                HorizontalSpan:new{width=UiScale.dp(2,1,3)},
-                bluetooth_value_cell,
-            },
-        },
-        HorizontalSpan:new{width = gap},
-        tappable(sync_w, m.header_h, LeftContainer:new{
-            dimen=Geom:new{w=sync_w,h=m.header_h},
-            HorizontalGroup:new{
-                align="center",
-                Ui.icon("sync",UiScale.dp(20,18,27),m.header_h,UiScale.dp(16,14,21),{icon_key="sync"}),
-                HorizontalSpan:new{width=UiScale.dp(2,1,3)},
-                sync_value_cell,
-            },
-        }, self.opts.on_quick_panel),
-        HorizontalSpan:new{width = gap},
-        CenterContainer:new{
-            dimen=Geom:new{w=battery_w,h=m.header_h},
-            HorizontalGroup:new{
-                align="center",
-                Ui.icon("battery",UiScale.dp(22,19,29),m.header_h,UiScale.dp(17,15,22),{icon_key="battery"}),
-                HorizontalSpan:new{width=UiScale.dp(2,1,3)},
-                battery_value_cell,
-            },
-        },
-        HorizontalSpan:new{width = gap},
-        tappable(menu_w, m.header_h,
-            fixed_frame(menu_w, m.header_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
-                Ui.text("更多", menu_w, m.header_h, face("smallinfofont", 10.8, 14.8), {bold = true})), function()
-            logger.info("[MiuRead][Home] more menu tapped")
-            if self.opts and self.opts.on_menu then self.opts.on_menu()
-            elseif self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel() end
-        end),
-    }
+    local header=HorizontalGroup:new{align="center"}
+    header[#header+1]=LeftContainer:new{dimen=Geom:new{w=title_w,h=m.header_h},TextWidget:new{
+        text=self.opts.title or "觅阅",face=face("cfont",16.8,21),bold=true,
+    }}
+    header[#header+1]=HorizontalSpan:new{width=gap}
+    header[#header+1]=tappable(account_w,m.header_h,account_cell,self.opts.on_account)
+    header[#header+1]=HorizontalSpan:new{width=gap}
+
+    local field_x=header_x+title_w+gap+account_w+gap
+    self._header_field_dimens={account=Geom:new{x=header_x+title_w+gap,y=m.margin,w=account_w,h=m.header_h}}
+
+    local function add_status(key,width,child,callback)
+        header[#header+1]=tappable(width,m.header_h,child,callback)
+        self._header_field_dimens[key]=Geom:new{x=field_x,y=m.margin,w=width,h=m.header_h}
+        field_x=field_x+width
+        header[#header+1]=HorizontalSpan:new{width=gap}
+        field_x=field_x+gap
+    end
+
+    add_status("wifi",status_w,LeftContainer:new{dimen=Geom:new{w=status_w,h=m.header_h},HorizontalGroup:new{
+        align="center",Ui.icon("wifi",UiScale.dp(22,19,29),m.header_h,UiScale.dp(18,16,24),{icon_key="wifi"}),
+        HorizontalSpan:new{width=UiScale.dp(2,2,4)},wifi_value_cell,
+    }},self.opts.on_quick_panel)
+
+    if has_bluetooth then
+        add_status("bluetooth",status_w,LeftContainer:new{dimen=Geom:new{w=status_w,h=m.header_h},HorizontalGroup:new{
+            align="center",Ui.icon("bluetooth",UiScale.dp(20,18,27),m.header_h,UiScale.dp(16,14,21),{icon_key="bluetooth"}),
+            HorizontalSpan:new{width=UiScale.dp(2,1,3)},bluetooth_value_cell,
+        }},self.opts.on_bluetooth or self.opts.on_quick_panel)
+    end
+
+    add_status("sync",status_w,LeftContainer:new{dimen=Geom:new{w=status_w,h=m.header_h},HorizontalGroup:new{
+        align="center",Ui.icon("sync",UiScale.dp(20,18,27),m.header_h,UiScale.dp(16,14,21),{icon_key="sync"}),
+        HorizontalSpan:new{width=UiScale.dp(2,1,3)},sync_value_cell,
+    }},self.opts.on_quick_panel)
+
+    add_status("battery",status_w,CenterContainer:new{dimen=Geom:new{w=status_w,h=m.header_h},HorizontalGroup:new{
+        align="center",Ui.icon("battery",UiScale.dp(22,19,29),m.header_h,UiScale.dp(17,15,22),{icon_key="battery"}),
+        HorizontalSpan:new{width=UiScale.dp(2,1,3)},battery_value_cell,
+    }},nil)
+
+    -- The final cell owns the remainder and no trailing span is painted outside
+    -- the safe inset. This is what keeps “更多” away from the bezel.
+    local menu_w=last_w
+    header[#header+1]=tappable(menu_w,m.header_h,
+        fixed_frame(menu_w,m.header_h,{bordersize=0,background=Blitbuffer.COLOR_WHITE},
+            Ui.text("更多",menu_w,m.header_h,face("smallinfofont",10.8,14.8),{bold=true})),function()
+        logger.info("[MiuRead][Home] more menu tapped")
+        if self.opts and self.opts.on_menu then self.opts.on_menu()
+        elseif self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel() end
+    end)
 
     self._header_text_refs={
-        account=account_cell[1],
-        wifi=wifi_value_cell[1],
-        bluetooth=bluetooth_value_cell[1],
-        sync=sync_value_cell[1],
-        battery=battery_value_cell[1],
+        account=account_cell[1],wifi=wifi_value_cell[1],bluetooth=bluetooth_value_cell and bluetooth_value_cell[1] or nil,
+        sync=sync_value_cell[1],battery=battery_value_cell[1],
     }
-    local field_x=m.margin+title_w+gap
-    self._header_field_dimens={}
-    self._header_field_dimens.account=Geom:new{x=field_x,y=m.margin,w=account_w,h=m.header_h}
-    field_x=field_x+account_w+gap
-    self._header_field_dimens.wifi=Geom:new{x=field_x,y=m.margin,w=wifi_w,h=m.header_h}
-    field_x=field_x+wifi_w+gap
-    self._header_field_dimens.bluetooth=Geom:new{x=field_x,y=m.margin,w=bluetooth_w,h=m.header_h}
-    field_x=field_x+bluetooth_w+gap
-    self._header_field_dimens.sync=Geom:new{x=field_x,y=m.margin,w=sync_w,h=m.header_h}
-    field_x=field_x+sync_w+gap
-    self._header_field_dimens.battery=Geom:new{x=field_x,y=m.margin,w=battery_w,h=m.header_h}
-
-    self:_add(children, m.margin, m.margin, header)
-    self:_add(children, m.margin, m.margin + m.header_h,
-        LineWidget:new{
-            background = Blitbuffer.COLOR_GRAY,
-            dimen = Geom:new{w = m.content_w, h = m.line or UiScale.line("thin")},
-        })
+    self:_add(children,header_x,m.margin,header)
+    self:_add(children,m.margin,m.margin+m.header_h,LineWidget:new{
+        background=Blitbuffer.COLOR_GRAY,dimen=Geom:new{w=m.content_w,h=m.line or UiScale.line("thin")},
+    })
 end
 
 function HomeWidget:_grid_geometry(m, width, available_h, count, force_rows)
@@ -1130,7 +1106,7 @@ local function dashboard_stats_card(title, detail, width, height, callback)
     local pad = UiScale.dp(7, 6, 11)
     local inner_w = math.max(1, width - pad * 2)
     local inner_h = math.max(1, height - pad * 2)
-    local title_h = math.max(UiScale.dp(24, 21, 33), math.floor(inner_h * .37))
+    local title_h = math.max(UiScale.dp(21, 18, 29), math.floor(inner_h * .28))
     local detail_h = math.max(1, inner_h - title_h)
     local title_box = Ui.textbox(tostring(title or "阅读数据") .. "  ›", inner_w, title_h,
         face("cfont", 11.2, 15.0, 9.4), {
@@ -1138,7 +1114,7 @@ local function dashboard_stats_card(title, detail, width, height, callback)
             height_overflow_show_ellipsis = true,
         })
     local detail_box = Ui.textbox(tostring(detail or "暂无阅读数据"), inner_w, detail_h,
-        face("smallinfofont", 9.4, 12.8, 8.0), {
+        face("smallinfofont", 8.8, 12.0, 7.5), {
             bold = true, alignment = "left", halign = "left", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
             height_overflow_show_ellipsis = true,
         })
@@ -1418,6 +1394,11 @@ end
 function HomeWidget:updateHeader(fields)
     fields=type(fields)=="table" and fields or {}
     self.opts=self.opts or {}
+    if fields.bluetooth_visible~=nil and (self.opts.bluetooth_visible==true)~=(fields.bluetooth_visible==true) then
+        self.opts.bluetooth_visible=fields.bluetooth_visible==true
+        if fields.bluetooth_text~=nil then self.opts.bluetooth_text=tostring(fields.bluetooth_text or "") end
+        return self:update(self.opts,"header")
+    end
     local refs=type(self._header_text_refs)=="table" and self._header_text_refs or {}
     local dimens=type(self._header_field_dimens)=="table" and self._header_field_dimens or {}
     local mapping={
