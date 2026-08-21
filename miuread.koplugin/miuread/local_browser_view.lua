@@ -207,6 +207,9 @@ function LocalBrowserWidget:_set_view_mode(mode)
     self.page = 1
     self:_build()
     UIManager:setDirty(self, "full")
+    if self.opts and self.opts.on_page_changed then
+        self.opts.on_page_changed(self.page, self:visibleBooks(), self)
+    end
     return true
 end
 
@@ -299,6 +302,7 @@ function LocalBrowserWidget:_build()
     local row_gap = UiScale.dp(5, 4, 9)
     local card_w = math.floor((sw - margin * 2 - col_gap * (columns - 1)) / columns)
     local card_h = math.floor((grid_h - row_gap * (rows - 1)) / rows)
+    self._visible_books = {}
     local slot = 0
     for _, entry in ipairs(pages[self.page] or {}) do
         local row = math.floor(slot / columns)
@@ -311,6 +315,7 @@ function LocalBrowserWidget:_build()
                 end))
             slot = slot + 2
         else
+            self._visible_books[#self._visible_books + 1] = entry.value
             self:_add(layers, margin + col * (card_w + col_gap), grid_y + row * (card_h + row_gap),
                 book_card(entry.value, card_w, card_h,
                     function() if self.opts and self.opts.on_open_book then self.opts.on_open_book(entry.value, self) end end,
@@ -345,10 +350,22 @@ function LocalBrowserWidget:_build()
     self[1] = layers
 end
 
+function LocalBrowserWidget:visibleBooks()
+    local out = {}
+    for _, book in ipairs(self._visible_books or {}) do out[#out + 1] = book end
+    return out
+end
+
 function LocalBrowserWidget:_change_page(delta)
     local next_page = math.max(1, math.min(self.pages, self.page + (tonumber(delta) or 0)))
     if next_page == self.page then return true end
-    self.page = next_page; self:_build(); UIManager:setDirty(self, "full"); return true
+    self.page = next_page
+    self:_build()
+    UIManager:setDirty(self, "full")
+    if self.opts and self.opts.on_page_changed then
+        self.opts.on_page_changed(self.page, self:visibleBooks(), self)
+    end
+    return true
 end
 function LocalBrowserWidget:init()
     self.page = tonumber(self.opts and self.opts.page) or 1
@@ -375,7 +392,12 @@ function LocalBrowserWidget:updateData(snapshot)
     if self.view_mode == "books" and #self.opts.books == 0 and #self.opts.folders > 0 then self.view_mode = "folders" end
     self.page = 1
     self.opts.empty_text = snapshot.error and ("无法读取文件夹\n" .. tostring(snapshot.error)) or self.opts.empty_text
-    self:_build(); UIManager:setDirty(self, "full"); return true
+    self:_build()
+    UIManager:setDirty(self, "full")
+    if self.opts and self.opts.on_page_changed then
+        self.opts.on_page_changed(self.page, self:visibleBooks(), self)
+    end
+    return true
 end
 function LocalBrowserWidget:onBrowserSwipe(_, ges)
     if ges and ges.direction == "west" then return self:_change_page(1) end
