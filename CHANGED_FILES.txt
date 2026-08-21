@@ -3,3 +3,7 @@ CHANGELOG.md
 miuread.koplugin/_meta.lua
 miuread.koplugin/main.lua
 miuread.koplugin/miuread/config.lua
+miuread.koplugin/miuread/local_browser_view.lua
+miuread.koplugin/miuread/local_library.lua
+miuread.koplugin/miuread/local_metadata.lua
+miuread.koplugin/miuread/store.lua
