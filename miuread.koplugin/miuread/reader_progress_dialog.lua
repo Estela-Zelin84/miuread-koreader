@@ -63,6 +63,8 @@ local Dialog = InputContainer:extend{
     percent = 0,
     whole_percent = nil,
     chapter_percent = nil,
+    whole_percent_quality = nil,
+    chapter_percent_quality = nil,
     progress_scope = "document",
     on_goto_percent = nil,
     on_adjust = nil,
@@ -176,27 +178,35 @@ function Dialog:init()
     root[#root + 1] = OffsetContainer:new{x_off = outer_margin + pad, y_off = y, header}
     y = y + header_h
 
-    local function pct_text(value)
+    local function pct_text(value,quality)
         value=math.max(0,math.min(100,tonumber(value) or 0))
-        return string.format("%.2f%%",value)
+        quality=tostring(quality or "")
+        if quality:match("^exact") or quality:match("^precise") then
+            return string.format("%.2f%%",value)
+        end
+        return "≈"..tostring(math.floor(value+.5)).."%"
     end
     local document_percent=math.max(0,math.min(100,tonumber(self.percent) or 0))
     local whole_percent=tonumber(self.whole_percent)
     local chapter_percent=tonumber(self.chapter_percent)
+    local whole_quality=tostring(self.whole_percent_quality or "")
+    local chapter_quality=tostring(self.chapter_percent_quality or "")
     local scope=tostring(self.progress_scope or "document")
     local primary,secondary
     if scope=="chapter" then
-        primary=whole_percent~=nil and ("整书进度  "..pct_text(whole_percent)) or "整书进度  暂无法换算"
-        secondary="本章位置  "..pct_text(chapter_percent~=nil and chapter_percent or document_percent)
+        primary=whole_percent~=nil and ("整书进度  "..pct_text(whole_percent,whole_quality)) or "整书进度  暂无法换算"
+        secondary="本章位置  "..pct_text(chapter_percent~=nil and chapter_percent or document_percent,
+            chapter_percent~=nil and chapter_quality or "estimated_document_ratio")
     elseif scope=="range" then
-        primary=whole_percent~=nil and ("整书进度  "..pct_text(whole_percent)) or "整书进度  暂无法换算"
-        local chapter=chapter_percent~=nil and ("本章 "..pct_text(chapter_percent).."  ·  ") or ""
-        secondary=chapter.."章节版位置 "..pct_text(document_percent)
+        primary=whole_percent~=nil and ("整书进度  "..pct_text(whole_percent,whole_quality)) or "整书进度  暂无法换算"
+        local chapter=chapter_percent~=nil and ("本章 "..pct_text(chapter_percent,chapter_quality).."  ·  ") or ""
+        secondary=chapter.."章节版位置 "..pct_text(document_percent,"estimated_document_ratio")
     elseif scope=="whole" then
-        primary="整书进度  "..pct_text(whole_percent~=nil and whole_percent or document_percent)
-        secondary=chapter_percent~=nil and ("本章位置  "..pct_text(chapter_percent)) or ""
+        primary="整书进度  "..pct_text(whole_percent~=nil and whole_percent or document_percent,
+            whole_percent~=nil and whole_quality or "estimated_document_ratio")
+        secondary=chapter_percent~=nil and ("本章位置  "..pct_text(chapter_percent,chapter_quality)) or ""
     else
-        primary="当前文档  "..pct_text(document_percent)
+        primary="当前文档  "..pct_text(document_percent,"estimated_document_ratio")
         secondary=""
     end
     local primary_h=math.floor(value_h*.58)
@@ -343,6 +353,8 @@ function M.show(opts)
         percent = opts.percent,
         whole_percent = opts.whole_percent,
         chapter_percent = opts.chapter_percent,
+        whole_percent_quality = opts.whole_percent_quality,
+        chapter_percent_quality = opts.chapter_percent_quality,
         progress_scope = opts.progress_scope,
         on_goto_percent = opts.on_goto_percent,
         on_adjust = opts.on_adjust,

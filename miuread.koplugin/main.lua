@@ -741,8 +741,11 @@ function Plugin:init()
     self._home_visible_cover_targets={}
     self._reader_quick_panel_pending=false
     self._reader_gesture_guard_until=0
-    self._reader_toolbar_state_cache={session=0,page=nil,total=nil,chapter="",chapter_percent=nil,whole_percent=nil,chapter_ordinal=nil,updated_at=0}
+    self._reader_toolbar_state_cache={session=0,page=nil,total=nil,chapter="",chapter_percent=nil,chapter_percent_quality=nil,
+        whole_percent=nil,whole_percent_quality=nil,estimated_whole_percent=nil,exact_page=nil,
+        exact_whole_percent=nil,exact_chapter_percent=nil,exact_quality=nil,chapter_ordinal=nil,updated_at=0}
     self._reader_toolbar_state_task=nil
+    self._reader_exact_progress_task=nil
     self._reader_toolbar_prewarm_task=nil
     self._reader_toolbar_header_perf=nil
     self._reader_toolbar_options_perf=nil
@@ -11444,7 +11447,9 @@ function Plugin:_reader_toolbar_cache()
     local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
     local cache=self._reader_toolbar_state_cache
     if type(cache)~="table" or tonumber(cache.session or -1)~=session then
-        cache={session=session,page=nil,total=nil,chapter="",chapter_percent=nil,whole_percent=nil,chapter_ordinal=nil,updated_at=0}
+        cache={session=session,page=nil,total=nil,chapter="",chapter_percent=nil,chapter_percent_quality=nil,
+            whole_percent=nil,whole_percent_quality=nil,estimated_whole_percent=nil,exact_page=nil,
+            exact_whole_percent=nil,exact_chapter_percent=nil,exact_quality=nil,chapter_ordinal=nil,updated_at=0}
         self._reader_toolbar_state_cache=cache
     end
     return cache
@@ -11455,9 +11460,16 @@ function Plugin:_reset_reader_toolbar_state_cache()
         UIManager:unschedule(self._reader_toolbar_state_task)
         self._reader_toolbar_state_task=nil
     end
+    if self._reader_exact_progress_task then
+        UIManager:unschedule(self._reader_exact_progress_task)
+        self._reader_exact_progress_task=nil
+    end
     self._reader_toolbar_state_cache={
         session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0,
-        page=nil,total=nil,chapter="",chapter_percent=nil,whole_percent=nil,chapter_ordinal=nil,updated_at=0,
+        page=nil,total=nil,chapter="",chapter_percent=nil,chapter_percent_quality=nil,
+        whole_percent=nil,whole_percent_quality=nil,estimated_whole_percent=nil,
+        exact_page=nil,exact_whole_percent=nil,exact_chapter_percent=nil,exact_quality=nil,
+        chapter_ordinal=nil,updated_at=0,
     }
 end
 
@@ -11482,10 +11494,20 @@ function Plugin:_refresh_reader_toolbar_state_cache(page)
 
     local page_total=tonumber(cache.total)
     cache.chapter_percent=nil
+    cache.chapter_percent_quality=nil
     cache.chapter_ordinal=nil
     cache.whole_percent=nil
+    cache.whole_percent_quality=nil
+    cache.estimated_whole_percent=nil
     if current and page_total and page_total>0 then
-        cache.whole_percent=math.max(0,math.min(100,current/page_total*100))
+        cache.estimated_whole_percent=math.max(0,math.min(100,current/page_total*100))
+        -- Ordinary local books may use document pagination as their visible
+        -- progress. WeRead books must not label this cheap estimate as exact
+        -- whole-book progress.
+        if not self:_reader_session_is_weread() then
+            cache.whole_percent=cache.estimated_whole_percent
+            cache.whole_percent_quality="document_page_ratio"
+        end
     end
 
     local chapter_started=os.clock()
@@ -11510,6 +11532,7 @@ function Plugin:_refresh_reader_toolbar_state_cache(page)
                     local finish_page=(next_page and next_page>start_page) and (next_page-1) or page_total
                     if finish_page and finish_page>=start_page then
                         cache.chapter_percent=math.max(0,math.min(100,(current-start_page+1)/math.max(1,finish_page-start_page+1)*100))
+                        cache.chapter_percent_quality="estimated_page_range"
                     end
                 end
             end
@@ -11523,21 +11546,26 @@ function Plugin:_refresh_reader_toolbar_state_cache(page)
     if type(nav)=="table" and normalized_reader_file(nav.path)==path then
         cache.chapter_ordinal=tonumber(nav.current_ordinal)
         if U.trim(tostring(nav.current_title or ""))~="" then cache.chapter=U.trim(tostring(nav.current_title)) end
-        if page_total and current then cache.chapter_percent=math.max(0,math.min(100,current/page_total*100)) end
+        if page_total and current then
+            cache.chapter_percent=math.max(0,math.min(100,current/page_total*100))
+            cache.chapter_percent_quality="estimated_page_ratio"
+        end
     end
 
-    -- Whole-book WeRead progress shown in the toolbar is a cheap map lookup. It
-    -- deliberately does not invoke the precise source-text locator.
-    if self:_reader_session_is_weread() and self.sync and type(self.sync.local_position)=="function"
-        and current and page_total and page_total>0 then
-        local ok,position=pcall(self.sync.local_position,self.sync,current/page_total)
-        if ok and type(position)=="table" then
-            if position.safe==true and tonumber(position.progress) then
-                cache.whole_percent=math.max(0,math.min(100,tonumber(position.progress)))
-            end
-            if tonumber(position.chapter_percent) then
-                cache.chapter_percent=math.max(0,math.min(100,tonumber(position.chapter_percent)))
-            end
+    -- beta.18: page-turn refresh is estimate-only. Never call local_position()
+    -- here and never promote current-page/page-count to "whole-book progress".
+    -- A cache-only source-coordinate worker updates exact_* after the reader has
+    -- been idle; until then the UI either keeps the exact value for this page or
+    -- explicitly marks the chapter estimate with ≈.
+    if self:_reader_session_is_weread() and current
+        and tonumber(cache.exact_page)==tonumber(current) then
+        if tonumber(cache.exact_whole_percent)~=nil then
+            cache.whole_percent=math.max(0,math.min(100,tonumber(cache.exact_whole_percent)))
+            cache.whole_percent_quality=tostring(cache.exact_quality or "precise_source_mapped")
+        end
+        if tonumber(cache.exact_chapter_percent)~=nil then
+            cache.chapter_percent=math.max(0,math.min(100,tonumber(cache.exact_chapter_percent)))
+            cache.chapter_percent_quality=tostring(cache.exact_quality or "precise_source_mapped")
         end
     end
     cache.updated_at=os.time()
@@ -11573,6 +11601,87 @@ function Plugin:_schedule_reader_toolbar_state_refresh(page,delay)
     end
     self._reader_toolbar_state_task=task
     UIManager:scheduleIn(tonumber(delay) or .05,task)
+    return true
+end
+
+function Plugin:_apply_reader_exact_progress_position(position,page_token)
+    if type(position)~="table" or position.safe~=true then return false end
+    local cache=self:_reader_toolbar_cache()
+    local current=self:_reader_current_page()
+    local requested=tonumber(page_token)
+    if requested and current and requested~=current then return false end
+    local whole=tonumber(position.display_progress or position.progress)
+    local chapter_ratio=tonumber(position.chapter_ratio)
+    local chapter=chapter_ratio and chapter_ratio*100 or tonumber(position.chapter_percent)
+    local quality=tostring(position.display_progress_quality or position.precision_level or "precise_source_mapped")
+    cache.exact_page=current or requested
+    cache.exact_whole_percent=whole
+    cache.exact_chapter_percent=chapter
+    cache.exact_quality=quality
+    cache.exact_captured_at=tonumber(position.captured_at) or os.time()
+    if whole~=nil then
+        cache.whole_percent=math.max(0,math.min(100,whole))
+        cache.whole_percent_quality=quality
+    end
+    if chapter~=nil then
+        cache.chapter_percent=math.max(0,math.min(100,chapter))
+        cache.chapter_percent_quality=quality
+    end
+    cache.updated_at=os.time()
+    logger.dbg("[MiuRead][ReaderExactProgress] adopted",
+        "page=",tostring(cache.exact_page or "-"),
+        "chapter=",chapter and string.format("%.3f",chapter) or "-",
+        "whole=",whole and string.format("%.3f",whole) or "-",
+        "quality=",quality)
+    return true
+end
+
+function Plugin:_schedule_reader_exact_progress_refresh(page,delay)
+    if self._reader_exact_progress_task then UIManager:unschedule(self._reader_exact_progress_task) end
+    if not self:_reader_session_is_weread() or not (self.sync and type(self.sync.resolve_display_position)=="function") then
+        self._reader_exact_progress_task=nil
+        return false
+    end
+    local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
+    local requested=tonumber(page)
+    local attempts=0
+    local task
+    task=function()
+        if self._reader_exact_progress_task~=task then return end
+        attempts=attempts+1
+        if self._miuread_suspended==true or HOME_SESSION.suspended==true or reader_close_active()
+            or not (self.ui and self.ui.document)
+            or tonumber(HOME_SESSION.reader_session_generation or 0)~=session then
+            self._reader_exact_progress_task=nil
+            return
+        end
+        local now_page=self:_reader_current_page()
+        if requested and now_page and requested~=now_page then
+            self._reader_exact_progress_task=nil
+            return
+        end
+        if not self:_reader_background_idle() or self._progress_check_running==true
+            or self._reading_end_sync_active==true or (self.sync.async and self.sync.async:busy()) then
+            if attempts<8 then UIManager:scheduleIn(.45,task) else self._reader_exact_progress_task=nil end
+            return
+        end
+        self._reader_exact_progress_task=nil
+        local page_token=now_page or requested
+        local started,err=self.sync:resolve_display_position(function(position,position_error)
+            if position and self.ui and self.ui.document
+                and tonumber(HOME_SESSION.reader_session_generation or 0)==session then
+                self:_apply_reader_exact_progress_position(position,page_token)
+            elseif position_error and position_error~="coord_cache_missing" then
+                logger.dbg("[MiuRead][ReaderExactProgress] unavailable",tostring(position_error))
+            end
+        end,{page_token=page_token,ratio_snapshot=self.sync:local_ratio()})
+        if not started and tostring(err or "")=="source_worker_busy" and attempts<8 then
+            self._reader_exact_progress_task=task
+            UIManager:scheduleIn(.6,task)
+        end
+    end
+    self._reader_exact_progress_task=task
+    UIManager:scheduleIn(math.max(.3,tonumber(delay) or 1.2),task)
     return true
 end
 
@@ -11617,6 +11726,7 @@ function Plugin:_reader_progress_display_state()
         or self:_reader_toolbar_cached_percent() or 0
     local state={
         percent=document_percent, whole_percent=nil, chapter_percent=nil,
+        whole_percent_quality=nil,chapter_percent_quality=nil,
         progress_scope="document",
     }
     local sync=self.sync
@@ -11626,11 +11736,6 @@ function Plugin:_reader_progress_display_state()
     local row=type(record.record)=="table" and record.record or {}
     local mode=sync:_record_mode(record)
     local partial_range=row.partial_range==true
-    local ratio=sync:local_ratio()
-    local position
-    local ok,value=pcall(sync._position_for_report,sync,ratio,true)
-    if ok and type(value)=="table" then position=value end
-
     if partial_range then
         state.progress_scope="range"
     elseif mode=="standalone" then
@@ -11639,22 +11744,30 @@ function Plugin:_reader_progress_display_state()
         state.progress_scope="whole"
     end
 
-    if type(position)=="table" then
-        if position.safe==true and tonumber(position.progress)~=nil then
-            state.whole_percent=math.max(0,math.min(100,tonumber(position.progress)))
+    -- beta.18: opening this dialog must not synchronously scan a chapter or
+    -- rebuild a position map. Reuse the cache-only source-coordinate result for
+    -- the current page. If it is not ready yet, show an explicit estimate/pending
+    -- state and let the idle worker populate it for the next paint/open.
+    local toolbar_cache=self:_reader_toolbar_cache()
+    local current_page=self:_reader_current_page()
+    if tonumber(toolbar_cache.exact_page)==tonumber(current_page) then
+        if tonumber(toolbar_cache.exact_whole_percent)~=nil then
+            state.whole_percent=math.max(0,math.min(100,tonumber(toolbar_cache.exact_whole_percent)))
+            state.whole_percent_quality=tostring(toolbar_cache.exact_quality or "precise_source_mapped")
         end
-        local chapter_ratio=tonumber(position.chapter_ratio)
-        if chapter_ratio~=nil then
-            state.chapter_percent=math.max(0,math.min(100,chapter_ratio*100))
-        elseif tonumber(position.chapter_percent)~=nil then
-            state.chapter_percent=math.max(0,math.min(100,tonumber(position.chapter_percent)))
+        if tonumber(toolbar_cache.exact_chapter_percent)~=nil then
+            state.chapter_percent=math.max(0,math.min(100,tonumber(toolbar_cache.exact_chapter_percent)))
+            state.chapter_percent_quality=tostring(toolbar_cache.exact_quality or "precise_source_mapped")
         end
     end
 
-    -- A complete EPUB's local document percentage is itself a valid whole-book
-    -- display fallback. Partial/standalone EPUBs must never use it as whole-book progress.
     if state.progress_scope=="whole" and state.whole_percent==nil then
         state.whole_percent=document_percent
+        state.whole_percent_quality="estimated_document_ratio"
+    elseif (state.progress_scope=="chapter" or state.progress_scope=="range")
+        and state.chapter_percent==nil then
+        state.chapter_percent=document_percent
+        state.chapter_percent_quality="estimated_document_ratio"
     end
     return state
 end
@@ -11946,6 +12059,8 @@ function Plugin:_show_reader_progress_control(back_callback)
         percent=display.percent or 0,
         whole_percent=display.whole_percent,
         chapter_percent=display.chapter_percent,
+        whole_percent_quality=display.whole_percent_quality,
+        chapter_percent_quality=display.chapter_percent_quality,
         progress_scope=display.progress_scope,
         on_goto_percent=function(target) self:_reader_goto_percent(target) end,
         on_adjust=function(delta) self:_reader_jump_percent(delta) end,
@@ -12439,12 +12554,30 @@ function Plugin:_reader_toolbar_header(title)
         chapter="第"..tostring(math.floor(ordinal+.5)).."章 · "..chapter
     end
     local chapter_percent=tonumber(cache.chapter_percent)
+    local chapter_quality=tostring(cache.chapter_percent_quality or "")
     local location_text=chapter
     if chapter_percent then
-        location_text=location_text.." · 本章 "..tostring(math.floor(chapter_percent+.5)).."%"
+        if chapter_quality:match("^exact") or chapter_quality:match("^precise") then
+            location_text=location_text.." · 本章 "..string.format("%.2f",chapter_percent).."%"
+        else
+            location_text=location_text.." · 本章 ≈"..tostring(math.floor(chapter_percent+.5)).."%"
+        end
     end
-    local whole_percent=tonumber(cache.whole_percent) or self:_reader_toolbar_cached_percent()
-    local progress_text=whole_percent and ("全书 "..string.format("%.1f",whole_percent).."%") or "阅读进度"
+    local whole_percent=tonumber(cache.whole_percent)
+    local whole_quality=tostring(cache.whole_percent_quality or "")
+    local progress_text
+    if whole_percent then
+        if whole_quality:match("^exact") or whole_quality:match("^precise") then
+            progress_text="全书 "..string.format("%.2f",whole_percent).."%"
+        else
+            progress_text="全书 ≈"..tostring(math.floor(whole_percent+.5)).."%"
+        end
+    elseif self:_reader_session_is_weread() then
+        progress_text="全书 待换算"
+    else
+        local document_percent=self:_reader_toolbar_cached_percent()
+        progress_text=document_percent and ("进度 "..tostring(math.floor(document_percent+.5)).."%") or "阅读进度"
+    end
     local state_ms=math.floor((os.clock()-state_started)*1000+.5)
     self._reader_toolbar_header_perf={
         device_ms=device_ms,
@@ -20422,6 +20555,8 @@ function Plugin:ensure_read_report_progress(reason,automatic)
 
     local started,resolve_error=self.sync:resolve_local_progress(function(local_position,local_err,meta)
         if not local_position then local_failed(local_err,meta); return end
+        self.sync:_save_local_snapshot(id,local_position)
+        self:_apply_reader_exact_progress_position(local_position,self:_reader_current_page())
         local localp=math.floor((tonumber(local_position.progress) or 0)+.5)
         self:_save_progress_state(id,"checking","正在读取云端位置",localp,nil)
         self.sync:remote(id,function(remote,remote_err)
@@ -20732,8 +20867,29 @@ function Plugin:_verify_progress_submission(book_id,submitted_position,options,c
                     "remote_basis=",tostring(remote and remote.position_basis or "-"),
                     "co_delta=",tostring(meta and meta.co_delta or "-"),
                     "matched=",tostring(matched==true))
+                local target_uid=tostring(submitted_position.chapter_uid or submitted_position.chapterUid or "")
+                local remote_uid=tostring(remote and (remote.chapter_uid or remote.chapterUid) or "")
+                local target_co=tonumber(submitted_position.canonical_offset or submitted_position.chapter_offset or submitted_position.offset)
+                local remote_co=tonumber(remote and (remote.canonical_offset or remote.offset or remote.chapter_offset))
+                local propagation_pending=not matched and target_uid~="" and remote_uid==target_uid
+                    and target_co~=nil and target_co>32 and remote_co==0
+                if propagation_pending then
+                    meta=type(meta)=="table" and meta or {}
+                    meta.propagation_pending=true
+                    meta.reason="cloud_propagation_pending"
+                end
                 if matched then
                     finish(true,remote,nil,{actual=actual,source=source,match=meta})
+                elseif propagation_pending and attempt<2 then
+                    -- WeRead can expose the target chapter before its native co
+                    -- has propagated. Wait once instead of immediately replaying
+                    -- the same upload and competing with reader/home work.
+                    options.second_delay=math.max(tonumber(options.second_delay) or 0,4.5)
+                    logger.info("[MiuRead][ProgressVerify] cloud coordinate propagation pending",
+                        "book=",book_id,"chapter=",target_uid,"submitted_co=",tostring(target_co))
+                    verify()
+                elseif propagation_pending then
+                    finish(false,remote,"cloud_propagation_pending",meta)
                 elseif attempt<2 then
                     verify()
                 else
@@ -20797,6 +20953,18 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
                     options.success_message or "阅读进度已上传并确认",
                     tonumber(snapshot.progress),remote and remote.percent,seq)
                 finish(true,remote,nil,verify_meta)
+                return
+            end
+            if verify_error=="cloud_propagation_pending" then
+                self:_save_pending_progress(book_id,snapshot,"cloud_propagation_pending")
+                self:_save_progress_state(book_id,"verifying_upload",
+                    "请求已提交；微信读书章节内位置仍在更新，稍后自动确认",
+                    tonumber(snapshot.progress),remote and remote.percent,seq)
+                logger.info("[MiuRead][ProgressVerify] replay suppressed during cloud propagation",
+                    "book=",book_id,"seq=",tostring(seq),
+                    "chapter=",tostring(snapshot.chapter_uid or "-"),
+                    "co=",tostring(snapshot.canonical_offset or snapshot.chapter_offset or snapshot.offset or "-"))
+                finish(false,remote,verify_error,verify_meta)
                 return
             end
             if submit_attempt<=retries then
@@ -24268,6 +24436,7 @@ function Plugin:onReaderReady()
     self:_schedule_reader_toolbar_state_refresh(nil,.35)
     self:_schedule_reader_toolbar_prewarm(ready_session,1.1)
     if self:_reader_session_is_weread() then
+        self:_schedule_reader_exact_progress_refresh(nil,1.35)
         -- Catalog lookup waits for reader idle and is cached once for this
         -- chapter. Prefetch remains delayed until the normal 30 s quiet point.
         self:_schedule_chapter_navigation_context(ready_session,1.8)
@@ -24430,6 +24599,10 @@ function Plugin:onPageUpdate(page)
     -- free of optional work.
     self:_schedule_reader_toolbar_state_refresh(current,.55)
     if weread then
+        -- Exact progress is resolved once after the page settles, from the
+        -- persistent coordinate cache in a subprocess. Rapid page turns
+        -- coalesce into the last request and never run source mapping per flip.
+        self:_schedule_reader_exact_progress_refresh(current,1.25)
         self.sync:on_page(page)
         self:_schedule_thought_prewarm()
     end

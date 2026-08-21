@@ -539,11 +539,51 @@ function Sync:_book_catalog_is_complete(record, catalog)
     if #catalog == 0 or type(record) ~= "table" then return false end
     local book = type(record.book) == "table" and record.book or {}
     local row = type(record.record) == "table" and record.record or {}
-    local expected = tonumber(row.catalog_chapter_count or row.expected_catalog_chapter_count)
-    if expected and expected > 0 then return #catalog >= expected end
-    if tostring(book.core_catalog_hash or "") ~= "" then return true end
-    local mode = self:_record_mode(record)
+    local mode, _, local_readable = self:_record_mode(record)
     local local_map = type(row.chapter_map) == "table" and row.chapter_map or {}
+
+    -- beta.18: completeness is a property of the whole WeRead catalog, never
+    -- of the number of chapters selected into this EPUB. beta.14-17 stored
+    -- `catalog_chapter_count=#selected` for chapter/range downloads, which made
+    -- one local chapter look like a complete one-chapter book.
+    local expected = tonumber(book.catalog_chapter_count
+        or row.catalog_chapter_count or row.expected_catalog_chapter_count)
+    local explicit_complete = book.catalog_complete == true or row.catalog_complete == true
+    if explicit_complete then
+        return expected == nil or expected <= 0 or #catalog >= expected
+    end
+
+    -- Runtime migration for beta.14-17 downloads: Downloader already saved the
+    -- full catalog at book level and a catalog-only hash, even though the row's
+    -- count was wrong. Trust that exact hash, not a non-empty hash in general.
+    local book_id = tostring(book.book_id or book.bookId or row.book_id or "")
+    local stored_catalog_hash = tostring(book.core_catalog_hash or "")
+    if stored_catalog_hash ~= "" and book_id ~= "" then
+        local actual_catalog_hash = BookIntegrity.core_map_hash(book_id, catalog, {})
+        if actual_catalog_hash ~= "" and actual_catalog_hash == stored_catalog_hash then
+            if mode == "standalone" or row.partial_range == true then
+                -- For legacy partial EPUBs, a catalog no larger than the local
+                -- selection is ambiguous and therefore unsafe. A genuine
+                -- one-chapter whole book will be confirmed by the context worker
+                -- once and then stored with explicit catalog_complete metadata.
+                if #catalog > math.max(0, tonumber(local_readable) or 0) then
+                    -- Promote only in the current in-memory record. Avoid a
+                    -- flash write on page-turn while also avoiding re-hashing
+                    -- the same legacy catalog on every idle display refresh.
+                    book.catalog_complete=true
+                    book.catalog_chapter_count=#catalog
+                    return true
+                end
+            else
+                book.catalog_complete=true
+                book.catalog_chapter_count=#catalog
+                return true
+            end
+        end
+    end
+
+    -- Full EPUBs remain safely recognizable without migration metadata because
+    -- the local chapter map and whole-book catalog are equivalent.
     if mode ~= "standalone" and row.partial_range ~= true
         and BookIntegrity.maps_equivalent(local_map, catalog) then
         return true
@@ -648,6 +688,8 @@ function Sync:local_position(ratio)
     position.standalone = mode == "standalone"
     position.epub_percent = math.floor(U.clamp(ratio, 0, 1) * 100 + .5)
     position.chapter_percent = tonumber(position.chapter_percent) or position.epub_percent
+    position.estimated_progress = tonumber(position.progress)
+    position.display_progress_quality = "estimated_document_ratio"
     return position
 end
 
@@ -719,15 +761,15 @@ function Sync:_prefer_inverse_cloud_mapping(record, position, ratio_override)
     end
 
     if native_offset then
-        -- Native co remains untouched. Only the whole-book progress percentage
-        -- adopts the continuous inverse whole-book ratio so `pr` stays aligned
-        -- with beta43's long-book precision improvements.
-        position.progress = tonumber(inverse.progress) or position.progress
-        position.chapter_word_count = tonumber(inverse.chapter_word_count) or position.chapter_word_count
-        position.total_word_count = tonumber(inverse.total_word_count) or position.total_word_count
-        position.words_before = tonumber(inverse.words_before) or position.words_before
+        -- beta.18: native source matching already gives us an exact chapter
+        -- ratio. Keep the whole-book percentage derived from that exact source
+        -- position. The document inverse ratio is only a diagnostic/cheap
+        -- estimate and must never overwrite the precise display/report value.
+        position.estimated_progress = tonumber(inverse.progress)
+        position.display_progress = tonumber(position.progress)
+        position.display_progress_quality = position.display_progress_quality or "precise_source_mapped"
         position.inverse_mapping_used = true
-        position.inverse_mapping_role = "progress_only"
+        position.inverse_mapping_role = "estimate_only"
         logger.info("[MiuRead][ProgressOffset]",
             "book=", tostring(record.book and record.book.book_id or ""),
             "chapter=", source_uid,
@@ -1079,6 +1121,7 @@ function Sync:_source_position_async(callback, options)
     local ratio_snapshot=tonumber(options.ratio_snapshot)
     if ratio_snapshot==nil then ratio_snapshot=self:local_ratio() end
     local reader = self.reader
+    local source_cache_only=options.cache_only==true
     local record_snapshot = {
         book = U.copy(record.book or {}),
         record = U.copy(record.record or {}),
@@ -1107,7 +1150,7 @@ function Sync:_source_position_async(callback, options)
     local function launch()
         if self.async:busy() then return false,"source_worker_busy" end
         return self.async:run("progress_source_position", function()
-            return SourcePosition.locate(reader, record_snapshot, anchor)
+            return SourcePosition.locate(reader, record_snapshot, anchor,{cache_only=source_cache_only})
         end,on_result,40)
     end
     local defer_seconds=math.max(0,tonumber(options.defer_seconds) or 0)
@@ -1136,6 +1179,41 @@ function Sync:_source_position_async(callback, options)
     return true
 end
 
+-- beta.18 display-only precise resolver. It is deliberately cache-only and
+-- subprocess-only: toolbar painting must never fetch a chapter, prepare a
+-- catalog or build PosMap on the Reader UI thread.
+function Sync:resolve_display_position(callback, options)
+    options=type(options)=="table" and options or {}
+    local record=self:record()
+    if not record then return false,"position_context_missing" end
+    local catalog,source=self:_progress_catalog(record)
+    if type(catalog)~="table" or #catalog==0 then return false,"full_catalog_missing" end
+    local book_id=tostring(record.book and record.book.book_id or "")
+    local page_token=options.page_token
+    local started,err=self:_source_position_async(function(position,position_error)
+        if type(position)=="table" and position.safe==true then
+            position.precision_level=(position.native_offset==true
+                and tostring(position.offset_basis or position.position_basis or "")=="wr_data_co")
+                and "exact_cloud" or "precise_local"
+            position.canonical_offset=tonumber(position.chapter_offset or position.offset)
+            position.display_progress=tonumber(position.progress)
+            position.display_progress_quality=position.display_progress_quality or "precise_source_mapped"
+            position.display_catalog_source=source
+            position.display_page_token=page_token
+            self:_save_local_snapshot(book_id,position)
+            if callback then callback(position,nil,{source=source,quality=position.display_progress_quality}) end
+        elseif callback then
+            callback(nil,tostring(position_error or "display_position_unavailable"),{source=source})
+        end
+    end,{
+        cache_only=true,
+        ratio_snapshot=tonumber(options.ratio_snapshot),
+        defer_seconds=0,
+    })
+    if not started then return false,err end
+    return true
+end
+
 function Sync:_position_for_report(ratio, precise)
     local fallback = self:local_position(ratio)
     if precise ~= true then return fallback end
@@ -1147,6 +1225,8 @@ function Sync:_position_for_report(ratio, precise)
     local position, err = PrecisePosition.locate(
         ui, record, self:_precision_catalog(record), self.precise_position_cache)
     if position then
+        position.display_progress = tonumber(position.progress)
+        position.display_progress_quality = "precise_local_text_anchor"
         position = self:_prefer_inverse_cloud_mapping(record, position)
         position.epub_percent = math.floor(U.clamp(tonumber(ratio) or self:local_ratio() or 0, 0, 1) * 100 + .5)
         logger.info("[MiuRead][Progress] precise position",

@@ -1001,7 +1001,9 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         sync_enabled=true,progress_sync_enabled=true,read_report_enabled=not partial_range,
         chapters=map,generated_at=now,complete=true,task_id=opt.download_run_id,
         title_transform_version=tonumber(opt.title_transform_version) or TITLE_TRANSFORM_VERSION,
-        access_scope=access_scope,catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
+        access_scope=access_scope,catalog_count=tonumber(opt.catalog_chapter_count) or 0,
+        catalog_complete=opt.catalog_complete==true,
+        local_chapter_count=tonumber(opt.local_chapter_count) or #chapters,
         readable_count=tonumber(opt.readable_chapter_count) or #chapters,
         restricted_count=tonumber(opt.restricted_chapter_count) or 0,
         preview_mode=access_scope=="preview" and preview_mode or nil,
@@ -1088,7 +1090,9 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
         range_end_title=opt.range_end_title,
         chapter_count=#chapters, expected_chapter_count=expected_chapter_count,
-        catalog_chapter_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
+        local_chapter_count=tonumber(opt.local_chapter_count) or #chapters,
+        catalog_chapter_count=tonumber(opt.catalog_chapter_count) or 0,
+        catalog_complete=opt.catalog_complete==true,
         readable_chapter_count=tonumber(opt.readable_chapter_count) or #chapters,
         restricted_chapter_count=tonumber(opt.restricted_chapter_count) or 0,
         failed_chapter_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
@@ -1123,6 +1127,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
         version=tonumber(book.version),
         directory=dir, updated_at=now, catalog=(type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map),
+        catalog_chapter_count=tonumber(opt.catalog_chapter_count) or 0,
+        catalog_complete=opt.catalog_complete==true,
         core_catalog_hash=BookIntegrity.core_map_hash(book.bookId,
             type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map,{}),
         content_type="book",
@@ -2154,7 +2160,14 @@ function Downloader:book(input, opt, progress)
             or ("正在生成官方试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章"))) or nil,
     })
     opt.expected_chapter_count = accessible_expected
-    opt.catalog_chapter_count = expected
+    -- beta.18: `expected` is the number of chapters selected for this local
+    -- EPUB, not the size of the whole WeRead catalog. Keep these two counts
+    -- separate; otherwise a standalone chapter can make a one-row catalog look
+    -- complete and its chapter percentage gets misreported as whole-book progress.
+    local full_catalog_count = type(opt.full_catalog_map)=="table" and #opt.full_catalog_map or 0
+    opt.catalog_chapter_count = full_catalog_count
+    opt.catalog_complete = full_catalog_count > 0
+    opt.local_chapter_count = readable_count
     opt.readable_chapter_count = readable_count
     opt.restricted_chapter_count = restricted_count
     opt.failed_chapter_count = #failures
