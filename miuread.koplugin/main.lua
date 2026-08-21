@@ -18121,7 +18121,7 @@ function Plugin:chapter_menu(b,ch)
     self:list(ch.title or uid,items)
 end
 
-local function chapter_uid_value(chapter)
+function Plugin:_chapter_uid_value(chapter)
     return tostring(chapter and (chapter.uid or chapter.chapterUid or chapter.chapter_uid) or "")
 end
 
@@ -18158,8 +18158,8 @@ function Plugin:_chapter_navigation_context(force)
     local current_index,current_ordinal,current_chapter
     local ordinal=0
     for index,chapter in ipairs(catalog) do
-        if chapter_uid_value(chapter)~="" and chapter.structural~=true then ordinal=ordinal+1 end
-        if chapter_uid_value(chapter)==current_uid then
+        if self:_chapter_uid_value(chapter)~="" and chapter.structural~=true then ordinal=ordinal+1 end
+        if self:_chapter_uid_value(chapter)==current_uid then
             current_index=index
             current_ordinal=math.max(1,ordinal)
             current_chapter=chapter
@@ -18177,7 +18177,7 @@ function Plugin:_chapter_navigation_context(force)
     local next_index,next_chapter
     for index=current_index+1,#catalog do
         local candidate=catalog[index]
-        if chapter_uid_value(candidate)~="" and candidate.structural~=true then
+        if self:_chapter_uid_value(candidate)~="" and candidate.structural~=true then
             next_index,next_chapter=index,candidate
             break
         end
@@ -18187,7 +18187,7 @@ function Plugin:_chapter_navigation_context(force)
         self._chapter_navigation_cache=base
         return nil,"last_chapter",base
     end
-    local next_uid=chapter_uid_value(next_chapter)
+    local next_uid=self:_chapter_uid_value(next_chapter)
     local ctx=base
     ctx.book={bookId=book_id,title=book.title,author=book.author,cover=book.cover,version=book.version,content_type=book.content_type}
     ctx.next_index=next_index
@@ -18683,9 +18683,6 @@ local function is_epub_residue_name(name)
         or name:match("%.miuread%-linkfix$")
         or name:match("%.miuread%-linkbak$")
 end
-local function is_pending_epub_name(name)
-    return tostring(name or ""):match("%.miuread%-pending$")~=nil
-end
 function Plugin:_all_partial_cache_paths()
     local paths={}
     for _,book_path in ipairs(U.list(self.store.cache_books_dir)) do
@@ -18714,7 +18711,7 @@ function Plugin:_storage_categories()
         local name=path_name(path)
         if (name:lower():match("%.epub$") or name:lower():match("%.epub%.miuread%-locked$")) and not is_epub_residue_name(name) then
             categories.books[#categories.books+1]=path
-        elseif is_epub_residue_name(name) or is_pending_epub_name(name) then
+        elseif is_epub_residue_name(name) or tostring(name or ""):match("%.miuread%-pending$")~=nil then
             categories.temp[#categories.temp+1]=path
         end
     end
@@ -25304,7 +25301,7 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
     return true
 end
 
-local function suspend_lease_names(snapshot)
+function Plugin:_suspend_lease_names(snapshot)
     local names={}
     for reason,enabled in pairs(type(snapshot)=="table" and snapshot.reasons or {}) do
         if enabled==true then names[#names+1]=tostring(reason) end
@@ -25328,7 +25325,7 @@ function Plugin:_power_diagnostic(kind,power_state,download_continue,download_re
         "download_reason=",tostring(download_reason or "unknown"),
         "stage=",tostring(stage or "none"),
         "pseudo_lock=",tostring(pseudo.active==true),
-        "leases=",suspend_lease_names(leases),
+        "leases=",self:_suspend_lease_names(leases),
         "memory_kb=",tostring(memory and memory.available_kb or "unknown"),
         "return_target=",tostring(HOME_SESSION.return_target or "none"))
     return true
