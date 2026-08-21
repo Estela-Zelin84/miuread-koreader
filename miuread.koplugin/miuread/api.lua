@@ -237,6 +237,10 @@ function Api:shelf_stream(options)
         retries=0,timeout=options.index_timeout or {7,12},
     })
     if not ok_index then
+        if options.allow_full_fallback==false then
+            logger.warn("[MiuRead][ShelfStream] index unavailable; keeping cached shelf",tostring(index))
+            error(tostring(index))
+        end
         logger.warn("[MiuRead][ShelfStream] index unavailable; falling back to full shelf",tostring(index))
         local full=self:shelf(options)
         if type(full)=="table" then full._miuread_stream={enabled=false,fallback=true,reason="index_failed"} end
@@ -247,6 +251,10 @@ function Api:shelf_stream(options)
     for i=1,math.min(first_count,#ids) do batch_ids[#batch_ids+1]=ids[i] end
     local ok_batch,batch=pcall(self.web_shelf_sync_books,self,batch_ids,{retries=0,timeout={8,15}})
     if not ok_batch or type(batch)~="table" then
+        if options.allow_full_fallback==false then
+            logger.warn("[MiuRead][ShelfStream] first batch unavailable; keeping cached shelf",tostring(batch))
+            error(tostring(batch or "first shelf batch unavailable"))
+        end
         logger.warn("[MiuRead][ShelfStream] first batch unavailable; falling back to full shelf",tostring(batch))
         local full=self:shelf(options)
         if type(full)=="table" then full._miuread_stream={enabled=false,fallback=true,reason="batch_failed"} end

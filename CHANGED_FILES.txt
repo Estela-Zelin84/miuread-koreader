@@ -1,8 +1,11 @@
-CHANGED_FILES.txt
-CHANGELOG.md
-miuread.koplugin/_meta.lua
-miuread.koplugin/main.lua
-miuread.koplugin/miuread/config.lua
-miuread.koplugin/miuread/home_data.lua
-miuread.koplugin/miuread/home_view.lua
-miuread.koplugin/miuread/reading_stats_dialog.lua
+4.9.0-beta.20
+
+Changed files:
+- miuread.koplugin/main.lua
+- miuread.koplugin/miuread/api.lua
+- miuread.koplugin/miuread/config.lua
+- miuread.koplugin/_meta.lua
+- CHANGELOG.md
+- CHANGED_FILES.txt
+
+Focus: remove reader-open blocking work and serialize automatic Home maintenance without changing download, suspend, or precise-progress core logic.

@@ -1944,7 +1944,9 @@ function Plugin:_friendly_remote_error(err, context)
     return tostring(context or "请求").."失败：\n"..U.first_line(text,120)
 end
 
-function Plugin:_refresh_shelf_async(on_ready,silent)
+function Plugin:_refresh_shelf_async(on_ready,silent,request_options)
+    request_options=type(request_options)=="table" and request_options or {}
+    local allow_full_fallback=request_options.allow_full_fallback~=false
     local function fail(err)
         if Http.is_auth_error(err) then self:_mark_auth_problem("shelf",err,true) end
         local message=self:_friendly_remote_error(err,"书架加载")
@@ -2001,7 +2003,7 @@ function Plugin:_refresh_shelf_async(on_ready,silent)
             local handled,unexpected=xpcall(function()
                 if generation~=self._shelf_refresh_generation then return end
                 local method=use_stream and self.api.shelf_stream or self.api.shelf
-                local ok,data=pcall(method,self.api,{retries=0,timeout={7,12},stream=use_stream,count=16})
+                local ok,data=pcall(method,self.api,{retries=0,timeout={7,12},stream=use_stream,count=16,allow_full_fallback=allow_full_fallback})
                 if not ok then error(tostring(data)) end
                 if loading then pcall(function() UIManager:close(loading) end); loading=nil end
                 succeed(data,"direct")
@@ -2025,7 +2027,7 @@ function Plugin:_refresh_shelf_async(on_ready,silent)
         }
         local api=ApiChild:new(HttpChild:new(child_store),child_store)
         if use_stream then
-            return api:shelf_stream({retries=1,timeout={10,18},stream=true,count=16})
+            return api:shelf_stream({retries=1,timeout={10,18},stream=true,count=16,allow_full_fallback=allow_full_fallback})
         end
         return api:shelf({retries=1,timeout={10,18}})
     end,function(result)
@@ -3335,8 +3337,17 @@ function Plugin:_save_home_preferences_deferred(home,preferences,delay)
     self._home_state_save_pending=true
     self._home_state_save_generation=(tonumber(self._home_state_save_generation) or 0)+1
     local generation=self._home_state_save_generation
-    UIManager:scheduleIn(tonumber(delay) or 1.20,function()
-        if generation~=self._home_state_save_generation or not self._home_state_save_pending then return end
+    if self._home_state_save_task then
+        UIManager:unschedule(self._home_state_save_task)
+        self._home_state_save_task=nil
+    end
+    local task
+    task=function()
+        if generation~=self._home_state_save_generation or not self._home_state_save_pending then
+            if self._home_state_save_task==task then self._home_state_save_task=nil end
+            return
+        end
+        self._home_state_save_task=nil
         self._home_state_save_pending=false
         local saved,err=self.store:flush()
         if saved==true then
@@ -3344,12 +3355,58 @@ function Plugin:_save_home_preferences_deferred(home,preferences,delay)
         else
             logger.warn("[MiuRead][HomeState] preferences save failed after idle",U.first_line(err or "unknown",160))
         end
-    end)
+    end
+    self._home_state_save_task=task
+    UIManager:scheduleIn(tonumber(delay) or 1.20,task)
+end
+
+function Plugin:_pause_home_preferences_flush(reason)
+    if not self._home_state_save_pending then return false end
+    self._home_state_save_generation=(tonumber(self._home_state_save_generation) or 0)+1
+    if self._home_state_save_task then
+        UIManager:unschedule(self._home_state_save_task)
+        self._home_state_save_task=nil
+    end
+    logger.info("[MiuRead][HomeState] preferences flush deferred",
+        "reason=",tostring(reason or "reader priority"))
+    return true
+end
+
+function Plugin:_resume_home_preferences_flush(delay)
+    if not self._home_state_save_pending or self._home_state_save_task then return false end
+    self._home_state_save_generation=(tonumber(self._home_state_save_generation) or 0)+1
+    local generation=self._home_state_save_generation
+    local task
+    task=function()
+        if generation~=self._home_state_save_generation or not self._home_state_save_pending then
+            if self._home_state_save_task==task then self._home_state_save_task=nil end
+            return
+        end
+        if not HomeView.is_shown() or self:_active_reader_ui() or self:_home_ui_busy() then
+            UIManager:scheduleIn(.8,task)
+            return
+        end
+        self._home_state_save_task=nil
+        self._home_state_save_pending=false
+        local saved,err=self.store:flush()
+        if saved==true then
+            logger.info("[MiuRead][HomeState] deferred preferences saved after home idle")
+        else
+            logger.warn("[MiuRead][HomeState] deferred preferences save failed",U.first_line(err or "unknown",160))
+        end
+    end
+    self._home_state_save_task=task
+    UIManager:scheduleIn(math.max(.8,tonumber(delay) or 4.5),task)
+    return true
 end
 
 function Plugin:_flush_home_preferences()
     if not self._home_state_save_pending then return false end
     self._home_state_save_generation=(tonumber(self._home_state_save_generation) or 0)+1
+    if self._home_state_save_task then
+        UIManager:unschedule(self._home_state_save_task)
+        self._home_state_save_task=nil
+    end
     self._home_state_save_pending=false
     local saved,err=self.store:flush()
     if saved~=true then
@@ -3665,6 +3722,10 @@ function Plugin:_background_cancel_worker(key,reason)
     elseif key=="sync_summary" then
         if self.sync_summary_async then self.sync_summary_async:cancel(reason) end
         self:_home_unschedule_task("_home_sync_summary_task")
+    elseif key=="home_stats" then
+        if self.reading_stats_async then self.reading_stats_async:cancel(reason) end
+        self:_home_unschedule_task("_home_stats_refresh_task")
+        self:_home_unschedule_task("_home_stats_apply_task")
     end
 end
 
@@ -4055,6 +4116,15 @@ function Plugin:_home_note_interaction(first,kind)
     -- automatic heavy job from starting until interaction is quiet.
     if self.background_scheduler then
         self.background_scheduler:set_foreground_barrier(duration,"home interaction:"..tostring(kind or "input"))
+        -- Statistics and sync-summary scans are optional Home maintenance.
+        -- If the user touches the screen, stop these two long-running workers
+        -- instead of letting a subprocess compete with foreground interaction.
+        local active=self.background_scheduler.active
+        if active and active.user_requested~=true
+            and (active.key=="home_stats" or active.key=="sync_summary") then
+            self:_background_cancel_worker(active.key,"home interaction")
+            self.background_scheduler:force_release("home interaction")
+        end
     end
     -- Keep the download subprocess alive during ordinary Home interaction.
     -- The child sees a short absolute yield deadline and defers only heavy local
@@ -4107,6 +4177,8 @@ function Plugin:_home_freeze_for_suspend()
     self:_home_unschedule_task("_home_stale_check_task")
     self:_home_unschedule_task("_home_cover_render_retry_task")
     self:_home_unschedule_task("_home_manual_metadata_retry_task")
+    self:_home_unschedule_task("_home_stats_refresh_task")
+    self:_home_unschedule_task("_home_stats_apply_task")
     self._home_pending_network_metadata_key=nil
     self._home_refresh_debounce_generation=(tonumber(self._home_refresh_debounce_generation) or 0)+1
     self._home_render_refresh_generation=(tonumber(self._home_render_refresh_generation) or 0)+1
@@ -4501,7 +4573,7 @@ function Plugin:_home_refresh_remote(force,user_requested)
             self:_home_apply_remote_cache_snapshot()
         end
         if user_requested then self:toast("书架已刷新",2) end
-    end,true)
+    end,true,{allow_full_fallback=user_requested==true})
     if not started then
         self._home_remote_refreshing=false
         self:_background_release("home_shelf",token,"not started")
@@ -9309,11 +9381,18 @@ function Plugin:_home_alerts()
     return alerts
 end
 
-function Plugin:_home_stop_background(reason)
-    self:_flush_home_preferences()
+function Plugin:_home_stop_background(reason,options)
+    options=type(options)=="table" and options or {}
+    if options.defer_home_preferences==true then
+        self:_pause_home_preferences_flush(reason or "home hidden")
+    else
+        self:_flush_home_preferences()
+    end
     self._home_resume_generation=(tonumber(self._home_resume_generation) or 0)+1
     self:_home_unschedule_task("_home_resume_background_task")
     self:_home_unschedule_task("_home_manual_metadata_retry_task")
+    self:_home_unschedule_task("_home_stats_refresh_task")
+    self:_home_unschedule_task("_home_stats_apply_task")
     self._home_pending_network_metadata_key=nil
     self._home_resume_barrier=false
     self._home_suspended=false
@@ -10515,6 +10594,123 @@ function Plugin:_home_local_stats_text(data)
     local marks,days=self:_home_week_check_lines(data.daily,1)
     return "本周 "..self:_home_short_duration(data.week_seconds or 0).." · 今日 "..self:_home_short_duration(data.today_seconds or 0)
         .."\n"..marks.."\n"..days
+end
+
+function Plugin:_schedule_home_stats_idle_refresh(delay)
+    self:_home_unschedule_task("_home_stats_refresh_task")
+    local task
+    task=function()
+        if self._home_stats_refresh_task~=task then return end
+        if not HomeView.is_shown() or self:_active_reader_ui()
+            or self._home_suspended==true or HOME_SESSION.suspended==true then
+            self._home_stats_refresh_task=nil
+            return
+        end
+        if self:_home_ui_busy() then
+            UIManager:scheduleIn(.9,task)
+            return
+        end
+        if not self.reading_stats_async or not self.reading_stats_async:available()
+            or self.reading_stats_async:busy() then
+            UIManager:scheduleIn(1.2,task)
+            return
+        end
+
+        local cache=self:_home_weread_stats_cache()
+        local now=os.time()
+        local online=self:is_online()
+        local weekly=type(cache.weekly)=="table" and cache.weekly or nil
+        local monthly=type(cache.monthly)=="table" and cache.monthly or nil
+        local need_weekly=online and self:logged_in() and now-(tonumber(weekly and weekly.fetched_at) or 0)>=10*60
+        local need_monthly=online and self:logged_in() and now-(tonumber(monthly and monthly.fetched_at) or 0)>=60*60
+        local need_local=now-(tonumber(self._home_local_stats_cache_at) or 0)>=120
+        if not need_local and not need_weekly and not need_monthly then
+            self._home_stats_refresh_task=nil
+            return
+        end
+
+        local token,_,deferred=self:_background_claim("home_stats",{
+            user_requested=false,priority=12,retry_delay=1.2,
+        },function()
+            if HomeView.is_shown() and not self:_active_reader_ui() then
+                self:_schedule_home_stats_idle_refresh(1.2)
+            end
+        end)
+        if not token then
+            self._home_stats_refresh_task=nil
+            if not deferred then self:_schedule_home_stats_idle_refresh(1.5) end
+            return
+        end
+
+        self._home_stats_refresh_task=nil
+        local started,err=self.reading_stats_async:run("home-idle-stats",function()
+            local out={}
+            if need_local then
+                local HomeDataChild=require("miuread.home_data")
+                out.local_stats=HomeDataChild.reading_stats(true,false)
+            end
+            if online and need_weekly then
+                out.weekly=HomeData.weread_summary(self.api:reading_stats("weekly",0,{no_auth_recovery=true}),os.time(),"weekly")
+            end
+            if online and need_monthly then
+                out.monthly=HomeData.weread_summary(self.api:reading_stats("monthly",0,{no_auth_recovery=true}),os.time(),"monthly")
+            end
+            return out
+        end,function(result)
+            self:_background_release("home_stats",token,result and result.ok==true and "completed" or "failed")
+            if not result or result.ok~=true or type(result.value)~="table" then
+                logger.warn("[MiuRead][HomeStats] idle refresh failed",tostring(result and result.error or "no result"))
+                return
+            end
+            local value=result.value
+            self:_home_unschedule_task("_home_stats_apply_task")
+            local apply_task
+            apply_task=function()
+                if self._home_stats_apply_task~=apply_task then return end
+                if not HomeView.is_shown() or self:_active_reader_ui()
+                    or self._home_suspended==true or HOME_SESSION.suspended==true then
+                    self._home_stats_apply_task=nil
+                    return
+                end
+                if self:_home_ui_busy() then
+                    UIManager:scheduleIn(.8,apply_task)
+                    return
+                end
+                self._home_stats_apply_task=nil
+                local update={}
+                if need_local then
+                    self._home_local_stats_cache=type(value.local_stats)=="table" and value.local_stats or nil
+                    self._home_local_stats_cache_at=os.time()
+                    update.local_stats_text=self:_home_local_stats_text(self._home_local_stats_cache)
+                end
+                if type(value.weekly)=="table" or type(value.monthly)=="table" then
+                    local current=self:_home_weread_stats_cache()
+                    current.account_key=self:_home_weread_stats_account_key()
+                    current.schema_version=2
+                    if type(value.weekly)=="table" then current.weekly=value.weekly end
+                    if type(value.monthly)=="table" then current.monthly=value.monthly end
+                    current.updated_at=os.time()
+                    -- Keep automatic refresh persistence off the UI thread's
+                    -- critical path. A later normal settings flush persists it.
+                    self.store:set_deferred("home_weread_stats_cache",current)
+                    update.weread_stats_text=self:_home_weread_stats_text(current)
+                end
+                if next(update)~=nil then HomeView.update_dashboard(update) end
+                logger.info("[MiuRead][HomeStats] idle refresh applied",
+                    "local=",tostring(need_local),"weekly=",tostring(type(value.weekly)=="table"),
+                    "monthly=",tostring(type(value.monthly)=="table"))
+            end
+            self._home_stats_apply_task=apply_task
+            UIManager:scheduleIn(.35,apply_task)
+        end,28)
+        if not started then
+            self:_background_release("home_stats",token,"not started")
+            logger.warn("[MiuRead][HomeStats] idle worker not started",tostring(err))
+        end
+    end
+    self._home_stats_refresh_task=task
+    UIManager:scheduleIn(math.max(2.5,tonumber(delay) or 4.5),task)
+    return true
 end
 
 local function shifted_stats_base(mode,base_time,delta)
@@ -15503,13 +15699,20 @@ function Plugin:_close_home_for_reader(reason)
         return true
     end
     self._desktop_frozen=true
-    logger.info("[MiuRead][DesktopPerf] desktop freeze","reason=",tostring(reason or "reader active"))
-    self:_home_stop_background(reason or "reader active")
-    self:_close_miuread_transients()
-    if HomeView.is_shown() then
-        HomeView.park()
-        self._home_view=HomeView.current()
-        logger.info("[MiuRead][Home] parked below reader",tostring(reason or "reader active"))
+    local first_freeze=self._home_background_stopped_for_reader~=true
+    if first_freeze then
+        self._home_background_stopped_for_reader=true
+        logger.info("[MiuRead][DesktopPerf] desktop freeze","reason=",tostring(reason or "reader active"))
+        self:_home_stop_background(reason or "reader active",{defer_home_preferences=true})
+        self:_close_miuread_transients()
+        if HomeView.is_shown() then
+            HomeView.park()
+            self._home_view=HomeView.current()
+            logger.info("[MiuRead][Home] parked below reader",tostring(reason or "reader active"))
+        end
+    else
+        logger.dbg("[MiuRead][DesktopPerf] duplicate reader freeze skipped",
+            "reason=",tostring(reason or "reader active"))
     end
     if self:_active_reader_ui() or (self.ui and self.ui.document) then
         self:_set_foreground("reader")
@@ -15579,10 +15782,12 @@ function Plugin:_complete_reader_close(generation,reason)
     HOME_RETURN_FILE=nil
     persist_home_session()
     self:_set_foreground("home")
+    self._home_background_stopped_for_reader=false
     self._home_book_open_lock=nil
     self:_close_reader_recovery_surface()
     self:_release_reader_transition_guard("home restored after stable close")
     self:_home_enter_post_reader_priority_window(4.0,"stable reader close")
+    self:_resume_home_preferences_flush(4.6)
     self:_finish_page_transition(.18,"home restored after stable close")
     -- Queue/install/download maintenance must not race the first usable Home
     -- surface. Let the interaction quiet window release before post-reader work.
@@ -15839,7 +16044,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
 
     local screensaver_file,screensaver_sources=self:_home_update_lockscreen_session(hero)
     local home_alerts=self:_home_alerts()
-    local local_reading_stats=HomeData.reading_stats(false)
+    local local_reading_stats=self._home_local_stats_cache
     local weread_reading_cache=self:_home_weread_stats_cache()
     self._home_panel_sync_label=self:progress_sync_label()
     self._home_panel_download_detail=""
@@ -15917,9 +16122,11 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     self._home_view=view
     rawset(_G,HOME_OWNER_KEY,self)
     self:_set_foreground("home")
+    self._home_background_stopped_for_reader=false
     self._home_refresh_pending=false
     self:_home_schedule_clock()
-    self:_schedule_home_weread_stats_refresh(false)
+    self:_schedule_home_stats_idle_refresh(4.5)
+    self:_resume_home_preferences_flush(4.8)
     if active=="local" then
         UIManager:scheduleIn(.05,function()
             if HomeView.is_shown() and self._home_active_section=="local" then self:_home_ensure_local_inline_loaded() end
@@ -18727,6 +18934,7 @@ function Plugin:_recover_failed_reader_open(path,generation,reason)
     HOME_SESSION.opening_kind=""
     HOME_SESSION.opening_book_id=""
     self._home_reader_transition=false
+    self._home_background_stopped_for_reader=false
     self:_finish_page_transition(0,"open failed")
     logger.warn("[MiuRead][Reader] open failed",tostring(path),tostring(reason or "unknown"))
     local lifecycle=self:_reader_lifecycle_state()
@@ -18740,6 +18948,7 @@ function Plugin:_recover_failed_reader_open(path,generation,reason)
 end
 
 function Plugin:_open_file_direct(path,session_kind,book_id)
+    local open_request_clock=monotonic_wall_time()
     path=normalized_reader_file(path)
     if not path or not U.file_exists(path) then self:info(_("No cached file")); return false end
 
@@ -18778,14 +18987,17 @@ function Plugin:_open_file_direct(path,session_kind,book_id)
         mark_reader_origin(path)
         self._home_reader_transition=true
         self:_begin_page_transition("opening_reader")
-        self:_home_stop_background(session_kind=="local" and "opening local book" or "reader opening")
-        self:_close_home_for_reader("reader opening")
+        self:_close_home_for_reader(session_kind=="local" and "opening local book" or "reader opening")
         self:_set_foreground("reader_pending")
     end
 
     local function fail(err)
         return self:_recover_failed_reader_open(path,opening_generation,err)
     end
+
+    logger.info("[MiuRead][ReaderOpenPerf] handoff",
+        "pre_handoff_ms=",tostring(math.floor((monotonic_wall_time()-open_request_clock)*1000+.5)),
+        "kind=",tostring(session_kind or ""),"file=",tostring(path))
 
     if self.ui and self.ui.document and type(self.ui.switchDocument)=="function" then
         local ok,result=xpcall(function() return self.ui:switchDocument(path) end,debug.traceback)
