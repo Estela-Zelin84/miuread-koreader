@@ -1864,8 +1864,7 @@ function Plugin:reader_menu()
     local desktop=self:_home_enabled()
     local out={
         {text=desktop and "退出阅读并返回觅阅主页" or "返回书架",callback=self:safe("shelf",function()
-            if desktop then self:return_to_miuread_home()
-            else self:show_shelf(false,false,"account") end
+            return self:_reader_home_action("reader menu")
         end)},
     }
     if desktop then
@@ -11873,7 +11872,7 @@ function Plugin:_show_reader_progress_control(back_callback)
         on_prev_chapter=function() self:_reader_previous_chapter() end,
         on_next_chapter=function() self:_reader_next_chapter() end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
     }
     return true
 end
@@ -11973,7 +11972,7 @@ function Plugin:_show_reader_toc(back_callback)
             items=items,
             auto_follow=true,
             on_back=back_callback or function() self:show_reader_quick_panel() end,
-            on_home=function() return self:return_to_miuread_home("reader surface") end,
+            on_home=function() return self:_reader_home_action("reader surface") end,
         }
         if dialog then return true end
         logger.warn("[MiuRead][ReaderToc] custom dialog unavailable",tostring(err or "unknown"))
@@ -12073,7 +12072,7 @@ function Plugin:_show_reader_spacing_panel(back_callback)
             }
         end,
         on_back=back_callback,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             local current=math.floor(self:_reader_line_spacing_value()+.5)
             return {
@@ -12100,7 +12099,7 @@ function Plugin:_show_reader_weight_panel(back_callback)
             }
         end,
         on_back=back_callback,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             local current=self:_reader_font_weight_value()
             return {
@@ -12209,7 +12208,7 @@ function Plugin:_show_reader_comment_settings(back_callback)
             return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · 字号 "..self:_thought_font_size_label()
         end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         controls=function()
             local prefs=self.store:preferences().thoughts or {}
             local follow=prefs.follow_body_font==true
@@ -12372,8 +12371,8 @@ function Plugin:_reader_toolbar_header(title)
     }
     return {
         title=tostring(title or "正在阅读"),
-        home_label="首页",
-        home_callback=function() return self:return_to_miuread_home("reader surface") end,
+        home_label=self:_home_enabled() and "首页" or "书架",
+        home_callback=function() return self:_reader_home_action("reader surface") end,
         book_callback=function() return self:_show_reader_current_book_panel(function() self:show_reader_quick_panel() end) end,
         wifi_label=wifi_text,wifi_alert=wifi_alert,
         wifi_callback=function() return self:_show_reader_wifi_quick_panel(function() self:show_reader_quick_panel() end) end,
@@ -12387,7 +12386,7 @@ function Plugin:_reader_toolbar_header(title)
         battery_label=battery,
         more_label="更多",
         more_callback=function() return self:show_reader_control_center("reading") end,
-        chapter_label=chapter,
+        chapter_label="目录",
         chapter_callback=function() return self:_show_reader_toc(function() self:show_reader_quick_panel() end) end,
         progress_label=progress_text,
         progress_callback=function() return self:_show_reader_progress_control(function() self:show_reader_quick_panel() end) end,
@@ -12525,7 +12524,7 @@ function Plugin:_show_reader_menu_table(title,source,back_callback)
         items=function() return self:_reader_menu_rows_from_table(source,title,back_callback) end,
         page_size=tonumber(type(source)=="table" and source.max_per_page) or 6,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
     }
     return true
 end
@@ -13109,7 +13108,7 @@ function Plugin:_show_reader_annotation_panel(back_callback)
         title="批注",
         subtitle=U.utf8_truncate(title,42,"…").." · 书签 划线 想法统一管理",
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             local sections={{
                 title="本书批注",rows={
@@ -13214,7 +13213,7 @@ function Plugin:_reader_search_results(query,results,back_callback)
         items=rows,page_size=5,
         empty_text="没有找到匹配内容",
         on_back=function() self:_reader_show_search(back_callback) end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
     }
     return true
 end
@@ -13320,7 +13319,7 @@ function Plugin:_show_reader_font_panel(back_callback)
         title="字体与排版",
         subtitle=function() return self:_reader_font_label().." · 字号 "..self:_reader_font_size_label() end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         controls=function()
             return {
                 {kind="select",label="字体",value=self:_reader_font_label(),close=true,callback=function() self:_show_reader_font_face_menu(return_to_font) end},
@@ -13368,7 +13367,7 @@ function Plugin:_show_reader_sync_diagnostics_panel(back_callback)
         title="同步诊断",
         subtitle="进度与批注分开显示，失败不会互相覆盖",
         on_back=back_callback or function() self:_show_reader_sync_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             local state=tostring(self:progress_sync_label() or "")
             local annotation_action=tonumber(annotation_summary.action_required or 0) or 0
@@ -13403,7 +13402,7 @@ function Plugin:_show_reader_sync_panel(back_callback)
         title="阅读同步",
         subtitle=function() return "时间、进度和批注可以分别设置" end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             local sync=self.store:preferences().sync or {}
             return {
@@ -13836,7 +13835,7 @@ function Plugin:_show_reader_refresh_settings(back_callback)
             return "普通 "..label(day).." · 夜间 "..label(night)
         end,
         on_back=back_callback or function() self:_show_reader_page_display_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             local day,night=self:_reader_refresh_rates()
             local rows={
@@ -13880,7 +13879,7 @@ function Plugin:_show_reader_page_display_panel(back_callback)
         title="页面显示",
         subtitle="阅读中的常用显示项目",
         on_back=back_callback or function() self:show_reader_quick_panel(true) end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             local info_rows={
                 {label="状态栏",value=self:_reader_status_bar_label(),value_bold=true,keep_open=true,callback=function() self:_reader_toggle_status_bar() end},
@@ -13919,7 +13918,7 @@ function Plugin:_show_reader_page_panel(back_callback)
         title="页面",
         subtitle="版面, 显示和刷新集中在这里",
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         rows=function()
             local rows={}
             if self:_reader_is_reflowable() then
@@ -14123,7 +14122,7 @@ function Plugin:_show_reader_margin_panel(back_callback)
         title="页边距",
         subtitle=function() return self:_reader_margin_label() end,
         on_back=back_callback or function() self:show_reader_control_center("typeset") end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             return {
                 {title="常用预设",rows={
@@ -14178,7 +14177,7 @@ function Plugin:_show_reader_word_spacing_panel(back_callback)
         title="字符间距（高级）",
         subtitle=function() return "空格缩放/压缩 "..self:_reader_word_spacing_label() end,
         on_back=back_callback or function() self:show_reader_control_center("typeset") end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             local cjk=tonumber(self:_reader_config_value("cjk_width_scaling")) or 100
             return {
@@ -14203,7 +14202,7 @@ function Plugin:_show_reader_refresh_panel(back_callback)
         title="刷新与显示",
         subtitle="只保留阅读过程中真正需要的显示控制",
         on_back=back_callback or function() self:show_reader_control_center("typeset") end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         rows=function()
             return {
                 {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,callback=function() self:_show_reader_refresh_settings(function() self:_show_reader_refresh_panel(back_callback) end) end},
@@ -14222,7 +14221,7 @@ function Plugin:_show_reader_advanced_typeset_panel(back_callback)
         title="高级排版",
         subtitle="界面由觅阅整理，设置直接写入 KOReader 当前书籍",
         on_back=back_callback or function() self:show_reader_control_center("typeset") end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         rows=function()
             local mode=tonumber(self:_reader_config_value("block_rendering_mode")) or 2
             local mode_labels={[0]="兼容",[1]="平面",[2]="书籍",[3]="网页"}
@@ -14247,7 +14246,7 @@ function Plugin:_show_reader_wifi_quick_panel(back_callback)
             return tostring(label)
         end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         rows=function()
             local on=self:_reader_wifi_state()==true
             return {
@@ -14264,7 +14263,7 @@ function Plugin:_show_reader_sync_quick_panel(back_callback)
         title="阅读同步",
         subtitle=function() return "当前状态: "..tostring(self:progress_sync_label()) end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         rows=function()
             return {
                 {label="立即同步",value="上传当前进度",value_bold=true,keep_open=true,callback=function() self:upload_local_progress(true) end},
@@ -14280,7 +14279,7 @@ function Plugin:_show_reader_gesture_panel(back_callback)
         title="手势与按键",
         subtitle="桌面模式只接管顶部下滑阅读面板, 正文阅读手势继续交给阅读器",
         on_back=back_callback or function() self:show_reader_control_center("device") end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         rows=function()
             local rows={
                 {label="顶部下滑",value="觅阅阅读快捷面板",arrow=false},
@@ -14301,7 +14300,7 @@ function Plugin:_show_reader_device_compat_panel(back_callback)
         title="系统与兼容",
         subtitle="日常阅读不需要进入 KOReader 原菜单",
         on_back=back_callback or function() self:show_reader_control_center("device") end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         rows=function()
             return {
                 {label="KOReader 原生菜单",value="仅用于未覆盖功能与故障排查",callback=function()
@@ -14334,10 +14333,10 @@ function Plugin:_reader_control_categories()
     end
 
     local reading_items={
-        {icon="toc",label="目录",value="当前章节",callback=function() self:_show_reader_toc(back_to("reading")) end},
+        {icon="toc",label="目录",value="",callback=function() self:_show_reader_toc(back_to("reading")) end},
         {icon="progress",label="阅读进度",value=(self:_reader_progress_percent() and (tostring(math.floor(self:_reader_progress_percent()+.5)).."%") or ""),callback=function() self:_show_reader_progress_control(back_to("reading")) end},
         {icon="search",label="书内搜索",value="搜索当前书籍",callback=function() self:_reader_show_search(back_to("reading")) end},
-        {icon="home",label="返回主页",value=self:_reader_session_is_weread() and "保存并结束本次阅读" or "直接返回觅阅主页",callback=function() self:return_to_miuread_home("reader control") end},
+        {icon="home",label=self:_home_enabled() and "返回主页" or "返回书架",value=self:_home_enabled() and (self:_reader_session_is_weread() and "保存并结束本次阅读" or "直接返回觅阅主页") or "保留当前阅读会话",callback=function() self:_reader_home_action("reader control") end},
         {icon="highlight",label="批注",value=self:_reader_annotation_summary_label(),callback=function() self:_show_reader_annotation_panel(back_to("reading")) end},
     }
     if self:_reader_session_is_weread() then
@@ -14387,7 +14386,7 @@ function Plugin:show_reader_control_center(initial_category)
         categories=self:_reader_control_categories(),
         initial_category=tostring(initial_category or "reading"),
         on_back=function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
     }
     if not panel then
         logger.warn("[MiuRead][ReaderControlCenter] unavailable",tostring(err or "unknown"))
@@ -14401,7 +14400,7 @@ function Plugin:_show_reader_edge_guard_panel(back_callback)
         title="边缘翻页防误触",
         subtitle="左右边缘点击优先翻页，避免划线评论抢占翻页操作",
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             local enabled,percent=self:_reader_edge_guard_state()
             local rows={
@@ -14439,7 +14438,7 @@ function Plugin:_reader_quick_definitions()
         search={key="search",icon="search",label="搜索",icon_scale=.94,callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
         -- Keep the legacy key so existing customized quick-panel layouts do not
         -- lose this slot after OTA; its action is now the requested Home action.
-        back={key="back",icon="home",label="主页",icon_scale=.98,callback=function() self:return_to_miuread_home("reader quick panel") end},
+        back={key="back",icon="home",label=self:_home_enabled() and "主页" or "书架",icon_scale=.98,callback=function() self:_reader_home_action("reader quick panel") end},
         font={key="font",icon="font",label="字体",callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end},
         spacing={key="spacing",icon="line-spacing",label="行距",callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end},
         page={key="page",icon="display",label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
@@ -16174,6 +16173,13 @@ function Plugin:_request_reader_close(generation,source)
     end
     self:_schedule_reader_return_finish(generation,.10,"close requested")
     return true
+end
+
+function Plugin:_reader_home_action(reason)
+    if self:_home_enabled() then
+        return self:return_to_miuread_home(reason)
+    end
+    return self:show_shelf(false,false,"account")
 end
 
 function Plugin:return_to_miuread_home(reason)
