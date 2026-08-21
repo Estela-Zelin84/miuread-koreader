@@ -581,6 +581,8 @@ end
 function Editor:onRotation() return self:onScreenResize() end
 function Editor:onCloseWidget()
     if active_dialog == self then active_dialog = nil end
+    -- 释放静影头图缓存：编辑器关闭后不再需要，避免长会话常驻多张头图
+    pcall(Card.clearStillnessHeadCache)
     if self.preview_image and type(self.preview_image.free) == "function" then pcall(self.preview_image.free, self.preview_image) end
     self.preview_image = nil
     local action = self.pending_action
