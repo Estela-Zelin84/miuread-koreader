@@ -741,7 +741,7 @@ function Plugin:init()
     self._home_visible_cover_targets={}
     self._reader_quick_panel_pending=false
     self._reader_gesture_guard_until=0
-    self._reader_toolbar_state_cache={session=0,page=nil,total=nil,chapter="",updated_at=0}
+    self._reader_toolbar_state_cache={session=0,page=nil,total=nil,chapter="",chapter_percent=nil,whole_percent=nil,chapter_ordinal=nil,updated_at=0}
     self._reader_toolbar_state_task=nil
     self._reader_toolbar_prewarm_task=nil
     self._reader_toolbar_header_perf=nil
@@ -905,6 +905,12 @@ function Plugin:init()
     self._chapter_prefetch_task=nil
     self._chapter_prefetch_generation=0
     self._chapter_prefetch_last_key=nil
+    self._chapter_navigation_cache=nil
+    self._chapter_navigation_task=nil
+    self._chapter_advance_waiting=false
+    self._chapter_advance_target_uid=nil
+    self._chapter_transition_active=false
+    self._chapter_transition_target=nil
     self._download_state_last_write=0
     self._download_state_last_stage=nil
     self._auth_notice_dialog=nil
@@ -11438,7 +11444,7 @@ function Plugin:_reader_toolbar_cache()
     local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
     local cache=self._reader_toolbar_state_cache
     if type(cache)~="table" or tonumber(cache.session or -1)~=session then
-        cache={session=session,page=nil,total=nil,chapter="",updated_at=0}
+        cache={session=session,page=nil,total=nil,chapter="",chapter_percent=nil,whole_percent=nil,chapter_ordinal=nil,updated_at=0}
         self._reader_toolbar_state_cache=cache
     end
     return cache
@@ -11451,7 +11457,7 @@ function Plugin:_reset_reader_toolbar_state_cache()
     end
     self._reader_toolbar_state_cache={
         session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0,
-        page=nil,total=nil,chapter="",updated_at=0,
+        page=nil,total=nil,chapter="",chapter_percent=nil,whole_percent=nil,chapter_ordinal=nil,updated_at=0,
     }
 end
 
@@ -11474,6 +11480,14 @@ function Plugin:_refresh_reader_toolbar_state_cache(page)
         if total and total>0 then cache.total=total end
     end
 
+    local page_total=tonumber(cache.total)
+    cache.chapter_percent=nil
+    cache.chapter_ordinal=nil
+    cache.whole_percent=nil
+    if current and page_total and page_total>0 then
+        cache.whole_percent=math.max(0,math.min(100,current/page_total*100))
+    end
+
     local chapter_started=os.clock()
     if current then
         local toc=self.ui and self.ui.toc or nil
@@ -11482,7 +11496,49 @@ function Plugin:_refresh_reader_toolbar_state_cache(page)
             local ok,value=pcall(toc.getTocTitleByPage,toc,current)
             if ok and value then chapter=U.trim(tostring(value)) end
         end
-        if chapter~="" then cache.chapter=chapter elseif tostring(cache.chapter or "")=="" then cache.chapter="当前章节" end
+        if chapter~="" then cache.chapter=chapter elseif tostring(cache.chapter or "")=="" then cache.chapter="当前阅读位置" end
+
+        -- For ordinary/range EPUBs, use an already-built TOC only. Never fill or
+        -- rebuild a TOC from the page-turn path just to paint this toolbar.
+        if toc and type(toc.toc)=="table" and #toc.toc>0 and type(toc.getTocIndexByPage)=="function" then
+            local ok_idx,index=pcall(toc.getTocIndexByPage,toc,current)
+            index=ok_idx and tonumber(index) or nil
+            if index and toc.toc[index] then
+                local start_page=tonumber(toc.toc[index].page or toc.toc[index].pageno)
+                local next_page=toc.toc[index+1] and tonumber(toc.toc[index+1].page or toc.toc[index+1].pageno) or nil
+                if start_page then
+                    local finish_page=(next_page and next_page>start_page) and (next_page-1) or page_total
+                    if finish_page and finish_page>=start_page then
+                        cache.chapter_percent=math.max(0,math.min(100,(current-start_page+1)/math.max(1,finish_page-start_page+1)*100))
+                    end
+                end
+            end
+        end
+    end
+
+    -- A standalone WeRead chapter already has a navigation context built only
+    -- after reader idle. Reuse it here rather than scanning the catalog again.
+    local nav=self._chapter_navigation_cache
+    local path=normalized_reader_file(self:_current_document_path())
+    if type(nav)=="table" and normalized_reader_file(nav.path)==path then
+        cache.chapter_ordinal=tonumber(nav.current_ordinal)
+        if U.trim(tostring(nav.current_title or ""))~="" then cache.chapter=U.trim(tostring(nav.current_title)) end
+        if page_total and current then cache.chapter_percent=math.max(0,math.min(100,current/page_total*100)) end
+    end
+
+    -- Whole-book WeRead progress shown in the toolbar is a cheap map lookup. It
+    -- deliberately does not invoke the precise source-text locator.
+    if self:_reader_session_is_weread() and self.sync and type(self.sync.local_position)=="function"
+        and current and page_total and page_total>0 then
+        local ok,position=pcall(self.sync.local_position,self.sync,current/page_total)
+        if ok and type(position)=="table" then
+            if position.safe==true and tonumber(position.progress) then
+                cache.whole_percent=math.max(0,math.min(100,tonumber(position.progress)))
+            end
+            if tonumber(position.chapter_percent) then
+                cache.chapter_percent=math.max(0,math.min(100,tonumber(position.chapter_percent)))
+            end
+        end
     end
     cache.updated_at=os.time()
     local chapter_ms=math.floor((os.clock()-chapter_started)*1000+.5)
@@ -12376,21 +12432,24 @@ function Plugin:_reader_toolbar_header(title)
     local state_started=os.clock()
     local sync_text,sync_alert=self:_reader_sync_summary()
     local cache=self:_reader_toolbar_cache()
-    local page,total=tonumber(cache.page),tonumber(cache.total)
     local chapter=U.trim(tostring(cache.chapter or ""))
-    if chapter=="" then chapter="当前章节" end
-    local progress_text=""
-    if page and total and total>0 then
-        progress_text=tostring(math.floor(page+.5)).." / "..tostring(math.floor(total+.5))
-    else
-        local percent=self:_reader_toolbar_cached_percent()
-        progress_text=percent and (tostring(math.floor(percent+.5)).."%") or "阅读进度"
+    if chapter=="" then chapter="当前阅读位置" end
+    local ordinal=tonumber(cache.chapter_ordinal)
+    if ordinal and ordinal>0 and not chapter:match("^第[^章]+章") then
+        chapter="第"..tostring(math.floor(ordinal+.5)).."章 · "..chapter
     end
+    local chapter_percent=tonumber(cache.chapter_percent)
+    local location_text=chapter
+    if chapter_percent then
+        location_text=location_text.." · 本章 "..tostring(math.floor(chapter_percent+.5)).."%"
+    end
+    local whole_percent=tonumber(cache.whole_percent) or self:_reader_toolbar_cached_percent()
+    local progress_text=whole_percent and ("全书 "..string.format("%.1f",whole_percent).."%") or "阅读进度"
     local state_ms=math.floor((os.clock()-state_started)*1000+.5)
     self._reader_toolbar_header_perf={
         device_ms=device_ms,
         state_ms=state_ms,
-        chapter_cached=chapter~="当前章节" or tostring(cache.chapter or "")~="",
+        chapter_cached=chapter~="当前阅读位置" or tostring(cache.chapter or "")~="",
         cache_age=math.max(0,os.time()-(tonumber(cache.updated_at) or os.time())),
         total_ms=math.floor((os.clock()-started)*1000+.5),
     }
@@ -12408,11 +12467,13 @@ function Plugin:_reader_toolbar_header(title)
         bluetooth_hold_callback=bluetooth_state.supported==true and function() return self:_bluetooth_show_devices() end or nil,
         sync_label=sync_text,sync_alert=sync_alert,
         sync_callback=function() return self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end,
+        time_label=self:_display_time("%H:%M"),
         battery_label=battery,
         more_label="更多",
         more_callback=function() return self:show_reader_control_center("reading") end,
-        chapter_label="目录",
+        chapter_label="☰ 目录",
         chapter_callback=function() return self:_show_reader_toc(function() self:show_reader_quick_panel() end) end,
+        location_label=location_text,
         progress_label=progress_text,
         progress_callback=function() return self:_show_reader_progress_control(function() self:show_reader_quick_panel() end) end,
     }
@@ -16999,6 +17060,7 @@ function Plugin:_finish_download_runtime(runtime,result)
     if not result or result.ok~=true then
         local err=result and result.error or "未知下载错误"
         if opt.prefetch==true then
+            if runtime.prefetch_open_after==true then self:_clear_chapter_advance_wait("prefetch failed") end
             logger.warn("[MiuRead][Prefetch] stopped",tostring(err))
             self.store:clear_download_state()
             self:_notify_home_data_changed("content")
@@ -17006,6 +17068,7 @@ function Plugin:_finish_download_runtime(runtime,result)
             self:_start_next_queued_download()
             return
         end
+        if opt.chapter_continuous_open==true then self:_clear_chapter_advance_wait("next chapter download failed") end
         logger.warn("[MiuRead][Download] failed",tostring(err))
         if tostring(err)=="下载已取消" then
             self.store:clear_download_state()
@@ -17129,8 +17192,16 @@ function Plugin:_finish_download_runtime(runtime,result)
         local should_open=runtime.prefetch_open_after==true and rec.file and U.file_exists(rec.file)
         self:_start_next_queued_download()
         if should_open then
+            local seamless=runtime.prefetch_seamless_after==true
+            local target_uid=tostring(opt.chapter_uid or "")
+            local target_book=tostring(b.bookId or b.book_id or "")
             UIManager:scheduleIn(.10,function()
-                if self.ui and self.ui.document and not reader_close_active() then self:open_file(rec.file) end
+                if not (self.ui and self.ui.document) or reader_close_active() then return end
+                if seamless then
+                    self:_switch_single_chapter_file(rec.file,target_book,target_uid,"prefetch ready")
+                else
+                    self:open_file(rec.file)
+                end
             end)
         end
         return
@@ -17157,6 +17228,10 @@ function Plugin:_finish_download_runtime(runtime,result)
     if pending then
         local text=DownloadResult.notice(b.title,rec,true)
         if was_background then self:status_toast("觅阅",text,5) else self:info(text) end
+    elseif open_after and rec.file and opt.chapter_continuous_open==true then
+        if not annotation_pending then self.store:clear_download_state() end
+        self:_switch_single_chapter_file(rec.file,tostring(opt.chapter_continuous_book_id or b.bookId or ""),
+            tostring(opt.chapter_continuous_target_uid or opt.chapter_uid or ""),"download ready")
     elseif was_background then
         if self.store:preferences().download_complete_notice~=false or annotation_pending or annotation_fallback then
             self:status_toast("觅阅",DownloadResult.notice(b.title,rec,false),5)
@@ -18050,10 +18125,27 @@ local function chapter_uid_value(chapter)
     return tostring(chapter and (chapter.uid or chapter.chapterUid or chapter.chapter_uid) or "")
 end
 
-function Plugin:_chapter_prefetch_context()
+function Plugin:_reset_chapter_navigation_context(reason)
+    if self._chapter_navigation_task then
+        pcall(UIManager.unschedule,UIManager,self._chapter_navigation_task)
+        self._chapter_navigation_task=nil
+    end
+    self._chapter_navigation_cache=nil
+    if reason then logger.dbg("[MiuRead][ChapterNav] context reset",tostring(reason)) end
+    return true
+end
+
+function Plugin:_chapter_navigation_context(force)
     if not (self.ui and self.ui.document) or not self:_reader_session_is_weread() then return nil,"not_weread" end
-    local path=self:_current_document_path()
+    local path=normalized_reader_file(self:_current_document_path())
     if not path then return nil,"no_path" end
+    local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
+    local cached=self._chapter_navigation_cache
+    if force~=true and type(cached)=="table" and tonumber(cached.session or -1)==session
+        and normalized_reader_file(cached.path)==path then
+        if cached.terminal_reason then return nil,cached.terminal_reason,cached end
+        return cached,nil,cached
+    end
     local book,record,kind=self.store:file_record_fast(path,false)
     if not book then book,record,kind=self.store:identify_file(path,false) end
     if type(book)~="table" or type(record)~="table" then return nil,"unidentified" end
@@ -18063,11 +18155,25 @@ function Plugin:_chapter_prefetch_context()
     if kind~="clean" and kind~="notes" then return nil,"unsupported_variant" end
     local catalog=type(book.catalog)=="table" and book.catalog or {}
     if #catalog==0 then return nil,"catalog_missing" end
-    local current_index
+    local current_index,current_ordinal,current_chapter
+    local ordinal=0
     for index,chapter in ipairs(catalog) do
-        if chapter_uid_value(chapter)==current_uid then current_index=index; break end
+        if chapter_uid_value(chapter)~="" and chapter.structural~=true then ordinal=ordinal+1 end
+        if chapter_uid_value(chapter)==current_uid then
+            current_index=index
+            current_ordinal=math.max(1,ordinal)
+            current_chapter=chapter
+            break
+        end
     end
     if not current_index then return nil,"chapter_missing" end
+    local book_id=tostring(book.book_id or book.bookId or "")
+    if book_id=="" then return nil,"book_id_missing" end
+    local base={
+        session=session,path=path,book_id=book_id,book_record=book,record=record,kind=kind,
+        current_uid=current_uid,current_index=current_index,current_ordinal=current_ordinal,
+        current_title=tostring(current_chapter and current_chapter.title or ""),
+    }
     local next_index,next_chapter
     for index=current_index+1,#catalog do
         local candidate=catalog[index]
@@ -18076,19 +18182,60 @@ function Plugin:_chapter_prefetch_context()
             break
         end
     end
-    if not next_chapter then return nil,"last_chapter" end
-    local book_id=tostring(book.book_id or book.bookId or "")
-    if book_id=="" then return nil,"book_id_missing" end
+    if not next_chapter then
+        base.terminal_reason="last_chapter"
+        self._chapter_navigation_cache=base
+        return nil,"last_chapter",base
+    end
     local next_uid=chapter_uid_value(next_chapter)
-    local existing=self.store:chapter_variant(book_id,next_uid,kind)
+    local ctx=base
+    ctx.book={bookId=book_id,title=book.title,author=book.author,cover=book.cover,version=book.version,content_type=book.content_type}
+    ctx.next_index=next_index
+    ctx.next_ordinal=(tonumber(current_ordinal) or 0)+1
+    ctx.next_uid=next_uid
+    ctx.next_title=tostring(next_chapter.title or ("第 "..tostring(ctx.next_ordinal).." 章"))
+    ctx.next_chapter=next_chapter
+    self._chapter_navigation_cache=ctx
+    logger.dbg("[MiuRead][ChapterNav] context ready","book=",book_id,
+        "current=",current_uid,"next=",next_uid,"session=",tostring(session))
+    return ctx,nil,ctx
+end
+
+function Plugin:_schedule_chapter_navigation_context(session,delay)
+    self:_reset_chapter_navigation_context("reschedule")
+    if not self:_reader_session_is_weread() then return false end
+    session=tonumber(session) or tonumber(HOME_SESSION.reader_session_generation or 0) or 0
+    local task
+    task=function()
+        if self._chapter_navigation_task~=task then return end
+        if self._miuread_suspended==true or HOME_SESSION.suspended==true or reader_close_active()
+            or not (self.ui and self.ui.document)
+            or tonumber(HOME_SESSION.reader_session_generation or 0)~=session then
+            self._chapter_navigation_task=nil
+            return
+        end
+        if not self:_reader_background_idle()
+            or self._progress_check_running==true or self._reading_end_sync_active==true
+            or (self.interactive_network_async and self.interactive_network_async:busy()) then
+            UIManager:scheduleIn(.45,task)
+            return
+        end
+        self._chapter_navigation_task=nil
+        self:_chapter_navigation_context(true)
+        self:_schedule_reader_toolbar_state_refresh(nil,.05)
+    end
+    self._chapter_navigation_task=task
+    UIManager:scheduleIn(math.max(.2,tonumber(delay) or 1.8),task)
+    return true
+end
+
+function Plugin:_chapter_prefetch_context()
+    local ctx,reason=self:_chapter_navigation_context(false)
+    if not ctx then return nil,reason end
+    local existing=self.store:chapter_variant(ctx.book_id,ctx.next_uid,ctx.kind)
     if not (existing and existing.file and U.file_exists(existing.file)) then existing=nil end
-    return {
-        book={bookId=book_id,title=book.title,author=book.author,cover=book.cover,version=book.version,content_type=book.content_type},
-        book_id=book_id,book_record=book,record=record,kind=kind,current_uid=current_uid,
-        current_index=current_index,next_index=next_index,next_uid=next_uid,
-        next_title=tostring(next_chapter.title or ("第 "..tostring(next_index).." 章")),
-        next_chapter=next_chapter,existing=existing,path=path,
-    }
+    ctx.existing=existing
+    return ctx,nil
 end
 
 function Plugin:_chapter_prefetch_status(context)
@@ -18152,6 +18299,25 @@ function Plugin:_schedule_chapter_prefetch(session,delay)
             UIManager:scheduleIn(1.2,task)
             return
         end
+        -- Foreground work gets first refusal. In particular, precise progress
+        -- checks finish before we even inspect the next-chapter context.
+        if (self.download_task and self.download_task:busy()) or self._download_runtime
+            or #(self.store:download_queue() or {})>0
+            or (self.cache_cleanup_task and self.cache_cleanup_task:busy())
+            or (self.annotation_async and self.annotation_async:busy())
+            or (self.sync_summary_async and self.sync_summary_async:busy())
+            or (self.interactive_network_async and self.interactive_network_async:busy())
+            or (self.sync and self.sync.busy==true)
+            or self._progress_check_running==true or self._reading_end_sync_active==true then
+            attempts=attempts+1
+            if attempts<=6 then
+                UIManager:scheduleIn(10,task)
+            else
+                self._chapter_prefetch_task=nil
+                logger.info("[MiuRead][Prefetch] yielded to foreground work")
+            end
+            return
+        end
         local ctx,reason=self:_chapter_prefetch_context()
         if not ctx then
             self._chapter_prefetch_task=nil
@@ -18182,22 +18348,6 @@ function Plugin:_schedule_chapter_prefetch(session,delay)
             logger.info("[MiuRead][Prefetch] skipped while offline or logged out",key)
             return
         end
-        if (self.download_task and self.download_task:busy()) or self._download_runtime
-            or #(self.store:download_queue() or {})>0
-            or (self.cache_cleanup_task and self.cache_cleanup_task:busy())
-            or (self.annotation_async and self.annotation_async:busy())
-            or (self.sync_summary_async and self.sync_summary_async:busy())
-            or (self.interactive_network_async and self.interactive_network_async:busy())
-            or self._progress_check_running==true or self._reading_end_sync_active==true then
-            attempts=attempts+1
-            if attempts<=6 then
-                UIManager:scheduleIn(10,task)
-            else
-                self._chapter_prefetch_task=nil
-                logger.info("[MiuRead][Prefetch] yielded to foreground work",key)
-            end
-            return
-        end
         self._chapter_prefetch_task=nil
         logger.info("[MiuRead][Prefetch] starting","book=",ctx.book_id,
             "current=",ctx.current_uid,"next=",ctx.next_uid,"variant=",ctx.kind)
@@ -18215,26 +18365,155 @@ function Plugin:_schedule_chapter_prefetch(session,delay)
     return true
 end
 
-function Plugin:_open_next_single_chapter()
-    local ctx,reason=self:_chapter_prefetch_context()
-    if not ctx then
-        self:toast(reason=="last_chapter" and "已经是最后一章" or "当前暂时无法确定下一章",2)
+function Plugin:_clear_chapter_advance_wait(reason)
+    self._chapter_advance_waiting=false
+    self._chapter_advance_target_uid=nil
+    if reason then logger.dbg("[MiuRead][ChapterNav] advance wait cleared",tostring(reason)) end
+    return true
+end
+
+function Plugin:_clear_chapter_switch_state(reason)
+    self._chapter_transition_active=false
+    self._chapter_transition_target=nil
+    HOME_SESSION.chapter_switch_active=false
+    HOME_SESSION.chapter_switch_source=nil
+    HOME_SESSION.chapter_switch_target=nil
+    HOME_SESSION.chapter_switch_book_id=nil
+    HOME_SESSION.chapter_switch_uid=nil
+    if reason then logger.dbg("[MiuRead][ChapterNav] switch state cleared",tostring(reason)) end
+    return true
+end
+
+function Plugin:_switch_single_chapter_file(path,book_id,chapter_uid,reason)
+    path=normalized_reader_file(path)
+    local source=normalized_reader_file(self:_current_document_path())
+    if not path or not U.file_exists(path) then
+        self:_clear_chapter_advance_wait("target missing")
+        self:toast("下一章文件尚未准备好",2)
         return false
     end
-    if ctx.existing then
-        self:open_file(ctx.existing.file)
+    if source==path then
+        self:_clear_chapter_advance_wait("already open")
         return true
+    end
+    if not (self.ui and self.ui.document and type(self.ui.switchDocument)=="function") then
+        self:_clear_chapter_advance_wait("switchDocument unavailable")
+        return self:open_file(path)
+    end
+    if self._chapter_transition_active==true and normalized_reader_file(self._chapter_transition_target)==path then return true end
+    self:_cancel_chapter_prefetch("continuous chapter switch")
+    self:_reset_chapter_navigation_context("continuous chapter switch")
+    self:_close_miuread_transients()
+    ReaderToolbar.invalidate()
+    self:_mark_reader_busy(3)
+    local now=os.time()
+    HOME_SESSION.opening_generation=(tonumber(HOME_SESSION.opening_generation) or 0)+1
+    HOME_SESSION.opening_file=path
+    HOME_SESSION.opening_at=now
+    HOME_SESSION.opening_kind="weread"
+    HOME_SESSION.opening_book_id=tostring(book_id or HOME_SESSION.reader_session_book_id or "")
+    HOME_SESSION.chapter_switch_active=true
+    HOME_SESSION.chapter_switch_source=source
+    HOME_SESSION.chapter_switch_target=path
+    HOME_SESSION.chapter_switch_book_id=HOME_SESSION.opening_book_id
+    HOME_SESSION.chapter_switch_uid=tostring(chapter_uid or "")
+    self._chapter_transition_active=true
+    self._chapter_transition_target=path
+    self:_clear_chapter_advance_wait("switch starting")
+    logger.info("[MiuRead][ChapterNav] switching chapter","old=",tostring(source or ""),
+        "new=",path,"uid=",tostring(chapter_uid or ""),"reason=",tostring(reason or "next"))
+    local ok,result=xpcall(function() return self.ui:switchDocument(path) end,debug.traceback)
+    if not ok or result==false then
+        self:_clear_chapter_switch_state("switch failed")
+        HOME_SESSION.opening_file=nil
+        HOME_SESSION.opening_at=0
+        HOME_SESSION.opening_kind=""
+        HOME_SESSION.opening_book_id=""
+        logger.warn("[MiuRead][ChapterNav] switch failed",tostring(ok and result or result))
+        self:info("下一章无法打开，请稍后重试。")
+        return false
+    end
+    return true
+end
+
+function Plugin:_open_next_single_chapter(options)
+    options=type(options)=="table" and options or {}
+    local ctx,reason=self:_chapter_prefetch_context()
+    if not ctx then
+        if reason=="last_chapter" then
+            self:status_toast("阅读完成","全书已读完",2.5)
+            return true
+        end
+        if options.silent~=true then self:toast("当前暂时无法确定下一章",2) end
+        return false
+    end
+    if self._chapter_advance_waiting==true and tostring(self._chapter_advance_target_uid or "")==ctx.next_uid then
+        self:status_toast("下一章",ctx.next_title.."正在准备",2)
+        return true
+    end
+    if ctx.existing then
+        return self:_switch_single_chapter_file(ctx.existing.file,ctx.book_id,ctx.next_uid,options.source or "next")
     end
     local runtime=self._download_runtime
     if runtime and type(runtime.options)=="table" and runtime.options.prefetch==true
         and tostring(runtime.book and (runtime.book.bookId or runtime.book.book_id) or "")==ctx.book_id
         and tostring(runtime.options.chapter_uid or "")==ctx.next_uid then
         runtime.prefetch_open_after=true
+        runtime.prefetch_seamless_after=true
+        self._chapter_advance_waiting=true
+        self._chapter_advance_target_uid=ctx.next_uid
         self:status_toast("下一章",ctx.next_title.."正在准备，完成后自动打开",3)
         return true
     end
-    self:download(ctx.book,{annotations=ctx.kind=="notes",chapter_uid=ctx.next_uid},true,nil,false)
+    if not self:is_online() or not self:logged_in() then
+        self:_clear_chapter_advance_wait("offline")
+        self:status_toast("下一章尚未准备",ctx.next_title.." · 网络恢复后再次翻页即可重试",4)
+        return true
+    end
+    self._chapter_advance_waiting=true
+    self._chapter_advance_target_uid=ctx.next_uid
+    local started=self:download(ctx.book,{
+        annotations=ctx.kind=="notes",chapter_uid=ctx.next_uid,
+        chapter_continuous_open=true,chapter_continuous_target_uid=ctx.next_uid,
+        chapter_continuous_book_id=ctx.book_id,chapter_continuous_title=ctx.next_title,
+    },true,nil,true)
+    local accepted=started~=false
+    if not self._download_runtime then
+        accepted=false
+        for _,job in ipairs(self.store:download_queue() or {}) do
+            local opt=type(job.options)=="table" and job.options or {}
+            if tostring(job.book and (job.book.bookId or job.book.book_id) or "")==ctx.book_id
+                and tostring(opt.chapter_uid or "")==ctx.next_uid then
+                accepted=true
+                break
+            end
+        end
+    end
+    if not accepted then self:_clear_chapter_advance_wait("download rejected") end
     return true
+end
+
+function Plugin:_toggle_chapter_continuous()
+    local prefs=self.store:preferences()
+    prefs.chapter_continuous_enabled=prefs.chapter_continuous_enabled~=true
+    self.store:save_preferences(prefs)
+    self:toast(prefs.chapter_continuous_enabled and "已开启章节末尾连续阅读" or "已关闭章节末尾连续阅读")
+    return true
+end
+
+function Plugin:onEndOfBook()
+    if self.store:preferences().chapter_continuous_enabled~=true then return false end
+    if not (self.ui and self.ui.document) or not self:_reader_session_is_weread() then return false end
+    if self._chapter_transition_active==true or HOME_SESSION.chapter_switch_active==true then return true end
+    local ctx,reason=self:_chapter_prefetch_context()
+    if not ctx then
+        if reason=="last_chapter" then
+            self:status_toast("阅读完成","全书已读完",2.5)
+            return true
+        end
+        return false
+    end
+    return self:_open_next_single_chapter({source="end_of_book",seamless=true})~=false
 end
 
 function Plugin:_toggle_chapter_prefetch()
@@ -22332,6 +22611,7 @@ function Plugin:download_settings_menu()
     local items={
         {text="阅读时下载策略",post_text=policy_label,sub_item_table_func=function() return self:download_reader_policy_menu() end},
         {text="自动准备下一章",post_text="仅单章节阅读",checked_func=function() return self.store:preferences().chapter_prefetch_enabled==true end,keep_menu_open=true,callback=function() self:_toggle_chapter_prefetch() end},
+        {text="章节末尾连续阅读",post_text="最后一页继续翻进入下一章",checked_func=function() return self.store:preferences().chapter_continuous_enabled~=false end,keep_menu_open=true,callback=function() self:_toggle_chapter_continuous() end},
         {text="下载网络",post_text=self:_download_network_mode_label(),sub_item_table_func=function() return self:download_network_mode_menu() end},
         {text="下载关键进度提示",checked_func=function() return self.store:preferences().download_notice_enabled~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_notice_enabled") end},
         {text="下载完成提醒",checked_func=function() return self.store:preferences().download_complete_notice~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_complete_notice") end},
@@ -23517,8 +23797,14 @@ function Plugin:on_sync_record_ready(current)
         self.sync:start("reader_ready_time_only")
     end
     if need_cloud_check then
-        local internal_rebuild=self._reader_session_preserved==true
-        if internal_rebuild and self.sync:is_current_verified() then
+        local chapter_switch=self._reader_chapter_switch_preserved==true
+        local internal_rebuild=self._reader_session_preserved==true and not chapter_switch
+        if chapter_switch then
+            -- Moving to the next cached chapter is still the same reading
+            -- session. Never pull cloud progress here and risk jumping back to
+            -- the chapter we just left.
+            self.sync:end_progress_sync("同一本书章节切换沿用当前阅读会话")
+        elseif internal_rebuild and self.sync:is_current_verified() then
             self.sync:end_progress_sync("内部重建沿用本次阅读已确认的位置")
         elseif self:is_online() then
             -- A genuine reopen always reads the current WeRead position. Do not
@@ -23575,6 +23861,7 @@ end
 
 function Plugin:_prepare_reader_disappearance(reason)
     self:_cancel_chapter_prefetch(reason or "reader disappeared")
+    self:_reset_chapter_navigation_context(reason or "reader disappeared")
     if self.ui and self.ui.document and self:_reader_session_is_weread() then
         pcall(function() self:_capture_local_annotation_snapshot("final:"..tostring(reason or "reader_disappeared")) end)
     end
@@ -23620,13 +23907,17 @@ function Plugin:_finalize_reader_instance_close(closing_path,session_generation,
         or normalized_reader_file(HOME_READER_FILE)
     session_generation=tonumber(session_generation) or tonumber(HOME_SESSION.reader_session_generation) or 0
 
+    local continuous_switch=options.continuous_chapter_switch==true
     local detached_sync=self._reading_end_sync_active==true or self._reading_end_home_detached==true
-    if self.sync and self.sync.reading_end_finalized~=true and self.ui and self.ui.document then
+    if not continuous_switch and self.sync and self.sync.reading_end_finalized~=true and self.ui and self.ui.document then
         detached_sync=self:_reading_end_sync(options.reason or "关闭书籍",{show_status=false,timeout=8})==true or detached_sync
     end
     self:_prepare_reader_disappearance(options.reason or "document closed")
     if self.sync and self:_reader_session_is_weread() then
-        self.sync:on_close({preserve_async=detached_sync})
+        -- Same-book chapter transitions only save the old chapter locally and
+        -- stop its timer. Remote finalization continues at the normal book-close
+        -- boundary, so entering a cached chapter never waits on precise sync.
+        self.sync:on_close({preserve_async=detached_sync or continuous_switch})
     end
 
     -- A confirmed switch has a new ReaderUI already alive. Never clear shared
@@ -23847,7 +24138,12 @@ function Plugin:onReaderReady()
         return
     end
 
+    local continuous_switch=HOME_SESSION.chapter_switch_active==true
+        and ready_path and normalized_reader_file(HOME_SESSION.chapter_switch_target)==ready_path
+        and tostring(HOME_SESSION.chapter_switch_book_id or "")~= ""
+        and tostring(HOME_SESSION.chapter_switch_book_id or "")==tostring(HOME_SESSION.reader_session_book_id or "")
     local had_candidate,preserve_session=self:_reader_rebuild_ready_state()
+    if continuous_switch then preserve_session=true end
     self:_reader_session_classify_ready(ready_path,preserve_session)
     self:_cancel_reader_close_settle("reader ready")
     if READER_CLOSE.state~="idle" then
@@ -23864,10 +24160,11 @@ function Plugin:onReaderReady()
     HOME_SESSION.reader_session_active=true
     HOME_SESSION.reader_session_file=ready_path
     self._reader_session_generation=HOME_SESSION.reader_session_generation
-    -- A preserved Reader session is an internal KOReader rebuild (rotation,
-    -- reflow, etc.), not a genuine reopen. Only that narrow case may reuse a
-    -- freshly verified cloud position; every real book open must re-read WeRead.
+    -- A preserved Reader session is either an internal KOReader rebuild or a
+    -- same-book chapter handoff. Both keep the already verified cloud session;
+    -- every genuine book reopen still re-reads WeRead.
     self._reader_session_preserved=preserve_session==true
+    self._reader_chapter_switch_preserved=continuous_switch==true
     if not preserve_session then self._reading_end_home_detached=false end
     local ready_session=self._reader_session_generation
     self._home_reader_transition=false
@@ -23884,7 +24181,7 @@ function Plugin:onReaderReady()
         "rebuild=",tostring(had_candidate==true),"preserved=",tostring(preserve_session==true))
     self:_arm_reader_gesture_guard(preserve_session==true and .20
         or tonumber(Config.READER_OPEN_GESTURE_GUARD_SECONDS) or .75,
-        preserve_session==true and "reader rebuild" or "reader open")
+        continuous_switch and "chapter switch" or (preserve_session==true and "reader rebuild" or "reader open"))
     -- ReaderUI already paints its first page. Avoid a second forced full-screen
     -- refresh, which was the visible extra flash after opening a book.
     self:_finish_page_transition(1.2,"reader first page")
@@ -23902,10 +24199,24 @@ function Plugin:onReaderReady()
         end
         self:_install_reader_menu_bridge()
         self:_install_reader_quick_panel_zone()
-        HOME_SESSION.opening_file=nil
-        HOME_SESSION.opening_at=0
-        HOME_SESSION.opening_kind=""
-        HOME_SESSION.opening_book_id=""
+        if continuous_switch then
+            -- Keep the shared switch target around briefly so the old ReaderUI
+            -- can still classify a late CloseDocument as the same-book handoff.
+            local switch_target=ready_path
+            UIManager:scheduleIn(.45,function()
+                if normalized_reader_file(HOME_SESSION.chapter_switch_target)~=switch_target then return end
+                HOME_SESSION.opening_file=nil
+                HOME_SESSION.opening_at=0
+                HOME_SESSION.opening_kind=""
+                HOME_SESSION.opening_book_id=""
+                self:_clear_chapter_switch_state("target reader settled")
+            end)
+        else
+            HOME_SESSION.opening_file=nil
+            HOME_SESSION.opening_at=0
+            HOME_SESSION.opening_kind=""
+            HOME_SESSION.opening_book_id=""
+        end
         local path=self:_current_document_path()
         local book,record,variant
         if path then
@@ -23956,10 +24267,14 @@ function Plugin:onReaderReady()
     -- close or page turn; every visible panel is created fresh and destroyed.
     ReaderToolbar.invalidate()
     self:_reset_reader_toolbar_state_cache()
+    self:_reset_chapter_navigation_context("reader ready")
     self:_schedule_reader_toolbar_state_refresh(nil,.35)
     self:_schedule_reader_toolbar_prewarm(ready_session,1.1)
-    if self:_reader_session_is_weread() and not preserve_session then
-        self:_schedule_chapter_prefetch(ready_session)
+    if self:_reader_session_is_weread() then
+        -- Catalog lookup waits for reader idle and is cached once for this
+        -- chapter. Prefetch remains delayed until the normal 30 s quiet point.
+        self:_schedule_chapter_navigation_context(ready_session,1.8)
+        if not preserve_session or continuous_switch then self:_schedule_chapter_prefetch(ready_session) end
     end
     self:_teardown_thought_tap()
     self._progress_prompted_book_id=nil
@@ -25689,6 +26004,10 @@ function Plugin:onCloseDocument()
     -- Preserve a genuine switch target. It is distinct from an unexplained
     -- disappearance of the current ReaderUI.
     local switching_document=opening_path and closing_path and opening_path~=closing_path
+    local continuous_switch=switching_document and HOME_SESSION.chapter_switch_active==true
+        and normalized_reader_file(HOME_SESSION.chapter_switch_source)==closing_path
+        and normalized_reader_file(HOME_SESSION.chapter_switch_target)==opening_path
+        and tostring(HOME_SESSION.chapter_switch_book_id or "")==tostring(HOME_SESSION.reader_session_book_id or "")
     if not switching_document and (opening_path==nil or opening_path==closing_path) then
         HOME_SESSION.opening_file=nil
         HOME_SESSION.opening_at=0
@@ -25709,7 +26028,8 @@ function Plugin:onCloseDocument()
         logger.info("[MiuRead][Lifecycle] document switch observed",
             "old=",tostring(closing_path or ""),"new=",tostring(opening_path or ""))
         return self:_finalize_reader_instance_close(closing_path,session_generation,
-            {document_switch=true,reason="document switch"})
+            {document_switch=true,continuous_chapter_switch=continuous_switch,
+                reason=continuous_switch and "continuous chapter switch" or "document switch"})
     end
 
     -- No MiuRead/Home request exists. Treat this first as an internal ReaderUI
