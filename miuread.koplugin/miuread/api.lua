@@ -109,6 +109,7 @@ function Api:call(name, params, request_options)
         local auth = self.store:auth()
         if tostring(auth.api_key or "") == "" then error("API key is not configured") end
         local options = U.copy(request_options or {})
+        options.no_auth_recovery = nil
         options.auth = false
         options.headers = options.headers or {}
         options.headers.Authorization = "Bearer " .. tostring(auth.api_key)
@@ -118,7 +119,8 @@ function Api:call(name, params, request_options)
 
     local ok, data = pcall(request_once)
     local annotation_endpoint=tostring(name)=="/book/underlines" or tostring(name)=="/book/readreviews"
-    if not ok and not annotation_endpoint and Http.is_auth_error(data) and self.reader then
+    local allow_auth_recovery = not (type(request_options)=="table" and request_options.no_auth_recovery==true)
+    if not ok and not annotation_endpoint and allow_auth_recovery and Http.is_auth_error(data) and self.reader then
         local recovered, recover_error = self.reader:_recover_login_session()
         logger.warn("[MiuRead][API] authentication recovery",
             "api=", tostring(name), "ok=", tostring(recovered),
@@ -127,6 +129,22 @@ function Api:call(name, params, request_options)
     end
     if not ok then error(tostring(name) .. ": " .. tostring(data)) end
     return unwrap(data)
+end
+
+function Api:reading_stats(mode, base_time, options)
+    options=options or {}
+    mode=tostring(mode or "monthly")
+    if mode~="weekly" and mode~="monthly" and mode~="annually" and mode~="overall" then
+        error("invalid reading statistics mode: "..mode)
+    end
+    return self:call("/readdata/detail", {
+        mode=mode,
+        baseTime=tonumber(base_time) or 0,
+    }, {
+        retries=options.retries==nil and 0 or options.retries,
+        timeout=options.timeout or {6,12},
+        no_auth_recovery=options.no_auth_recovery~=false,
+    })
 end
 
 function Api:shelf(options)

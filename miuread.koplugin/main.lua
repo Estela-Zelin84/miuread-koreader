@@ -863,6 +863,9 @@ function Plugin:init()
     -- Summary scans may touch one SQLite cache per annotated book. Keep them
     -- out of every home tap and pull-down path.
     self.sync_summary_async=Async:new(self.store,{poll_interval=.45,allow_android=true,disable_fallback=true})
+    -- Reading statistics are independent from shelf, cover and sync workers.
+    -- Slow Skill responses therefore cannot delay home rendering or downloads.
+    self.reading_stats_async=Async:new(self.store,{poll_interval=.35,allow_android=true,disable_fallback=true})
     self._annotation_summary_cache=nil
     self._annotation_summary_cache_at=0
     self._home_sync_summary_task=nil
@@ -2881,6 +2884,9 @@ function Plugin:_schedule_bluetooth_startup_probe(delay)
             end
             local state=Bluetooth.adopt(result.value)
             self:_bluetooth_migrate_panel(state)
+            if HomeView.is_shown() and not self:_active_reader_ui() then
+                HomeView.update_header{bluetooth_text=self:_home_bluetooth_text()}
+            end
             logger.info("[MiuRead][Bluetooth] deferred probe complete",
                 "supported=",tostring(state.supported==true),
                 "backend=",tostring(state.backend or "none"))
@@ -2959,6 +2965,9 @@ function Plugin:_bluetooth_toggle()
     -- verifies the platform result without making the next pull-down wait.
     UIManager:scheduleIn(.45,function()
         local refreshed=Bluetooth.refresh()
+        if HomeView.is_shown() and not self:_active_reader_ui() then
+            HomeView.update_header{bluetooth_text=self:_home_bluetooth_text()}
+        end
         logger.info("[MiuRead][Bluetooth] toggle readback",
             "enabled=",tostring(refreshed.enabled==true),"backend=",tostring(refreshed.backend or ""))
     end)
@@ -3845,8 +3854,8 @@ function Plugin:_home_refresh_header_now(force_device,force_sync)
     return HomeView.update_header{
         account_name=self:_home_account_name(),
         wifi_text=self:_home_wifi_text(),
+        bluetooth_text=self:_home_bluetooth_text(),
         sync_text=self:_home_sync_status_label(force_sync==true),
-        time_text=self:_display_time("%H:%M"),
         battery_text=self:_home_battery_text(),
     }
 end
@@ -3860,9 +3869,10 @@ function Plugin:_home_schedule_clock()
     end
     if not HomeView.is_shown() or self:_active_reader_ui() then return false end
     HomeData.quick_power_state(true)
-    HomeView.update_header{
-        time_text=self:_display_time("%H:%M"),
-        battery_text=self:_home_battery_text(),
+    HomeView.update_header{battery_text=self:_home_battery_text()}
+    HomeView.update_dashboard{
+        clock_text=self:_display_time("%H:%M"),
+        date_text=self:_home_date_text(),
     }
     local task
     task=function()
@@ -3877,9 +3887,10 @@ function Plugin:_home_schedule_clock()
             -- changed, so a stable battery percentage costs no extra e-ink
             -- refresh and never reloads the shelf.
             HomeData.quick_power_state(true)
-            HomeView.update_header{
-                time_text=self:_display_time("%H:%M"),
-                battery_text=self:_home_battery_text(),
+            HomeView.update_header{battery_text=self:_home_battery_text()}
+            HomeView.update_dashboard{
+                clock_text=self:_display_time("%H:%M"),
+                date_text=self:_home_date_text(),
             }
         end
         local now=os.time()
@@ -4108,6 +4119,7 @@ function Plugin:_home_freeze_for_suspend()
         self._auto_update_check_running=false
     end
     if self.sync_summary_async then self.sync_summary_async:cancel("device suspended") end
+    if self.reading_stats_async then self.reading_stats_async:cancel("device suspended") end
     self:_home_unschedule_task("_home_sync_summary_task")
     if self.shelf_async and self._home_resume_pending_work.remote then self.shelf_async:cancel("device suspended") end
     self:_background_cancel_all("device suspended",true,false)
@@ -9305,6 +9317,7 @@ function Plugin:_home_stop_background(reason)
     if self.home_metadata_async then self.home_metadata_async:cancel(reason or "home hidden") end
     if self.home_cover_async then self.home_cover_async:cancel(reason or "home hidden") end
     if self.cover_render_async then self.cover_render_async:cancel(reason or "home hidden") end
+    if self.reading_stats_async then self.reading_stats_async:cancel(reason or "home hidden") end
     self:_background_cancel_all(reason or "home hidden",true,false)
 end
 
@@ -10416,6 +10429,122 @@ function Plugin:_home_account_name()
     local name=U.trim(tostring(account.name or ""))
     if name~="" then return name end
     return self:logged_in() and "已登录" or "未登录"
+end
+
+function Plugin:_home_short_duration(seconds)
+    return HomeData.format_duration(seconds):gsub("%s+", "")
+end
+
+function Plugin:_home_date_text()
+    local weekday={ ["0"]="周日", ["1"]="周一", ["2"]="周二", ["3"]="周三", ["4"]="周四", ["5"]="周五", ["6"]="周六" }
+    return self:_display_time("%m月%d日") .. "  " .. tostring(weekday[self:_display_time("%w")] or "")
+end
+
+function Plugin:_home_bluetooth_text()
+    local state=self:_bluetooth_state(false)
+    if state.known~=true then return "检测中" end
+    if state.supported~=true then return "--" end
+    return state.enabled==true and "已开启" or "已关闭"
+end
+
+function Plugin:_home_weread_stats_account_key()
+    local auth=self.store:auth()
+    local account=type(auth.account)=="table" and auth.account or {}
+    return tostring(account.vid or auth.login_session_id or "")
+end
+
+function Plugin:_home_weread_stats_cache()
+    local value=self.store:get("home_weread_stats_cache",{})
+    value=type(value)=="table" and value or {}
+    local account_key=self:_home_weread_stats_account_key()
+    if tostring(value.account_key or "")~=account_key then return {account_key=account_key} end
+    return value
+end
+
+function Plugin:_home_weread_stats_data(cache)
+    cache=type(cache)=="table" and cache or self:_home_weread_stats_cache()
+    local weekly=type(cache.weekly)=="table" and cache.weekly or {}
+    local monthly=type(cache.monthly)=="table" and cache.monthly or {}
+    local data=U.copy(weekly)
+    data.week_seconds=tonumber(weekly.total_seconds)
+    data.month_seconds=tonumber(monthly.total_seconds)
+    data.daily=type(weekly.daily)=="table" and U.copy(weekly.daily) or {}
+    return data
+end
+
+function Plugin:_home_weread_stats_text(cache)
+    local data=self:_home_weread_stats_data(cache)
+    if data.week_seconds==nil and data.today_seconds==nil then
+        return self:logged_in() and "正在获取阅读数据…" or "登录后显示阅读数据"
+    end
+    return "今日 "..self:_home_short_duration(data.today_seconds or 0).."\n本周 "..self:_home_short_duration(data.week_seconds or 0)
+end
+
+function Plugin:_home_local_stats_text(data)
+    data=type(data)=="table" and data or nil
+    if not data then return "暂无本地阅读数据" end
+    return "今日 "..self:_home_short_duration(data.today_seconds or 0).."\n本周 "..self:_home_short_duration(data.week_seconds or 0)
+end
+
+function Plugin:_show_home_weread_stats()
+    local cache=self:_home_weread_stats_cache()
+    self:_schedule_home_weread_stats_refresh(false)
+    return require("miuread.reading_stats_dialog").show("weread",self:_home_weread_stats_data(cache))
+end
+
+function Plugin:_show_home_local_stats()
+    local data=HomeData.reading_stats(true) or {}
+    if HomeView.is_shown() then
+        HomeView.update_dashboard{local_stats_text=self:_home_local_stats_text(data)}
+    end
+    return require("miuread.reading_stats_dialog").show("local",data)
+end
+
+function Plugin:_schedule_home_weread_stats_refresh(force)
+    if not self:logged_in() or not self.reading_stats_async or not self.reading_stats_async:available() then return false end
+    if self.reading_stats_async:busy() then return false end
+    local cache=self:_home_weread_stats_cache()
+    local now=os.time()
+    local weekly=type(cache.weekly)=="table" and cache.weekly or nil
+    local monthly=type(cache.monthly)=="table" and cache.monthly or nil
+    local weekly_at=tonumber(weekly and weekly.fetched_at) or 0
+    local monthly_at=tonumber(monthly and monthly.fetched_at) or 0
+    local need_weekly=force==true or now-weekly_at>=10*60
+    local need_monthly=force==true or now-monthly_at>=60*60
+    if not need_weekly and not need_monthly then return false end
+    local state=HomeData.cached_device_state()
+    if type(state)=="table" and state.online==false then return false end
+
+    local started,err=self.reading_stats_async:run("home-reading-stats",function()
+        local out={fetched_at=os.time()}
+        if need_weekly then
+            out.weekly=HomeData.weread_summary(self.api:reading_stats("weekly",0,{no_auth_recovery=true}),os.time())
+        end
+        if need_monthly then
+            out.monthly=HomeData.weread_summary(self.api:reading_stats("monthly",0,{no_auth_recovery=true}),os.time())
+        end
+        return out
+    end,function(result)
+        if not result or result.ok~=true or type(result.value)~="table" then
+            logger.warn("[MiuRead][HomeStats] WeRead refresh failed",tostring(result and result.error or "no result"))
+            return
+        end
+        local current=self:_home_weread_stats_cache()
+        current.account_key=self:_home_weread_stats_account_key()
+        if type(result.value.weekly)=="table" then current.weekly=result.value.weekly end
+        if type(result.value.monthly)=="table" then current.monthly=result.value.monthly end
+        current.updated_at=os.time()
+        self.store:set("home_weread_stats_cache",current)
+        if HomeView.is_shown() and not self:_active_reader_ui()
+            and HOME_SESSION.suspended~=true and self._miuread_suspended~=true then
+            HomeView.update_dashboard{weread_stats_text=self:_home_weread_stats_text(current)}
+        end
+        logger.info("[MiuRead][HomeStats] WeRead refreshed",
+            "weekly=",tostring(type(result.value.weekly)=="table"),
+            "monthly=",tostring(type(result.value.monthly)=="table"))
+    end,20)
+    if not started then logger.warn("[MiuRead][HomeStats] worker not started",tostring(err)) end
+    return started==true
 end
 
 function Plugin:_cancel_native_menu_guard()
@@ -15252,6 +15381,7 @@ function Plugin:_home_prepare_hero_book(book)
         hero.edition_text="纯净版"
     end
     hero.on_tap=function(anchor,ges) self:_home_open_book(hero,anchor,ges,true) end
+    hero.on_history=function() self:show_home_reading_history() end
     hero.on_refresh_metadata=function() self:_home_refresh_current_network_metadata(hero) end
     return hero
 end
@@ -15456,6 +15586,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
 
     local screensaver_file,screensaver_sources=self:_home_update_lockscreen_session(hero)
     local home_alerts=self:_home_alerts()
+    local local_reading_stats=HomeData.reading_stats(false)
+    local weread_reading_cache=self:_home_weread_stats_cache()
     self._home_panel_sync_label=self:progress_sync_label()
     self._home_panel_download_detail=""
     self._home_panel_status_text=(home_alerts[1] and tostring(home_alerts[1].title or "")) or ""
@@ -15464,10 +15596,14 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local view,err=HomeView.show({
         title="觅阅",
         wifi_text=self:_home_wifi_text(),
+        bluetooth_text=self:_home_bluetooth_text(),
         sync_text=self:_home_sync_status_label(),
-        time_text=self:_display_time("%H:%M"),
         battery_text=self:_home_battery_text(),
         account_name=self:_home_account_name(),
+        clock_text=self:_display_time("%H:%M"),
+        date_text=self:_home_date_text(),
+        weread_stats_text=self:_home_weread_stats_text(weread_reading_cache),
+        local_stats_text=self:_home_local_stats_text(local_reading_stats),
         layout_style=home.layout_style,
         display_size=home.display_size,
         hero=hero,
@@ -15488,6 +15624,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         on_quick_panel=function() self:show_home_quick_panel() end,
         on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
         on_account=function() self:_home_leave_and_run("account status",function() self:show_account_status() end) end,
+        on_weread_stats=function() self:_show_home_weread_stats() end,
+        on_local_stats=function() self:_show_home_local_stats() end,
         on_menu=function() self:show_home_menu() end,
         on_back=function() return self:_home_handle_back() end,
         on_empty_account=function() self:_home_open_section(active) end,
@@ -15526,6 +15664,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     self:_set_foreground("home")
     self._home_refresh_pending=false
     self:_home_schedule_clock()
+    self:_schedule_home_weread_stats_refresh(false)
     if active=="local" then
         UIManager:scheduleIn(.05,function()
             if HomeView.is_shown() and self._home_active_section=="local" then self:_home_ensure_local_inline_loaded() end

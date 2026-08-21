@@ -46,20 +46,63 @@ function HomeData.reading_stats(force)
                 hour = 0, min = 0, sec = 0,
             }
             local week_start = day_start - ((date.wday + 5) % 7) * 86400
-            local statement = conn:prepare([[
-                SELECT COALESCE(SUM(duration), 0),
-                       COUNT(DISTINCT (id_book || ':' || page))
+            local month_start = os.time{
+                year = date.year, month = date.month, day = 1,
+                hour = 0, min = 0, sec = 0,
+            }
+
+            local total_statement = conn:prepare([[
+                SELECT COALESCE(SUM(duration), 0)
                   FROM page_stat_data
                  WHERE start_time >= ?
             ]])
-            local today = statement:bind(day_start):step()
-            statement:clearbind():reset()
-            local week = statement:bind(week_start):step()
-            statement:close()
+            local function total_since(stamp)
+                local row = total_statement:bind(stamp):step()
+                local seconds = tonumber(row and row[1]) or 0
+                total_statement:clearbind():reset()
+                return seconds
+            end
+            local today_seconds = total_since(day_start)
+            local week_seconds = total_since(week_start)
+            local month_seconds = total_since(month_start)
+            total_statement:close()
+
+            local pages_statement = conn:prepare([[
+                SELECT COUNT(DISTINCT (id_book || ':' || page))
+                  FROM page_stat_data
+                 WHERE start_time >= ?
+            ]])
+            local pages_row = pages_statement:bind(day_start):step()
+            local today_pages = tonumber(pages_row and pages_row[1]) or 0
+            pages_statement:close()
+
+            local daily = {}
+            local daily_statement = conn:prepare([[
+                SELECT COALESCE(SUM(duration), 0)
+                  FROM page_stat_data
+                 WHERE start_time >= ? AND start_time < ?
+            ]])
+            for index = 0, 6 do
+                local stamp = week_start + index * 86400
+                if stamp > day_start then break end
+                local row = daily_statement:bind(stamp, stamp + 86400):step()
+                daily_statement:clearbind():reset()
+                daily[#daily + 1] = {
+                    stamp = stamp,
+                    date = os.date("%m-%d", stamp),
+                    weekday = os.date("%w", stamp),
+                    seconds = tonumber(row and row[1]) or 0,
+                }
+            end
+            daily_statement:close()
+
             result = {
-                today_seconds = tonumber(today and today[1]) or 0,
-                today_pages = tonumber(today and today[2]) or 0,
-                week_seconds = tonumber(week and week[1]) or 0,
+                today_seconds = today_seconds,
+                today_pages = today_pages,
+                week_seconds = week_seconds,
+                month_seconds = month_seconds,
+                daily = daily,
+                updated_at = now,
             }
         end)
         conn:close()
@@ -73,6 +116,53 @@ function HomeData.reading_stats(force)
     end
     stats_cache = {at = now, value = value}
     return value
+end
+
+local function normalized_timestamp(value)
+    local stamp = tonumber(value)
+    if not stamp then return nil end
+    if stamp > 100000000000 then stamp = math.floor(stamp / 1000) end
+    return stamp
+end
+
+local function weread_bucket_seconds(read_times, target_date)
+    if type(read_times) ~= "table" then return 0 end
+    for key, value in pairs(read_times) do
+        local stamp = normalized_timestamp(key)
+        if stamp and os.date("%Y-%m-%d", stamp) == target_date then
+            return math.max(0, tonumber(value) or 0)
+        end
+    end
+    return 0
+end
+
+function HomeData.weread_summary(data, now)
+    data = type(data) == "table" and data or {}
+    now = tonumber(now) or os.time()
+    local read_times = type(data.readTimes) == "table" and data.readTimes or {}
+    local buckets = {}
+    for key, value in pairs(read_times) do
+        local stamp = normalized_timestamp(key)
+        if stamp then
+            buckets[#buckets + 1] = {
+                stamp = stamp,
+                date = os.date("%m-%d", stamp),
+                weekday = os.date("%w", stamp),
+                seconds = math.max(0, tonumber(value) or 0),
+            }
+        end
+    end
+    table.sort(buckets, function(a, b) return (a.stamp or 0) < (b.stamp or 0) end)
+    return {
+        today_seconds = weread_bucket_seconds(read_times, os.date("%Y-%m-%d", now)),
+        total_seconds = math.max(0, tonumber(data.totalReadTime) or 0),
+        read_days = math.max(0, tonumber(data.readDays) or 0),
+        day_average_seconds = math.max(0, tonumber(data.dayAverageReadTime) or 0),
+        compare = tonumber(data.compare),
+        daily = buckets,
+        base_time = normalized_timestamp(data.baseTime) or 0,
+        fetched_at = now,
+    }
 end
 
 function HomeData.invalidate_device_state()
