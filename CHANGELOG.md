@@ -8,6 +8,11 @@
 - 为顶部专用触摸区和 ReaderMenu bridge 增加 ReaderUI generation/owner 校验；关闭开关、Reader 结束或旧回调失效后，残留 callback 只能返回给 KOReader，不能再次拉起觅阅工具栏。
 - `show_reader_quick_panel()` 与实际显示函数增加最终权限门，即使来自旧手势、Gesture Manager action 或延迟回调，也必须通过当前运行模式对应的工具栏开关才能创建界面。ReaderReady、旋转提交和休眠唤醒统一重新同步当前模式的 hook 状态。
 - 不修改 beta.29 前光/色温控制器，也不修改登录认证、下载任务、Kindle/Kobo 休眠唤醒、阅读时间、精确进度和主页布局；未新增持久化字段，`SCHEMA` 保持 119。
+- docs: 补充 beta.30 修复记录
+
+补充 4.9.0-beta.30 已修复 KOReader 顶部状态栏触摸异常。
+
+Fixes #43
 
 ## 4.9.0-beta.29 - 2026-08-22
 
