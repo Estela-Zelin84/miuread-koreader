@@ -1,12 +1,12 @@
-4.9.0-beta.24
+4.9.0-beta.26
 
 Changed files:
 - miuread.koplugin/main.lua
 - miuread.koplugin/miuread/home_view.lua
-- miuread.koplugin/miuread/reading_stats_dialog.lua
+- miuread.koplugin/miuread/store.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: finish the beta.22/beta.23 Home UI work on the real runtime paths, make current-book refresh non-blocking, tie the hero cover to the actual shelf cover geometry, and improve e-ink small-text/reading-check visibility without changing reader lifecycle, download, sync or precise-progress behavior.
+Focus: make the Home reading-stat cards independently visible, skip hidden Home-stat refresh work, expand the remaining card or clock automatically, align the recent-reading/dashboard outer borders, and restore the optional sync-success notice setting without changing sync, download, suspend/resume or precise-progress core logic.

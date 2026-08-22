@@ -300,8 +300,12 @@ local function notice_strip(item, width, height)
     }, row), item.on_tap)
 end
 
+local function home_card_outer_inset()
+    return math.max(1, UiScale.dp(2, 2, 3))
+end
+
 local function hero_card(book, width, height, callback, compact, hold_callback, shelf_cover_w, shelf_cover_h)
-    local frame_inset = math.max(1, UiScale.dp(2, 2, 3))
+    local frame_inset = home_card_outer_inset()
     local frame_w = math.max(1, width - frame_inset * 2)
     local frame_h = math.max(1, height - frame_inset * 2)
     local mini = width < Screen:getWidth() * .62
@@ -1190,7 +1194,7 @@ local function dashboard_week_cells(stats, width, height)
     return VerticalGroup:new{align = "left", marks, labels}
 end
 
-local function dashboard_stats_card(title, stats, width, height, callback)
+local function dashboard_stats_card(title, stats, width, height, callback, expanded)
     stats = type(stats) == "table" and stats or {}
     local pad = math.max(UiScale.dp(5, 4, 8), math.floor(math.min(width, height) * .025))
     local inner_w = math.max(1, width - pad * 2)
@@ -1209,9 +1213,16 @@ local function dashboard_stats_card(title, stats, width, height, callback)
         if tostring(stats.kind or "") == "local" then
             secondary = "今日 " .. dashboard_short_duration(stats.today_seconds or 0)
             if tonumber(stats.today_pages) then secondary = secondary .. " · " .. tostring(math.floor(stats.today_pages + .5)) .. "页" end
+            if expanded==true then
+                if tonumber(stats.average_seconds) then secondary = secondary .. " · 日均 " .. dashboard_short_duration(stats.average_seconds) end
+                if tonumber(stats.read_days) then secondary = secondary .. " · 本周 " .. tostring(math.floor(stats.read_days + .5)) .. "天" end
+            end
         else
             secondary = "今日 " .. dashboard_short_duration(stats.today_seconds or 0)
             if tonumber(stats.average_seconds) then secondary = secondary .. " · 日均 " .. dashboard_short_duration(stats.average_seconds) end
+            if expanded==true and tonumber(stats.read_days) then
+                secondary = secondary .. " · 本周 " .. tostring(math.floor(stats.read_days + .5)) .. "天"
+            end
         end
     end
 
@@ -1294,31 +1305,53 @@ function HomeWidget:_build_sections(children, m, compact, mode)
                 self:_add(children, x, y, welcome_card(hero_w, available_h, self.opts.on_empty_account))
             end
             local dash_gap = math.max(UiScale.dp(3, 3, 6), math.floor(gap * .72))
-            local clock_h = math.max(UiScale.dp(66, 58, 90), math.floor((available_h - dash_gap * 2) * .32))
-            local stats_h = math.max(1, math.floor((available_h - clock_h - dash_gap * 2) / 2))
-            local final_stats_h = math.max(1, available_h - clock_h - dash_gap * 2 - stats_h)
+            local outer_inset=home_card_outer_inset()
+            local dashboard_y=y+outer_inset
+            local dashboard_h=math.max(1,available_h-outer_inset*2)
+            local show_weread=self.opts.show_weread_stats~=false
+            local show_local=self.opts.show_local_stats~=false
+            local stats_count=(show_weread and 1 or 0)+(show_local and 1 or 0)
+            local clock_h
+            if stats_count==0 then
+                clock_h=dashboard_h
+            else
+                clock_h=math.max(UiScale.dp(66, 58, 90), math.floor((dashboard_h - dash_gap * 2) * .32))
+            end
             local clock_card, clock_refs = dashboard_clock_card(dashboard_w, clock_h,
                 self.opts.clock_text, self.opts.date_text)
-            local weread_card = dashboard_stats_card("微信读书", self.opts.weread_stats,
-                dashboard_w, stats_h, self.opts.on_weread_stats)
-            local local_card = dashboard_stats_card("本地阅读", self.opts.local_stats,
-                dashboard_w, final_stats_h, self.opts.on_local_stats)
-            self:_add(children, dashboard_x, y, clock_card)
-            self:_add(children, dashboard_x, y + clock_h + dash_gap, weread_card)
-            local weread_index=#children
-            self:_add(children, dashboard_x, y + clock_h + dash_gap + stats_h + dash_gap, local_card)
-            local local_index=#children
+            self:_add(children, dashboard_x, dashboard_y, clock_card)
             self._dashboard_text_refs={clock=clock_refs.time, date=clock_refs.date}
-            self._dashboard_card_slots={
-                weread={parent=children,index=weread_index,x=dashboard_x,y=y+clock_h+dash_gap,w=dashboard_w,h=stats_h,title="微信读书",callback=self.opts.on_weread_stats},
-                local_stats={parent=children,index=local_index,x=dashboard_x,y=y+clock_h+dash_gap+stats_h+dash_gap,w=dashboard_w,h=final_stats_h,title="本地阅读",callback=self.opts.on_local_stats},
-            }
+            self._dashboard_card_slots={}
             self._dashboard_field_dimens={
-                clock=Geom:new{x=dashboard_x,y=y,w=dashboard_w,h=clock_h},
-                date=Geom:new{x=dashboard_x,y=y,w=dashboard_w,h=clock_h},
-                weread=Geom:new{x=dashboard_x,y=y+clock_h+dash_gap,w=dashboard_w,h=stats_h},
-                local_stats=Geom:new{x=dashboard_x,y=y+clock_h+dash_gap+stats_h+dash_gap,w=dashboard_w,h=final_stats_h},
+                clock=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
+                date=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
             }
+            if stats_count>0 then
+                local stats_y=dashboard_y+clock_h+dash_gap
+                local stats_total_h=math.max(1,dashboard_h-clock_h-dash_gap)
+                if stats_count==1 then
+                    local title=show_weread and "微信读书" or "本地阅读"
+                    local data=show_weread and self.opts.weread_stats or self.opts.local_stats
+                    local callback=show_weread and self.opts.on_weread_stats or self.opts.on_local_stats
+                    local card=dashboard_stats_card(title,data,dashboard_w,stats_total_h,callback,true)
+                    self:_add(children,dashboard_x,stats_y,card)
+                    local slot_key=show_weread and "weread" or "local_stats"
+                    self._dashboard_card_slots[slot_key]={parent=children,index=#children,x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_total_h,title=title,callback=callback,expanded=true}
+                    self._dashboard_field_dimens[slot_key]=Geom:new{x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_total_h}
+                else
+                    local stats_h=math.max(1,math.floor((stats_total_h-dash_gap)/2))
+                    local final_stats_h=math.max(1,stats_total_h-dash_gap-stats_h)
+                    local weread_card=dashboard_stats_card("微信读书",self.opts.weread_stats,dashboard_w,stats_h,self.opts.on_weread_stats)
+                    self:_add(children,dashboard_x,stats_y,weread_card)
+                    self._dashboard_card_slots.weread={parent=children,index=#children,x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_h,title="微信读书",callback=self.opts.on_weread_stats}
+                    self._dashboard_field_dimens.weread=Geom:new{x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_h}
+                    local local_y=stats_y+stats_h+dash_gap
+                    local local_card=dashboard_stats_card("本地阅读",self.opts.local_stats,dashboard_w,final_stats_h,self.opts.on_local_stats)
+                    self:_add(children,dashboard_x,local_y,local_card)
+                    self._dashboard_card_slots.local_stats={parent=children,index=#children,x=dashboard_x,y=local_y,w=dashboard_w,h=final_stats_h,title="本地阅读",callback=self.opts.on_local_stats}
+                    self._dashboard_field_dimens.local_stats=Geom:new{x=dashboard_x,y=local_y,w=dashboard_w,h=final_stats_h}
+                end
+            end
         end
         self.section_dimen = Geom:new{x = shelf_x, y = y, w = shelf_w, h = available_h}
         if build_section then
@@ -1364,37 +1397,52 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             end
 
             local dash_gap = math.max(UiScale.dp(3, 3, 6), math.floor(gap * .72))
-            -- beta.21 portrait dashboard: time on top, WeRead and local
-            -- statistics side by side below it.
-            local clock_h = math.max(UiScale.dp(68, 60, 92), math.floor((hero_h - dash_gap) * .29))
-            local stats_y = y + clock_h + dash_gap
-            local stats_h = math.max(1, hero_h - clock_h - dash_gap)
-            local pair_gap = dash_gap
-            local weread_w = math.max(1, math.floor((dashboard_w - pair_gap) / 2))
-            local local_w = math.max(1, dashboard_w - pair_gap - weread_w)
-            local local_x = dashboard_x + weread_w + pair_gap
+            -- beta.26: the visible dashboard uses the same top/bottom inset as
+            -- the recent-reading frame, so both outer borders align exactly.
+            local outer_inset=home_card_outer_inset()
+            local dashboard_y=y+outer_inset
+            local dashboard_h=math.max(1,hero_h-outer_inset*2)
+            local show_weread=self.opts.show_weread_stats~=false
+            local show_local=self.opts.show_local_stats~=false
+            local stats_count=(show_weread and 1 or 0)+(show_local and 1 or 0)
+            local clock_h=stats_count==0 and dashboard_h
+                or math.max(UiScale.dp(68, 60, 92), math.floor((dashboard_h - dash_gap) * .29))
             local clock_card, clock_refs = dashboard_clock_card(dashboard_w, clock_h,
                 self.opts.clock_text, self.opts.date_text)
-            local weread_card = dashboard_stats_card("微信读书", self.opts.weread_stats,
-                weread_w, stats_h, self.opts.on_weread_stats)
-            local local_card = dashboard_stats_card("本地阅读", self.opts.local_stats,
-                local_w, stats_h, self.opts.on_local_stats)
-            self:_add(children, dashboard_x, y, clock_card)
-            self:_add(children, dashboard_x, stats_y, weread_card)
-            local weread_index=#children
-            self:_add(children, local_x, stats_y, local_card)
-            local local_index=#children
+            self:_add(children, dashboard_x, dashboard_y, clock_card)
             self._dashboard_text_refs={clock=clock_refs.time, date=clock_refs.date}
-            self._dashboard_card_slots={
-                weread={parent=children,index=weread_index,x=dashboard_x,y=stats_y,w=weread_w,h=stats_h,title="微信读书",callback=self.opts.on_weread_stats},
-                local_stats={parent=children,index=local_index,x=local_x,y=stats_y,w=local_w,h=stats_h,title="本地阅读",callback=self.opts.on_local_stats},
-            }
+            self._dashboard_card_slots={}
             self._dashboard_field_dimens={
-                clock=Geom:new{x=dashboard_x,y=y,w=dashboard_w,h=clock_h},
-                date=Geom:new{x=dashboard_x,y=y,w=dashboard_w,h=clock_h},
-                weread=Geom:new{x=dashboard_x,y=stats_y,w=weread_w,h=stats_h},
-                local_stats=Geom:new{x=local_x,y=stats_y,w=local_w,h=stats_h},
+                clock=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
+                date=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
             }
+            if stats_count>0 then
+                local stats_y=dashboard_y+clock_h+dash_gap
+                local stats_h=math.max(1,dashboard_h-clock_h-dash_gap)
+                if stats_count==1 then
+                    local title=show_weread and "微信读书" or "本地阅读"
+                    local data=show_weread and self.opts.weread_stats or self.opts.local_stats
+                    local callback=show_weread and self.opts.on_weread_stats or self.opts.on_local_stats
+                    local card=dashboard_stats_card(title,data,dashboard_w,stats_h,callback,true)
+                    self:_add(children,dashboard_x,stats_y,card)
+                    local slot_key=show_weread and "weread" or "local_stats"
+                    self._dashboard_card_slots[slot_key]={parent=children,index=#children,x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_h,title=title,callback=callback,expanded=true}
+                    self._dashboard_field_dimens[slot_key]=Geom:new{x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_h}
+                else
+                    local pair_gap=dash_gap
+                    local weread_w=math.max(1,math.floor((dashboard_w-pair_gap)/2))
+                    local local_w=math.max(1,dashboard_w-pair_gap-weread_w)
+                    local local_x=dashboard_x+weread_w+pair_gap
+                    local weread_card=dashboard_stats_card("微信读书",self.opts.weread_stats,weread_w,stats_h,self.opts.on_weread_stats)
+                    self:_add(children,dashboard_x,stats_y,weread_card)
+                    self._dashboard_card_slots.weread={parent=children,index=#children,x=dashboard_x,y=stats_y,w=weread_w,h=stats_h,title="微信读书",callback=self.opts.on_weread_stats}
+                    self._dashboard_field_dimens.weread=Geom:new{x=dashboard_x,y=stats_y,w=weread_w,h=stats_h}
+                    local local_card=dashboard_stats_card("本地阅读",self.opts.local_stats,local_w,stats_h,self.opts.on_local_stats)
+                    self:_add(children,local_x,stats_y,local_card)
+                    self._dashboard_card_slots.local_stats={parent=children,index=#children,x=local_x,y=stats_y,w=local_w,h=stats_h,title="本地阅读",callback=self.opts.on_local_stats}
+                    self._dashboard_field_dimens.local_stats=Geom:new{x=local_x,y=stats_y,w=local_w,h=stats_h}
+                end
+            end
         end
         y = y + hero_h + gap
     end
@@ -1637,14 +1685,16 @@ function HomeWidget:updateDashboard(fields)
             changed=true
             local slot=slots[slot_key]
             if slot and slot.parent and slot.index and slot.w and slot.h then
-                local card=dashboard_stats_card(slot.title,fields[key],slot.w,slot.h,slot.callback)
+                local card=dashboard_stats_card(slot.title,fields[key],slot.w,slot.h,slot.callback,slot.expanded==true)
                 local old=slot.parent[slot.index]
                 slot.parent[slot.index]=OffsetContainer:new{x_off=slot.x,y_off=slot.y,card}
                 if old and old~=slot.parent[slot.index] and old.free then pcall(old.free,old) end
                 local region=dimens[slot_key]
                 if region then changed_region=changed_region and changed_region:combine(region) or region:copy() end
             else
-                fallback=true
+                local visible=(slot_key=="weread" and self.opts.show_weread_stats~=false)
+                    or (slot_key=="local_stats" and self.opts.show_local_stats~=false)
+                if visible then fallback=true end
             end
         end
     end

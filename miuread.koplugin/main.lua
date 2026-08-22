@@ -3119,6 +3119,12 @@ function Plugin:_home_preferences()
         home.layout_version=23
         changed=true
     end
+    if old_layout_version<24 then
+        home.layout_version=24
+        if home.show_weread_stats==nil then home.show_weread_stats=true end
+        if home.show_local_stats==nil then home.show_local_stats=true end
+        changed=true
+    end
     if (tonumber(home.performance_defaults_version) or 0)<1 then
         -- Historical performance defaults are no longer allowed to change a
         -- feature switch during ordinary startup. The current local-library
@@ -3595,7 +3601,7 @@ function Plugin:_set_home_mode(use_miuread_home)
         return false
     end
     home.enabled=enabled
-    home.layout_version=23
+    home.layout_version=24
     local saved,save_error=self:_save_home_preferences(home,preferences)
     if saved~=true then
         logger.warn("[MiuRead][Mode] mode preference save failed",U.first_line(save_error or "unknown",180))
@@ -4715,7 +4721,7 @@ function Plugin:_set_home_layout(style)
     style=style=="compact" and "compact" or "desk"
     local home,preferences=self:_home_preferences()
     home.layout_style=style
-    home.layout_version=23
+    home.layout_version=24
     self:_save_home_preferences(home,preferences)
     self:_refresh_home_view(style=="compact" and "已切换到紧凑布局" or "已切换到标准布局","full")
 end
@@ -10650,6 +10656,58 @@ function Plugin:_home_bluetooth_text()
     return state.enabled==true and "已开启" or "已关闭"
 end
 
+function Plugin:_home_stats_visibility(home)
+    home=type(home)=="table" and home or self:_home_preferences()
+    return home.show_weread_stats~=false,home.show_local_stats~=false
+end
+
+function Plugin:_home_stats_visibility_label(home)
+    local show_weread,show_local=self:_home_stats_visibility(home)
+    if show_weread and show_local then return "微信读书 + 本地阅读" end
+    if show_weread then return "仅微信读书" end
+    if show_local then return "仅本地阅读" end
+    return "已隐藏"
+end
+
+function Plugin:_set_home_stats_visibility(kind,enabled)
+    if kind~="weread" and kind~="local" then return false end
+    local home,preferences=self:_home_preferences()
+    local key=kind=="weread" and "show_weread_stats" or "show_local_stats"
+    enabled=enabled==true
+    if home[key]==enabled then return false end
+    home[key]=enabled
+    home.layout_version=24
+    self:_home_unschedule_task("_home_stats_refresh_task")
+    self:_home_unschedule_task("_home_stats_apply_task")
+    local saved,err=self:_save_home_preferences(home,preferences)
+    if saved~=true then
+        logger.warn("[MiuRead][HomeStats] visibility save failed",tostring(err or "unknown"))
+        self:info("主页阅读统计设置没有保存成功，请稍后重试。")
+        return false
+    end
+    local label=kind=="weread" and "微信读书统计" or "本地阅读统计"
+    self:_refresh_home_view(label..(enabled and "已显示" or "已隐藏"),"content")
+    return true
+end
+
+function Plugin:home_stats_settings_menu()
+    return {
+        {text="显示微信读书统计",post_text="隐藏后主页不再刷新微信读书统计",checked_func=function()
+            return self:_home_preferences().show_weread_stats~=false
+        end,keep_menu_open=true,callback=function()
+            local home=self:_home_preferences()
+            self:_set_home_stats_visibility("weread",home.show_weread_stats==false)
+        end},
+        {text="显示本地阅读统计",post_text="隐藏后主页不再读取本地阅读统计",checked_func=function()
+            return self:_home_preferences().show_local_stats~=false
+        end,keep_menu_open=true,callback=function()
+            local home=self:_home_preferences()
+            self:_set_home_stats_visibility("local",home.show_local_stats==false)
+        end},
+        {text="布局规则",post_text="只显示一个时自动扩展；全部隐藏时放大时间卡",enabled=false},
+    }
+end
+
 function Plugin:_home_weread_stats_account_key()
     local auth=self.store:auth()
     local account=type(auth.account)=="table" and auth.account or {}
@@ -10691,6 +10749,7 @@ function Plugin:_home_weread_stats_card(cache)
         total_seconds=tonumber(data.week_seconds) or 0,
         today_seconds=tonumber(data.today_seconds) or 0,
         average_seconds=tonumber(data.day_average_seconds) or 0,
+        read_days=tonumber(data.read_days) or 0,
         daily=HomeData.week_rows(data.daily,os.time()),threshold=1,
     }
 end
@@ -10705,6 +10764,8 @@ function Plugin:_home_local_stats_card(data)
         total_seconds=tonumber(data.week_seconds) or 0,
         today_seconds=tonumber(data.today_seconds) or 0,
         today_pages=tonumber(data.today_pages) or 0,
+        average_seconds=tonumber(data.day_average_seconds) or 0,
+        read_days=tonumber(data.read_days) or 0,
         daily=HomeData.week_rows(data.daily,os.time()),threshold=1,
     }
 end
@@ -10729,14 +10790,19 @@ function Plugin:_schedule_home_stats_idle_refresh(delay)
             return
         end
 
+        local show_weread,show_local=self:_home_stats_visibility()
+        if not show_weread and not show_local then
+            self._home_stats_refresh_task=nil
+            return
+        end
         local cache=self:_home_weread_stats_cache()
         local now=os.time()
-        local online=self:logged_in() and self:_network_radio_hint()~=false
+        local online=show_weread and self:logged_in() and self:_network_radio_hint()~=false
         local weekly=type(cache.weekly)=="table" and cache.weekly or nil
         local monthly=type(cache.monthly)=="table" and cache.monthly or nil
-        local need_weekly=online and self:logged_in() and now-(tonumber(weekly and weekly.fetched_at) or 0)>=10*60
-        local need_monthly=online and self:logged_in() and now-(tonumber(monthly and monthly.fetched_at) or 0)>=60*60
-        local need_local=now-(tonumber(self._home_local_stats_cache_at) or 0)>=120
+        local need_weekly=show_weread and online and self:logged_in() and now-(tonumber(weekly and weekly.fetched_at) or 0)>=10*60
+        local need_monthly=show_weread and online and self:logged_in() and now-(tonumber(monthly and monthly.fetched_at) or 0)>=60*60
+        local need_local=show_local and now-(tonumber(self._home_local_stats_cache_at) or 0)>=120
         if not need_local and not need_weekly and not need_monthly then
             self._home_stats_refresh_task=nil
             return
@@ -10791,10 +10857,11 @@ function Plugin:_schedule_home_stats_idle_refresh(delay)
                 end
                 self._home_stats_apply_task=nil
                 local update={}
+                local show_weread_now,show_local_now=self:_home_stats_visibility()
                 if need_local then
                     self._home_local_stats_cache=type(value.local_stats)=="table" and value.local_stats or nil
                     self._home_local_stats_cache_at=os.time()
-                    update.local_stats=self:_home_local_stats_card(self._home_local_stats_cache)
+                    if show_local_now then update.local_stats=self:_home_local_stats_card(self._home_local_stats_cache) end
                 end
                 if type(value.weekly)=="table" or type(value.monthly)=="table" then
                     local current=self:_home_weread_stats_cache()
@@ -10806,7 +10873,7 @@ function Plugin:_schedule_home_stats_idle_refresh(delay)
                     -- Keep automatic refresh persistence off the UI thread's
                     -- critical path. A later normal settings flush persists it.
                     self.store:set_deferred("home_weread_stats_cache",current)
-                    update.weread_stats=self:_home_weread_stats_card(current)
+                    if show_weread_now then update.weread_stats=self:_home_weread_stats_card(current) end
                 end
                 if next(update)~=nil then HomeView.update_dashboard(update) end
                 logger.info("[MiuRead][HomeStats] idle refresh applied",
@@ -16175,6 +16242,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         date_text=self:_home_date_text(),
         weread_stats=self:_home_weread_stats_card(weread_reading_cache),
         local_stats=self:_home_local_stats_card(local_reading_stats),
+        show_weread_stats=home.show_weread_stats~=false,
+        show_local_stats=home.show_local_stats~=false,
         layout_style=home.layout_style,
         display_size=home.display_size,
         hero=hero,
@@ -16237,7 +16306,13 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     self._home_background_stopped_for_reader=false
     self._home_refresh_pending=false
     self:_home_schedule_clock()
-    self:_schedule_home_stats_idle_refresh(4.5)
+    local show_weread_stats,show_local_stats=self:_home_stats_visibility(home)
+    if show_weread_stats or show_local_stats then
+        self:_schedule_home_stats_idle_refresh(4.5)
+    else
+        self:_home_unschedule_task("_home_stats_refresh_task")
+        self:_home_unschedule_task("_home_stats_apply_task")
+    end
     self:_resume_home_preferences_flush(4.8)
     if active=="local" then
         UIManager:scheduleIn(.05,function()
@@ -20796,6 +20871,7 @@ function Plugin:sync_settings_menu()
         {text="结束阅读时上传批注",post_text=self:_annotation_close_upload_enabled() and "已开启" or "已关闭",checked_func=function() return self:_annotation_close_upload_enabled() end,keep_menu_open=true,callback=function() self:toggle_annotation_close_upload() end},
         {text="新想法云端可见范围",post_text=self:annotation_sync_visibility_label(),sub_item_table_func=function() return self:annotation_sync_visibility_menu() end},
         {text="同步异常提醒",checked_func=function() return self:_sync_error_notice_enabled() end,keep_menu_open=true,callback=function() self:toggle_sync_error_notice() end},
+        {text="同步成功提醒",post_text=self:_sync_success_notice_enabled() and "已开启" or "已关闭",checked_func=function() return self:_sync_success_notice_enabled() end,keep_menu_open=true,callback=function() self:toggle_sync_success_notice() end},
         {text="同步诊断",sub_item_table_func=function() return self:sync_diagnostics_menu() end},
     }
 end
@@ -22918,6 +22994,7 @@ function Plugin:display_settings_menu()
         {text="页面布局",post_text=(home.layout_style=="compact" and "紧凑布局" or "标准布局"),sub_item_table_func=function() return self:home_layout_settings_menu() end},
         {text="觅阅显示大小",post_text=size_labels[home.display_size] or "标准",sub_item_table_func=function() return self:home_display_size_menu() end},
         {text="觅阅界面字体",post_text=self:_home_ui_font_label(home),sub_item_table_func=function() return self:home_ui_font_menu() end},
+        {text="主页阅读统计",post_text=self:_home_stats_visibility_label(home),sub_item_table_func=function() return self:home_stats_settings_menu() end},
         {text="首页书架来源",post_text="选择显示项目",sub_item_table_func=function() return self:home_source_settings_menu() end},
         {text="微信书架范围",post_text=self:_shelf_filter_label(),sub_item_table_func=function() return self:shelf_filter_settings_menu() end},
         {text="本地书籍",post_text="按文件夹读取",sub_item_table_func=function() return self:local_library_settings_menu() end},
