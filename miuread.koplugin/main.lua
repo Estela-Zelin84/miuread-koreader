@@ -10596,6 +10596,39 @@ function Plugin:_home_local_stats_text(data)
         .."\n"..marks.."\n"..days
 end
 
+
+function Plugin:_home_weread_stats_card(cache)
+    local data=self:_home_weread_stats_data(cache)
+    if data.week_seconds==nil and data.today_seconds==nil then
+        return {
+            kind="weread",available=false,
+            message=self:logged_in() and "正在获取阅读数据…" or "登录后显示阅读数据",
+            daily=HomeData.week_rows(data.daily,os.time()),threshold=60,
+        }
+    end
+    return {
+        kind="weread",available=true,
+        total_seconds=tonumber(data.week_seconds) or 0,
+        today_seconds=tonumber(data.today_seconds) or 0,
+        average_seconds=tonumber(data.day_average_seconds) or 0,
+        daily=HomeData.week_rows(data.daily,os.time()),threshold=60,
+    }
+end
+
+function Plugin:_home_local_stats_card(data)
+    data=type(data)=="table" and data or nil
+    if not data then
+        return {kind="local",available=false,message="暂无本地阅读数据",daily={},threshold=1}
+    end
+    return {
+        kind="local",available=true,
+        total_seconds=tonumber(data.week_seconds) or 0,
+        today_seconds=tonumber(data.today_seconds) or 0,
+        today_pages=tonumber(data.today_pages) or 0,
+        daily=HomeData.week_rows(data.daily,os.time()),threshold=1,
+    }
+end
+
 function Plugin:_schedule_home_stats_idle_refresh(delay)
     self:_home_unschedule_task("_home_stats_refresh_task")
     local task
@@ -10681,7 +10714,7 @@ function Plugin:_schedule_home_stats_idle_refresh(delay)
                 if need_local then
                     self._home_local_stats_cache=type(value.local_stats)=="table" and value.local_stats or nil
                     self._home_local_stats_cache_at=os.time()
-                    update.local_stats_text=self:_home_local_stats_text(self._home_local_stats_cache)
+                    update.local_stats=self:_home_local_stats_card(self._home_local_stats_cache)
                 end
                 if type(value.weekly)=="table" or type(value.monthly)=="table" then
                     local current=self:_home_weread_stats_cache()
@@ -10693,7 +10726,7 @@ function Plugin:_schedule_home_stats_idle_refresh(delay)
                     -- Keep automatic refresh persistence off the UI thread's
                     -- critical path. A later normal settings flush persists it.
                     self.store:set_deferred("home_weread_stats_cache",current)
-                    update.weread_stats_text=self:_home_weread_stats_text(current)
+                    update.weread_stats=self:_home_weread_stats_card(current)
                 end
                 if next(update)~=nil then HomeView.update_dashboard(update) end
                 logger.info("[MiuRead][HomeStats] idle refresh applied",
@@ -10827,7 +10860,7 @@ function Plugin:_show_home_local_stats()
         end,
     })
     if HomeView.is_shown() then
-        HomeView.update_dashboard{local_stats_text=self:_home_local_stats_text(data)}
+        HomeView.update_dashboard{local_stats=self:_home_local_stats_card(data)}
     end
     return dialog
 end
@@ -10922,7 +10955,7 @@ function Plugin:_schedule_home_weread_stats_refresh(force)
         self.store:set("home_weread_stats_cache",current)
         if HomeView.is_shown() and not self:_active_reader_ui()
             and HOME_SESSION.suspended~=true and self._miuread_suspended~=true then
-            HomeView.update_dashboard{weread_stats_text=self:_home_weread_stats_text(current)}
+            HomeView.update_dashboard{weread_stats=self:_home_weread_stats_card(current)}
         end
         logger.info("[MiuRead][HomeStats] WeRead refreshed",
             "weekly=",tostring(type(result.value.weekly)=="table"),
@@ -16061,8 +16094,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         account_name=self:_home_account_name(),
         clock_text=self:_display_time("%H:%M"),
         date_text=self:_home_date_text(),
-        weread_stats_text=self:_home_weread_stats_text(weread_reading_cache),
-        local_stats_text=self:_home_local_stats_text(local_reading_stats),
+        weread_stats=self:_home_weread_stats_card(weread_reading_cache),
+        local_stats=self:_home_local_stats_card(local_reading_stats),
         layout_style=home.layout_style,
         display_size=home.display_size,
         hero=hero,

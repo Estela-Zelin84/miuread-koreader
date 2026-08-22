@@ -1,11 +1,12 @@
-4.9.0-beta.20
+4.9.0-beta.21
 
 Changed files:
+- miuread.koplugin/miuread/home_view.lua
+- miuread.koplugin/miuread/reading_stats_dialog.lua
 - miuread.koplugin/main.lua
-- miuread.koplugin/miuread/api.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: remove reader-open blocking work and serialize automatic Home maintenance without changing download, suspend, or precise-progress core logic.
+Focus: redesign recent reading and reading-statistics UI while preserving beta.20 Home performance and background-work behavior.
