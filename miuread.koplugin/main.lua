@@ -3585,7 +3585,7 @@ end
 function Plugin:_show_mode_restart_notice(enabled)
     local text=enabled
         and "重启后将使用觅阅桌面。觅阅会提供完整主页和阅读快捷界面。"
-        or "重启后将使用插件模式。KOReader 将继续管理主页和主要阅读界面，觅阅书架、下载、评论、同步、修复和账号功能仍可使用。"
+        or "重启后将使用插件模式。KOReader 默认继续管理主页和阅读界面；觅阅阅读工具栏可在插件设置中单独开启，且默认关闭。觅阅书架、下载、评论、同步、修复和账号功能仍可使用。"
     if not self:_notice_enabled("mode_switch") then
         self:toast("运行模式已保存，重启 KOReader 后生效",3)
         return true
@@ -3708,7 +3708,7 @@ function Plugin:_show_mode_intro()
         }
     else
         dialog=ButtonDialog:new{
-            title="当前使用：插件模式\n\n插件模式不会替换 KOReader 的主页和主要阅读界面，适合使用 KOReader 原界面，或搭配其他美化 UI 和美化补丁。\n\n微信书架、搜索、下载、评论、同步、修复和公众号等觅阅功能仍可使用。\n\n如果希望使用觅阅完整主页和阅读快捷界面，可以恢复觅阅桌面。恢复前建议先禁用或删除其他美化 UI 和相关补丁。",
+            title="当前使用：插件模式\n\n插件模式默认保留 KOReader 的主页和阅读界面，适合使用 KOReader 原界面，或搭配其他美化 UI 和美化补丁。觅阅阅读工具栏可在‘插件设置 → 阅读界面’中单独开启，默认关闭。\n\n微信书架、搜索、下载、评论、同步、修复和公众号等觅阅功能仍可使用。\n\n如果希望使用觅阅完整主页和阅读快捷界面，可以恢复觅阅桌面。恢复前建议先禁用或删除其他美化 UI 和相关补丁。",
             title_align="center",
             buttons={
                 {{text="继续使用插件模式",callback=function() UIManager:close(dialog); self:_ack_mode_intro() end}},
@@ -6052,7 +6052,9 @@ function Plugin:_reader_preferences()
     local reader=type(preferences.reader_ui)=="table" and preferences.reader_ui or {}
     local changed=false
     if reader.enabled==nil then reader.enabled=true; changed=true end
-    if reader.plugin_mode_enabled~=false then reader.plugin_mode_enabled=false; changed=true end
+    -- Desktop and plugin mode intentionally keep independent toolbar switches.
+    -- Missing plugin-mode preferences must stay disabled for existing installs.
+    if reader.plugin_mode_enabled==nil then reader.plugin_mode_enabled=false; changed=true end
     -- beta.11 keeps the reading surface completely clean while the panel is hidden.
     -- All reader controls live in the transient quick panel or the complete MiuRead menu.
     if reader.show_title~=false then reader.show_title=false; changed=true end
@@ -6103,9 +6105,24 @@ function Plugin:_reader_preferences()
     return reader,preferences
 end
 
-function Plugin:_reader_panel_active()
+function Plugin:_reader_toolbar_mode()
+    return self:_home_enabled() and "desktop" or "plugin"
+end
+
+function Plugin:_reader_toolbar_enabled()
     local reader=self:_reader_preferences()
-    return self:_home_enabled() and reader.enabled~=false
+    if self:_reader_toolbar_mode()=="desktop" then
+        return reader.enabled~=false
+    end
+    return reader.plugin_mode_enabled==true
+end
+
+function Plugin:_reader_toolbar_setting_summary()
+    return self:_reader_toolbar_enabled() and "已开启" or "已关闭"
+end
+
+function Plugin:_reader_panel_active()
+    return self:_reader_toolbar_enabled()
 end
 
 function Plugin:_save_reader_preferences(reader,preferences)
@@ -6137,11 +6154,28 @@ function Plugin:_reader_set_edge_guard_percent(percent)
     return true
 end
 
+function Plugin:_set_reader_toolbar_enabled(enabled)
+    local reader,preferences=self:_reader_preferences()
+    local mode=self:_reader_toolbar_mode()
+    if mode=="desktop" then
+        reader.enabled=enabled==true
+    else
+        reader.plugin_mode_enabled=enabled==true
+    end
+    self:_save_reader_preferences(reader,preferences)
+    self:_sync_reader_toolbar_hooks("toolbar setting changed")
+    logger.info("[MiuRead][ReaderToolbar] mode setting",
+        "mode=",mode,"enabled=",tostring(enabled==true))
+    return enabled==true
+end
+
 function Plugin:reader_quick_panel_settings_menu()
+    local mode=self:_reader_toolbar_mode()
     return {
-        {text="启用觅阅阅读控制中心",checked_func=function() return self:_reader_preferences().enabled~=false end,keep_menu_open=true,callback=function()
-            local reader,preferences=self:_reader_preferences(); reader.enabled=reader.enabled==false; self:_save_reader_preferences(reader,preferences)
-        end},
+        {text="启用觅阅阅读工具栏",post_text=mode=="plugin" and "插件模式独立设置" or "桌面模式独立设置",
+            checked_func=function() return self:_reader_toolbar_enabled() end,keep_menu_open=true,callback=function()
+                self:_set_reader_toolbar_enabled(not self:_reader_toolbar_enabled())
+            end},
         {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
         {text="评论显示设置",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
     }
@@ -15205,6 +15239,9 @@ function Plugin:_schedule_reader_toolbar_prewarm(_session,_delay)
 end
 
 function Plugin:_show_reader_quick_panel_now()
+    -- Final authorization gate: stale callbacks or old gesture handlers must
+    -- never be able to open the MiuRead toolbar in a mode where it is disabled.
+    if not self:_reader_panel_active() then return false end
     if not (self.ui and self.ui.document) then return false end
     local started=monotonic_wall_time()
     self:_mark_reader_busy(2)
@@ -15234,6 +15271,9 @@ function Plugin:_show_reader_quick_panel_now()
 end
 
 function Plugin:show_reader_quick_panel()
+    -- Keep the same hard gate on the public action path as on the deferred
+    -- renderer. This also protects Gesture Manager actions and stale callbacks.
+    if not self:_reader_panel_active() then return false end
     -- UiScale is already applied when preferences are loaded/saved. Re-reading
     -- and normalizing the whole home preference tree on every swipe needlessly
     -- adds work to the most latency-sensitive reader gesture.
@@ -15322,10 +15362,54 @@ function Plugin:_reader_top_menu_tap(ges)
     return x>=width*xmin and x<=width*xmax and y>=0 and y<=height*ymax
 end
 
+function Plugin:_reader_toolbar_hook_token(readerui)
+    if not readerui then return nil end
+    if self._reader_toolbar_hook_reader~=readerui or not self._reader_toolbar_hook_generation then
+        self._reader_toolbar_hook_generation=(tonumber(self._reader_toolbar_hook_generation) or 0)+1
+        self._reader_toolbar_hook_reader=readerui
+    end
+    return self._reader_toolbar_hook_generation
+end
+
+function Plugin:_invalidate_reader_toolbar_hook_token(readerui)
+    if readerui==nil or self._reader_toolbar_hook_reader==readerui then
+        self._reader_toolbar_hook_generation=(tonumber(self._reader_toolbar_hook_generation) or 0)+1
+        self._reader_toolbar_hook_reader=nil
+    end
+    return self._reader_toolbar_hook_generation
+end
+
+function Plugin:_reader_toolbar_hook_current(readerui,generation)
+    return readerui~=nil and self.ui==readerui and readerui.document~=nil
+        and self._reader_toolbar_hook_reader==readerui
+        and tonumber(self._reader_toolbar_hook_generation)==tonumber(generation)
+        and self:_reader_panel_active()
+end
+
+function Plugin:_uninstall_reader_quick_panel_zone(readerui,reason)
+    readerui=readerui or self.ui
+    if not readerui then return false end
+    local installed=readerui._miuread_top_menu_zone_installed==true
+    local unregister=readerui.unRegisterTouchZones or readerui.unregisterTouchZones
+    if installed and type(unregister)=="function" then
+        local ok,err=pcall(unregister,readerui,{{id="miuread_reader_top_menu_tap"}})
+        if not ok then
+            logger.warn("[MiuRead][ReaderToolbar] top tap zone unregister failed",tostring(err))
+        end
+    end
+    readerui._miuread_top_menu_zone_installed=nil
+    readerui._miuread_top_menu_zone_generation=nil
+    if installed then
+        logger.info("[MiuRead][ReaderToolbar] top tap zone released",tostring(reason or "disabled"))
+    end
+    return installed
+end
+
 function Plugin:_install_reader_quick_panel_zone()
-    if not self:_home_enabled() then return false end
+    if not self:_reader_panel_active() then return false end
     local readerui=self.ui
     if not readerui or not readerui.document then return false end
+    local generation=self:_reader_toolbar_hook_token(readerui)
 
     -- Keep KOReader's existing reader-menu gestures, and add one narrow,
     -- discoverable tap target in the top center. The corners stay outside this
@@ -15336,9 +15420,14 @@ function Plugin:_install_reader_quick_panel_zone()
         readerui._miuread_native_menu_zone_preserved=true
         logger.info("[MiuRead][ReaderToolbar] native menu touch zones preserved")
     end
-    if readerui._miuread_top_menu_zone_installed or type(readerui.registerTouchZones)~="function" then
+    if readerui._miuread_top_menu_zone_installed
+        and tonumber(readerui._miuread_top_menu_zone_generation)==tonumber(generation) then
         return true
     end
+    if readerui._miuread_top_menu_zone_installed then
+        self:_uninstall_reader_quick_panel_zone(readerui,"generation changed")
+    end
+    if type(readerui.registerTouchZones)~="function" then return false end
 
     local xmin=math.max(0,math.min(1,tonumber(Config.READER_TOP_MENU_X_MIN) or .25))
     local xmax=math.max(xmin,math.min(1,tonumber(Config.READER_TOP_MENU_X_MAX) or .75))
@@ -15351,7 +15440,7 @@ function Plugin:_install_reader_quick_panel_zone()
             screen_zone={ratio_x=xmin,ratio_y=0,ratio_w=xmax-xmin,ratio_h=ymax},
             overrides={"readermenu_tap","readermenu_ext_tap","tap_forward","tap_backward"},
             handler=function(ges)
-                if not (plugin and plugin.ui==readerui and readerui.document and plugin:_reader_panel_active()) then
+                if not (plugin and plugin:_reader_toolbar_hook_current(readerui,generation)) then
                     return false
                 end
                 if plugin:_reader_gesture_guard_active() then
@@ -15362,56 +15451,129 @@ function Plugin:_install_reader_quick_panel_zone()
                     local ok,link=pcall(readerui.link.getLinkFromGes,readerui.link,ges)
                     if ok and link then return false end
                 end
-                logger.info("[MiuRead][ReaderToolbar] opened by dedicated top tap zone")
+                logger.info("[MiuRead][ReaderToolbar] opened by dedicated top tap zone",
+                    "mode=",plugin:_reader_toolbar_mode())
                 return plugin:show_reader_quick_panel()
             end,
         },
     })
     readerui._miuread_top_menu_zone_installed=true
+    readerui._miuread_top_menu_zone_generation=generation
     logger.info("[MiuRead][ReaderToolbar] top-center tap zone installed",
+        "mode=",self:_reader_toolbar_mode(),"generation=",tostring(generation),
         "x=",tostring(xmin).."-"..tostring(xmax),"height=",tostring(ymax))
     return true
 end
 
+function Plugin:_uninstall_reader_menu_bridge(readerui,reason)
+    readerui=readerui or self.ui
+    local menu=readerui and readerui.menu or nil
+    if not menu then return false end
+    local handlers=menu._miuread_bridge_handlers
+    local installed=handlers~=nil or menu._miuread_bridge_owner~=nil
+    if handlers then
+        if menu.onTapShowMenu==handlers.tap then
+            menu.onTapShowMenu=menu._miuread_native_onTapShowMenu
+        end
+        if menu.onSwipeShowMenu==handlers.swipe then
+            menu.onSwipeShowMenu=menu._miuread_native_onSwipeShowMenu
+        end
+        if menu.onPressMenu==handlers.press then
+            menu.onPressMenu=menu._miuread_native_onPressMenu
+        end
+        if menu.onKeyPressShowMenu==handlers.key then
+            menu.onKeyPressShowMenu=menu._miuread_native_onKeyPressShowMenu
+        end
+    elseif menu._miuread_bridge_owner~=nil then
+        -- beta.29 and earlier did not retain wrapper identities. If such a
+        -- legacy MiuRead bridge survives a hot plugin reload, restore the
+        -- original KOReader methods recorded by that bridge before clearing it.
+        menu.onTapShowMenu=menu._miuread_native_onTapShowMenu or menu._miuread_original_onTapShowMenu
+        menu.onSwipeShowMenu=menu._miuread_native_onSwipeShowMenu or menu._miuread_original_onSwipeShowMenu
+        menu.onPressMenu=menu._miuread_native_onPressMenu or menu._miuread_original_onPressMenu
+        menu.onKeyPressShowMenu=menu._miuread_native_onKeyPressShowMenu or menu._miuread_original_onKeyPressShowMenu
+    end
+    menu._miuread_bridge_owner=nil
+    menu._miuread_bridge_generation=nil
+    menu._miuread_bridge_handlers=nil
+    if installed then
+        logger.info("[MiuRead][ReaderToolbar] native menu handlers restored",tostring(reason or "disabled"))
+    end
+    return installed
+end
+
 function Plugin:_install_reader_menu_bridge()
-    if not self:_home_enabled() then return false end
+    if not self:_reader_panel_active() then return false end
     local readerui=self.ui
     local menu=readerui and readerui.menu or nil
     if not readerui or not readerui.document or not menu then return false end
-    if menu._miuread_bridge_owner==self then return true end
+    local generation=self:_reader_toolbar_hook_token(readerui)
+    if menu._miuread_bridge_owner==self
+        and tonumber(menu._miuread_bridge_generation)==tonumber(generation)
+        and menu._miuread_bridge_handlers then return true end
 
-    local original_tap=menu.onTapShowMenu
-    local original_swipe=menu.onSwipeShowMenu
-    local original_press=menu.onPressMenu
-    local original_key=menu.onKeyPressShowMenu
+    -- If an older MiuRead owner left wrappers on this ReaderMenu, first recover
+    -- the one saved KOReader baseline instead of capturing another wrapper as
+    -- our "original" handler. This prevents MiuRead -> MiuRead -> KOReader
+    -- chains after ReaderUI/plugin rebuilds.
+    local previous=menu._miuread_bridge_handlers
+    if previous then
+        if menu.onTapShowMenu==previous.tap and menu._miuread_native_onTapShowMenu then
+            menu.onTapShowMenu=menu._miuread_native_onTapShowMenu
+        end
+        if menu.onSwipeShowMenu==previous.swipe and menu._miuread_native_onSwipeShowMenu then
+            menu.onSwipeShowMenu=menu._miuread_native_onSwipeShowMenu
+        end
+        if menu.onPressMenu==previous.press and menu._miuread_native_onPressMenu then
+            menu.onPressMenu=menu._miuread_native_onPressMenu
+        end
+        if menu.onKeyPressShowMenu==previous.key and menu._miuread_native_onKeyPressShowMenu then
+            menu.onKeyPressShowMenu=menu._miuread_native_onKeyPressShowMenu
+        end
+    end
+
+    local native_tap=menu._miuread_native_onTapShowMenu or menu._miuread_original_onTapShowMenu or menu.onTapShowMenu
+    local native_swipe=menu._miuread_native_onSwipeShowMenu or menu._miuread_original_onSwipeShowMenu or menu.onSwipeShowMenu
+    local native_press=menu._miuread_native_onPressMenu or menu._miuread_original_onPressMenu or menu.onPressMenu
+    local native_key=menu._miuread_native_onKeyPressShowMenu or menu._miuread_original_onKeyPressShowMenu or menu.onKeyPressShowMenu
+    menu._miuread_native_onTapShowMenu=native_tap
+    menu._miuread_native_onSwipeShowMenu=native_swipe
+    menu._miuread_native_onPressMenu=native_press
+    menu._miuread_native_onKeyPressShowMenu=native_key
+    -- Keep the legacy fields coherent for safe upgrades from beta.29.
+    menu._miuread_original_onTapShowMenu=native_tap
+    menu._miuread_original_onSwipeShowMenu=native_swipe
+    menu._miuread_original_onPressMenu=native_press
+    menu._miuread_original_onKeyPressShowMenu=native_key
+
     local plugin=self
+    local handlers={}
+    local function current()
+        return plugin and plugin:_reader_toolbar_hook_current(readerui,generation)
+            and menu._miuread_bridge_owner==plugin
+            and tonumber(menu._miuread_bridge_generation)==tonumber(generation)
+    end
+    local function call_native(fn,native_menu,...)
+        if type(fn)=="function" then return fn(native_menu,...) end
+    end
 
-    menu._miuread_bridge_owner=self
-    menu._miuread_original_onTapShowMenu=original_tap
-    menu._miuread_original_onSwipeShowMenu=original_swipe
-    menu._miuread_original_onPressMenu=original_press
-    menu._miuread_original_onKeyPressShowMenu=original_key
-
-    menu.onTapShowMenu=function(native_menu,ges)
-        if plugin and plugin.ui==readerui and readerui.document and plugin:_reader_panel_active() then
-            -- beta.17 keeps ordinary reading taps untouched, but adds a
-            -- discoverable top-center entry to the same MiuRead reader toolbar.
-            -- A very short Home -> Reader guard consumes stale transition taps
-            -- before they can open the menu or trigger a KOReader corner action.
+    handlers.tap=function(native_menu,ges)
+        if current() then
             if plugin:_reader_gesture_guard_active() then
                 logger.info("[MiuRead][ReaderGesture] stale menu tap suppressed")
                 return true
             end
             if plugin:_reader_top_menu_tap(ges) then
-                logger.info("[MiuRead][ReaderToolbar] opened by top tap")
+                logger.info("[MiuRead][ReaderToolbar] opened by top tap",
+                    "mode=",plugin:_reader_toolbar_mode())
                 return plugin:show_reader_quick_panel()
             end
             return nil
         end
-        if type(original_tap)=="function" then return original_tap(native_menu,ges) end
+        return call_native(native_tap,native_menu,ges)
     end
-    menu.onSwipeShowMenu=function(native_menu,ges)
-        if plugin and plugin.ui==readerui and readerui.document and plugin:_reader_panel_active() then
+    handlers.swipe=function(native_menu,ges)
+        if current() then
             local activation=native_menu.activation_menu
                 or (G_reader_settings and G_reader_settings:readSetting("activate_menu")) or "swipe_tap"
             if activation~="tap" and ges and ges.direction=="south" then
@@ -15421,21 +15583,55 @@ function Plugin:_install_reader_menu_bridge()
             end
             return nil
         end
-        if type(original_swipe)=="function" then return original_swipe(native_menu,ges) end
+        return call_native(native_swipe,native_menu,ges)
     end
-    menu.onPressMenu=function(native_menu,...)
-        if plugin and plugin.ui==readerui and readerui.document and plugin:_reader_panel_active() then
-            return plugin:show_reader_quick_panel()
-        end
-        if type(original_press)=="function" then return original_press(native_menu,...) end
+    handlers.press=function(native_menu,...)
+        if current() then return plugin:show_reader_quick_panel() end
+        return call_native(native_press,native_menu,...)
     end
-    menu.onKeyPressShowMenu=function(native_menu,...)
-        if plugin and plugin.ui==readerui and readerui.document and plugin:_reader_panel_active() then
-            return plugin:show_reader_quick_panel()
-        end
-        if type(original_key)=="function" then return original_key(native_menu,...) end
+    handlers.key=function(native_menu,...)
+        if current() then return plugin:show_reader_quick_panel() end
+        return call_native(native_key,native_menu,...)
     end
-    logger.info("[MiuRead][ReaderToolbar] native menu handlers redirected; touch zones unchanged")
+
+    menu._miuread_bridge_owner=self
+    menu._miuread_bridge_generation=generation
+    menu._miuread_bridge_handlers=handlers
+    menu.onTapShowMenu=handlers.tap
+    menu.onSwipeShowMenu=handlers.swipe
+    menu.onPressMenu=handlers.press
+    menu.onKeyPressShowMenu=handlers.key
+    logger.info("[MiuRead][ReaderToolbar] native menu handlers redirected; touch zones unchanged",
+        "mode=",self:_reader_toolbar_mode(),"generation=",tostring(generation))
+    return true
+end
+
+function Plugin:_uninstall_reader_toolbar_hooks(readerui,reason)
+    readerui=readerui or self.ui
+    -- Invalidate first so any callback already queued for this ReaderUI becomes
+    -- harmless before we touch the registered zones or menu methods.
+    self:_invalidate_reader_toolbar_hook_token(readerui)
+    ReaderToolbar.close()
+    self:_uninstall_reader_quick_panel_zone(readerui,reason)
+    self:_uninstall_reader_menu_bridge(readerui,reason)
+    return true
+end
+
+function Plugin:_sync_reader_toolbar_hooks(reason)
+    local readerui=self.ui
+    if not (readerui and readerui.document) then
+        if not self:_reader_panel_active() then self:_uninstall_reader_toolbar_hooks(readerui,reason) end
+        return false
+    end
+    if not self:_reader_panel_active() then
+        self:_uninstall_reader_toolbar_hooks(readerui,reason or "mode disabled")
+        return false
+    end
+    self:_reader_toolbar_hook_token(readerui)
+    self:_install_reader_menu_bridge()
+    self:_install_reader_quick_panel_zone()
+    logger.info("[MiuRead][ReaderToolbar] hooks synchronized",
+        "mode=",self:_reader_toolbar_mode(),"reason=",tostring(reason or "reader active"))
     return true
 end
 
@@ -24636,6 +24832,7 @@ function Plugin:_reader_rebuild_cancel(reason,clear_shared)
 end
 
 function Plugin:_prepare_reader_disappearance(reason)
+    self:_uninstall_reader_toolbar_hooks(self.ui,reason or "reader disappeared")
     self:_cancel_chapter_prefetch(reason or "reader disappeared")
     self:_reset_chapter_navigation_context(reason or "reader disappeared")
     if self.ui and self.ui.document and self:_reader_session_is_weread() then
@@ -24973,8 +25170,7 @@ function Plugin:onReaderReady()
                 logger.warn("[MiuRead][HighlightMenu] install failed",tostring(ok and reason or installed))
             end
         end
-        self:_install_reader_menu_bridge()
-        self:_install_reader_quick_panel_zone()
+        self:_sync_reader_toolbar_hooks("reader ready")
         if continuous_switch then
             -- Keep the shared switch target around briefly so the old ReaderUI
             -- can still classify a late CloseDocument as the same-book handoff.
@@ -25183,9 +25379,9 @@ function Plugin:onSetDimensions()
             ReaderToolbar.invalidate()
             self:_reset_reader_toolbar_state_cache()
             self:_schedule_reader_toolbar_state_refresh(nil,.10)
-            -- Menu method bridges are geometry-independent; only the gesture
-            -- zone needs to be rebound after a real size commit.
-            self:_install_reader_quick_panel_zone()
+            -- Re-evaluate the mode-specific reader toolbar hooks after a real
+            -- geometry commit. Disabled plugin mode remains fully native.
+            self:_sync_reader_toolbar_hooks("reader geometry committed")
             local reader=self:_active_reader_ui()
             UIManager:setDirty(reader or nil,"full")
         end
@@ -26565,8 +26761,7 @@ function Plugin:onResume()
         self:_set_foreground("reader")
         UIManager:nextTick(function()
             if self.ui and self.ui.document then
-                self:_install_reader_menu_bridge()
-                self:_install_reader_quick_panel_zone()
+                self:_sync_reader_toolbar_hooks("resume into reader")
             end
         end)
         if self._reader_resume_surface_task then UIManager:unschedule(self._reader_resume_surface_task) end

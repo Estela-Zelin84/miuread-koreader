@@ -1,14 +1,11 @@
-4.9.0-beta.29
+4.9.0-beta.30
 
 Changed files:
 - miuread.koplugin/main.lua
-- miuread.koplugin/miuread/frontlight_controller.lua
-- miuread.koplugin/miuread/home_quick_panel.lua
-- miuread.koplugin/miuread/reader_toolbar.lua
-- miuread.koplugin/miuread/reader_frontlight_dialog.lua
+- miuread.koplugin/miuread/plugin_settings.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: make KOReader the single source of truth for frontlight brightness and natural-light warmth. MiuRead now follows each device's KOReader-native ranges dynamically, writes through KOReader's DeviceListener, reads the actual state back after changes, and does not alter authentication, download, suspend/resume, progress, or layout architecture.
+Focus: fully separate the MiuRead reader-toolbar preference and hook lifecycle between desktop mode and plugin mode. Plugin mode now has its own visible switch, defaults to disabled, restores KOReader-native reader menu behavior when disabled, and cannot inherit the desktop-mode toolbar state. No frontlight, authentication, download, suspend/resume, progress, or home-layout logic is changed.
