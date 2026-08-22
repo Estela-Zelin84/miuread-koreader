@@ -8689,14 +8689,18 @@ function Plugin:_show_home_refresh_popup(anchor)
         subtitle="内容更新与墨水屏全刷分开执行",
         actions={
             {icon="↻",label="更新当前栏目",detail="只检查当前看到的内容",callback=function() self:_home_manual_refresh() end},
-            {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
-            {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
-            {icon="⌕",label="刷新本地书",detail="更新最近阅读；文件夹打开时只读取当前层",callback=function() self:_home_scan_local(true,true) end},
-            {icon="i",label="更新最近阅读信息",detail="更新顶部这本书的资料和封面",callback=function()
+            {icon="i",label="更新当前书籍",detail="重新读取最近阅读书籍的资料与封面",callback=function()
                 local hero=self._home_hero
-                if hero then self:_home_refresh_current_network_metadata(hero)
-                else self:toast("当前没有最近阅读书籍",2) end
+                if not hero then self:toast("当前没有可更新的书籍",2); return end
+                if hero.source=="local" or hero.local_file==true then
+                    self:_home_refresh_one_book_metadata(hero,true)
+                else
+                    self:_home_refresh_current_network_metadata(hero)
+                end
             end},
+            {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
+            {icon="⌕",label="刷新本地书",detail="重新检查本地书籍；文件夹打开时只读取当前层",callback=function() self:_home_scan_local(true,true) end},
+            {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
             },
     }
 end
@@ -10603,7 +10607,7 @@ function Plugin:_home_weread_stats_card(cache)
         return {
             kind="weread",available=false,
             message=self:logged_in() and "正在获取阅读数据…" or "登录后显示阅读数据",
-            daily=HomeData.week_rows(data.daily,os.time()),threshold=60,
+            daily=HomeData.week_rows(data.daily,os.time()),threshold=1,
         }
     end
     return {
@@ -10611,7 +10615,7 @@ function Plugin:_home_weread_stats_card(cache)
         total_seconds=tonumber(data.week_seconds) or 0,
         today_seconds=tonumber(data.today_seconds) or 0,
         average_seconds=tonumber(data.day_average_seconds) or 0,
-        daily=HomeData.week_rows(data.daily,os.time()),threshold=60,
+        daily=HomeData.week_rows(data.daily,os.time()),threshold=1,
     }
 end
 
@@ -15873,7 +15877,6 @@ function Plugin:_home_prepare_hero_book(book)
     end
     hero.on_tap=function(anchor,ges) self:_home_open_book(hero,anchor,ges,true) end
     hero.on_history=function() self:show_home_reading_history() end
-    hero.on_refresh_metadata=function() self:_home_refresh_current_network_metadata(hero) end
     return hero
 end
 

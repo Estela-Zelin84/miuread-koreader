@@ -123,7 +123,7 @@ local function metric_block(label,value,width,height)
             height_overflow_show_ellipsis=true,
         }),
         Ui.textbox(tostring(label or ""),width,label_h,Skin.face("smallinfofont",8.1,10.8,6.8),{
-            alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_DARK_GRAY,
+            alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
             height_overflow_show_ellipsis=true,
         }),
     }
@@ -145,18 +145,18 @@ local function summary_card(kind,key,period,width,height)
         metrics[#metrics+1]={label="阅读页数",value=tostring(math.floor(tonumber(period.pages) or 0)).."页"}
     else
         local compare=compare_text(period.compare)
-        if compare then metrics[#metrics+1]={label="周期变化",value=compare}
-        else metrics[#metrics+1]={label="数据来源",value="微信读书"} end
+        if compare then metrics[#metrics+1]={label="周期变化",value=compare} end
     end
-    local metric_w=math.max(1,math.floor(inner_w/3))
+    local metric_count=math.max(1,#metrics)
+    local metric_w=math.max(1,math.floor(inner_w/metric_count))
     local metric_row=HorizontalGroup:new{align="center"}
     for index,item in ipairs(metrics) do
-        local actual=index==3 and math.max(1,inner_w-metric_w*2) or metric_w
+        local actual=index==metric_count and math.max(1,inner_w-metric_w*(metric_count-1)) or metric_w
         metric_row[#metric_row+1]=metric_block(item.label,item.value,actual,metric_h)
     end
     return card(width,height,VerticalGroup:new{align="left",
         Ui.textbox(title,inner_w,title_h,Skin.face("smallinfofont",9.4,12.6,7.9),{
-            bold=true,alignment="left",fgcolor=Blitbuffer.COLOR_DARK_GRAY,
+            bold=true,alignment="left",fgcolor=Blitbuffer.COLOR_BLACK,
         }),
         Ui.textbox(main,inner_w,main_h,Skin.face("cfont",23.0,30.0,18.5),{
             bold=true,alignment="left",fgcolor=Blitbuffer.COLOR_BLACK,
@@ -166,15 +166,17 @@ local function summary_card(kind,key,period,width,height)
     },pad)
 end
 
-local function check_box(checked,future,size)
-    local bg=checked and Blitbuffer.COLOR_DARK_GRAY or (future and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_LIGHT_GRAY)
-    local border=future and Skin.line("thin") or 0
+local function check_circle(checked,size)
+    if checked then
+        return Skin.frame(size,size,{
+            bordersize=0,padding=0,radius=math.floor(size/2),
+            background=Blitbuffer.COLOR_BLACK,color=Blitbuffer.COLOR_BLACK,
+        },Widget:new{dimen=Geom:new{w=1,h=1}})
+    end
     return Skin.frame(size,size,{
-        bordersize=border,padding=0,radius=Skin.radius(3,2,5),
-        background=bg,color=Blitbuffer.COLOR_LIGHT_GRAY,
-    },Ui.textbox(checked and "✓" or "",math.max(1,size-border*2),math.max(1,size-border*2),Skin.face("cfont",9.8,13.2,8.2),{
-        bold=true,alignment="center",halign="center",fgcolor=checked and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_DARK_GRAY,
-    }))
+        bordersize=math.max(1,Skin.line("thick")),padding=0,radius=math.floor(size/2),
+        background=Blitbuffer.COLOR_WHITE,color=Blitbuffer.COLOR_BLACK,
+    },Widget:new{dimen=Geom:new{w=1,h=1}})
 end
 
 local function weekly_visual(kind,period,width,height)
@@ -210,7 +212,7 @@ local function weekly_visual(kind,period,width,height)
         end
         chart[#chart+1]=OffsetContainer:new{x_off=(index-1)*cell_w,y_off=bars_h,
             Ui.textbox(WEEKDAY[index],cell_w,label_h,Skin.face("smallinfofont",8.2,11.0,6.8),{
-                alignment="center",halign="center",fgcolor=row.future and Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY,
+                alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
             })}
     end
 
@@ -219,12 +221,12 @@ local function weekly_visual(kind,period,width,height)
     local box_size=math.max(Skin.dp(16,14,22),math.min(math.floor(cell_w*.62),check_box_h))
     local boxes=HorizontalGroup:new{align="center"}
     local labels=HorizontalGroup:new{align="center"}
-    local threshold=kind=="weread" and 60 or 1
+    local threshold=1
     for index,row in ipairs(rows) do
         local checked=not row.future and (tonumber(row.seconds) or 0)>=threshold
-        boxes[#boxes+1]=CenterContainer:new{dimen=Geom:new{w=cell_w,h=check_box_h},check_box(checked,row.future,box_size)}
+        boxes[#boxes+1]=CenterContainer:new{dimen=Geom:new{w=cell_w,h=check_box_h},check_circle(checked,box_size)}
         labels[#labels+1]=Ui.textbox(row.future and "" or short_duration(row.seconds),cell_w,day_label_h,Skin.face("smallinfofont",7.0,9.5,5.8),{
-            alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_DARK_GRAY,height_overflow_show_ellipsis=true,
+            alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,height_overflow_show_ellipsis=true,
         })
     end
     return card(width,height,VerticalGroup:new{align="left",
@@ -238,9 +240,9 @@ local function intensity_color(seconds,future)
     if future then return Blitbuffer.COLOR_WHITE end
     seconds=math.max(0,tonumber(seconds) or 0)
     if seconds<=0 then return Blitbuffer.COLOR_WHITE end
-    if seconds<15*60 then return Blitbuffer.COLOR_LIGHT_GRAY end
-    if seconds<45*60 then return Blitbuffer.COLOR_GRAY end
-    return Blitbuffer.COLOR_DARK_GRAY
+    if seconds<15*60 then return Blitbuffer.COLOR_GRAY end
+    if seconds<45*60 then return Blitbuffer.COLOR_DARK_GRAY end
+    return Blitbuffer.COLOR_BLACK
 end
 
 local function monthly_calendar(period,width,height)
@@ -256,7 +258,7 @@ local function monthly_calendar(period,width,height)
     local cell_h=math.max(1,math.floor(grid_h/day_rows))
     local weekday_row=HorizontalGroup:new{align="center"}
     for i=1,7 do weekday_row[#weekday_row+1]=Ui.textbox(WEEKDAY[i],cell_w,weekday_h,Skin.face("smallinfofont",8.0,10.8,6.7),{
-        alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_DARK_GRAY,
+        alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
     }) end
     local grid=OverlapGroup:new{dimen=Geom:new{w=inner_w,h=grid_h},allow_mirroring=false}
     if #rows>0 then
@@ -271,13 +273,13 @@ local function monthly_calendar(period,width,height)
                 local bx=c*cell_w+math.floor((cell_w-box_size)/2)
                 local by=r*cell_h+math.floor((cell_h-box_size)/2)
                 local bg=intensity_color(row.seconds,row.future)
-                local dark=bg==Blitbuffer.COLOR_DARK_GRAY
+                local dark=bg==Blitbuffer.COLOR_DARK_GRAY or bg==Blitbuffer.COLOR_BLACK
                 local day=tostring(row.date or ""):match("%-(%d%d)$") or tostring(index)
                 grid[#grid+1]=OffsetContainer:new{x_off=bx,y_off=by,Skin.frame(box_size,box_size,{
                     bordersize=bg==Blitbuffer.COLOR_WHITE and Skin.line("thin") or 0,padding=0,radius=Skin.radius(3,2,5),
                     background=bg,color=Blitbuffer.COLOR_LIGHT_GRAY,
                 },Ui.textbox(tostring(tonumber(day) or day),box_size,box_size,Skin.face("smallinfofont",7.7,10.4,6.4),{
-                    bold=row.today==true,alignment="center",halign="center",fgcolor=dark and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_DARK_GRAY,
+                    bold=row.today==true,alignment="center",halign="center",fgcolor=dark and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
                 }))}
             end
         end
@@ -321,7 +323,7 @@ local function bucket_visual(period,width,height,heading)
         end
         chart[#chart+1]=OffsetContainer:new{x_off=(index-1)*cell_w,y_off=bars_h,
             Ui.textbox(tostring(item.label or ""),cell_w,label_h,Skin.face("smallinfofont",7.4,10.0,6.1),{
-                alignment="center",halign="center",fgcolor=item.future and Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY,
+                alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
                 height_overflow_show_ellipsis=true,
             })}
     end
@@ -343,7 +345,7 @@ local function rank_card(kind,key,period,width,height)
     body[#body+1]=Ui.textbox("读书排行",inner_w,title_h,Skin.face("cfont",11.8,15.8,9.8),{bold=true,alignment="left"})
     if limit==0 then
         body[#body+1]=Ui.textbox("当前周期暂无可用的逐书统计",inner_w,row_h,Skin.face("smallinfofont",9.0,12.0,7.5),{
-            alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_DARK_GRAY,
+            alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
         })
     else
         local max_seconds=0
@@ -360,7 +362,7 @@ local function rank_card(kind,key,period,width,height)
                         bold=i==1,alignment="left",height_overflow_show_ellipsis=true,
                     }),
                     Ui.textbox(short_duration(item.seconds),right_w,text_h,Skin.face("smallinfofont",8.8,11.8,7.3),{
-                        alignment="right",halign="right",fgcolor=Blitbuffer.COLOR_DARK_GRAY,height_overflow_show_ellipsis=true,
+                        alignment="right",halign="right",fgcolor=Blitbuffer.COLOR_BLACK,height_overflow_show_ellipsis=true,
                     }),
                 }},
                 OffsetContainer:new{x_off=0,y_off=math.max(text_h,math.floor(row_h*.72)),LineWidget:new{
@@ -385,7 +387,7 @@ local function rank_card(kind,key,period,width,height)
         end
         if extra=="" and tonumber(period.read_rate) then extra="文字阅读占比："..tostring(math.floor(period.read_rate+.5)).."%" end
         body[#body+1]=Ui.textbox(extra,inner_w,extra_h,Skin.face("smallinfofont",8.2,11.0,6.8),{
-            alignment="left",fgcolor=Blitbuffer.COLOR_DARK_GRAY,height_overflow_show_ellipsis=true,
+            alignment="left",fgcolor=Blitbuffer.COLOR_BLACK,height_overflow_show_ellipsis=true,
         })
     end
     return card(width,height,body,pad)
@@ -394,7 +396,7 @@ end
 local function loading_card(period,width,height)
     local text=period and period.loading==true and ("正在获取 "..tostring(period.label or "这一周期").."…") or "正在获取这一周期的数据…"
     return card(width,height,Ui.textbox(text,math.max(1,width-Skin.dp(20,16,28)),math.max(1,height-Skin.dp(20,16,28)),Skin.face("cfont",11.0,14.8,9.2),{
-        alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_DARK_GRAY,
+        alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
     }),Skin.dp(10,8,14))
 end
 
@@ -421,7 +423,7 @@ function Dialog:_tab(label,key,width,height)
     local selected=self.selected_key==key
     local layers=OverlapGroup:new{dimen=Geom:new{w=width,h=height},allow_mirroring=false}
     layers[#layers+1]=Ui.textbox(label,width,height,Skin.face("cfont",11.0,14.8,9.2),{
-        bold=selected,alignment="center",halign="center",fgcolor=selected and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
+        bold=selected,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
     })
     if selected then
         local lw=math.max(Skin.dp(28,24,40),math.floor(width*.34))
@@ -439,7 +441,7 @@ end
 function Dialog:_period_nav(period,width,height)
     if self.selected_key=="overall" then
         return Ui.textbox("全部阅读记录",width,height,Skin.face("smallinfofont",9.0,12.0,7.5),{
-            alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_DARK_GRAY,
+            alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
         })
     end
     local side=math.max(Skin.dp(48,42,64),math.floor(width*.12))
@@ -500,7 +502,7 @@ function Dialog:_build_content()
     y=y+header_h
     root[#root+1]=OffsetContainer:new{x_off=outer+pad,y_off=y,
         Ui.textbox(self.kind=="weread" and "微信读书网页端数据" or "KOReader 本机阅读记录",content_w,subtitle_h,Skin.face("smallinfofont",8.6,11.4,7.2),{
-            alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_DARK_GRAY,
+            alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
         })}
     y=y+subtitle_h
 

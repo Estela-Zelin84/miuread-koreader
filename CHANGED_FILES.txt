@@ -1,4 +1,4 @@
-4.9.0-beta.21
+4.9.0-beta.22
 
 Changed files:
 - miuread.koplugin/miuread/home_view.lua
@@ -9,4 +9,4 @@ Changed files:
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: redesign recent reading and reading-statistics UI while preserving beta.20 Home performance and background-work behavior.
+Focus: improve e-ink readability and recent-reading layout without changing beta.21 Home structure or beta.20 background-work behavior.
