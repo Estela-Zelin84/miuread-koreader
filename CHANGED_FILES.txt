@@ -1,12 +1,12 @@
-4.9.0-beta.22
+4.9.0-beta.23
 
 Changed files:
-- miuread.koplugin/miuread/home_view.lua
-- miuread.koplugin/miuread/reading_stats_dialog.lua
 - miuread.koplugin/main.lua
+- miuread.koplugin/miuread/local_annotation_database.lua
+- miuread.koplugin/miuread/sync.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: improve e-ink readability and recent-reading layout without changing beta.21 Home structure or beta.20 background-work behavior.
+Focus: remove synchronous network/database stalls from reader lifecycle paths, freeze ordinary Home work at the first lock-screen edge, and reduce ReadReport barrier polling I/O without changing precise progress or locked-download behavior.

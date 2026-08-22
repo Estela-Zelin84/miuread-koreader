@@ -488,6 +488,23 @@ local function install_home_screensaver_patch()
         local args={n=select("#",...),...}
         local current=HomeView.current()
         local opts=current and current.opts or nil
+        -- The visual lock can precede Plugin:onSuspend by seconds on Kindle.
+        -- Quiesce ordinary Home producers at the first screensaver edge so a
+        -- shelf/statistics/cover worker cannot start behind an already-painted
+        -- lock screen. This is only a visual hold; Plugin:onSuspend still owns
+        -- the real lifecycle transition, while DownloadTask/finalizer keep their
+        -- existing background-power behavior.
+        if HomeView.is_shown() then
+            local owner=home_owner()
+            if owner and type(owner._home_quiesce_for_lockscreen_visual)=="function" then
+                local ok_freeze,freeze_err=pcall(owner._home_quiesce_for_lockscreen_visual,owner)
+                if not ok_freeze then
+                    logger.warn("[MiuRead][Suspend] early home quiesce failed",tostring(freeze_err))
+                else
+                    logger.info("[MiuRead][Suspend] early home quiesce committed","source=screensaver_setup")
+                end
+            end
+        end
         local enabled=(opts and opts.lockscreen_enabled~=false)
         if not opts then enabled=HOME_SESSION.lockscreen_recent_enabled~=false end
         local use_home_target=enabled and (HomeView.is_shown() or HOME_READER_ORIGIN)
@@ -953,6 +970,7 @@ function Plugin:init()
     self._home_cover_render_generation=0
     self._home_cover_render_retry_task=nil
     self._home_suspended=false
+    self._home_lockscreen_visual_hold=false
     self._home_resume_generation=0
     self._home_resume_barrier=false
     self._home_resume_first_frame=false
@@ -1126,6 +1144,19 @@ function Plugin:_shelf_covers_enabled(prefs)
 end
 function Plugin:safe(label,fn) return function(...) local a={...}; local ok,e=xpcall(function() return fn(unpack_args(a)) end,debug.traceback); if not ok then logger.err("[MiuRead]",label,e); self:info(_("Operation failed")..":\n"..U.first_line(e)) end end end
 function Plugin:is_online() local ok,N=pcall(require,"ui/network/manager"); if not ok or not N or not N.isOnline then return true end; local g,v=pcall(N.isOnline,N); return not g or v==true end
+-- Fast local hint for lifecycle paths. Never call NetworkManager:isOnline() from
+-- ReaderReady/close/Suspend: on some Kindle network states that synchronous
+-- probe can stall the UI thread for many seconds. false means the Wi-Fi radio
+-- is definitely off; true/nil means background work may try the real request.
+function Plugin:_network_radio_hint()
+    local ok,N=pcall(require,"ui/network/manager")
+    if not ok or not N then return nil end
+    if type(N.isWifiOn)=="function" then
+        local good,value=pcall(N.isWifiOn,N)
+        if good then return value==true end
+    end
+    return nil
+end
 function Plugin:online(label,fn) if not self:is_online() then self:info(_("Network unavailable")); return end; UIManager:scheduleIn(.05,self:safe(label,fn)) end
 
 local function interactive_child_store(auth,data_dir,temp_dir)
@@ -1298,7 +1329,7 @@ function Plugin:_wait_for_network(label,callback,options)
     local function check()
         if not self._network_wait_tokens or self._network_wait_tokens[label]~=token then return end
         local elapsed=os.time()-started
-        if elapsed>=minimum and self:is_online() then
+        if elapsed>=minimum and self:_network_radio_hint()~=false then
             self._network_wait_tokens[label]=nil
             callback(true)
             return
@@ -1957,7 +1988,11 @@ function Plugin:_refresh_shelf_async(on_ready,silent,request_options)
         end
         return false,err
     end
-    if not self:is_online() then
+    if request_options.skip_online_probe==true then
+        if self:_network_radio_hint()==false then
+            return fail("network request failed: offline")
+        end
+    elseif not self:is_online() then
         return fail("network request failed: offline")
     end
 
@@ -2629,9 +2664,14 @@ function Plugin:_refresh_mp_accounts(on_done,silent)
         if on_done then on_done(nil,"尚未登录") end
         return false
     end
-    if not self:is_online() then
+    if silent then
+        if self:_network_radio_hint()==false then
+            if on_done then on_done(nil,"网络不可用") end
+            return false
+        end
+    elseif not self:is_online() then
         if on_done then on_done(nil,"网络不可用") end
-        if not silent then self:info(_("Network unavailable")) end
+        self:info(_("Network unavailable"))
         return false
     end
     if self.mp_async:busy() then
@@ -2763,7 +2803,7 @@ function Plugin:show_mp_shelf(force_remote)
     local cached=self.mp:cached_accounts()
     if not force_remote and #cached>0 then
         render(cached,nil)
-        if self.mp:accounts_stale() and self:logged_in() and self:is_online() and not self.mp_async:busy() then
+        if self.mp:accounts_stale() and self:logged_in() and self:_network_radio_hint()~=false and not self.mp_async:busy() then
             self:_refresh_mp_accounts(function(value)
                 if value and self._shelf_view and not self._shelf_view._miu_closed then
                     self:_reopen_shelf(true,"account")
@@ -3690,6 +3730,7 @@ function Plugin:_background_block_reason(options)
     local power_state=PowerState.state()
     if power_state~="NORMAL" then return "power_"..power_state:lower() end
     if self._miuread_suspended==true or HOME_SESSION.suspended==true or self._home_suspended==true then return "suspended" end
+    if self._home_lockscreen_visual_hold==true then return "lockscreen_visual" end
     if self._desktop_frozen==true then return "desktop_frozen" end
     if self:_page_transition_active() or reader_close_active() or reader_rebuild_active() then return "reader_transition" end
     if self:_active_reader_ui() then return "reader_active" end
@@ -3791,7 +3832,8 @@ function Plugin:_background_claim(key,options,retry)
     local token,reason=self.background_scheduler:claim(key,options)
     if token then return token,nil,false end
     local retryable=reason~="suspended" and reason~="exiting" and reason~="reader_active" and reason~="reader_transition"
-        and reason~="desktop_frozen" and not tostring(reason or ""):find("^power_")
+        and reason~="desktop_frozen" and reason~="lockscreen_visual"
+        and not tostring(reason or ""):find("^power_")
     if retryable and type(retry)=="function" then
         local retry_delay=options.retry_delay or tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9
         if reason=="memory_critical" then retry_delay=math.max(4.0,tonumber(retry_delay) or .9) end
@@ -3890,6 +3932,7 @@ end
 
 function Plugin:_home_background_blocked()
     return PowerState.state()~="NORMAL" or self._home_suspended==true or self._home_resume_barrier==true
+        or self._home_lockscreen_visual_hold==true
         or self._desktop_frozen==true or self:_page_transition_active()
 end
 
@@ -4106,11 +4149,36 @@ function Plugin:_home_bump_interaction_generation()
     return self._home_interaction_generation
 end
 
+function Plugin:_home_quiesce_for_lockscreen_visual()
+    if self._home_lockscreen_visual_hold==true then return true end
+    self._home_lockscreen_visual_hold=true
+    -- Stop only ordinary Home work. DownloadTask, Sync progress workers and the
+    -- ReadReport service are intentionally outside this scheduler and therefore
+    -- keep the existing locked-background semantics.
+    self:_home_unschedule_task("_home_stats_refresh_task")
+    self:_home_unschedule_task("_home_stats_apply_task")
+    self:_home_unschedule_task("_home_sync_summary_task")
+    self:_home_unschedule_task("_home_stale_check_task")
+    self:_home_unschedule_task("_home_cover_render_retry_task")
+    self:_background_cancel_all("lockscreen visual",true,false)
+    logger.info("[MiuRead][HomePerf] ordinary background quiesced","reason=lockscreen_visual")
+    return true
+end
+
+function Plugin:_home_clear_lockscreen_visual_hold(reason)
+    if self._home_lockscreen_visual_hold~=true then return false end
+    self._home_lockscreen_visual_hold=false
+    logger.info("[MiuRead][HomePerf] lockscreen visual hold cleared",
+        "reason=",tostring(reason or "foreground"))
+    return true
+end
+
 function Plugin:_home_note_interaction(first,kind)
+    self:_home_clear_lockscreen_visual_hold("home interaction")
     local duration=math.max(.8,tonumber(Config.HOME_FOREGROUND_BARRIER_SECONDS) or 2.2)
     self._home_ui_quiet_until=math.max(tonumber(self._home_ui_quiet_until) or 0,monotonic_wall_time()+duration)
     self:_home_bump_interaction_generation()
-    -- beta.22 soft-yield: user input no longer invalidates generations, kills
+    -- Foreground soft-yield: user input no longer invalidates generations, kills
     -- cover/metadata workers, or clears the scheduler queue. The active worker
     -- may finish its current smallest unit; the barrier prevents the next
     -- automatic heavy job from starting until interaction is quiet.
@@ -4121,7 +4189,7 @@ function Plugin:_home_note_interaction(first,kind)
         -- instead of letting a subprocess compete with foreground interaction.
         local active=self.background_scheduler.active
         if active and active.user_requested~=true
-            and (active.key=="home_stats" or active.key=="sync_summary") then
+            and (active.key=="home_stats" or active.key=="sync_summary" or active.key=="home_shelf") then
             self:_background_cancel_worker(active.key,"home interaction")
             self.background_scheduler:force_release("home interaction")
         end
@@ -4310,6 +4378,7 @@ function Plugin:_home_resume_interaction(generation,first,kind)
 end
 
 function Plugin:_home_begin_resume(slept)
+    self:_home_clear_lockscreen_visual_hold("resume")
     self._home_suspended=false
     self._home_resume_barrier=true
     self._home_resume_first_frame=false
@@ -4539,8 +4608,12 @@ function Plugin:_home_refresh_remote(force,user_requested)
         if user_requested then self:toast("登录后才能刷新微信书架",3) end
         return false
     end
-    if not self:is_online() then
-        if user_requested then self:toast("当前没有网络连接",3) end
+    if user_requested==true then
+        if not self:is_online() then
+            self:toast("当前没有网络连接",3)
+            return false
+        end
+    elseif self:_network_radio_hint()==false then
         return false
     end
 
@@ -4573,7 +4646,10 @@ function Plugin:_home_refresh_remote(force,user_requested)
             self:_home_apply_remote_cache_snapshot()
         end
         if user_requested then self:toast("书架已刷新",2) end
-    end,true,{allow_full_fallback=user_requested==true})
+    end,true,{
+        allow_full_fallback=user_requested==true,
+        skip_online_probe=user_requested~=true,
+    })
     if not started then
         self._home_remote_refreshing=false
         self:_background_release("home_shelf",token,"not started")
@@ -4796,7 +4872,7 @@ function Plugin:_home_stream_prefetch_page(section,page)
         self._home_stream_pending_page=math.max(tonumber(self._home_stream_pending_page) or 0,page)
         return true
     end
-    if not self:is_online() or not self:logged_in() then return false end
+    if not self:logged_in() or self:_network_radio_hint()==false then return false end
 
     self._home_stream_prefetching=true
     local requested=U.copy(ids)
@@ -9836,7 +9912,12 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done,explic
         end
         return false
     end
-    if not self:is_online() or not self.home_metadata_async or not self.home_metadata_async:available() then return false end
+    if not self.home_metadata_async or not self.home_metadata_async:available() then return false end
+    if explicit then
+        if not self:is_online() then return false end
+    elseif self:_network_radio_hint()==false then
+        return false
+    end
     local retry=function()
         if HomeView.is_shown() and not self:_active_reader_ui() then
             self:_home_schedule_network_metadata(book,force,silent,on_done,explicit)
@@ -10655,7 +10736,7 @@ function Plugin:_schedule_home_stats_idle_refresh(delay)
 
         local cache=self:_home_weread_stats_cache()
         local now=os.time()
-        local online=self:is_online()
+        local online=self:logged_in() and self:_network_radio_hint()~=false
         local weekly=type(cache.weekly)=="table" and cache.weekly or nil
         local monthly=type(cache.monthly)=="table" and cache.monthly or nil
         local need_weekly=online and self:logged_in() and now-(tonumber(weekly and weekly.fetched_at) or 0)>=10*60
@@ -15496,7 +15577,7 @@ function Plugin:_schedule_hibernated_download_resume(reason)
         end
         local hibernate_reason=type(self.download_task.hibernated_reason)=="function"
             and self.download_task:hibernated_reason() or nil
-        if hibernate_reason=="network_offline" and not self:is_online() then
+        if hibernate_reason=="network_offline" and self:_network_radio_hint()==false then
             logger.info("[MiuRead][DownloadTask] network-hibernated task remains parked",
                 "reason=offline","navigation=",state)
             self:_schedule_hibernated_download_resume("network restored")
@@ -16936,8 +17017,13 @@ function Plugin:_refresh_mp_articles(book,silent,on_done)
         if on_done then on_done(nil,"尚未登录") end
         return false
     end
-    if not self:is_online() then
-        if not silent then self:info(_("Network unavailable")) end
+    if silent then
+        if self:_network_radio_hint()==false then
+            if on_done then on_done(nil,"网络不可用") end
+            return false
+        end
+    elseif not self:is_online() then
+        self:info(_("Network unavailable"))
         if on_done then on_done(nil,"网络不可用") end
         return false
     end
@@ -16983,7 +17069,7 @@ function Plugin:mp_account(book)
     local cached=self.mp:cached_articles(book.bookId)
     if #cached>0 then
         self:show_mp_articles(book,cached)
-        if self.mp:list_stale(book.bookId) and self:logged_in() and self:is_online() and not self.mp_async:busy() then
+        if self.mp:list_stale(book.bookId) and self:logged_in() and self:_network_radio_hint()~=false and not self.mp_async:busy() then
             self:_refresh_mp_articles(book,true)
         end
     else
@@ -18233,7 +18319,7 @@ function Plugin:_start_next_queued_download()
     if state.status=="active" or state.status=="failed" or state.status=="interrupted" then
         return false
     end
-    if not self:is_online() or not self:logged_in() then return false end
+    if not self:logged_in() or self:_network_radio_hint()==false then return false end
     local queue=self.store:download_queue()
     local next_job=queue[1]
     if not next_job then return false end
@@ -18267,11 +18353,15 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
     opt=U.copy(opt or {})
     local is_prefetch=opt.prefetch==true
     if is_prefetch then
-        if not self:logged_in() or not self:is_online() then return false end
+        if not self:logged_in() or self:_network_radio_hint()==false then return false end
         if #(self.store:download_queue() or {})>0 then return false end
     else
         if not self:require_login() then return end
-        if not self:is_online() then self:info(_("Network unavailable")); return end
+        if start_in_background==true or from_queue==true then
+            if self:_network_radio_hint()==false then return false end
+        elseif not self:is_online() then
+            self:info(_("Network unavailable")); return
+        end
     end
     local requested_id=tostring(b and (b.bookId or b.book_id) or "")
     if from_queue~=true and requested_id~="" then
@@ -18768,7 +18858,7 @@ function Plugin:_schedule_chapter_prefetch(session,delay)
             logger.info("[MiuRead][Prefetch] skipped for low battery","battery=",tostring(battery))
             return
         end
-        if not self:is_online() or not self:logged_in() then
+        if not self:logged_in() or self:_network_radio_hint()==false then
             self._chapter_prefetch_task=nil
             logger.info("[MiuRead][Prefetch] skipped while offline or logged out",key)
             return
@@ -18890,7 +18980,7 @@ function Plugin:_open_next_single_chapter(options)
         self:status_toast("下一章",ctx.next_title.."正在准备，完成后自动打开",3)
         return true
     end
-    if not self:is_online() or not self:logged_in() then
+    if not self:logged_in() or self:_network_radio_hint()==false then
         self:_clear_chapter_advance_wait("offline")
         self:status_toast("下一章尚未准备",ctx.next_title.." · 网络恢复后再次翻页即可重试",4)
         return true
@@ -20311,7 +20401,7 @@ function Plugin:_retry_saved_progress_verification(item,callback)
     local requested=type(item.pending_progress)=="table" and U.copy(item.pending_progress) or nil
     if book_id=="" or not requested then callback(false,"缺少已提交的位置记录"); return false end
     if not self:logged_in() then callback(false,"请先登录微信读书账号"); return false end
-    if not self:is_online() then callback(false,"当前网络不可用"); return false end
+    if self:_network_radio_hint()==false then callback(false,"当前 Wi-Fi 未开启"); return false end
 
     -- Home and Reader may own different Store instances. Always read the
     -- persisted per-book snapshot before replaying it so a stale Home item can
@@ -20469,7 +20559,7 @@ function Plugin:_schedule_home_progress_recovery(delay)
         if self._home_progress_recovery_task~=task then return end
         self._home_progress_recovery_task=nil
         if not HomeView.is_shown() or self:_active_reader_ui() then return end
-        if not self:logged_in() or not self:is_online() then return end
+        if not self:logged_in() or self:_network_radio_hint()==false then return end
         local now=os.time()
         if now-(tonumber(self._home_progress_recovery_at) or 0)<20 then return end
         self:_clear_verified_progress_ghosts()
@@ -20806,18 +20896,10 @@ function Plugin:ensure_read_report_progress(reason,automatic)
         return false
     end
     local id=tostring(r.book.book_id)
-    if not self:is_online() then
+    if automatic~=true and not self:is_online() then
         self:_save_progress_state(id,"waiting_network","等待 Wi-Fi 恢复后读取云端位置",nil,nil)
         self.sync:end_progress_sync("等待网络恢复")
-        if automatic then
-            self:_wait_for_network("progress-"..id,function(ready)
-                if ready and self.ui and self.ui.document then
-                    self:ensure_read_report_progress("network_ready",true)
-                end
-            end,{minimum_delay=2,max_wait=90,interval=3})
-        else
-            self:info("Wi-Fi 尚未恢复。\n\n本地阅读位置已保留。阅读时间失败部分不会补传，联网后会重新确认当前进度。")
-        end
+        self:info("Wi-Fi 尚未恢复。\n\n本地阅读位置已保留。阅读时间失败部分不会补传，联网后会重新确认当前进度。")
         return false
     end
     if self._progress_check_running then
@@ -23575,7 +23657,7 @@ function Plugin:maybe_auto_check_update(force)
     local interval=math.max(21600,tonumber(update.interval) or Config.AUTO_UPDATE_INTERVAL)
     local last=tonumber(update.last_attempt_at) or 0
     if not force and now-last<interval then return false end
-    if not self:is_online() then return false end
+    if self:_network_radio_hint()==false then return false end
     if self.updater_async and self.updater_async:busy() then return false end
     self._auto_update_check_running=true
     update.last_attempt_at=now
@@ -24233,24 +24315,15 @@ function Plugin:on_sync_record_ready(current)
             self.sync:end_progress_sync("同一本书章节切换沿用当前阅读会话")
         elseif internal_rebuild and self.sync:is_current_verified() then
             self.sync:end_progress_sync("内部重建沿用本次阅读已确认的位置")
-        elseif self:is_online() then
-            -- A genuine reopen always reads the current WeRead position. Do not
-            -- let the multi-hour verification cache stand in for a fresh cloud
-            -- read; that cache is now only for same-session Reader rebuilds.
-            UIManager:scheduleIn(.05,function()
+        else
+            -- A genuine reopen still reads the current WeRead position, but the
+            -- request is allowed to discover offline/transport failure inside
+            -- its async worker. Never run isOnline() on the ReaderReady UI path.
+            UIManager:scheduleIn(.08,function()
                 if self.ui and self.ui.document and not reader_close_active() then
                     self:ensure_read_report_progress("reader_ready",true)
                 end
             end)
-        else
-            self:_wait_for_network("reader-ready-progress",function(ready)
-                if ready and self.ui and self.ui.document then
-                    self:ensure_read_report_progress("reader_ready_network_ready",true)
-                elseif self.ui and self.ui.document then
-                    self:_save_progress_state(tostring(current.book.book_id),"waiting_network",
-                        "等待 Wi-Fi 恢复后读取云端位置",nil,nil)
-                end
-            end,{minimum_delay=.2,max_wait=60,interval=1.2})
         end
     end
 end
@@ -24918,11 +24991,22 @@ function Plugin:_reading_end_sync(reason,options,callback)
 
     local book_id=tostring(current.book.book_id or current.book.bookId or "")
     local need_progress=self:progress_upload_mode()~="manual"
-    local annotation_summary=book_id~="" and (LocalAnnotationDatabase.summary(self.store,book_id) or {}) or {}
+    local close_annotations=self:_annotation_close_upload_enabled()
+    local annotation_summary,annotation_summary_err={},nil
+    if close_annotations and book_id~="" then
+        annotation_summary,annotation_summary_err=LocalAnnotationDatabase.summary_fast(self.store,book_id)
+        annotation_summary=annotation_summary or {}
+    end
     local annotation_retryable=(tonumber(annotation_summary.pending or 0) or 0)
         +(tonumber(annotation_summary.delete_pending or 0) or 0)
-    local need_annotations=self:_annotation_close_upload_enabled() and annotation_retryable>0
-    local online=self:logged_in() and self:is_online()
+    -- A failed fast summary must not lose a pending mutation. Let the detached
+    -- worker perform the authoritative full check later instead of blocking UI.
+    local need_annotations=close_annotations and (annotation_retryable>0 or annotation_summary_err~=nil)
+    if annotation_summary_err then
+        logger.warn("[MiuRead][ReadingEnd] annotation fast summary deferred",
+            "book=",book_id,"reason=",tostring(annotation_summary_err))
+    end
+    local online=self:logged_in() and self:_network_radio_hint()~=false
     local final_elapsed=self.sync and self.sync:_final_elapsed(true) or nil
     local need_time=online and final_elapsed~=nil and tonumber(final_elapsed)>0
     local writer_barrier_seq=nil
@@ -25168,11 +25252,22 @@ function Plugin:_reading_end_detach_for_home(reason)
     end
 
     local need_progress=self:progress_upload_mode()~="manual"
-    local annotation_summary=LocalAnnotationDatabase.summary(self.store,book_id) or {}
+    local close_annotations=self:_annotation_close_upload_enabled()
+    local annotation_summary,annotation_summary_err={},nil
+    if close_annotations then
+        annotation_summary,annotation_summary_err=LocalAnnotationDatabase.summary_fast(self.store,book_id)
+        annotation_summary=annotation_summary or {}
+    end
     local annotation_retryable=(tonumber(annotation_summary.pending or 0) or 0)
         +(tonumber(annotation_summary.delete_pending or 0) or 0)
-    local need_annotations=self:_annotation_close_upload_enabled() and annotation_retryable>0
-    local online=self:logged_in() and self:is_online()
+    local need_annotations=close_annotations and (annotation_retryable>0 or annotation_summary_err~=nil)
+    if annotation_summary_err then
+        logger.warn("[MiuRead][ReadingEnd] detached annotation fast summary deferred",
+            "book=",book_id,"reason=",tostring(annotation_summary_err))
+    end
+    -- Home return never probes Internet synchronously. Authentication is local;
+    -- the detached HTTP workers decide whether the current link can actually run.
+    local authenticated=self:logged_in()
     local final_elapsed=self.sync:_final_elapsed(true)
     local writer_barrier_seq=self.sync:stop_fast("reading_end:"..reason,final_elapsed or 0)
     self.sync.reading_end_finalized=true
@@ -25186,9 +25281,9 @@ function Plugin:_reading_end_detach_for_home(reason)
     end
 
     if need_progress then
-        if not online then
+        if not authenticated then
             self:_save_progress_state(book_id,"waiting_network",
-                "已保存本机阅读位置；等待网络后继续同步",nil,nil)
+                "已保存本机阅读位置；等待登录状态恢复后继续同步",nil,nil)
         else
             local local_percent=ratio_snapshot and math.floor(U.clamp(ratio_snapshot,0,1)*100+.5) or nil
             self:_save_progress_state(book_id,"deferred",
@@ -25274,7 +25369,7 @@ function Plugin:_reading_end_detach_for_home(reason)
         end
     end
 
-    if need_annotations and online then
+    if need_annotations and authenticated then
         local prefs=U.copy(self:_annotation_sync_preferences())
         local book=U.copy(current.book or {})
         local record=U.copy(current.record or {})
@@ -25300,7 +25395,8 @@ function Plugin:_reading_end_detach_for_home(reason)
     logger.info("[MiuRead][ReadingEnd] foreground released; cloud work detached",
         "book=",book_id,"progress=",tostring(need_progress),
         "annotations=",tostring(need_annotations),"time=",tostring(final_elapsed~=nil),
-        "writer_barrier=",tostring(writer_barrier_seq or "-"),"online=",tostring(online),
+        "writer_barrier=",tostring(writer_barrier_seq or "-"),"network=detached",
+        "authenticated=",tostring(authenticated),
         "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-started_at)*1000+.5)))
     refresh_home_sync_state()
     return true

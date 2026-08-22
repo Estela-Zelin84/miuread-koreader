@@ -3421,7 +3421,11 @@ function Sync:writer_barrier_done(seq)
     if seq<=0 then return true end
     local daemon=self.daemon
     if not daemon then return true end
-    self:_import_daemon_status(true)
+    -- Barrier polling runs every ~200 ms. A forced import also persists the
+    -- daemon session when the status stamp is unchanged, creating needless
+    -- flash writes for the entire network timeout. A normal import still reads
+    -- the status file immediately and processes every new status exactly once.
+    self:_import_daemon_status(false)
     local ack=tonumber(daemon.writer_barrier_ack_seq or 0) or 0
     local done=ack>=seq and daemon.final_flush_pending~=true
     if done and daemon.active~=true then daemon.book_id=nil end
