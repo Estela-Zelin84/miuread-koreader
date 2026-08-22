@@ -6,6 +6,7 @@ local Config=require("miuread.config")
 local Json=require("miuread.json")
 local DownloadDatabase=require("miuread.download_database")
 local U=require("miuread.util")
+local Cookies=require("miuread.cookies")
 local logger=require("logger")
 local Store={}; Store.__index=Store
 local function generate_login_session_id()
@@ -13,7 +14,7 @@ local function generate_login_session_id()
 end
 local defaults={
  schema=Config.SCHEMA,
- auth={login_session_id="",api_key="",cookies={},wr_ticket="",wr_wrpa="",ticket_updated_at=0,
+ auth={login_session_id="",auth_revision=0,api_key="",cookies={},wr_ticket="",wr_wrpa="",ticket_updated_at=0,
      account={name="",vid="",logged_at=0},
      health={state="unknown",last_checked_at=0,last_ok_at=0,last_error_at=0,
          last_error_code="",last_error_message="",last_error_channel="",notice_pending=false,
@@ -24,9 +25,10 @@ local defaults={
              annotations={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",download_dir="",shelf_section="account",account_shelf_kind="books",shelf_filter={enabled=false,archives={}},home_ui={enabled=false,layout_version=23,layout_style="desk",display_size="standard",ui_font_mode="default",ui_font_face="",local_root="",local_roots={},local_entry_root="",local_entry_version=1,local_browse_version=3,local_library_mode="auto",local_auto_update=true,performance_defaults_version=1,auto_scan=true,local_check_on_open=true,lockscreen_style="frame",page_by_section={},source_order={"account","generated","local","mp"},action_items={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false},action_order={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot"},action_layout_version=3,panel_items={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,koreader_settings=true,return_koreader=true,quit=true,sync=true,miuread_settings=false,downloads=false,restart=false,sleep=false},panel_order={"wifi","bluetooth","rotate","screenshot","full_refresh","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep"},panel_layout_version=3,more_expanded=false,network_metadata_defaults_version=2,network_metadata_user_set=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=false,show_status=false,show_recent=false,recent_actions={},edge_guard_enabled=true,edge_guard_percent=15,quick_layout_version=11,quick_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true},quick_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,library_scan=true,repair_while_reading=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="plugin",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,font="standard",font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0,close_upload_enabled=true},repair={auto_check=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=true,progress_enabled=true,progress_mode="close",success_notice_enabled=false,error_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",chapter_prefetch_enabled=true,chapter_continuous_enabled=true,download_dir="",shelf_section="account",account_shelf_kind="books",shelf_filter={enabled=false,archives={}},home_ui={enabled=false,layout_version=24,layout_style="desk",show_weread_stats=true,show_local_stats=true,display_size="standard",ui_font_mode="default",ui_font_face="",local_root="",local_roots={},local_entry_root="",local_entry_version=1,local_browse_version=3,local_library_mode="auto",local_auto_update=true,performance_defaults_version=1,auto_scan=true,local_check_on_open=true,lockscreen_style="frame",page_by_section={},source_order={"account","generated","local","mp"},action_items={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false},action_order={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot"},action_layout_version=3,panel_items={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,koreader_settings=true,return_koreader=true,quit=true,sync=true,miuread_settings=false,downloads=false,restart=false,sleep=false},panel_order={"wifi","bluetooth","rotate","screenshot","full_refresh","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep"},panel_layout_version=3,more_expanded=false,network_metadata_defaults_version=2,network_metadata_user_set=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=false,show_status=false,show_recent=false,recent_actions={},edge_guard_enabled=true,edge_guard_percent=15,quick_layout_version=11,quick_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true},quick_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,library_scan=true,repair_while_reading=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="plugin",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,font="standard",font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0,close_upload_enabled=true},repair={auto_check=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=true,progress_enabled=true,progress_mode="close",success_notice_enabled=false,error_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0,stream={enabled=false,ids={},hydrated_ids={},total=0,source="",updated_at=0}},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},recent_reads={version=1,items={}},
+ prefetch_cache={},
 }
 local function invalidate_report_contexts_table(sessions)
     sessions=type(sessions)=="table" and sessions or {}
@@ -162,7 +164,7 @@ end
 function Store:new(options)
     options=options or {}
     local data=options.data_dir or (DataStorage:getFullDataDir().."/"..Config.DATA_DIR)
-    U.mkdir(data); U.mkdir(data.."/books"); U.mkdir(data.."/mp"); U.mkdir(data.."/covers"); U.mkdir(data.."/temp"); U.mkdir(data.."/updates")
+    U.mkdir(data); U.mkdir(data.."/books"); U.mkdir(data.."/mp"); U.mkdir(data.."/covers"); U.mkdir(data.."/temp"); U.mkdir(data.."/updates"); U.mkdir(data.."/prefetch")
     local settings_path=options.settings_path or (DataStorage:getSettingsDir().."/miuread.lua")
     local settings_backup_path=settings_path..".miuread-backup"
     if options.isolated~=true then restore_settings_file(settings_path,settings_backup_path) end
@@ -174,6 +176,7 @@ function Store:new(options)
         covers_dir=data.."/covers",
         temp_dir=data.."/temp",
         updates_dir=data.."/updates",
+        prefetch_dir=data.."/prefetch",
         settings_path=settings_path,
         settings_backup_path=settings_backup_path,
         legacy_download_state_path=data.."/download-state.json",
@@ -1479,6 +1482,50 @@ function Store:migrate()
             logger.info("[MiuRead][Migration] schema 114 -> 115 done",
                 "entry=",tostring(home.local_entry_root~="" and home.local_entry_root or "default"))
         end
+        if schema<116 then
+            logger.info("[MiuRead][Migration] schema 115 -> 116 begin","from=",tostring(schema))
+            -- 4.9.0-beta.16 adds low-priority next-chapter prefetch for
+            -- standalone WeRead chapter EPUBs. Existing installs opt in to the
+            -- same default as fresh installs; users may disable it in downloads.
+            local current=self:preferences()
+            if previous.chapter_prefetch_enabled==nil then current.chapter_prefetch_enabled=true end
+            self:save_preferences(current)
+            logger.info("[MiuRead][Migration] schema 115 -> 116 done")
+        end
+        if schema<117 then
+            logger.info("[MiuRead][Migration] schema 116 -> 117 begin","from=",tostring(schema))
+            -- beta.17 keeps the existing next-chapter prefetch switch and adds
+            -- a separate opt-out for crossing into that chapter at end-of-book.
+            local current=self:preferences()
+            if previous.chapter_continuous_enabled==nil then current.chapter_continuous_enabled=true end
+            self:save_preferences(current)
+            logger.info("[MiuRead][Migration] schema 116 -> 117 done")
+        end
+        if schema<118 then
+            logger.info("[MiuRead][Migration] schema 117 -> 118 begin","from=",tostring(schema))
+            -- beta.27 moves future automatic next-chapter work into a private
+            -- cache. Existing beta.16-26 prefetched chapter EPUBs remain valid
+            -- formal chapter downloads and are intentionally left untouched.
+            if self.db:readSetting("prefetch_cache",nil)==nil then
+                self.db:saveSetting("prefetch_cache",{})
+            end
+            logger.info("[MiuRead][Migration] schema 117 -> 118 done")
+        end
+        if schema<119 then
+            logger.info("[MiuRead][Migration] schema 118 -> 119 begin","from=",tostring(schema))
+            -- beta.28 gives every durable credential change a monotonically
+            -- increasing revision. Long-lived/read/download workers can then
+            -- prove that their response still belongs to the current login
+            -- credentials before they are allowed to write anything back.
+            local auth=U.merge(defaults.auth,self.db:readSetting("auth",{}) or {})
+            local account=type(auth.account)=="table" and auth.account or {}
+            local logged=tostring(auth.login_session_id or "")~=""
+                and tostring(account.vid or (auth.cookies or {}).wr_vid or "")~=""
+            auth.auth_revision=logged and math.max(1,tonumber(auth.auth_revision or 0) or 0) or 0
+            self.db:saveSetting("auth",auth)
+            logger.info("[MiuRead][Migration] schema 118 -> 119 done",
+                "logged_in=",tostring(logged),"revision=",tostring(auth.auth_revision))
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end
@@ -1490,6 +1537,7 @@ end
 function Store:set_deferred(k,v) self.db:saveSetting(k,v) end
 local function sanitized_auth(value)
     local auth=U.merge(defaults.auth,value or {})
+    auth.auth_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     auth.mp_cookie_header=nil
     auth.mp_extra_headers=nil
     auth.mp_referer=nil
@@ -1497,8 +1545,56 @@ local function sanitized_auth(value)
     auth.mp_authorized_at=nil
     return auth
 end
+local function same_login_cookies(a,b)
+    a=type(a)=="table" and a or {}; b=type(b)=="table" and b or {}
+    for key,value in pairs(a) do
+        if type(key)=="string" and key:match("^wr_") and tostring((b or {})[key] or "")~=tostring(value or "") then
+            return false
+        end
+    end
+    for key,value in pairs(b) do
+        if type(key)=="string" and key:match("^wr_") and tostring((a or {})[key] or "")~=tostring(value or "") then
+            return false
+        end
+    end
+    return true
+end
+local function same_auth_credentials(a,b)
+    a=sanitized_auth(a); b=sanitized_auth(b)
+    local aa=type(a.account)=="table" and a.account or {}
+    local ba=type(b.account)=="table" and b.account or {}
+    return tostring(a.login_session_id or "")==tostring(b.login_session_id or "")
+        and tostring(aa.vid or "")==tostring(ba.vid or "")
+        and tostring(a.api_key or "")==tostring(b.api_key or "")
+        and tostring(a.wr_ticket or "")==tostring(b.wr_ticket or "")
+        and tostring(a.wr_wrpa or "")==tostring(b.wr_wrpa or "")
+        and same_login_cookies(a.cookies,b.cookies)
+end
 function Store:auth() return sanitized_auth(self:get("auth",{})) end
-function Store:save_auth(v) return self:set("auth",sanitized_auth(v)) end
+function Store:save_auth(v,opt)
+    opt=type(opt)=="table" and opt or {}
+    local current=sanitized_auth(self:get("auth",{}))
+    local incoming=sanitized_auth(v)
+    local current_revision=math.max(0,tonumber(current.auth_revision or 0) or 0)
+    local incoming_revision=math.max(0,tonumber(incoming.auth_revision or 0) or 0)
+    local expected=opt.expected_revision~=nil and tonumber(opt.expected_revision) or nil
+    if expected~=nil and expected~=current_revision then
+        return false,"登录凭据已经更新，已忽略旧任务结果"
+    end
+    local credentials_changed=not same_auth_credentials(current,incoming)
+    if credentials_changed then
+        if opt.replace_login~=true and current_revision>0 and incoming_revision~=current_revision then
+            return false,"登录凭据版本已经变化，已拒绝旧凭据覆盖"
+        end
+        incoming.auth_revision=current_revision+1
+    else
+        incoming.auth_revision=current_revision
+    end
+    return self:set("auth",incoming)
+end
+function Store:auth_revision()
+    return math.max(0,tonumber(self:auth().auth_revision or 0) or 0)
+end
 function Store:generate_login_session_id() return generate_login_session_id() end
 function Store:ensure_login_session_id()
     local auth=self:auth()
@@ -1534,6 +1630,16 @@ function Store:save_preferences(v) return self:set("preferences",U.merge(default
 function Store:save_preferences_deferred(v) self:set_deferred("preferences",U.merge(defaults.preferences,v or {})) end
 function Store:books_root() local p=self:preferences().download_dir; if p=="" then p=self.default_books_dir end; U.mkdir(p); return p end
 function Store:epub_root() return self:books_root() end
+function Store:prefetch_book_path(id) return self.prefetch_dir.."/"..U.id_name(id) end
+function Store:prefetch_root(id)
+    U.mkdir(self.prefetch_dir)
+    if id==nil then return self.prefetch_dir end
+    local path=self:prefetch_book_path(id); U.mkdir(path); return path
+end
+function Store:hidden_prefetch_path(id,uid,kind)
+    local dir=self:prefetch_root(id)
+    return dir.."/"..U.id_name(uid).."-"..U.safe_name(kind or "clean","clean")..".epub"
+end
 function Store:book_cache_path(id) return self.cache_books_dir.."/"..U.id_name(id) end
 function Store:mp_account_dir(id)
     local path=self.mp_dir.."/"..U.id_name(id)
@@ -1603,13 +1709,18 @@ function Store:book_paths(id,include_cache)
         for _,r in pairs(b.variants or {}) do add_unique_path(out,seen,r and r.file) end
         for _,row in pairs(b.chapters or {}) do for _,r in pairs(row or {}) do add_unique_path(out,seen,r and r.file) end end
     end
-    if include_cache~=false then add_unique_path(out,seen,self:book_cache_path(id)) end
+    if include_cache~=false then
+        add_unique_path(out,seen,self:book_cache_path(id))
+        local prefetch_path=self:prefetch_book_path(id)
+        if lfs.attributes(prefetch_path)~=nil then add_unique_path(out,seen,prefetch_path) end
+    end
     return out
 end
 function Store:all_download_paths(include_covers)
     local out,seen={},{}
     for id,_ in pairs(self:library()) do for _,path in ipairs(self:book_paths(id,true)) do add_unique_path(out,seen,path) end end
     add_unique_path(out,seen,self.cache_books_dir)
+    add_unique_path(out,seen,self.prefetch_dir)
     if include_covers then add_unique_path(out,seen,self.covers_dir) end
     return out
 end
@@ -1642,6 +1753,8 @@ function Store:forget_book_local_state(id)
     local key=tostring(id or "")
     if key=="" then return false end
     local all=self:library(); all[key]=nil; self:set("library",all)
+    local prefetch=self:get("prefetch_cache",{}); prefetch[key]=nil; self:set("prefetch_cache",prefetch)
+    U.remove_tree(self:prefetch_book_path(key))
     local sessions=self:get("sessions",{}); sessions[key]=nil; self:set("sessions",sessions)
     local covers=self:get("cover_index",{}); covers[key]=nil; self:set("cover_index",covers)
 
@@ -1703,6 +1816,122 @@ end
 function Store:delete_chapter(id,uid,kind)
     local r=self:chapter_variant(id,uid,kind); if r and r.file then U.remove_tree(r.file) end
     self:forget_chapter(id,uid,kind)
+end
+function Store:hidden_prefetch_record(id,uid,kind)
+    local all=self:get("prefetch_cache",{})
+    local book=type(all[tostring(id)])=="table" and all[tostring(id)] or nil
+    local row=book and type(book[tostring(uid)])=="table" and book[tostring(uid)] or nil
+    return row and type(row[tostring(kind)])=="table" and U.copy(row[tostring(kind)]) or nil
+end
+function Store:save_hidden_prefetch(id,uid,kind,record)
+    local book_id,chapter_uid,variant=tostring(id),tostring(uid),tostring(kind)
+    if book_id=="" or chapter_uid=="" or variant=="" or type(record)~="table" then return nil,"invalid prefetch record" end
+    local all=self:get("prefetch_cache",{})
+    local old=type(all[book_id])=="table" and all[book_id] or {}
+    -- One passive next-chapter artifact per book. This bounds storage and also
+    -- prevents two automatic generations from racing after a chapter switch.
+    for old_uid,row in pairs(old) do
+        for old_kind,old_record in pairs(type(row)=="table" and row or {}) do
+            if old_uid~=chapter_uid or old_kind~=variant then
+                local old_file=type(old_record)=="table" and tostring(old_record.file or "") or ""
+                if old_file~="" and U.file_exists(old_file) then U.remove_tree(old_file) end
+            end
+        end
+    end
+    all[book_id]={[chapter_uid]={[variant]=U.copy(record)}}
+    return self:set("prefetch_cache",all)
+end
+function Store:forget_hidden_prefetch(id,uid,kind,remove_file)
+    local book_id,chapter_uid,variant=tostring(id),tostring(uid),tostring(kind)
+    local all=self:get("prefetch_cache",{})
+    local book=all[book_id]
+    local row=type(book)=="table" and book[chapter_uid] or nil
+    local record=type(row)=="table" and row[variant] or nil
+    if remove_file==true and type(record)=="table" and tostring(record.file or "")~="" then U.remove_tree(record.file) end
+    if type(row)=="table" then
+        row[variant]=nil
+        if next(row)==nil then book[chapter_uid]=nil end
+    end
+    if type(book)=="table" and next(book)==nil then all[book_id]=nil end
+    self:set("prefetch_cache",all)
+    return record~=nil
+end
+function Store:hidden_prefetch_entries(id)
+    local wanted=id~=nil and tostring(id) or nil
+    local all=self:get("prefetch_cache",{})
+    local out={}
+    for book_id,book in pairs(all) do
+        if wanted==nil or tostring(book_id)==wanted then
+            for uid,row in pairs(type(book)=="table" and book or {}) do
+                for kind,record in pairs(type(row)=="table" and row or {}) do
+                    if type(record)=="table" then
+                        out[#out+1]={book_id=tostring(book_id),uid=tostring(uid),kind=tostring(kind),
+                            file=record.file,record=U.copy(record),hidden=true}
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+function Store:prune_hidden_prefetch(ttl)
+    ttl=math.max(60,tonumber(ttl) or tonumber(Config.CHAPTER_PREFETCH_TTL) or 86400)
+    local now=os.time(); local all=self:get("prefetch_cache",{}); local changed=false; local removed=0
+    for book_id,book in pairs(all) do
+        for uid,row in pairs(type(book)=="table" and book or {}) do
+            for kind,record in pairs(type(row)=="table" and row or {}) do
+                local file=type(record)=="table" and tostring(record.file or "") or ""
+                local created=tonumber(type(record)=="table" and (record.prefetch_at or record.downloaded_at) or 0) or 0
+                local stale=created>0 and now-created>ttl
+                if file=="" or not U.file_exists(file) or stale then
+                    if stale and file~="" and U.file_exists(file) then U.remove_tree(file) end
+                    row[kind]=nil; removed=removed+1; changed=true
+                end
+            end
+            if next(row)==nil then book[uid]=nil end
+        end
+        if next(book)==nil then all[book_id]=nil end
+    end
+    if changed then self:set("prefetch_cache",all) end
+    return removed
+end
+function Store:prefetched_chapters(id)
+    local wanted=id~=nil and tostring(id) or nil
+    local out={}
+    -- Legacy beta.16-26 prefetches were saved as normal chapter variants with
+    -- a marker. Keep them manageable without migrating or deleting them.
+    for book_id,book in pairs(self:library()) do
+        if wanted==nil or tostring(book_id)==wanted then
+            for uid,row in pairs(book.chapters or {}) do
+                for kind,record in pairs(row or {}) do
+                    if type(record)=="table" and record.prefetch==true then
+                        out[#out+1]={book_id=tostring(book_id),uid=tostring(uid),kind=tostring(kind),
+                            file=record.file,record=U.copy(record),hidden=false}
+                    end
+                end
+            end
+        end
+    end
+    for _,entry in ipairs(self:hidden_prefetch_entries(wanted)) do out[#out+1]=entry end
+    table.sort(out,function(a,b)
+        if a.book_id~=b.book_id then return a.book_id<b.book_id end
+        if a.uid~=b.uid then return a.uid<b.uid end
+        if a.kind~=b.kind then return a.kind<b.kind end
+        return (a.hidden==true) and not (b.hidden==true)
+    end)
+    return out
+end
+function Store:prefetched_chapter_count(id) return #self:prefetched_chapters(id) end
+function Store:mark_chapter_prefetch_consumed(id,uid,kind)
+    local record=self:chapter_variant(id,uid,kind)
+    if type(record)~="table" or record.prefetch~=true then return false end
+    record=U.copy(record)
+    record.prefetch=nil
+    record.prefetch_origin=nil
+    record.prefetch_at=nil
+    record.prefetch_consumed_at=os.time()
+    self:save_chapter_variant(id,uid,kind,record)
+    return true
 end
 function Store:delete_book(id)
     for _,path in ipairs(self:book_paths(id,true)) do U.remove_tree(path) end

@@ -168,6 +168,7 @@ function Service.run(job)
         if value.generation==nil then value.generation=generation end
         if value.controller_token==nil then value.controller_token=tostring(source_job.controller_token or "") end
         if value.login_session_id==nil then value.login_session_id=tostring(source_job.login_session_id or "") end
+        if value.auth_revision==nil then value.auth_revision=math.max(0,tonumber(source_job.auth_revision or 0) or 0) end
         if value.account_vid==nil then value.account_vid=tostring(source_job.account_vid or "") end
         if value.book_id==nil then value.book_id=tostring(source_job.book_id or "") end
         if value.core_map_hash==nil then value.core_map_hash=tostring(source_job.core_map_hash or "") end
@@ -181,6 +182,7 @@ function Service.run(job)
             generation=generation,
             controller_token=tostring(current_job.controller_token or ""),
             login_session_id=tostring(current_job.login_session_id or ""),
+            auth_revision=math.max(0,tonumber(current_job.auth_revision or 0) or 0),
             account_vid=tostring(current_job.account_vid or ""),
             book_id=tostring(current_job.book_id or ""),
             core_map_hash=tostring(current_job.core_map_hash or ""),
@@ -388,6 +390,7 @@ function Service.run(job)
             if loaded and tonumber(loaded.generation or 0) == requested
                 and tostring(control.controller_token or "")==tostring(loaded.controller_token or "")
                 and tostring(control.login_session_id or "")==tostring(loaded.login_session_id or "")
+                and math.max(0,tonumber(control.auth_revision or 0) or 0)==math.max(0,tonumber(loaded.auth_revision or 0) or 0)
                 and tostring(control.account_vid or "")==tostring(loaded.account_vid or "")
                 and (tostring(loaded.action or "")=="reset_auth" or (
                     tostring(control.book_id or "")==tostring(loaded.book_id or "")
@@ -441,6 +444,7 @@ function Service.run(job)
         if current_job and control and tonumber(control.generation or 0) == generation
             and tostring(control.controller_token or "") == tostring(current_job.controller_token or "")
             and tostring(control.login_session_id or "") == tostring(current_job.login_session_id or "")
+            and math.max(0,tonumber(control.auth_revision or 0) or 0)==math.max(0,tonumber(current_job.auth_revision or 0) or 0)
             and tostring(control.account_vid or "") == tostring(current_job.account_vid or "")
             and tostring(control.book_id or "") == tostring(current_job.book_id or "")
             and tostring(control.core_map_hash or "") ~= ""
