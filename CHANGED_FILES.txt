@@ -1,12 +1,13 @@
-4.9.0-beta.26
+4.9.0-beta.27
 
 Changed files:
 - miuread.koplugin/main.lua
-- miuread.koplugin/miuread/home_view.lua
+- miuread.koplugin/miuread/sync.lua
+- miuread.koplugin/miuread/downloader.lua
 - miuread.koplugin/miuread/store.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: make the Home reading-stat cards independently visible, skip hidden Home-stat refresh work, expand the remaining card or clock automatically, align the recent-reading/dashboard outer borders, and restore the optional sync-success notice setting without changing sync, download, suspend/resume or precise-progress core logic.
+Focus: repair the standalone WeRead next-chapter pipeline without redesigning the normal downloader. Reuse the verified whole-book catalog, distinguish NEXT/LAST/UNKNOWN at EOF, build passive next-chapter EPUBs in a private cache, promote the same in-flight task when the reader actually needs the next chapter, and keep passive prefetch from holding suspend. Existing progress, reading-time, normal download and platform suspend behavior remain unchanged.

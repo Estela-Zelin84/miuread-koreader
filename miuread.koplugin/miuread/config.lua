@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.9.0-beta.26",
-    SCHEMA = 117,
+    VERSION = "4.9.0-beta.27",
+    SCHEMA = 118,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
@@ -57,6 +57,9 @@ local C = {
     -- the reader has been stable for a while. It never wakes a sleeping device
     -- just to prefetch, and any explicit user download takes priority.
     CHAPTER_PREFETCH_DELAY = 30,
+    -- Hidden next-chapter EPUBs are cache, not formal downloads. Keep them
+    -- long enough for a short reading break but prune stale unused entries.
+    CHAPTER_PREFETCH_TTL = 24 * 60 * 60,
     -- Failed automatic cover fetches must not restart on every home gesture.
     -- A manual refresh bypasses the runtime backoff once.
     COVER_RETRY_DELAYS = {30, 120, 600, 1800},

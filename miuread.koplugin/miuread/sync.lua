@@ -627,6 +627,32 @@ function Sync:_progress_catalog(record)
     return {}, "missing"
 end
 
+function Sync:chapter_catalog_context(record)
+    record=record or self:record()
+    if not record then return {catalog_complete=false,chapters={},source="missing_record",book_id=""} end
+    local chapters,source=self:_progress_catalog(record)
+    local book_id=tostring(record.book and (record.book.book_id or record.book.bookId) or "")
+    local complete=type(chapters)=="table" and #chapters>0 and tostring(source or "")~="missing"
+    return {catalog_complete=complete,chapters=complete and U.copy(chapters) or {},
+        source=tostring(source or "missing"),book_id=book_id}
+end
+
+function Sync:ensure_chapter_catalog_context(callback)
+    local current=self:chapter_catalog_context()
+    if current.catalog_complete==true then
+        if callback then callback(current,nil) end
+        return true,"cached"
+    end
+    return self:_prepare_progress_catalog(function(_,err,meta)
+        local refreshed=self:chapter_catalog_context()
+        if refreshed.catalog_complete==true then
+            if callback then callback(refreshed,nil) end
+        elseif callback then
+            callback(nil,err or "catalog_context_failed",meta)
+        end
+    end)
+end
+
 function Sync:position(record, ratio, chapters, full_catalog)
     ratio = ratio or self:local_ratio() or 0
     local local_map = chapters or (record.record and record.record.chapter_map) or {}
