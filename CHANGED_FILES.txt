@@ -1,17 +1,14 @@
-4.9.0-beta.28
+4.9.0-beta.29
 
 Changed files:
 - miuread.koplugin/main.lua
-- miuread.koplugin/miuread/auth.lua
-- miuread.koplugin/miuread/http.lua
-- miuread.koplugin/miuread/reader.lua
-- miuread.koplugin/miuread/sync.lua
-- miuread.koplugin/miuread/read_report_service.lua
-- miuread.koplugin/miuread/download_task.lua
-- miuread.koplugin/miuread/store.lua
+- miuread.koplugin/miuread/frontlight_controller.lua
+- miuread.koplugin/miuread/home_quick_panel.lua
+- miuread.koplugin/miuread/reader_toolbar.lua
+- miuread.koplugin/miuread/reader_frontlight_dialog.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: stabilize WeRead authentication without changing download/power architecture. Credential writes are revision-guarded; renewal commits only after server acceptance; same-account QR refreshes preserve shelf/local data; the long-lived reading-time service reloads renewed credentials instead of reusing a stale snapshot and never overwrites the parent login.
+Focus: make KOReader the single source of truth for frontlight brightness and natural-light warmth. MiuRead now follows each device's KOReader-native ranges dynamically, writes through KOReader's DeviceListener, reads the actual state back after changes, and does not alter authentication, download, suspend/resume, progress, or layout architecture.

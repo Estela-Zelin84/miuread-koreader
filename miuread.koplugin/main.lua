@@ -73,6 +73,7 @@ local TransientGuard=require("miuread.transient_guard")
 local ScreenshotMode=require("miuread.screenshot_mode")
 local GestureBridge=require("miuread.gesture_bridge")
 local Orientation=require("miuread.orientation_controller")
+local FrontlightController=require("miuread.frontlight_controller")
 local Bluetooth=require("miuread.bluetooth")
 local HomeData=require("miuread.home_data")
 local TimeZone=require("miuread.timezone")
@@ -763,6 +764,7 @@ function Plugin:init()
     self._reader_toolbar_prewarm_task=nil
     self._reader_toolbar_header_perf=nil
     self._reader_toolbar_options_perf=nil
+    self._frontlight_ui_refresh_task=nil
     self._mode_intro_generation=0
     self._thought_popup_marker_path=self.store.temp_dir.."/thought-popup.pending.json"
     self._thought_popup_last_crash_path=self.store.data_dir.."/thought-popup-last-crash.json"
@@ -8899,7 +8901,7 @@ function Plugin:_show_home_frontlight_popup(anchor)
         subtitle="当前亮度 "..tostring(value),
         actions={
             {icon="☼",label="亮度与色温",detail="打开完整前光调节",callback=function() self:_home_frontlight() end},
-            {icon=enabled and "○" or "●",label=enabled and "关闭前光" or "开启前光",detail="快速切换前光",callback=function() self:_reader_toggle_frontlight() end},
+            {icon=enabled and "○" or "●",label=enabled and "关闭前光" or "开启前光",detail="快速切换前光",callback=function() self:_reader_toggle_frontlight("home_frontlight_popup") end},
             {icon="◐",label="切换夜间模式",detail="反转阅读显示",callback=function() self:_home_toggle_night() end},
         },
         wide_last=true,
@@ -11800,14 +11802,14 @@ function Plugin:show_home_quick_panel(more_expanded)
         frontlight_control={
             get_enabled=function() return self:_reader_frontlight_enabled() end,
             get_night=function() return self:_reader_night_enabled() end,
-            on_toggle=function() return self:_reader_toggle_frontlight() end,
+            on_toggle=function() return self:_reader_toggle_frontlight("home_quick_panel") end,
             on_night=function() return self:_home_toggle_night() end,
-            brightness={min=minimum,max=maximum,value=self:_reader_frontlight_value() or minimum,get_value=function() return self:_reader_frontlight_value() or minimum end,on_set=function(value)
-                if not self:_reader_set_frontlight(value) then return false end
+            brightness={min=minimum,max=maximum,value=self:_reader_frontlight_value() or minimum,get_value=function() return self:_reader_frontlight_value() or minimum end,on_set=function(value,interaction)
+                if not self:_reader_set_frontlight(value,"home_quick_panel",interaction) then return false end
                 return self:_reader_frontlight_value() or value
             end},
-            warmth=warmth_state and {min=warmth_state.min,max=warmth_state.max,value=warmth_state.value,get_value=function() local latest=self:_reader_warmth_state(); return latest and latest.value or warmth_state.value end,on_set=function(value)
-                if not self:_reader_set_warmth(value) then return false end
+            warmth=warmth_state and {min=warmth_state.min,max=warmth_state.max,value=warmth_state.value,get_value=function() local latest=self:_reader_warmth_state(); return latest and latest.value or warmth_state.value end,on_set=function(value,interaction)
+                if not self:_reader_set_warmth(value,"home_quick_panel",interaction) then return false end
                 local latest=self:_reader_warmth_state(); return latest and latest.value or value
             end} or nil,
         }
@@ -14174,120 +14176,64 @@ function Plugin:_show_reader_koreader_actions()
     }
 end
 function Plugin:_reader_power_device()
-    if not Device:hasFrontlight() or type(Device.getPowerDevice)~="function" then return nil end
-    local ok,powerd=pcall(Device.getPowerDevice,Device)
-    if ok then return powerd end
-    return nil
+    return FrontlightController.power_device()
 end
 
 function Plugin:_reader_frontlight_value()
-    local powerd=self:_reader_power_device()
-    if not powerd then return nil end
-    local current
-    if type(powerd.frontlightIntensity)=="function" then
-        local ok,value=pcall(powerd.frontlightIntensity,powerd)
-        if ok then current=tonumber(value) end
-    end
-    return current or tonumber(powerd.fl_intensity or powerd.hw_intensity) or tonumber(powerd.fl_min) or 0
+    local state=FrontlightController.brightness_state()
+    return state and state.value or nil
 end
 
 function Plugin:_reader_frontlight_bounds()
-    local powerd=self:_reader_power_device()
-    if not powerd then return 0,100 end
-    local minimum=tonumber(powerd.fl_min) or 0
-    local maximum=tonumber(powerd.fl_max) or 100
-    if maximum<=minimum then maximum=minimum+100 end
-    return minimum,maximum
+    local state=FrontlightController.brightness_state()
+    if not state then return 0,0 end
+    return state.min,state.max
 end
 
 function Plugin:_reader_frontlight_enabled()
-    local powerd=self:_reader_power_device()
-    if not powerd then return false end
-    if type(powerd.isFrontlightOn)=="function" then
-        local ok,value=pcall(powerd.isFrontlightOn,powerd)
-        if ok then return value==true end
-    end
-    local minimum=self:_reader_frontlight_bounds()
-    return (self:_reader_frontlight_value() or minimum)>minimum
+    local state=FrontlightController.brightness_state()
+    return state and state.enabled==true or false
 end
 
-function Plugin:_reader_set_frontlight(value)
-    local listener=self:_koreader_device_listener()
-    if not (listener and type(listener.onSetFlIntensity)=="function") then
+function Plugin:_reader_set_frontlight(value,source,interaction)
+    local ok=FrontlightController.set_brightness(value,source or "miuread",interaction,self:_koreader_device_listener())
+    if not ok then
         self:info("当前 KOReader 暂时无法调整前光")
         return false
     end
-    local minimum,maximum=self:_reader_frontlight_bounds()
-    local target=math.max(minimum,math.min(maximum,math.floor((tonumber(value) or minimum)+.5)))
-    local ok,err=pcall(listener.onSetFlIntensity,listener,target)
-    if not ok then
-        logger.warn("[MiuRead][Frontlight] native intensity failed",tostring(err))
-        self:info("前光调整失败")
-        return false
-    end
     return true
 end
 
-function Plugin:_reader_toggle_frontlight()
-    local listener=self:_koreader_device_listener()
-    if not (listener and type(listener.onToggleFrontlight)=="function") then
+function Plugin:_reader_toggle_frontlight(source)
+    local ok=FrontlightController.toggle(source or "miuread",self:_koreader_device_listener())
+    if not ok then
         self:info("当前 KOReader 暂时无法切换前光")
         return false
     end
-    local ok,err=pcall(listener.onToggleFrontlight,listener)
-    if not ok then
-        logger.warn("[MiuRead][Frontlight] native toggle failed",tostring(err))
-        self:info("前光切换失败")
-        return false
-    end
     return true
 end
 
-function Plugin:_reader_adjust_frontlight(delta)
-    local minimum,maximum=self:_reader_frontlight_bounds()
-    local current=self:_reader_frontlight_value() or minimum
-    local stride=math.max(1,math.ceil((maximum-minimum+1)/25))
-    return self:_reader_set_frontlight(current+(tonumber(delta) or 0)*stride)
+function Plugin:_reader_adjust_frontlight(delta,source,interaction)
+    local ok=FrontlightController.adjust_brightness(delta,source or "miuread",interaction,self:_koreader_device_listener())
+    if not ok then
+        self:info("当前 KOReader 暂时无法调整前光")
+        return false
+    end
+    return true
 end
 
 function Plugin:_reader_warmth_state()
-    local powerd=self:_reader_power_device()
-    local has_natural=type(Device.hasNaturalLight)=="function" and Device:hasNaturalLight()
-    if not (powerd and has_natural) then return nil end
-    local minimum=tonumber(powerd.fl_warmth_min) or 0
-    local maximum=tonumber(powerd.fl_warmth_max) or 100
-    local value
-    if type(powerd.frontlightWarmth)=="function" then
-        local ok,current=pcall(powerd.frontlightWarmth,powerd)
-        if ok then value=tonumber(current) end
-    end
-    value=value or tonumber(powerd.fl_warmth) or minimum
-    if type(powerd.toNativeWarmth)=="function" then
-        local ok,native=pcall(powerd.toNativeWarmth,powerd,value)
-        if ok and tonumber(native) then value=tonumber(native) end
-    end
-    value=math.max(minimum,math.min(maximum,value))
-    return {min=minimum,max=maximum,value=value}
+    return FrontlightController.warmth_state()
 end
 
-function Plugin:_reader_set_warmth(value)
-    local state=self:_reader_warmth_state()
-    local listener=self:_koreader_device_listener()
-    if not (state and listener and type(listener.onSetFlWarmth)=="function") then return false end
-    local target=math.max(state.min,math.min(state.max,math.floor((tonumber(value) or state.value)+.5)))
-    local ok,err=pcall(listener.onSetFlWarmth,listener,target)
-    if not ok then
-        logger.warn("[MiuRead][Frontlight] native warmth failed",tostring(err))
-        return false
-    end
-    return true
+function Plugin:_reader_set_warmth(value,source,interaction)
+    local ok=FrontlightController.set_warmth(value,source or "miuread",interaction,self:_koreader_device_listener())
+    return ok==true
 end
 
-function Plugin:_reader_adjust_warmth(delta)
-    local state=self:_reader_warmth_state()
-    if not state then return false end
-    local stride=math.max(1,math.ceil((state.max-state.min+1)/25))
-    return self:_reader_set_warmth(state.value+(tonumber(delta) or 0)*stride)
+function Plugin:_reader_adjust_warmth(delta,source,interaction)
+    local ok=FrontlightController.adjust_warmth(delta,source or "miuread",interaction,self:_koreader_device_listener())
+    return ok==true
 end
 
 function Plugin:_show_frontlight_panel(options)
@@ -14304,7 +14250,7 @@ function Plugin:_show_frontlight_panel(options)
                 label="前光",
                 value=enabled and "开" or "关",
                 selected=enabled,
-                callback=function() self:_reader_toggle_frontlight() end,
+                callback=function() self:_reader_toggle_frontlight("frontlight_dialog") end,
             }
         end,
         brightness=function()
@@ -14313,10 +14259,10 @@ function Plugin:_show_frontlight_panel(options)
                 min=minimum,
                 max=maximum,
                 value=self:_reader_frontlight_value() or minimum,
-                on_decrease=function() self:_reader_adjust_frontlight(-1) end,
-                on_increase=function() self:_reader_adjust_frontlight(1) end,
-                on_set=function(value)
-                    if not self:_reader_set_frontlight(value) then return false end
+                on_decrease=function() self:_reader_adjust_frontlight(-1,"frontlight_dialog","step") end,
+                on_increase=function() self:_reader_adjust_frontlight(1,"frontlight_dialog","step") end,
+                on_set=function(value,interaction)
+                    if not self:_reader_set_frontlight(value,"frontlight_dialog",interaction) then return false end
                     return self:_reader_frontlight_value() or value
                 end,
             }
@@ -14328,23 +14274,23 @@ function Plugin:_show_frontlight_panel(options)
                 min=current.min,
                 max=current.max,
                 value=current.value,
-                on_decrease=function() self:_reader_adjust_warmth(-1) end,
-                on_increase=function() self:_reader_adjust_warmth(1) end,
-                on_set=function(value)
-                    if not self:_reader_set_warmth(value) then return false end
+                on_decrease=function() self:_reader_adjust_warmth(-1,"frontlight_dialog","step") end,
+                on_increase=function() self:_reader_adjust_warmth(1,"frontlight_dialog","step") end,
+                on_set=function(value,interaction)
+                    if not self:_reader_set_warmth(value,"frontlight_dialog",interaction) then return false end
                     local state=self:_reader_warmth_state()
                     return state and state.value or value
                 end,
             }
         end or nil,
         actions={
-            {label="最低",callback=function() self:_reader_set_frontlight(math.min(maximum,minimum+1)) end},
+            {label="最低",callback=function() self:_reader_set_frontlight(math.min(maximum,minimum+1),"frontlight_dialog_action","step") end},
             {
                 label=function() return "夜间模式 · "..(self:_reader_night_enabled() and "开" or "关") end,
                 selected=function() return self:_reader_night_enabled() end,
                 callback=function() self:_home_toggle_night() end,
             },
-            {label="最高",callback=function() self:_reader_set_frontlight(maximum) end},
+            {label="最高",callback=function() self:_reader_set_frontlight(maximum,"frontlight_dialog_action","step") end},
         },
         on_back=options.on_back,
     }
@@ -15188,16 +15134,17 @@ function Plugin:_reader_quick_panel_options()
         local minimum,maximum=self:_reader_frontlight_bounds()
         frontlight={
             icon="frontlight",label="前光",min=minimum,max=maximum,value=self:_reader_frontlight_value() or minimum,
-            on_set=function(value)
-                if not self:_reader_set_frontlight(value) then return false end
+            get_value=function() return self:_reader_frontlight_value() or minimum end,
+            on_set=function(value,interaction)
+                if not self:_reader_set_frontlight(value,"reader_toolbar",interaction) then return false end
                 return self:_reader_frontlight_value() or value
             end,
             on_decrease=function()
-                if not self:_reader_adjust_frontlight(-1) then return false end
+                if not self:_reader_adjust_frontlight(-1,"reader_toolbar","step") then return false end
                 return self:_reader_frontlight_value() or minimum
             end,
             on_increase=function()
-                if not self:_reader_adjust_frontlight(1) then return false end
+                if not self:_reader_adjust_frontlight(1,"reader_toolbar","step") then return false end
                 return self:_reader_frontlight_value() or minimum
             end,
         }
@@ -15205,18 +15152,19 @@ function Plugin:_reader_quick_panel_options()
         if state then
             warmth={
                 icon="warmth",label="色温",min=state.min,max=state.max,value=state.value,
-                on_set=function(value)
-                    if not self:_reader_set_warmth(value) then return false end
+                get_value=function() local current=self:_reader_warmth_state(); return current and current.value or state.value end,
+                on_set=function(value,interaction)
+                    if not self:_reader_set_warmth(value,"reader_toolbar",interaction) then return false end
                     local current=self:_reader_warmth_state()
                     return current and current.value or value
                 end,
                 on_decrease=function()
-                    if not self:_reader_adjust_warmth(-1) then return false end
+                    if not self:_reader_adjust_warmth(-1,"reader_toolbar","step") then return false end
                     local current=self:_reader_warmth_state()
                     return current and current.value or state.value
                 end,
                 on_increase=function()
-                    if not self:_reader_adjust_warmth(1) then return false end
+                    if not self:_reader_adjust_warmth(1,"reader_toolbar","step") then return false end
                     local current=self:_reader_warmth_state()
                     return current and current.value or state.value
                 end,
@@ -26223,6 +26171,30 @@ function Plugin:_refresh_home_power_header(reason)
     return false
 end
 
+
+function Plugin:_schedule_frontlight_ui_refresh(delay)
+    if self._frontlight_ui_refresh_task then
+        UIManager:unschedule(self._frontlight_ui_refresh_task)
+        self._frontlight_ui_refresh_task=nil
+    end
+    local task
+    task=function()
+        if self._frontlight_ui_refresh_task~=task then return end
+        self._frontlight_ui_refresh_task=nil
+        if HOME_SESSION.suspended==true or self._miuread_suspended==true then return end
+        if type(HomeQuickPanel.refreshFrontlight)=="function" then pcall(HomeQuickPanel.refreshFrontlight) end
+        if type(ReaderToolbar.refreshFrontlight)=="function" then pcall(ReaderToolbar.refreshFrontlight) end
+    end
+    self._frontlight_ui_refresh_task=task
+    UIManager:scheduleIn(math.max(.02,tonumber(delay) or .08),task)
+end
+
+function Plugin:onFrontlightStateChanged()
+    -- KOReader is the source of truth. Debounce native state broadcasts so a
+    -- dragged slider cannot turn into a repaint storm.
+    self:_schedule_frontlight_ui_refresh(.08)
+end
+
 function Plugin:onCharging()
     return self:_refresh_home_power_header("charging")
 end
@@ -26551,6 +26523,7 @@ function Plugin:onResume()
         end)
     end
     self:_background_log_state("resume lifecycle",true)
+    self:_schedule_frontlight_ui_refresh(.20)
     self._resume_lifecycle_generation=(tonumber(self._resume_lifecycle_generation) or 0)+1
     local resume_generation=self._resume_lifecycle_generation
     local power_generation=power.generation

@@ -161,7 +161,7 @@ function SliderBar:_set_from_position(ges, force)
     local target = math.floor(self.min + ratio * (self.max - self.min) + .5)
     local actual = target
     if self.on_change then
-        local ok, result = pcall(self.on_change, target)
+        local ok, result = pcall(self.on_change, target, force and "commit" or "drag")
         if not ok then
             logger.warn("[MiuRead][ReaderToolbar] slider action failed", tostring(result))
             return true
@@ -632,9 +632,9 @@ function Toolbar:_light_row(root, setting, x, y, width, height)
         value = tonumber(setting.value) or 0,
         owner = self,
         value_widget = value_widget,
-        on_change = function(target)
+        on_change = function(target, interaction)
             if type(setting.on_set) ~= "function" then return target end
-            local result = setting.on_set(target)
+            local result = setting.on_set(target, interaction)
             if result == false then return false end
             return tonumber(result) or target
         end,
@@ -801,6 +801,25 @@ local function set_ref(ref,value,formatter)
     ref:setText(text)
 end
 
+function Toolbar:refreshFrontlightState()
+    local changed=false
+    for _,key in ipairs({"frontlight","warmth"}) do
+        local setting=type(self.opts[key])=="table" and self.opts[key] or nil
+        local slider=self._sliders and self._sliders[key] or nil
+        if setting and slider and type(setting.get_value)=="function" then
+            local ok,value=pcall(setting.get_value)
+            if ok and tonumber(value) then
+                slider:setValue(tonumber(value),false)
+                changed=true
+            end
+        end
+    end
+    if changed and self.panel_dimen then
+        UIManager:setDirty(self,function() return "ui",Skin.expand_region(self.panel_dimen,Skin.dp(2,2,3)) end)
+    end
+    return changed
+end
+
 function Toolbar:updateFromOptions(opts)
     opts=type(opts)=="table" and opts or {}
     if self:_signature(opts)~=self._layout_signature then return false end
@@ -898,6 +917,12 @@ local M = {}
 function M.close()
     if live_toolbar and not live_toolbar.closed then live_toolbar:_close(nil, true) end
     live_toolbar = nil
+end
+function M.refreshFrontlight()
+    if live_toolbar and not live_toolbar.closed and type(live_toolbar.refreshFrontlightState)=="function" then
+        return live_toolbar:refreshFrontlightState()
+    end
+    return false
 end
 function M.invalidate()
     M.close()
