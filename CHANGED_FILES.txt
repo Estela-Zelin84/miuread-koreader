@@ -1,13 +1,17 @@
-4.9.0-beta.27
+4.9.0-beta.28
 
 Changed files:
 - miuread.koplugin/main.lua
+- miuread.koplugin/miuread/auth.lua
+- miuread.koplugin/miuread/http.lua
+- miuread.koplugin/miuread/reader.lua
 - miuread.koplugin/miuread/sync.lua
-- miuread.koplugin/miuread/downloader.lua
+- miuread.koplugin/miuread/read_report_service.lua
+- miuread.koplugin/miuread/download_task.lua
 - miuread.koplugin/miuread/store.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: repair the standalone WeRead next-chapter pipeline without redesigning the normal downloader. Reuse the verified whole-book catalog, distinguish NEXT/LAST/UNKNOWN at EOF, build passive next-chapter EPUBs in a private cache, promote the same in-flight task when the reader actually needs the next chapter, and keep passive prefetch from holding suspend. Existing progress, reading-time, normal download and platform suspend behavior remain unchanged.
+Focus: stabilize WeRead authentication without changing download/power architecture. Credential writes are revision-guarded; renewal commits only after server acceptance; same-account QR refreshes preserve shelf/local data; the long-lived reading-time service reloads renewed credentials instead of reusing a stale snapshot and never overwrites the parent login.

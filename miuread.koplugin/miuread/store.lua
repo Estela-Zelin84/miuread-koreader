@@ -6,6 +6,7 @@ local Config=require("miuread.config")
 local Json=require("miuread.json")
 local DownloadDatabase=require("miuread.download_database")
 local U=require("miuread.util")
+local Cookies=require("miuread.cookies")
 local logger=require("logger")
 local Store={}; Store.__index=Store
 local function generate_login_session_id()
@@ -13,7 +14,7 @@ local function generate_login_session_id()
 end
 local defaults={
  schema=Config.SCHEMA,
- auth={login_session_id="",api_key="",cookies={},wr_ticket="",wr_wrpa="",ticket_updated_at=0,
+ auth={login_session_id="",auth_revision=0,api_key="",cookies={},wr_ticket="",wr_wrpa="",ticket_updated_at=0,
      account={name="",vid="",logged_at=0},
      health={state="unknown",last_checked_at=0,last_ok_at=0,last_error_at=0,
          last_error_code="",last_error_message="",last_error_channel="",notice_pending=false,
@@ -1510,6 +1511,21 @@ function Store:migrate()
             end
             logger.info("[MiuRead][Migration] schema 117 -> 118 done")
         end
+        if schema<119 then
+            logger.info("[MiuRead][Migration] schema 118 -> 119 begin","from=",tostring(schema))
+            -- beta.28 gives every durable credential change a monotonically
+            -- increasing revision. Long-lived/read/download workers can then
+            -- prove that their response still belongs to the current login
+            -- credentials before they are allowed to write anything back.
+            local auth=U.merge(defaults.auth,self.db:readSetting("auth",{}) or {})
+            local account=type(auth.account)=="table" and auth.account or {}
+            local logged=tostring(auth.login_session_id or "")~=""
+                and tostring(account.vid or (auth.cookies or {}).wr_vid or "")~=""
+            auth.auth_revision=logged and math.max(1,tonumber(auth.auth_revision or 0) or 0) or 0
+            self.db:saveSetting("auth",auth)
+            logger.info("[MiuRead][Migration] schema 118 -> 119 done",
+                "logged_in=",tostring(logged),"revision=",tostring(auth.auth_revision))
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end
@@ -1521,6 +1537,7 @@ end
 function Store:set_deferred(k,v) self.db:saveSetting(k,v) end
 local function sanitized_auth(value)
     local auth=U.merge(defaults.auth,value or {})
+    auth.auth_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     auth.mp_cookie_header=nil
     auth.mp_extra_headers=nil
     auth.mp_referer=nil
@@ -1528,8 +1545,56 @@ local function sanitized_auth(value)
     auth.mp_authorized_at=nil
     return auth
 end
+local function same_login_cookies(a,b)
+    a=type(a)=="table" and a or {}; b=type(b)=="table" and b or {}
+    for key,value in pairs(a) do
+        if type(key)=="string" and key:match("^wr_") and tostring((b or {})[key] or "")~=tostring(value or "") then
+            return false
+        end
+    end
+    for key,value in pairs(b) do
+        if type(key)=="string" and key:match("^wr_") and tostring((a or {})[key] or "")~=tostring(value or "") then
+            return false
+        end
+    end
+    return true
+end
+local function same_auth_credentials(a,b)
+    a=sanitized_auth(a); b=sanitized_auth(b)
+    local aa=type(a.account)=="table" and a.account or {}
+    local ba=type(b.account)=="table" and b.account or {}
+    return tostring(a.login_session_id or "")==tostring(b.login_session_id or "")
+        and tostring(aa.vid or "")==tostring(ba.vid or "")
+        and tostring(a.api_key or "")==tostring(b.api_key or "")
+        and tostring(a.wr_ticket or "")==tostring(b.wr_ticket or "")
+        and tostring(a.wr_wrpa or "")==tostring(b.wr_wrpa or "")
+        and same_login_cookies(a.cookies,b.cookies)
+end
 function Store:auth() return sanitized_auth(self:get("auth",{})) end
-function Store:save_auth(v) return self:set("auth",sanitized_auth(v)) end
+function Store:save_auth(v,opt)
+    opt=type(opt)=="table" and opt or {}
+    local current=sanitized_auth(self:get("auth",{}))
+    local incoming=sanitized_auth(v)
+    local current_revision=math.max(0,tonumber(current.auth_revision or 0) or 0)
+    local incoming_revision=math.max(0,tonumber(incoming.auth_revision or 0) or 0)
+    local expected=opt.expected_revision~=nil and tonumber(opt.expected_revision) or nil
+    if expected~=nil and expected~=current_revision then
+        return false,"登录凭据已经更新，已忽略旧任务结果"
+    end
+    local credentials_changed=not same_auth_credentials(current,incoming)
+    if credentials_changed then
+        if opt.replace_login~=true and current_revision>0 and incoming_revision~=current_revision then
+            return false,"登录凭据版本已经变化，已拒绝旧凭据覆盖"
+        end
+        incoming.auth_revision=current_revision+1
+    else
+        incoming.auth_revision=current_revision
+    end
+    return self:set("auth",incoming)
+end
+function Store:auth_revision()
+    return math.max(0,tonumber(self:auth().auth_revision or 0) or 0)
+end
 function Store:generate_login_session_id() return generate_login_session_id() end
 function Store:ensure_login_session_id()
     local auth=self:auth()

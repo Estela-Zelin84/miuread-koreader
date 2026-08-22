@@ -1164,7 +1164,9 @@ local function interactive_child_store(auth,data_dir,temp_dir)
     local changed=false
     local store={data_dir=tostring(data_dir or ""),temp_dir=tostring(temp_dir or "")}
     function store:auth() return U.copy(current) end
-    function store:save_auth(value) current=U.copy(type(value)=="table" and value or {}); changed=true end
+    -- The isolated child deliberately keeps the parent's starting revision.
+    -- The parent performs the real compare-and-swap when this snapshot returns.
+    function store:save_auth(value) current=U.copy(type(value)=="table" and value or {}); changed=true; return true end
     function store:snapshot() return U.copy(current),changed end
     return store
 end
@@ -1209,7 +1211,11 @@ function Plugin:_apply_interactive_auth(snapshot)
         logger.warn("[MiuRead][NetTask] ignored cross-account auth snapshot")
         return false
     end
-    self.store:save_auth(incoming)
+    local saved,save_error=self.store:save_auth(incoming,{expected_revision=tonumber(incoming.auth_revision or 0) or 0})
+    if saved~=true then
+        logger.warn("[MiuRead][NetTask] ignored stale auth snapshot",U.first_line(save_error or "credential revision changed",120))
+        return false
+    end
     return true
 end
 
@@ -1677,14 +1683,25 @@ function Plugin:confirm_logout()
     end})
 end
 
-function Plugin:on_auth_replacing(_old_auth,_new_auth)
-    self:_cancel_interactive_network("auth replacing")
+function Plugin:on_auth_replaced(old_auth,new_auth)
+    old_auth=type(old_auth)=="table" and old_auth or {}
+    new_auth=type(new_auth)=="table" and new_auth or {}
+    local old_vid=tostring((old_auth.account or {}).vid or (old_auth.cookies or {}).wr_vid or "")
+    local new_vid=tostring((new_auth.account or {}).vid or (new_auth.cookies or {}).wr_vid or "")
+    local same_account=old_vid~="" and new_vid~="" and old_vid==new_vid
+    self:_cancel_interactive_network(same_account and "auth refreshed" or "account changed")
     self._auth_transitioning=true
     if self.sync and self.sync.invalidate_login_session then
-        self.sync:invalidate_login_session("new_login")
+        self.sync:invalidate_login_session(same_account and "login_refreshed" or "account_changed")
     end
-    if self.store.clear_login_bound_sessions then self.store:clear_login_bound_sessions("new_login") end
-    if self.store.clear_account_shelf_cache then self.store:clear_account_shelf_cache() end
+    if self.store.clear_login_bound_sessions then
+        self.store:clear_login_bound_sessions(same_account and "login_refreshed" or "account_changed")
+    end
+    -- A same-account QR refresh is only a new credential set for this device.
+    -- Keep its shelf/cache/history. A real account switch still clears account data.
+    if not same_account and self.store.clear_account_shelf_cache then self.store:clear_account_shelf_cache() end
+    logger.info("[MiuRead][Auth] committed login transition",
+        "same_account=",tostring(same_account),"old_present=",tostring(old_vid~=""),"new_present=",tostring(new_vid~=""))
 end
 
 function Plugin:on_auth_commit_failed()
@@ -18079,10 +18096,13 @@ function Plugin:_merge_download_result(result,book,opt)
         local snapshot_session=tostring(snapshot.login_session_id or "")
         local snapshot_vid=tostring(snapshot.vid or child_account.vid or "")
         local snapshot_logged=tonumber(snapshot.logged_at or child_account.logged_at or 0) or 0
+        local snapshot_revision=math.max(0,tonumber(snapshot.auth_revision or 0) or 0)
+        local current_revision=math.max(0,tonumber(current.auth_revision or 0) or 0)
         local same_login=snapshot_session~=""
             and snapshot_session==tostring(current.login_session_id or "")
             and snapshot_vid~=""
             and snapshot_vid==tostring(current_account.vid or "")
+            and snapshot_revision==current_revision
         if same_login then
             local merged_cookies=U.copy(current.cookies or {})
             local core={wr_vid=true,wr_skey=true,wr_rt=true}
@@ -18101,7 +18121,11 @@ function Plugin:_merge_download_result(result,book,opt)
                 if tostring(result.auth.wr_wrpa or "")~="" then current.wr_wrpa=result.auth.wr_wrpa end
                 if child_ticket_time>current_ticket_time then current.ticket_updated_at=child_ticket_time end
             end
-            self.store:save_auth(current)
+            local saved,save_error=self.store:save_auth(current,{expected_revision=current_revision})
+            if saved~=true then
+                logger.warn("[MiuRead][Download] child authentication merge skipped",
+                    "reason=credential_revision_changed",U.first_line(save_error or "",120))
+            end
         else
             logger.warn("[MiuRead][Download] child authentication merge skipped",
                 "snapshot_session=",snapshot_session,
@@ -18109,7 +18133,9 @@ function Plugin:_merge_download_result(result,book,opt)
                 "snapshot_vid=",snapshot_vid,
                 "current_vid=",tostring(current_account.vid or ""),
                 "snapshot_logged_at=",tostring(snapshot_logged),
-                "current_logged_at=",tostring(current_account.logged_at or 0))
+                "current_logged_at=",tostring(current_account.logged_at or 0),
+                "snapshot_revision=",tostring(snapshot_revision),
+                "current_revision=",tostring(current_revision))
         end
     end
 

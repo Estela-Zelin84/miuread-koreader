@@ -1822,6 +1822,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         vid=tostring(start_account.vid or ""),
         logged_at=tonumber(start_account.logged_at or 0) or 0,
         ticket_updated_at=tonumber(start_auth.ticket_updated_at or 0) or 0,
+        auth_revision=math.max(0,tonumber(start_auth.auth_revision or 0) or 0),
     }
     self.keep_awake_enabled = self.store:preferences().download_keep_awake ~= false
     clean_options.cancelled = nil

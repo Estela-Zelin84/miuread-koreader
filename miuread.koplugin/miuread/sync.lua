@@ -18,7 +18,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 20
+local READ_REPORT_SERVICE_VERSION = 21
 local FIRST_REPORT_DELAY = 60
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -850,6 +850,7 @@ function Sync:_prepare_progress_catalog(callback)
     local auth = self.store:auth()
     local account = type(auth.account) == "table" and auth.account or {}
     local login_snapshot = tostring(auth.login_session_id or "")
+    local auth_revision_snapshot=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local vid_snapshot = tostring(account.vid or "")
     if login_snapshot == "" or vid_snapshot == "" then return false, "authentication_required" end
 
@@ -926,6 +927,7 @@ function Sync:_prepare_progress_catalog(callback)
             return
         end
         if login_snapshot ~= tostring(current_auth.login_session_id or "")
+            or auth_revision_snapshot~=math.max(0,tonumber(current_auth.auth_revision or 0) or 0)
             or vid_snapshot ~= tostring(current_account.vid or "") then
             if callback then callback(nil, "login_changed", {error_kind="authentication"}) end
             return
@@ -971,7 +973,10 @@ function Sync:_prepare_progress_catalog(callback)
             latest_auth.cookies = value.cookies
             if value.wr_ticket_changed then latest_auth.wr_ticket = value.wr_ticket end
             if value.wr_wrpa_changed then latest_auth.wr_wrpa = value.wr_wrpa end
-            self.store:save_auth(latest_auth)
+            local saved_auth,save_error=self.store:save_auth(latest_auth,{expected_revision=auth_revision_snapshot})
+            if saved_auth~=true then
+                logger.warn("[MiuRead][ProgressMap] stale worker credential update ignored",U.first_line(save_error or "",120))
+            end
         end
         self.daemon_context = U.copy(context)
         self.store:save_session(book_id,{
@@ -2130,6 +2135,7 @@ function Sync:upload(elapsed, callback, options)
     local auth = self.store:auth()
     local account=type(auth.account)=="table" and auth.account or {}
     local login_snapshot=tostring(auth.login_session_id or "")
+    local auth_revision_snapshot=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local vid_snapshot=tostring(account.vid or "")
     if login_snapshot=="" or vid_snapshot=="" then
         if callback then callback(false,"当前账号登录会话无效，请重新扫码登录") end
@@ -2247,6 +2253,7 @@ function Sync:upload(elapsed, callback, options)
         local current_auth=self.store:auth()
         local current_account=type(current_auth.account)=="table" and current_auth.account or {}
         if login_snapshot~=tostring(current_auth.login_session_id or "")
+            or auth_revision_snapshot~=math.max(0,tonumber(current_auth.auth_revision or 0) or 0)
             or vid_snapshot~=tostring(current_account.vid or "") then
             logger.warn("[MiuRead][ReadReport] stale worker result ignored")
             emit_callback(false,"登录状态已变化")
@@ -2274,7 +2281,10 @@ function Sync:upload(elapsed, callback, options)
             latest_auth.cookies = value.cookies
             if value.wr_ticket_changed then latest_auth.wr_ticket = value.wr_ticket end
             if value.wr_wrpa_changed then latest_auth.wr_wrpa = value.wr_wrpa end
-            self.store:save_auth(latest_auth)
+            local saved_auth,save_error=self.store:save_auth(latest_auth,{expected_revision=auth_revision_snapshot})
+            if saved_auth~=true then
+                logger.warn("[MiuRead][ReadReport] stale worker credential update ignored",U.first_line(save_error or "",120))
+            end
         end
         local attempts_count = #(value.attempts or {})
         local public = value.payload_public or {}
@@ -2614,12 +2624,14 @@ local function acquire_lock_dir(path)
 end
 
 function Sync:_retire_legacy_daemon()
-    -- Stop workers created by earlier service layouts before starting v10.
-    -- Their job files contained authentication snapshots, so overwrite those
-    -- snapshots immediately and remove the remaining files after the worker exits.
+    -- Stop workers created by every earlier service layout before starting the
+    -- current one. Their job files contain credential snapshots; leaving an old
+    -- worker alive across OTA would defeat the auth-revision barrier.
     local base = self.store.temp_dir .. "/readtime-service"
     local retired={}
-    for _, suffix in ipairs({"", "-v1", "-v2", "-v3", "-v4", "-v5", "-v6", "-v7", "-v8", "-v9"}) do
+    local suffixes={""}
+    for version=1,READ_REPORT_SERVICE_VERSION-1 do suffixes[#suffixes+1]="-v"..tostring(version) end
+    for _, suffix in ipairs(suffixes) do
         local prefix=base..suffix
         local owner_path=prefix..".owner.json"
         retired[#retired+1]={
@@ -2698,6 +2710,7 @@ function Sync:_attach_existing_daemon(paths, owner)
         book_id=nil, interval=Config.READ_INTERVAL, reason="reused", is_child=false,
         service_version=READ_REPORT_SERVICE_VERSION,
         login_session_id=tostring(job.login_session_id or ""),
+        auth_revision=math.max(0,tonumber(job.auth_revision or 0) or 0),
         account_vid=tostring(job.account_vid or ""),
     }
     self.daemon_status_stamp = nil
@@ -2825,6 +2838,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
             generation = own_generation,
             controller_token = self.controller_token,
             login_session_id = tostring(d.login_session_id or auth.login_session_id or ""),
+            auth_revision = math.max(0,tonumber(d.auth_revision or auth.auth_revision or 0) or 0),
             account_vid = tostring(d.account_vid or account.vid or ""),
             book_id = book_id,
             core_map_hash = tostring(d.core_map_hash or existing.core_map_hash or ""),
@@ -2912,6 +2926,7 @@ function Sync:_load_daemon_context()
     if tonumber(envelope.generation or -1)~=tonumber(daemon.generation or 0)
         or tostring(envelope.controller_token or "")~=tostring(self.controller_token or "")
         or tostring(envelope.login_session_id or "")~=tostring(auth.login_session_id or "")
+        or math.max(0,tonumber(envelope.auth_revision or 0) or 0)~=math.max(0,tonumber(auth.auth_revision or 0) or 0)
         or tostring(envelope.account_vid or "")~=tostring(account.vid or "")
         or tostring(envelope.book_id or "")~=tostring(daemon.book_id or daemon.final_book_id or "")
         or tostring(envelope.core_map_hash or "")~=tostring(daemon.core_map_hash or "") then
@@ -2939,9 +2954,11 @@ function Sync:_import_daemon_status(force)
     local auth=self.store:auth()
     local account=type(auth.account)=="table" and auth.account or {}
     local current_session=tostring(auth.login_session_id or "")
+    local current_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local current_vid=tostring(account.vid or "")
     if current_session=="" or current_vid==""
         or tostring(status.login_session_id or "")~=current_session
+        or math.max(0,tonumber(status.auth_revision or 0) or 0)~=current_revision
         or tostring(status.account_vid or "")~=current_vid then
         logger.warn("[MiuRead][ReadReport] stale login status ignored",
             "status_session=",tostring(status.login_session_id or ""),
@@ -3016,12 +3033,13 @@ function Sync:_import_daemon_status(force)
         self.last_stage = status.accepted and "兼容上传链路已确认" or "后台上传失败"
     end
 
-    if status.cookies_changed and type(status.cookies) == "table" then
-        local auth = self.store:auth()
-        auth.cookies = status.cookies
-        if status.wr_ticket_changed then auth.wr_ticket = status.wr_ticket or "" end
-        if status.wr_wrpa_changed then auth.wr_wrpa = status.wr_wrpa or "" end
-        self.store:save_auth(auth)
+    if status.cookies_changed or status.wr_ticket_changed or status.wr_wrpa_changed then
+        -- The long-lived service is not an authentication authority. It may use
+        -- response cookies inside its own current job, but it is never allowed
+        -- to overwrite the parent's durable credentials. Renewal/relogin is
+        -- serialized by the parent and then pushed back as a new job revision.
+        logger.info("[MiuRead][ReadReport] background credential update kept local",
+            "revision=",tostring(status.auth_revision or 0))
     end
 
     if status.accepted then
@@ -3256,6 +3274,7 @@ function Sync:_start_daemon(reason)
     local auth = self.store:auth()
     local current_account=type(auth.account)=="table" and auth.account or {}
     local login_session_id=tostring(auth.login_session_id or "")
+    local auth_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local account_vid=tostring(current_account.vid or "")
     if login_session_id=="" or account_vid=="" then
         self.state="stopped"
@@ -3272,6 +3291,7 @@ function Sync:_start_daemon(reason)
     end
     local existing_job=read_json_file(daemon.paths.job) or {}
     local same_account=tostring(existing_job.login_session_id or "")==login_session_id
+        and math.max(0,tonumber(existing_job.auth_revision or 0) or 0)==auth_revision
         and tostring(existing_job.account_vid or "")==account_vid
     local same_document=tostring(existing_job.book_path or "")==tostring(record.path or "")
     local same_core=tostring(existing_job.core_map_hash or "")==core_hash
@@ -3325,6 +3345,7 @@ function Sync:_start_daemon(reason)
     daemon.interval = interval
     daemon.reason = reason
     daemon.login_session_id = login_session_id
+    daemon.auth_revision = auth_revision
     daemon.account_vid = account_vid
     daemon.core_map_hash=core_hash
     daemon.record_generation=tonumber(self.record_generation or 0) or 0
@@ -3334,6 +3355,7 @@ function Sync:_start_daemon(reason)
         generation = daemon.generation,
         controller_token = self.controller_token,
         login_session_id = login_session_id,
+        auth_revision = auth_revision,
         account_vid = account_vid,
         book_id = book_id,
         core_map_hash = core_hash,
@@ -3349,6 +3371,7 @@ function Sync:_start_daemon(reason)
             wr_ticket = auth.wr_ticket or "",
             wr_wrpa = auth.wr_wrpa or "",
             login_session_id = login_session_id,
+            auth_revision = auth_revision,
             account = U.copy(auth.account or {}),
         },
         interval = interval,
@@ -3991,11 +4014,11 @@ function Sync:invalidate_login_session(reason)
         os.remove(daemon.paths.status)
         U.atomic_write(daemon.paths.job,Json.encode({
             action="reset_auth",generation=generation,controller_token=self.controller_token,
-            login_session_id="",account_vid="",book_id="",book={},auth={},interval=Config.READ_INTERVAL,first_delay=10,
+            login_session_id="",auth_revision=0,account_vid="",book_id="",book={},auth={},interval=Config.READ_INTERVAL,first_delay=10,
         }),true)
         U.atomic_write(daemon.paths.control,Json.encode({
             active=false,generation=generation,controller_token=self.controller_token,
-            login_session_id="",account_vid="",book_id="",updated_at=os.time(),reset_reason=reason,
+            login_session_id="",auth_revision=0,account_vid="",book_id="",updated_at=os.time(),reset_reason=reason,
         }),true)
         logger.info("[MiuRead][ReadReport] login session invalidated",
             "reason=",reason,"generation=",tostring(generation))
