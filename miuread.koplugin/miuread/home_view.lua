@@ -300,7 +300,7 @@ local function notice_strip(item, width, height)
     }, row), item.on_tap)
 end
 
-local function hero_card(book, width, height, callback, compact, hold_callback)
+local function hero_card(book, width, height, callback, compact, hold_callback, shelf_cover_w, shelf_cover_h)
     local frame_inset = math.max(1, UiScale.dp(2, 2, 3))
     local frame_w = math.max(1, width - frame_inset * 2)
     local frame_h = math.max(1, height - frame_inset * 2)
@@ -309,21 +309,37 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
     local inner_w = math.max(1, frame_w - pad * 2)
     local inner_h = math.max(1, frame_h - pad * 2)
 
-    -- beta.22: keep the cover/information area compact, then give the title
-    -- the full card width above a dedicated full-width progress row.
+    -- beta.24: the title owns a real two-line slot and the recent-reading
+    -- cover uses the visible shelf cover as its minimum target.  This avoids
+    -- the old situation where the hero cover could still look smaller than a
+    -- normal bookshelf cover on some Kindle geometries.
     local section_gap = UiScale.dp(4, 3, 6)
-    local title_h = math.max(UiScale.dp(40, 36, 56), math.min(UiScale.dp(50, 44, 66), math.floor(inner_h * .15)))
+    local title_face = face("cfont", mini and 13.0 or (compact and 13.8 or 14.6),
+        mini and 17.4 or (compact and 18.6 or 19.6), mini and 11.2 or 12.2)
+    local title_line_h = UiScale.dp(22, 19, 30)
+    if title_face and title_face.ftsize and type(title_face.ftsize.getHeightAndAscender) == "function" then
+        local ok, fh = pcall(title_face.ftsize.getHeightAndAscender, title_face.ftsize)
+        if ok and tonumber(fh) and tonumber(fh) > 0 then title_line_h = math.floor(tonumber(fh) + .5) end
+    end
+    local title_h = math.max(UiScale.dp(38, 34, 52), title_line_h * 2 + UiScale.dp(2, 1, 3))
     local progress_h = math.max(UiScale.dp(29, 26, 40), math.min(UiScale.dp(38, 33, 48), math.floor(inner_h * .11)))
     local body_h = math.max(1, inner_h - title_h - progress_h - section_gap * 2)
 
-    -- The recent-reading cover must not feel smaller than a normal shelf cover.
-    -- Use nearly the full body height and a slightly wider cap than beta.21.
-    local cover_h = math.max(UiScale.dp(mini and 126 or 136, mini and 108 or 116, mini and 184 or 198), body_h)
-    cover_h = math.min(body_h, cover_h)
-    local cover_w = math.max(UiScale.dp(mini and 88 or 96, mini and 76 or 82, mini and 134 or 146), math.min(
-        math.floor(inner_w * (mini and .43 or .40)),
-        math.floor(cover_h * .715)
-    ))
+    local baseline_h = math.max(0, tonumber(shelf_cover_h) or 0)
+    local baseline_w = math.max(0, tonumber(shelf_cover_w) or 0)
+    local minimum_h = UiScale.dp(mini and 126 or 136, mini and 108 or 116, mini and 184 or 198)
+    local desired_h = math.max(minimum_h, baseline_h)
+    local cover_h = math.min(body_h, desired_h)
+    local width_cap = math.max(1, math.floor(inner_w * (mini and .50 or .46)))
+    local desired_w = math.max(baseline_w, math.floor(cover_h * .715))
+    local cover_w = math.min(width_cap, desired_w)
+    -- Keep the same cover-box aspect rule as the shelf.  If width is the
+    -- limiting factor, shrink height rather than squeezing the artwork.
+    if cover_w < math.floor(cover_h * .715) then
+        cover_h = math.min(body_h, math.max(1, math.floor(cover_w / .715)))
+    else
+        cover_w = math.min(width_cap, math.max(1, math.floor(cover_h * .715)))
+    end
     local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .05)
         or placeholder(cover_w, cover_h, book.title, book.author)
     local gap = math.max(UiScale.dp(8, 6, 13), math.floor(width * .018))
@@ -334,10 +350,18 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
     local author = U.trim(tostring(book.author or ""))
     local category = U.trim(tostring(book.category or ""))
     local publisher = U.trim(tostring(book.publisher or ""))
+    local published_date = U.trim(tostring(book.published_date or book.publishTime or ""))
+    local published_number = tonumber(published_date)
+    if published_number and published_number > 1000000000 then
+        if published_number > 100000000000 then published_number = published_number / 1000 end
+        local ok, year = pcall(os.date, "%Y", published_number)
+        published_date = ok and tostring(year or "") or ""
+    elseif published_date ~= "" then
+        published_date = U.utf8_truncate(published_date, 16, "…")
+    end
     local format = U.trim(tostring(book.format or "")):upper()
     local edition = U.trim(tostring(book.edition_text or ""))
     local recent_line = U.trim(tostring(book.last_read_text or ""))
-    if recent_line == "" then recent_line = "最近阅读时间暂无" end
 
     local source_line
     if book.source == "local" or book.local_file == true then
@@ -349,45 +373,58 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
     end
 
     local info_lines = {}
-    local function add_info(value)
+    local function add_info(label, value)
         value = U.trim(tostring(value or ""))
-        if value ~= "" then info_lines[#info_lines + 1] = value end
+        if value ~= "" then info_lines[#info_lines + 1] = tostring(label or "") .. value end
     end
-    add_info(author ~= "" and author or "作者未知")
-    add_info(source_line)
-    if category ~= "" then add_info(category) end
-    if publisher ~= "" then add_info(publisher) end
+    add_info("作者  ", author)
+    add_info("来源  ", source_line)
+    add_info("分类  ", category)
+    if publisher ~= "" then
+        local pub = publisher
+        if published_date ~= "" then pub = pub .. " · " .. published_date end
+        add_info("出版  ", pub)
+    elseif published_date ~= "" then
+        add_info("出版  ", published_date)
+    end
     if edition ~= "" then
-        add_info(edition)
+        add_info("版本  ", edition)
     elseif (book.source == "local" or book.local_file == true) and format ~= "" then
-        add_info(format)
+        add_info("格式  ", format)
     end
-    add_info(recent_line)
+    add_info("最近  ", recent_line)
 
-    -- Reserve the top-right corner for History, then fit as many real metadata
-    -- lines as the device can show. Nothing is padded with invented fields.
-    local info_top = history_h + UiScale.dp(3, 2, 5)
-    local info_h = math.max(1, body_h - info_top)
+    -- History only owns the top-right corner.  It no longer wastes a whole
+    -- metadata row.  The first information line simply shortens around it;
+    -- every following line uses the full information width.
+    local info_h = body_h
     local min_line_h = math.max(UiScale.dp(18, 16, 25), math.floor(body_h * .105))
     local max_lines = math.max(1, math.floor(info_h / math.max(1, min_line_h)))
     while #info_lines > max_lines do table.remove(info_lines, #info_lines - 1) end
-    local line_h = math.max(1, math.floor(info_h / math.max(1, #info_lines)))
-    local info = VerticalGroup:new{align = "left", VerticalSpan:new{height = info_top}}
-    for index, value in ipairs(info_lines) do
-        info[#info + 1] = TextBoxWidget:new{
-            text = value,
-            face = face(index == 1 and "cfont" or "smallinfofont",
-                index == 1 and (mini and 11.0 or 11.6) or (mini and 9.0 or 9.5),
-                index == 1 and (mini and 15.0 or 15.8) or (mini and 12.3 or 13.1)),
-            bold = index == 1,
-            width = text_w, height = line_h, height_adjust = false,
-            height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
-        }
+    local line_count = math.max(1, #info_lines)
+    local line_h = math.max(1, math.floor(info_h / line_count))
+    local info = OverlapGroup:new{dimen = Geom:new{w = text_w, h = info_h}, allow_mirroring = false}
+    if #info_lines == 0 then
+        info[#info + 1] = Widget:new{dimen = Geom:new{w = text_w, h = info_h}}
+    else
+        for index, value in ipairs(info_lines) do
+            local line_w = text_w
+            if index == 1 and history_w > 0 then
+                line_w = math.max(1, text_w - history_w - UiScale.dp(5, 4, 8))
+            end
+            info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = (index - 1) * line_h, TextBoxWidget:new{
+                text = value,
+                face = face("smallinfofont", mini and 9.2 or 9.8, mini and 12.6 or 13.4, mini and 7.8 or 8.2),
+                bold = true,
+                width = line_w, height = line_h, height_adjust = false,
+                height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
+            }}
+        end
     end
 
     local title = TextBoxWidget:new{
         text = tostring(book.title or "未命名"),
-        face = face("cfont", mini and 14.0 or (compact and 14.8 or 15.6), mini and 18.8 or (compact and 19.8 or 21.0)),
+        face = title_face,
         bold = true,
         width = inner_w, height = title_h, height_adjust = false,
         height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
@@ -1122,7 +1159,7 @@ local function dashboard_week_cells(stats, width, height)
     local cell_w = math.max(1, math.floor((width - gap * 6) / 7))
     local label_h = math.max(UiScale.dp(14, 12, 19), math.floor(height * .34))
     local mark_h = math.max(1, height - label_h)
-    local mark_size = math.max(UiScale.dp(9, 8, 13), math.min(math.floor(cell_w * .56), math.floor(mark_h * .66)))
+    local mark_size = math.max(UiScale.dp(12, 10, 17), math.min(math.floor(cell_w * .64), math.floor(mark_h * .76)))
     local marks = HorizontalGroup:new{align = "center"}
     local labels = HorizontalGroup:new{align = "center"}
     for index = 1, 7 do
@@ -1142,8 +1179,8 @@ local function dashboard_week_cells(stats, width, height)
         end
         marks[#marks + 1] = CenterContainer:new{dimen = Geom:new{w = cell_w, h = mark_h}, mark}
         labels[#labels + 1] = Ui.textbox(DASH_WEEKDAY[index], cell_w, label_h,
-            face("smallinfofont", 7.7, 10.4, 6.4), {
-                alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+            face("smallinfofont", 8.1, 10.9, 6.8), {
+                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
             })
         if index < 7 then
             marks[#marks + 1] = HorizontalSpan:new{width = gap}
@@ -1185,8 +1222,8 @@ local function dashboard_stats_card(title, stats, width, height, callback)
                 height_overflow_show_ellipsis = true,
             }),
         Ui.textbox(caption, inner_w, caption_h,
-            face("smallinfofont", 8.4, 11.4, 7.0), {
-                alignment = "left", halign = "left", fgcolor = Blitbuffer.COLOR_BLACK,
+            face("smallinfofont", 8.8, 11.9, 7.4), {
+                bold = true, alignment = "left", halign = "left", fgcolor = Blitbuffer.COLOR_BLACK,
                 height_overflow_show_ellipsis = true,
             }),
         Ui.textbox(main_text, inner_w, main_h,
@@ -1195,8 +1232,8 @@ local function dashboard_stats_card(title, stats, width, height, callback)
                 height_overflow_show_ellipsis = true,
             }),
         Ui.textbox(secondary, inner_w, secondary_h,
-            face("smallinfofont", 8.2, 11.0, 6.8), {
-                alignment = "left", halign = "left", fgcolor = Blitbuffer.COLOR_BLACK,
+            face("smallinfofont", 8.6, 11.6, 7.2), {
+                bold = true, alignment = "left", halign = "left", fgcolor = Blitbuffer.COLOR_BLACK,
                 height_overflow_show_ellipsis = true,
             }),
     }
@@ -1244,8 +1281,15 @@ function HomeWidget:_build_sections(children, m, compact, mode)
         local shelf_x = dashboard_x + dashboard_w + gap
         local shelf_w = math.max(1, w - hero_w - dashboard_w - gap * 2)
         if build_static then
+            local shelf_sy = y + tabs_h + math.max(3, math.floor(gap * .35))
+            if section_h > 0 then shelf_sy = shelf_sy + section_h + math.max(2, math.floor(gap * .25)) end
+            local shelf_footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
+            local shelf_grid_h = math.max(1, bottom - shelf_sy - shelf_footer_h)
+            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, shelf_w, shelf_grid_h, #books, 2)
+            local shelf_cover_w, shelf_cover_h = shelf_cover_target_size(shelf_card_w, shelf_card_h, 1.0)
             if self.opts.hero then
-                self:_add(children, x, y, hero_card(self.opts.hero, hero_w, available_h, self.opts.hero.on_tap, compact, self.opts.on_hold_book))
+                self:_add(children, x, y, hero_card(self.opts.hero, hero_w, available_h, self.opts.hero.on_tap, compact,
+                    self.opts.on_hold_book, shelf_cover_w, shelf_cover_h))
             else
                 self:_add(children, x, y, welcome_card(hero_w, available_h, self.opts.on_empty_account))
             end
@@ -1304,8 +1348,17 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             local hero_w = math.max(UiScale.dp(250, 215, 350), math.floor((w - gap) * .50))
             local dashboard_x = x + hero_w + gap
             local dashboard_w = math.max(1, w - hero_w - gap)
+            local shelf_y = y + hero_h + gap
+            if #actions > 0 and shelf_y + action_h < bottom then shelf_y = shelf_y + action_h + gap end
+            if shelf_y + tabs_h < bottom then shelf_y = shelf_y + tabs_h + math.max(3, math.floor(gap * .35)) end
+            if section_h > 0 and shelf_y + section_h < bottom then shelf_y = shelf_y + section_h + math.max(2, math.floor(gap * .25)) end
+            local shelf_footer_h = math.max(36, math.min(48, math.floor(m.body_h * .045)))
+            local shelf_grid_h = math.max(1, bottom - shelf_y - shelf_footer_h)
+            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, w, shelf_grid_h, #books, 2)
+            local shelf_cover_w, shelf_cover_h = shelf_cover_target_size(shelf_card_w, shelf_card_h, 1.0)
             if self.opts.hero then
-                self:_add(children, x, y, hero_card(self.opts.hero, hero_w, hero_h, self.opts.hero.on_tap, compact, self.opts.on_hold_book))
+                self:_add(children, x, y, hero_card(self.opts.hero, hero_w, hero_h, self.opts.hero.on_tap, compact,
+                    self.opts.on_hold_book, shelf_cover_w, shelf_cover_h))
             else
                 self:_add(children, x, y, welcome_card(hero_w, hero_h, self.opts.on_empty_account))
             end

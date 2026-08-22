@@ -1,12 +1,12 @@
-4.9.0-beta.23
+4.9.0-beta.24
 
 Changed files:
 - miuread.koplugin/main.lua
-- miuread.koplugin/miuread/local_annotation_database.lua
-- miuread.koplugin/miuread/sync.lua
+- miuread.koplugin/miuread/home_view.lua
+- miuread.koplugin/miuread/reading_stats_dialog.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: remove synchronous network/database stalls from reader lifecycle paths, freeze ordinary Home work at the first lock-screen edge, and reduce ReadReport barrier polling I/O without changing precise progress or locked-download behavior.
+Focus: finish the beta.22/beta.23 Home UI work on the real runtime paths, make current-book refresh non-blocking, tie the hero cover to the actual shelf cover geometry, and improve e-ink small-text/reading-check visibility without changing reader lifecycle, download, sync or precise-progress behavior.

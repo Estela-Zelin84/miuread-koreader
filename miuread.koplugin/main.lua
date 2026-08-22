@@ -8426,35 +8426,78 @@ end
 function Plugin:_home_refresh_one_book_metadata(book,network_too)
     if type(book)~="table" then return false end
     local path=tostring(book.file or "")
-    local local_changed=false
-    if path~="" and U.file_exists(path) then
-        self:toast("正在更新这本书的信息…",2)
-        local metadata,err=LocalMetadata.read(path,self:_home_local_metadata_dir(),{open_document=true,use_bim=true})
-        if metadata then
-            if book.source=="local" or book.local_file==true then
-                local_changed=self:_home_update_local_cache(path,metadata)
-            else
-                local_changed=self:_home_update_miuread_metadata(path,metadata)
-            end
-            if LocalMetadata.merge(book,metadata) then local_changed=true end
-            book.status_text=self:_home_status_text(book,book.source=="local" or book.local_file==true)
-        else
-            logger.warn("[MiuRead][Home] local metadata refresh failed",tostring(err or "unknown"))
+    local has_file=path~="" and U.file_exists(path)
+    local wants_network=network_too~=false
+
+    local function start_network(local_changed)
+        local network_started=false
+        if wants_network then
+            network_started=self:_home_schedule_network_metadata(book,true,false,nil,true)==true
         end
+        if local_changed then
+            if HomeView.is_shown() then HomeView.update_hero(self._home_hero or book) end
+            self:toast(network_started and "本地信息已更新，正在网络补全…" or "书籍信息已更新",2)
+        elseif network_started then
+            self:toast("正在从网络补全书籍信息…",2)
+        elseif not has_file then
+            self:toast(self:_network_radio_hint()==false and "当前没有可读取的本地文件，网络也未连接" or "当前没有可读取的本地文件",2)
+        else
+            self:toast("没有发现需要更新的信息",2)
+        end
+        return local_changed or network_started
     end
-    local network_started=false
-    if network_too~=false then
-        network_started=self:_home_schedule_network_metadata(book,true,false,nil,true)==true
+
+    if not has_file then return start_network(false) end
+    if not self.home_metadata_async or not self.home_metadata_async:available() then
+        -- Never fall back to opening a potentially large document on the UI
+        -- thread.  The fast sidecar/package read still updates lightweight
+        -- metadata; network completion remains asynchronous.
+        self:toast("正在更新这本书的信息…",2)
+        local metadata,err=LocalMetadata.read(path,self:_home_local_metadata_dir(),{open_document=false,use_bim=false})
+        local changed=false
+        if metadata then
+            if book.source=="local" or book.local_file==true then changed=self:_home_update_local_cache(path,metadata)
+            else changed=self:_home_update_miuread_metadata(path,metadata) end
+            if LocalMetadata.merge(book,metadata) then changed=true end
+            book.status_text=self:_home_status_text(book,book.source=="local" or book.local_file==true)
+        elseif err then
+            logger.warn("[MiuRead][Home] fast local metadata refresh failed",tostring(err))
+        end
+        return start_network(changed)
     end
-    if local_changed then self:_refresh_home_view(network_started and "本地信息已更新，正在网络补全" or "书籍信息已更新","content")
-    elseif network_started then self:toast("正在从网络补全书籍信息…",2)
-    elseif path=="" or not U.file_exists(path) then
-        self:info("当前没有可读取的本地文件，网络信息也暂时无法获取")
+    if self.home_metadata_async:busy() then
+        self:toast("已有图书信息任务正在进行，请稍后再试",2)
         return false
-    else
-        self:toast("没有发现需要更新的信息",2)
     end
-    return local_changed or network_started
+
+    self:toast("正在更新这本书的信息…",2)
+    local cache_dir=self:_home_local_metadata_dir()
+    local is_local=book.source=="local" or book.local_file==true
+    local started,err=self.home_metadata_async:run("home-current-local-metadata",function()
+        local Metadata=require("miuread.local_metadata")
+        local metadata,read_err=Metadata.read(path,cache_dir,{open_document=true,use_bim=true})
+        return {metadata=metadata,error=read_err}
+    end,function(result)
+        local value=result and result.ok==true and type(result.value)=="table" and result.value or nil
+        local metadata=value and value.metadata or nil
+        local read_err=value and value.error or (result and result.error)
+        local changed=false
+        if metadata then
+            if is_local then changed=self:_home_update_local_cache(path,metadata)
+            else changed=self:_home_update_miuread_metadata(path,metadata) end
+            if LocalMetadata.merge(book,metadata) then changed=true end
+            book.status_text=self:_home_status_text(book,is_local)
+        elseif read_err then
+            logger.warn("[MiuRead][Home] local metadata refresh failed",tostring(read_err))
+        end
+        start_network(changed)
+    end,45)
+    if not started then
+        logger.warn("[MiuRead][Home] local metadata worker not started",tostring(err or "unknown"))
+        self:toast("当前暂时无法开始书籍信息更新",2)
+        return false
+    end
+    return true
 end
 
 function Plugin:_home_remove_lockscreen_cover_cache(book)
@@ -8511,8 +8554,9 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
             end
         end
     end
-    if id=="" or cover=="" or not self.home_cover_async or self.home_cover_async:busy() then return false end
-    if not self:is_online() then return false end
+    if id=="" or cover=="" or not self.home_cover_async or not self.home_cover_async:available()
+        or self.home_cover_async:busy() then return false end
+    if self:_network_radio_hint()==false then return false end
 
     local old_cached=self.library:cached_cover_path(id)
     local refresh_token="manual-"..tostring(os.time()).."-"..tostring(math.floor((os.clock()%1)*1000))
@@ -8634,12 +8678,12 @@ end
 
 function Plugin:_home_refresh_current_network_metadata(book)
     if type(book)~="table" then return false end
-    if not self:is_online() then
+    if self:_network_radio_hint()==false then
         self:toast("当前未联网，无法更新书籍信息和封面",2)
         return false
     end
 
-    self:toast("正在更新这本书的信息和封面…",2)
+    self:toast("正在后台更新这本书的信息和封面…",2)
     local state={metadata_done=false,metadata_ok=false,metadata_partial=false,cover_done=false,cover_ok=false,cover_unchanged=false,finished=false}
     local function finish()
         if state.finished or not state.metadata_done or not state.cover_done then return end
@@ -8754,31 +8798,6 @@ function Plugin:_home_repair_book(book)
     local id=tostring(book and (book.bookId or book.book_id) or "")
     if id=="" then self:info("这本书没有可用的修复记录") return false end
     return self:_repair_downloaded_book(id)
-end
-
-function Plugin:_show_home_refresh_popup(anchor)
-    ActionSheet.show{
-        cache_key="home_refresh",
-        anchor=anchor,
-        preferred_direction="below",
-        title="更新",
-        subtitle="内容更新与墨水屏全刷分开执行",
-        actions={
-            {icon="↻",label="更新当前栏目",detail="只检查当前看到的内容",callback=function() self:_home_manual_refresh() end},
-            {icon="i",label="更新当前书籍",detail="重新读取最近阅读书籍的资料与封面",callback=function()
-                local hero=self._home_hero
-                if not hero then self:toast("当前没有可更新的书籍",2); return end
-                if hero.source=="local" or hero.local_file==true then
-                    self:_home_refresh_one_book_metadata(hero,true)
-                else
-                    self:_home_refresh_current_network_metadata(hero)
-                end
-            end},
-            {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
-            {icon="⌕",label="刷新本地书",detail="重新检查本地书籍；文件夹打开时只读取当前层",callback=function() self:_home_scan_local(true,true) end},
-            {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
-            },
-    }
 end
 
 function Plugin:_show_home_download_popup(anchor)
@@ -9036,9 +9055,18 @@ end
 function Plugin:_home_action_function_actions(key,anchor)
     if key=="refresh" then return {
         {icon="↻",label="更新当前栏目",detail="只检查当前看到的内容",callback=function() self:_home_manual_refresh() end},
-        {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
+        {icon="i",label="更新当前书籍",detail="后台更新最近阅读书籍的资料与封面",callback=function()
+            local hero=self._home_hero
+            if not hero then self:toast("当前没有可更新的书籍",2); return end
+            if hero.source=="local" or hero.local_file==true then
+                self:_home_refresh_one_book_metadata(hero,true)
+            else
+                self:_home_refresh_current_network_metadata(hero)
+            end
+        end},
         {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
-        {icon="⌕",label="刷新本地书",detail="更新最近阅读；文件夹打开时只读取当前层",callback=function() self:_home_scan_local(true,true) end},
+        {icon="⌕",label="刷新本地书",detail="重新检查本地书籍；文件夹打开时只读取当前层",callback=function() self:_home_scan_local(true,true) end},
+        {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
     } end
     if key=="search" then return {
         {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
@@ -9913,9 +9941,10 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done,explic
         return false
     end
     if not self.home_metadata_async or not self.home_metadata_async:available() then return false end
-    if explicit then
-        if not self:is_online() then return false end
-    elseif self:_network_radio_hint()==false then
+    if self:_network_radio_hint()==false then
+        if explicit and on_done then
+            UIManager:nextTick(function() on_done(false,nil,{error="offline"}) end)
+        end
         return false
     end
     local retry=function()
@@ -10647,40 +10676,6 @@ function Plugin:_home_weread_stats_data(cache)
     data.daily=HomeData.week_rows(weekly.daily,os.time())
     return data
 end
-
-local HOME_WEEKDAY_SHORT={ ["1"]="一",["2"]="二",["3"]="三",["4"]="四",["5"]="五",["6"]="六",["0"]="日" }
-
-function Plugin:_home_week_check_lines(rows, threshold)
-    rows=HomeData.week_rows(rows,os.time())
-    threshold=math.max(0,tonumber(threshold) or 1)
-    local marks,days={},{}
-    for _,row in ipairs(rows) do
-        if row.future==true then marks[#marks+1]="·"
-        elseif (tonumber(row.seconds) or 0)>=threshold then marks[#marks+1]="✓"
-        else marks[#marks+1]="—" end
-        days[#days+1]=HOME_WEEKDAY_SHORT[tostring(row.weekday or "")] or "·"
-    end
-    return table.concat(marks,"  "),table.concat(days,"  ")
-end
-
-function Plugin:_home_weread_stats_text(cache)
-    local data=self:_home_weread_stats_data(cache)
-    if data.week_seconds==nil and data.today_seconds==nil then
-        return self:logged_in() and "正在获取阅读数据…" or "登录后显示阅读数据"
-    end
-    local marks,days=self:_home_week_check_lines(data.daily,60)
-    return "本周 "..self:_home_short_duration(data.week_seconds or 0).." · 今日 "..self:_home_short_duration(data.today_seconds or 0)
-        .." · 日均 "..self:_home_short_duration(data.day_average_seconds or 0).."\n"..marks.."\n"..days
-end
-
-function Plugin:_home_local_stats_text(data)
-    data=type(data)=="table" and data or nil
-    if not data then return "暂无本地阅读数据" end
-    local marks,days=self:_home_week_check_lines(data.daily,1)
-    return "本周 "..self:_home_short_duration(data.week_seconds or 0).." · 今日 "..self:_home_short_duration(data.today_seconds or 0)
-        .."\n"..marks.."\n"..days
-end
-
 
 function Plugin:_home_weread_stats_card(cache)
     local data=self:_home_weread_stats_data(cache)
