@@ -1,5 +1,11 @@
 # Changelog
 
+## 5.0.0-beta.1 - 2026-08-23
+
+- Delete miuread.koplugin/main.lua
+- Add files via upload
+- fix: 兼容旧版 KOReader 并完整锁定屏幕方向
+
 ## 4.9.0-beta.30 - 2026-08-23
 
 - 将觅阅阅读工具栏拆成桌面模式与插件模式两个独立开关：桌面模式继续使用 `reader_ui.enabled`，插件模式使用现有 `reader_ui.plugin_mode_enabled`。插件模式缺省/旧配置一律按关闭处理，不再被桌面模式的开关状态带入。
